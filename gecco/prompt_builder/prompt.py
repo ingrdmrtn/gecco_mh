@@ -1,4 +1,4 @@
-def build_prompt(cfg, data_text, feedback_text=None):
+def build_prompt(cfg, data_text, data, feedback_text=None):
     """
     Construct the structured LLM prompt for cognitive model generation.
     Order:
@@ -8,9 +8,10 @@ def build_prompt(cfg, data_text, feedback_text=None):
     4. Guardrails
     5. Template model
     """
-    task, llm = cfg.task, cfg.llm
+    task, llm, evaluation = cfg.task, cfg.llm, cfg.evaluation
     guardrails = getattr(llm, "guardrails", [])
     include_feedback = getattr(llm, "include_feedback", False)
+    fit_type = getattr(evaluation, "fit_type")
 
     # Format goal section dynamically
     names = [f"`cognitive_model{i+1}`" for i in range(llm.models_per_iteration)]
@@ -18,6 +19,14 @@ def build_prompt(cfg, data_text, feedback_text=None):
         models_per_iteration=llm.models_per_iteration,
         model_names=", ".join(names),
     )
+
+    if fit_type == "individual":
+
+        individual_variability_feature = cfg.individual_difference.individual_feature
+        individual_variability_feature = data[individual_variability_feature][0]
+        individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
+    else:
+        individual_variability_section = ""
 
     feedback_section = (
         f"\n\n### Feedback\n{feedback_text.strip()}"
@@ -27,10 +36,15 @@ def build_prompt(cfg, data_text, feedback_text=None):
 
     if cfg.llm.provider in ["openai", "claude", "gemini"]:
         # --- prompt layout for closed models ---
+
+
         prompt = f"""
 ### Task Description
 {task.name}
 {task.description.strip()}
+
+# individual_variability_section
+{individual_variability_section}
 
 ### Example Participant Data
 Here is example data from several participants:
@@ -47,9 +61,12 @@ Here is example data from several participants:
 
 {feedback_section}
 """.strip()
+
+    # --- prompt layout for open models ---
     else:
-        # --- prompt layout for open models ---
+
         prompt = f"""
+
 {task.description.strip()}
 
 Here's data from several participants:
@@ -71,9 +88,13 @@ Your function:
 
     return prompt
 
+
+
+
 class PromptBuilderWrapper:
-    def __init__(self, cfg, data_text):
+    def __init__(self, cfg, data_text, data):
         self.cfg = cfg
         self._data_text = data_text
+        self.data = data
     def build_input_prompt(self, feedback_text: str = ""):
-        return build_prompt(self.cfg, self._data_text, feedback_text=feedback_text)
+        return build_prompt(self.cfg, self._data_text, self.data, feedback_text=feedback_text)

@@ -31,7 +31,7 @@ class FeedbackGenerator:
             "and explore alternative parameter configurations or mechanisms.\n"
         )
 
-        if self.cfg.feedback.prompt:
+        if hasattr(self.cfg, "feedback") and hasattr(self.cfg.feedback, "prompt"): #self.cfg.feedback.prompt:
             # Allow user to use {best_model} and {previous_parameters} in their custom prompt
             feedback = self.cfg.feedback.prompt.format(
                 best_model=best_model,

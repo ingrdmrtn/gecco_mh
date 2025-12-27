@@ -2,6 +2,7 @@
 import os
 import json
 import numpy as np
+import pandas as pd
 
 from gecco.offline_evaluation.fit_generated_models import run_fit
 from gecco.utils import extract_full_function
@@ -27,7 +28,14 @@ class GeCCoModelSearch:
         self.project_root = Path(__file__).resolve().parents[1]
 
         # --- Results directory (absolute path) ---
-        self.results_dir = self.project_root / "results" / self.cfg.task.name
+        # self.results_dir = self.project_root / "results" / self.cfg.task.name if self.cfg.evaluation.fit_type != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
+
+        self.results_dir = (
+            self.project_root / "results" / self.cfg.task.name
+            if self.cfg.evaluation.fit_type != "individual"
+            else self.project_root / "results" / f"{self.cfg.task.name}_individual"
+        )
+
         (self.results_dir / "models").mkdir(parents=True, exist_ok=True)
         (self.results_dir / "bics").mkdir(parents=True, exist_ok=True)
 
@@ -92,22 +100,25 @@ class GeCCoModelSearch:
             )
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    def run_n_shots(self, run_idx):
+    def run_n_shots(self, run_idx, baseline_bic):
         for it in range(self.cfg.loop.max_iterations):
             print(f"\n[GeCCo] --- Iteration {it} ---")
 
-            # === Feedback generation ===
+            stop_iterations = False  # ✅ reset each iteration
+
             feedback = ""
             if self.best_model is not None:
-                feedback = self.feedback.get_feedback(
-                    self.best_model,
-                    self.tried_param_sets,
-                )
+                feedback = self.feedback.get_feedback(self.best_model, self.tried_param_sets)
 
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
             code_text = self.generate(self.model, self.tokenizer, prompt)
 
-            model_file = self.results_dir / "models" / f"iter{it}_run{run_idx}.txt"
+            model_file = (
+                self.results_dir / "models" / f"iter{it}_run{run_idx}.txt"
+                if self.cfg.evaluation.fit_type != "individual"
+                else self.results_dir / "models" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
+            )
+
             with open(model_file, "w") as f:
                 f.write(code_text)
 
@@ -134,7 +145,7 @@ class GeCCoModelSearch:
                         "metric_name": metric_name,
                         "metric_value": mean_metric,
                         "param_names": params,
-                        "code_file": str(model_file),  # ✅ convert Path -> str
+                        "code_file": str(model_file),
                     })
 
                     if mean_metric < self.best_metric:
@@ -142,21 +153,40 @@ class GeCCoModelSearch:
                         self.best_model = func_code
                         self.best_iter = it
                         self.best_params = params
+                        self.best_param_names = fit_res["param_names"]  # ✅ store names
+
                         print(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 
-                        best_model_file = self.results_dir / "models" / f"best_model_{run_idx}.txt"
+                        best_model_file = (
+                            self.results_dir / "models" / f"best_model_{run_idx}.txt"
+                            if self.cfg.evaluation.fit_type != "individual"
+                            else self.results_dir / "models" / f"best_model_{run_idx}_participant{self.df.participant[0]}.txt"
+                        )
                         with open(best_model_file, "w") as f:
                             f.write(func_code)
+
+                    # ✅ stop if ANY model beats baseline
+                    if baseline_bic is not None and mean_metric < baseline_bic:
+                        stop_iterations = True
+                        # optional: break here to save compute evaluating remaining models
+                        break
 
                 except Exception as e:
                     print(f"[⚠️ GeCCo] Error fitting {func_name}: {e}")
 
-            # Save iteration results
-            bic_file = self.results_dir / "bics" / f"iter{it}_run{run_idx}.json"
+            # ✅ always save what happened this iteration (even if stopping)
+            bic_file = (
+                self.results_dir / "bics" / f"iter{it}_run{run_idx}.json"
+                if self.cfg.evaluation.fit_type != "individual"
+                else self.results_dir / "bics" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.json"
+            )
             with open(bic_file, "w") as f:
                 json.dump(iteration_results, f, indent=2)
 
             self.feedback.record_iteration(it, iteration_results)
+
+            if stop_iterations:
+                break  # ✅ breaks iterations loop only (run loop unaffected)
 
         print(
             f"\n[🏁 GeCCo] Finished search. "
@@ -164,6 +194,24 @@ class GeCCoModelSearch:
             f"{self.cfg.evaluation.metric.upper()}={self.best_metric:.2f}"
         )
 
+        # --- save best parameters ---
+        if self.best_model is not None and self.best_params:
+            param_df = pd.DataFrame(
+                [self.best_params],
+                columns=self.best_param_names
+            )
+
+            param_dir = self.results_dir / "parameters"
+            param_dir.mkdir(parents=True, exist_ok=True)
+
+            param_file = (
+                param_dir / f"best_params_run{run_idx}.csv"
+                if self.cfg.evaluation.fit_type != "individual"
+                else param_dir / f"best_params_run{run_idx}_participant{self.df.participant[0]}.csv"
+            )
+
+            param_df.to_csv(param_file, index=False)
+
+
         return self.best_model, self.best_metric, self.best_params
 
-    

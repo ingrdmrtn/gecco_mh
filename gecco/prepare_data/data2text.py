@@ -44,7 +44,7 @@ def narrative(
 
 def get_data2text_function(name):
     if name == "narrative":
-        def data2text(df, id_col, template, max_trials=None, value_mappings=None):
+        def data2text(df, id_col, template, fit_type, max_trials=None, value_mappings=None):
             """
             Convert participant trial data into a narrative string.
             Generic across tasks — assumes only participant ID and trial rows.
@@ -87,7 +87,11 @@ def get_data2text_function(name):
 
                 # Join participant's trials
                 participant_text = "\n".join(trial_lines)
-                narratives.append(f"Participant {pid}:\n{participant_text}\n")
+
+                if fit_type == "individual":
+                    narratives.append(f"Participant data:\n{participant_text}\n")
+                else:
+                    narratives.append(f"Participant {pid}:\n{participant_text}\n")
 
             return "\n".join(narratives)
         return data2text

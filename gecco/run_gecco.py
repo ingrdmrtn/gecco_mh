@@ -8,7 +8,7 @@ from gecco.offline_evaluation.fit_generated_models import run_fit
 from gecco.utils import extract_full_function
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
-
+from google.genai import types
 
 class GeCCoModelSearch:
     def __init__(self, model, tokenizer, cfg, df, prompt_builder):
@@ -77,6 +77,27 @@ class GeCCoModelSearch:
                 ],
             )
             decoded = resp.output_text.strip()
+
+            return decoded
+
+        elif "gemini" in provider:
+            reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
+
+            print(
+                f"[GeCCo] Using Gemini model '{self.cfg.llm.base_model}' "
+                f"(reasoning={reasoning_effort})"
+            )
+
+            resp = model.models.generate_content(
+                model=self.cfg.llm.base_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                       temperature=self.cfg.llm.temperature,
+                       system_instruction=self.cfg.llm.system_prompt,
+                       thinking_config=types.ThinkingConfig(thinking_level=reasoning_effort),
+                )
+            )
+            decoded = resp.text.strip()
 
             return decoded
 

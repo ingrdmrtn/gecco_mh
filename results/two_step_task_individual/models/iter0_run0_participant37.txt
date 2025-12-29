@@ -1,0 +1,277 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """
+    Hybrid model-based/model-free RL with eligibility trace and stickiness.
+    Parameters (all used):
+    - alpha: learning rate for both stages (bound [0,1])
+    - beta: inverse temperature for softmax (bound [0,10])
+    - w: weight on model-based vs model-free (0=model-free, 1=model-based) (bound [0,1])
+    - lam: eligibility trace that propagates second-stage reward to first-stage MF (bound [0,1])
+    - kappa: choice stickiness bias for repeating the last action at each stage (bound [0,1])
+
+    Inputs:
+    - action_1: array-like of ints in {0,1} for first-stage actions (A=0, U=1)
+    - state: array-like of ints in {0,1} for second-stage states/planets (X=0, Y=1)
+    - action_2: array-like of ints in {0,1} for second-stage actions/aliens (index within state)
+    - reward: array-like of floats in [0,1]
+    - model_parameters: iterable of the five parameters [alpha, beta, w, lam, kappa]
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices under the model.
+    """
+    alpha, beta, w, lam, kappa = model_parameters
+    n_trials = len(action_1)
+
+    # Known transition structure: A->X common, U->Y common
+    transition_matrix = np.array([[0.7, 0.3],   # from A to [X, Y]
+                                  [0.3, 0.7]])  # from U to [X, Y]
+
+    # Probabilities of chosen actions across trials
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Q-values
+    q1_mf = np.zeros(2)           # model-free first-stage Q
+    q2 = np.zeros((2, 2))         # second-stage Q: [state, action]
+
+    # Stickiness (previous actions)
+    last_a1 = None
+    last_a2 = np.array([None, None], dtype=object)  # per-state last second-stage action
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Model-based first-stage values via expected max over second stage
+        max_q2 = np.max(q2, axis=1)  # max over actions for each state
+        q1_mb = transition_matrix @ max_q2  # expected value for each first-stage action
+
+        # Combine MF and MB for first-stage policy, add stickiness
+        q1_comb = (1.0 - w) * q1_mf + w * q1_mb
+        stick1 = np.zeros(2)
+        if last_a1 is not None:
+            stick1[last_a1] += kappa
+        logits1 = beta * q1_comb + stick1
+        # Softmax for first-stage choice probabilities
+        logits1_shift = logits1 - np.max(logits1)
+        exp1 = np.exp(logits1_shift)
+        probs1 = exp1 / np.sum(exp1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with stickiness within the current state
+        q2_state = q2[s].copy()
+        stick2 = np.zeros(2)
+        if last_a2[s] is not None:
+            stick2[last_a2[s]] += kappa
+        logits2 = beta * q2_state + stick2
+        logits2_shift = logits2 - np.max(logits2)
+        exp2 = np.exp(logits2_shift)
+        probs2 = exp2 / np.sum(exp2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Observe reward
+        r = reward[t]
+
+        # Learning updates
+        # Second-stage TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # First-stage MF updates: bootstrap to second stage and eligibility to reward
+        delta1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha * (delta1 + lam * delta2)
+
+        # Update stickiness memory
+        last_a1 = a1
+        last_a2[s] = a2
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """
+    Uncertainty-bonus model-based RL with learned transitions and perseveration.
+    Parameters (all used):
+    - alpha: learning rate for second-stage Q and first-stage MF bootstrap (bound [0,1])
+    - beta: inverse temperature for both stages (bound [0,10])
+    - tau: weight on an uncertainty bonus (higher favors exploratory choices) (bound [0,1])
+    - eta: transition learning rate to update T(s' | a1) (bound [0,1])
+    - kappa: first-stage stickiness bias for repeating last a1 (bound [0,1])
+
+    Inputs:
+    - action_1: array-like of ints in {0,1} for first-stage actions
+    - state: array-like of ints in {0,1} for second-stage states
+    - action_2: array-like of ints in {0,1} for second-stage actions
+    - reward: array-like of floats in [0,1]
+    - model_parameters: iterable of the five parameters [alpha, beta, tau, eta, kappa]
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, tau, eta, kappa = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize learned transition matrix; start agnostic (0.5, 0.5)
+    T = np.ones((2, 2)) * 0.5  # rows: a1, cols: states [X, Y]
+
+    # Second-stage Q and visit counts for uncertainty bonus
+    q2 = np.zeros((2, 2))
+    counts = np.zeros((2, 2))  # visit counts per (state, action2)
+
+    # First-stage MF values
+    q1_mf = np.zeros(2)
+
+    # Probabilities of chosen actions
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None
+    last_a2 = np.array([None, None], dtype=object)
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Uncertainty bonus: larger when action has been sampled less
+        # bonus = tau * 1 / sqrt(N+1) for the current state's two actions
+        bonus_state = tau * (1.0 / np.sqrt(counts[s] + 1.0))
+
+        # Second-stage policy uses Q2 + bonus
+        q2_aug = q2[s] + bonus_state
+        stick2 = np.zeros(2)
+        if last_a2[s] is not None:
+            # mild within-state stickiness via a fraction of kappa to avoid parameter explosion
+            stick2[last_a2[s]] += 0.5 * kappa
+        logits2 = beta * q2_aug + stick2
+        logits2_shift = logits2 - np.max(logits2)
+        exp2 = np.exp(logits2_shift)
+        probs2 = exp2 / np.sum(exp2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Model-based first-stage values using learned transitions and optimistic Q2 (max over a2)
+        max_q2_aug = np.max(q2 + (tau * (1.0 / np.sqrt(counts + 1.0))), axis=1)  # per state
+        q1_mb = T @ max_q2_aug
+
+        # Combine with MF and apply stickiness
+        q1 = 0.5 * q1_mf + 0.5 * q1_mb  # equal blend; MF updated below; keeps w out to save params
+        stick1 = np.zeros(2)
+        if last_a1 is not None:
+            stick1[last_a1] += kappa
+        logits1 = beta * q1 + stick1
+        logits1_shift = logits1 - np.max(logits1)
+        exp1 = np.exp(logits1_shift)
+        probs1 = exp1 / np.sum(exp1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Observe reward
+        r = reward[t]
+
+        # Learning updates
+        # Update transitions T(a1, :) toward observed state s
+        # One-hot target for state s
+        target = np.array([0.0, 0.0])
+        target[s] = 1.0
+        T[a1, :] += eta * (target - T[a1, :])
+
+        # Update second-stage Q and counts
+        counts[s, a2] += 1.0
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # First-stage MF bootstrap and reward propagation
+        q1_mf[a1] += alpha * ((q2[s, a2] - q1_mf[a1]) + delta2)
+
+        # Update stickiness traces
+        last_a1 = a1
+        last_a2[s] = a2
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """
+    Habitual chunking model: pure model-free SARSA with separate learning rates,
+    global forgetting, and perseveration at both stages.
+    Parameters (all used):
+    - alpha1: learning rate for first-stage Q (bound [0,1])
+    - alpha2: learning rate for second-stage Q (bound [0,1])
+    - rho: forgetting/decay rate applied each trial to all Q-values (bound [0,1])
+    - phi: perseveration strength added to repeating the last action at each stage (bound [0,1])
+    - beta: inverse temperature for both stages (bound [0,10])
+
+    Inputs:
+    - action_1: array-like of ints in {0,1}
+    - state: array-like of ints in {0,1}
+    - action_2: array-like of ints in {0,1}
+    - reward: array-like of floats in [0,1]
+    - model_parameters: iterable of the five parameters [alpha1, alpha2, rho, phi, beta]
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    alpha1, alpha2, rho, phi, beta = model_parameters
+    n_trials = len(action_1)
+
+    # Q-values
+    q1 = np.zeros(2)        # first-stage MF values
+    q2 = np.zeros((2, 2))   # second-stage MF values
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None
+    last_a2 = np.array([None, None], dtype=object)
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Apply global forgetting to all Q values (decay toward 0)
+        q1 *= (1.0 - rho)
+        q2 *= (1.0 - rho)
+
+        # First-stage policy with perseveration
+        stick1 = np.zeros(2)
+        if last_a1 is not None:
+            stick1[last_a1] += phi
+        logits1 = beta * q1 + stick1
+        logits1_shift = logits1 - np.max(logits1)
+        exp1 = np.exp(logits1_shift)
+        probs1 = exp1 / np.sum(exp1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with perseveration within state
+        stick2 = np.zeros(2)
+        if last_a2[s] is not None:
+            stick2[last_a2[s]] += phi
+        logits2 = beta * q2[s] + stick2
+        logits2_shift = logits2 - np.max(logits2)
+        exp2 = np.exp(logits2_shift)
+        probs2 = exp2 / np.sum(exp2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Second-stage update (SARSA-style to reward since terminal after stage 2)
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha2 * delta2
+
+        # First-stage update bootstrapping on updated second-stage value plus immediate reward
+        # This "chunking" assumes a cached mapping from a1 directly to the observed second-stage return.
+        td_to_s2 = q2[s, a2] - q1[a1]
+        q1[a1] += alpha1 * (td_to_s2 + delta2)
+
+        # Update perseveration traces
+        last_a1 = a1
+        last_a2[s] = a2
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

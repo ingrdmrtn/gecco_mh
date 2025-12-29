@@ -1,0 +1,267 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Hybrid MB/MF with learned transitions and surprise-gated arbitration.
+    
+    This model combines model-free (MF) and model-based (MB) control at the first stage,
+    learns its own transition model from experience, and adapts the MB weighting based
+    on transition surprise on each trial. Second-stage values are learned model-free.
+    
+    Parameters (bounds):
+    - alpha_q (0-1): Learning rate for MF Q-values (both stages).
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - alpha_tr (0-1): Learning rate for the transition model T(a -> s).
+    - omega0 (0-1): Baseline MB weight at stage 1 (0 = pure MF, 1 = pure MB).
+    - zeta (0-1): 
+        - Eligibility strength for bootstrapping stage-1 MF from stage-2.
+        - Also scales how much surprise boosts the MB weight on each trial.
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, spaceship chosen at stage 1 (0=A, 1=U).
+    - state: array-like of ints in {0,1}, planet observed at stage 2 (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, alien chosen at the observed planet.
+    - reward: array-like of floats/ints, obtained outcome on each trial.
+    - model_parameters: [alpha_q, beta, alpha_tr, omega0, zeta]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    alpha_q, beta, alpha_tr, omega0, zeta = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Initialize learned transition model; start agnostic (0.5/0.5 per action)
+    T = np.ones((2, 2)) * 0.5  # rows: actions A/U; cols: states X/Y
+
+    # Model-free Q-values
+    Q1_mf = np.zeros(2)        # stage-1 actions
+    Q2_mf = np.zeros((2, 2))   # stage-2 actions within states
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based action values at stage 1 via learned transitions and MF stage-2 values
+        max_Q2 = np.max(Q2_mf, axis=1)  # best alien per planet
+        Q1_mb = T @ max_Q2  # shape (2,)
+
+        # Surprise-based arbitration weight for this trial
+        # Surprise = 1 - predicted probability of the observed transition
+        surprise = 1.0 - T[a1, s]
+        omega = omega0 + zeta * surprise
+        # clip omega to [0,1]
+        omega = 0.0 if omega < 0.0 else (1.0 if omega > 1.0 else omega)
+
+        # Hybrid value for stage-1 policy
+        Q1_hyb = (1.0 - omega) * Q1_mf + omega * Q1_mb
+
+        # Stage-1 policy
+        logits1 = beta * Q1_hyb
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy (pure MF)
+        logits2 = beta * Q2_mf[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Learn transition model T with simple delta rule towards one-hot outcome
+        target_row = np.array([0.0, 0.0])
+        target_row[s] = 1.0
+        T[a1] = (1.0 - alpha_tr) * T[a1] + alpha_tr * target_row
+        # Ensure normalization (numerical safety)
+        T[a1] = T[a1] / (np.sum(T[a1]) + eps)
+
+        # MF learning: stage-2 TD update
+        delta2 = r - Q2_mf[s, a2]
+        Q2_mf[s, a2] += alpha_q * delta2
+
+        # MF learning: stage-1 bootstraps from stage-2 with eligibility strength zeta
+        boot = np.max(Q2_mf[s])  # bootstrap toward best observed-state option
+        delta1 = boot - Q1_mf[a1]
+        Q1_mf[a1] += (alpha_q * zeta) * delta1
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Pure model-based controller with learned transitions, reward values,
+    uncertainty-driven exploration bonus, and first-stage stay bias.
+    
+    The agent learns the transition model and second-stage values, computes a
+    model-based (MB) action value for each spaceship as the expected value over
+    successor states. It adds an exploration bonus proportional to transition
+    uncertainty (entropy of T row) to encourage selecting actions with uncertain
+    consequences. A first-stage stay bias favors repeating the previous spaceship.
+    
+    Parameters (bounds):
+    - alpha_v (0-1): Learning rate for second-stage values (aliens).
+    - alpha_tr (0-1): Learning rate for the transition model T(a -> s).
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - xi_bonus (0-1): Weight of the exploration bonus based on transition uncertainty.
+    - kappa_stay (0-1): Strength of first-stage stay bias (adds to logits for last a1).
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, spaceship chosen at stage 1 (0=A, 1=U).
+    - state: array-like of ints in {0,1}, planet observed at stage 2 (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, alien chosen at the observed planet.
+    - reward: array-like of floats/ints, obtained outcome on each trial.
+    - model_parameters: [alpha_v, alpha_tr, beta, xi_bonus, kappa_stay]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    alpha_v, alpha_tr, beta, xi_bonus, kappa_stay = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Initialize learned transition model at 0.5/0.5 and second-stage values at 0
+    T = np.ones((2, 2)) * 0.5
+    Q2 = np.zeros((2, 2))  # values for aliens per planet
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None  # for stay bias
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # MB value of stage-1 actions from current T and Q2
+        max_Q2 = np.max(Q2, axis=1)
+        Q1_mb = T @ max_Q2  # shape (2,)
+
+        # Uncertainty-driven exploration bonus from transition entropy per action
+        # Entropy H in [0, log 2]; normalize to [0,1] by dividing by log(2).
+        # Add xi_bonus * H to the action value before softmax.
+        H = np.zeros(2)
+        for a in range(2):
+            p = T[a]
+            # avoid log(0) by clipping
+            p_safe = np.clip(p, eps, 1.0)
+            H[a] = -np.sum(p * np.log(p_safe)) / np.log(2.0)  # normalized entropy in [0,1]
+        bonus = xi_bonus * H
+
+        # Stay bias vector
+        stay_vec = np.zeros(2)
+        if last_a1 is not None:
+            stay_vec[last_a1] = kappa_stay
+
+        # Stage-1 policy with bonus and stay bias added to logits
+        logits1 = beta * (Q1_mb + bonus) + stay_vec
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy (softmax over Q2 in observed state)
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Update transition model for the chosen action
+        target_row = np.array([0.0, 0.0])
+        target_row[s] = 1.0
+        T[a1] = (1.0 - alpha_tr) * T[a1] + alpha_tr * target_row
+        T[a1] = T[a1] / (np.sum(T[a1]) + eps)
+
+        # Update second-stage values with TD error (model-free at the terminal step)
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha_v * delta2
+
+        # Update last action for stay bias
+        last_a1 = a1
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Dual-rate model-free learner with value decay and outcome sensitivity.
+    
+    This model learns model-free values at both stages with separate learning rates,
+    applies decay (forgetting) to unchosen/uncharted values on each trial, and
+    transforms outcomes via a tunable outcome-sensitivity mapping before learning.
+    
+    Parameters (bounds):
+    - alpha1 (0-1): Learning rate for stage-1 MF values (spaceships).
+    - alpha2 (0-1): Learning rate for stage-2 MF values (aliens).
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - mu_decay (0-1): Global decay (forgetting) rate applied to all Q-values each trial.
+    - s_val (0-1): Outcome sensitivity; interpolates between raw reward and a
+                   valence-only code. Effective reward: r_eff = (1 - s)*r + s*I(r > 0).
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, spaceship chosen at stage 1 (0=A, 1=U).
+    - state: array-like of ints in {0,1}, planet observed at stage 2 (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, alien chosen at the observed planet.
+    - reward: array-like of floats/ints, obtained outcome on each trial.
+    - model_parameters: [alpha1, alpha2, beta, mu_decay, s_val]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    alpha1, alpha2, beta, mu_decay, s_val = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Model-free Q-values
+    Q1 = np.zeros(2)        # stage-1 actions
+    Q2 = np.zeros((2, 2))   # stage-2 actions per state
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r_raw = reward[t]
+
+        # Apply outcome sensitivity transform
+        # Interpolate between raw reward and valence-only outcome (1 if positive else 0)
+        valence = 1.0 if r_raw > 0 else 0.0
+        r_eff = (1.0 - s_val) * r_raw + s_val * valence
+
+        # Stage-1 policy
+        logits1 = beta * Q1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Global decay (forgetting) of all Q-values toward zero
+        Q1 *= (1.0 - mu_decay)
+        Q2 *= (1.0 - mu_decay)
+
+        # Stage-2 TD update
+        delta2 = r_eff - Q2[s, a2]
+        Q2[s, a2] += alpha2 * delta2
+
+        # Stage-1 TD update bootstrapping from updated stage-2 value at observed state
+        boot = np.max(Q2[s])  # value of the best alien in the observed state
+        delta1 = boot - Q1[a1]
+        Q1[a1] += alpha1 * delta1
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss

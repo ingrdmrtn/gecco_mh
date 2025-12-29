@@ -1,0 +1,290 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Hybrid model-based/model-free with learned transitions and uncertainty-weighted arbitration.
+    
+    Mechanism:
+    - Learns second-stage values Q2[s, a2] from reward (model-free at stage 2).
+    - Learns the first-stage transition function T[a1, s] with a recency-weighted update.
+    - Forms a model-based first-stage value Q1_mb = T @ max_a2 Q2.
+    - Maintains a model-free first-stage value Q1_mf updated by the second-stage TD error (eligibility-like).
+    - Arbitrates between MB and MF at stage 1 with a dynamic weight:
+        w_eff = (1 - k_unc)*w_base + k_unc*U
+      where U is a normalized uncertainty measure of the learned transitions (higher near 0.5/0.5).
+    
+    Parameters (bounds):
+    - alpha_r (0-1): Learning rate for reward updates to Q2 and the eligibility update to Q1_mf.
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - alpha_T (0-1): Learning rate for updating the transition matrix T.
+    - w_base (0-1): Baseline weight on the model-based component at stage 1.
+    - k_unc (0-1): Weight of transition uncertainty in modulating the MB/MF arbitration.
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien (0/1) at the observed planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [alpha_r, beta, alpha_T, w_base, k_unc]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    alpha_r, beta, alpha_T, w_base, k_unc = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Initialize values
+    Q2 = np.zeros((2, 2))          # second-stage action values
+    Q1_mf = np.zeros(2)            # first-stage MF values
+
+    # Initialize transition model T[a1, s]; start unbiased at 0.5/0.5
+    T = np.full((2, 2), 0.5)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based first-stage value using current T and Q2
+        max_q2 = np.max(Q2, axis=1)              # value of each planet
+        Q1_mb = T @ max_q2                       # MB action values at stage 1
+
+        # Compute transition uncertainty U in [0,1]; higher when T ~ [0.5,0.5]
+        # For each action: u_a = 1 - 2*|T[a,0]-0.5|; then average across actions
+        u_a0 = 1.0 - 2.0 * abs(T[0, 0] - 0.5)
+        u_a1 = 1.0 - 2.0 * abs(T[1, 0] - 0.5)
+        U = 0.5 * (u_a0 + u_a1)
+        # Dynamic arbitration weight
+        w_eff = (1.0 - k_unc) * w_base + k_unc * U
+        w_eff = min(max(w_eff, 0.0), 1.0)  # clamp numerically
+
+        # Combine MB and MF for stage 1
+        Q1 = w_eff * Q1_mb + (1.0 - w_eff) * Q1_mf
+
+        # Stage-1 policy
+        logits1 = beta * Q1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Learning: Stage 2 TD update
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha_r * delta2
+
+        # Eligibility-like update to first-stage MF value
+        Q1_mf[a1] += alpha_r * delta2
+
+        # Update transition model T for the chosen action toward observed state
+        # One-hot target for observed state
+        target = np.array([1.0 if s == 0 else 0.0, 1.0 if s == 1 else 0.0])
+        T[a1, :] = (1.0 - alpha_T) * T[a1, :] + alpha_T * target
+
+        # Keep rows normalized (for numerical stability)
+        row_sum = np.sum(T[a1, :])
+        if row_sum > 0:
+            T[a1, :] /= row_sum
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Hybrid first-stage valuation (MF + fixed-transition MB) with transition-outcome interaction bias.
+    
+    Mechanism:
+    - Second stage: standard model-free learning of Q2[s, a2].
+    - First stage:
+        - MF component Q1_mf updated via the second-stage TD error (eligibility-like).
+        - MB component Q1_mb computed using a fixed transition matrix (A->X, U->Y common = 0.7).
+        - A transition-outcome interaction bias term encourages:
+            - repeating the previous first-stage action when the prior trial was rewarded and common;
+            - switching when the prior trial was rewarded and rare;
+          scaled by chi_TO and applied only to the previously chosen action.
+    - Final first-stage action values: Q1 = w_mf*Q1_mf + w_mb*Q1_mb + bias_vector.
+    
+    Parameters (bounds):
+    - eta_q2 (0-1): Learning rate for Q2 updates.
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - w_mf (0-1): Weight on the MF component in the first-stage value combination.
+    - w_mb (0-1): Weight on the MB component in the first-stage value combination.
+    - chi_TO (0-1): Strength of the transition-outcome interaction bias at stage 1.
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien (0/1) at the observed planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [eta_q2, beta, w_mf, w_mb, chi_TO]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    eta_q2, beta, w_mf, w_mb, chi_TO = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Fixed transition matrix (common=0.7): rows=actions(A,U), cols=states(X,Y)
+    T_fixed = np.array([[0.7, 0.3],
+                        [0.3, 0.7]])
+
+    Q2 = np.zeros((2, 2))   # second-stage values
+    Q1_mf = np.zeros(2)     # first-stage MF values
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Variables to compute transition-outcome interaction from previous trial
+    prev_a1 = None
+    prev_is_common = None
+    prev_r = None
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based Q1 using fixed transitions
+        max_q2 = np.max(Q2, axis=1)     # value of planets
+        Q1_mb = T_fixed @ max_q2
+
+        # Transition-outcome interaction bias vector (applied to previous action only)
+        bias_vec = np.zeros(2)
+        if prev_a1 is not None:
+            # Signal: +1 for rewarded-common; -1 for rewarded-rare; 0 if no reward (r == 0)
+            sig = 0.0
+            if prev_r > 0:
+                sig = 1.0 if prev_is_common else -1.0
+            elif prev_r < 0:
+                # If losses, invert the pattern (prefer switching after common loss, repeating after rare loss)
+                sig = -1.0 if prev_is_common else 1.0
+            # Apply only to the previously chosen action
+            bias_vec[prev_a1] = chi_TO * sig
+
+        # Combine to get final first-stage values
+        Q1 = w_mf * Q1_mf + w_mb * Q1_mb + bias_vec
+
+        # Stage-1 policy
+        logits1 = beta * Q1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Learning: Stage 2 TD update
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += eta_q2 * delta2
+
+        # Eligibility-like MF update for stage 1
+        Q1_mf[a1] += eta_q2 * delta2
+
+        # Prepare previous trial features for next step
+        prev_a1 = a1
+        prev_is_common = (a1 == s)  # with mapping A->X(0), U->Y(1)
+        prev_r = r
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Purely model-based planner with learned transitions and TD-momentum at the second stage.
+    
+    Mechanism:
+    - Learns transition probabilities T[a1, s] online via recency-weighted updates.
+    - Computes first-stage values purely model-based: Q1_mb = T @ max_a2 Q2.
+    - Learns second-stage Q2[s, a2] with a TD update augmented by a momentum term m[s, a2],
+      which accumulates recent TD errors to capture non-stationary reward drift.
+    
+    Parameters (bounds):
+    - eta_q (0-1): Base learning rate for Q2 TD updates.
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - alpha_T (0-1): Learning rate for updating transition probabilities T.
+    - xi_mom (0-1): Strength of the momentum contribution added to the Q2 update.
+    - z_mdec (0-1): Momentum update rate (decay/accumulation parameter).
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien (0/1) at the observed planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [eta_q, beta, alpha_T, xi_mom, z_mdec]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    eta_q, beta, alpha_T, xi_mom, z_mdec = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Initialize learned transitions (start unbiased 0.5/0.5)
+    T = np.full((2, 2), 0.5)
+
+    # Second-stage values and momentum per state-action
+    Q2 = np.zeros((2, 2))
+    M = np.zeros((2, 2))  # momentum accumulator for TD errors
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based first-stage value
+        max_q2 = np.max(Q2, axis=1)
+        Q1_mb = T @ max_q2
+
+        # Stage-1 policy (pure MB)
+        logits1 = beta * Q1_mb
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # TD error at stage 2
+        delta2 = r - Q2[s, a2]
+
+        # Momentum update: accumulate recent TD errors
+        M[s, a2] = (1.0 - z_mdec) * M[s, a2] + z_mdec * delta2
+
+        # Update Q2 with base TD and momentum contribution
+        Q2[s, a2] += eta_q * delta2 + xi_mom * M[s, a2]
+
+        # Update learned transition model toward observed state
+        target = np.array([1.0 if s == 0 else 0.0, 1.0 if s == 1 else 0.0])
+        T[a1, :] = (1.0 - alpha_T) * T[a1, :] + alpha_T * target
+
+        # Normalize row to ensure probabilities sum to 1
+        row_sum = np.sum(T[a1, :])
+        if row_sum > 0:
+            T[a1, :] /= row_sum
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss

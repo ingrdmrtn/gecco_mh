@@ -154,7 +154,7 @@ class GeCCoModelSearch:
                         self.best_iter = it
                         self.best_params = params
                         self.best_param_names = fit_res["param_names"]  # ✅ store names
-
+                        self.best_param_values = fit_res["parameter_values"]
                         print(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
@@ -196,8 +196,10 @@ class GeCCoModelSearch:
 
         # --- save best parameters ---
         if self.best_model is not None and self.best_params:
+
+            # if self.cfg.evaluation.fit_type == "individual":
             param_df = pd.DataFrame(
-                [self.best_params],
+                self.best_param_values,
                 columns=self.best_param_names
             )
 

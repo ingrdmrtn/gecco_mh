@@ -1,0 +1,250 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Hybrid MB/MF with anxiety-modulated transition trust.
+    The agent learns second-stage MF values and a simple transition model (per action),
+    and combines MF and MB estimates for first-stage choice. Anxiety reduces trust in
+    the learned transition model, effectively blending it toward an agnostic (0.5/0.5)
+    transition belief, which shifts control toward model-free.
+
+    Parameters
+    - action_1: array-like (ints in {0,1}). First-stage choices (0=A, 1=U).
+    - state: array-like (ints in {0,1}). Second-stage state reached (0=X, 1=Y).
+    - action_2: array-like (ints in {0,1}). Second-stage choices within the reached state.
+    - reward: array-like (floats in [0,1]). Outcome on each trial.
+    - stai: array-like with one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        alpha_q: [0,1] — learning rate for Q-values (both stages)
+        beta: [0,10] — inverse temperature for both stages
+        trust0: [0,1] — step size for updating transition beliefs and baseline trust
+        mb_bias: [0,1] — baseline weight toward model-based control at stage 1
+        anx_trust_gain: [0,1] — how strongly anxiety reduces transition trust (and thus MB control)
+
+    Returns
+    - Negative log-likelihood of observed first- and second-stage choices.
+    """
+    alpha_q, beta, trust0, mb_bias, anx_trust_gain = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    # Model-free values
+    q1_mf = np.zeros(2)          # A vs U
+    q2 = np.zeros((2, 2))        # per state (X,Y) and alien
+
+    # Transition beliefs per first-stage action: P(state=0|action) and P(state=1|action)
+    # Initialize around the canonical mapping (A->X, U->Y) but allow learning to move it.
+    T_hat = np.array([[0.7, 0.3],   # for action A: P(X), P(Y)
+                      [0.3, 0.7]])  # for action U: P(X), P(Y)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    eps = 1e-12
+
+    for t in range(n_trials):
+        # Anxiety-reduced trust in transitions -> blend towards uniform (0.5/0.5)
+        trust_c = np.clip(trust0 * (1.0 - anx_trust_gain * stai_val), 0.0, 1.0)
+        T_eff = trust_c * T_hat + (1.0 - trust_c) * 0.5  # applied elementwise vs scalar -> broadcast to 0.5
+
+        # Model-based stage-1 action values from current Q2 via expected max over second stage
+        max_q2 = np.max(q2, axis=1)  # [X, Y]
+        q1_mb = np.array([
+            T_eff[0, 0] * max_q2[0] + T_eff[0, 1] * max_q2[1],
+            T_eff[1, 0] * max_q2[0] + T_eff[1, 1] * max_q2[1]
+        ])
+
+        # MB/MF mixture weight: baseline mb_bias, diminished when trust is low (higher anxiety → lower trust)
+        w_mb = np.clip(mb_bias * trust_c + (1.0 - trust_c) * 0.0, 0.0, 1.0)
+        q1 = w_mb * q1_mb + (1.0 - w_mb) * q1_mf
+
+        # First-stage policy
+        a1 = action_1[t]
+        logits1 = beta * (q1 - np.max(q1))
+        probs1 = np.exp(logits1)
+        probs1 /= (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy in reached state
+        s = state[t]
+        a2 = action_2[t]
+        logits2 = beta * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(logits2)
+        probs2 /= (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Update second-stage MF value
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha_q * pe2
+
+        # Update first-stage MF value by bootstrapping from second stage
+        pe1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha_q * pe1
+
+        # Update transition beliefs for the chosen action using trust0 as a step size
+        # Move probability mass toward the observed state for the chosen first-stage action.
+        # Represent as a simple exponential moving average on P(state|action).
+        if s == 0:
+            T_hat[a1, 0] = (1.0 - trust0) * T_hat[a1, 0] + trust0 * 1.0
+            T_hat[a1, 1] = 1.0 - T_hat[a1, 0]
+        else:
+            T_hat[a1, 1] = (1.0 - trust0) * T_hat[a1, 1] + trust0 * 1.0
+            T_hat[a1, 0] = 1.0 - T_hat[a1, 1]
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """MF with anxiety-modulated valence learning and eligibility credit.
+    Learning rate at stage 2 depends on outcome valence and anxiety, making positive
+    outcomes learned faster under higher anxiety. Credit assignment from stage 2 to
+    stage 1 uses an eligibility trace that grows with anxiety.
+
+    Parameters
+    - action_1: array-like (ints in {0,1}). First-stage choices (0=A, 1=U).
+    - state: array-like (ints in {0,1}). Second-stage state reached (0=X, 1=Y).
+    - action_2: array-like (ints in {0,1}). Second-stage choices within state.
+    - reward: array-like (floats in [0,1]). Outcome.
+    - stai: array-like with one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        alpha_base: [0,1] — baseline learning rate
+        beta: [0,10] — inverse temperature for both stages
+        trace_decay: [0,1] — scales eligibility (credit from stage 2 to stage 1)
+        valence_sensitivity: [0,1] — how strongly outcome valence modulates alpha
+        anx_valence_gain: [0,1] — how strongly anxiety amplifies valence sensitivity
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_base, beta, trace_decay, valence_sensitivity, anx_valence_gain = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Anxiety increases trace-based credit assignment modestly
+    lambda_eff_const = np.clip(trace_decay * (1.0 + 0.5 * stai_val), 0.0, 1.0)
+
+    eps = 1e-12
+
+    for t in range(n_trials):
+        # First-stage choice
+        a1 = action_1[t]
+        logits1 = beta * (q1 - np.max(q1))
+        probs1 = np.exp(logits1)
+        probs1 /= (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage choice
+        s = state[t]
+        a2 = action_2[t]
+        logits2 = beta * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(logits2)
+        probs2 /= (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Outcome-valence- and anxiety-modulated learning rate at stage 2
+        # Positive outcomes (r>0.5) increase alpha, negative decrease it; anxiety amplifies this.
+        valence_term = valence_sensitivity * (r - 0.5)
+        alpha2 = np.clip(alpha_base + (1.0 + anx_valence_gain * stai_val) * valence_term, 0.0, 1.0)
+
+        # Update Q2
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha2 * pe2
+
+        # Eligibility-based credit assignment to stage 1
+        # Move Q1[a1] toward the updated second-stage value with anxiety-scaled lambda.
+        target1 = q2[s, a2]
+        pe1 = target1 - q1[a1]
+        q1[a1] += np.clip(alpha_base * lambda_eff_const, 0.0, 1.0) * pe1
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Count-based exploration bonus with anxiety-shifted meta-control split.
+    The agent receives an uncertainty (novelty) bonus inversely proportional to the
+    square-root of action visit counts. Anxiety reallocates this bonus: more toward
+    first-stage exploration and away from second-stage exploration.
+
+    Parameters
+    - action_1: array-like (ints in {0,1}). First-stage choices (0=A, 1=U).
+    - state: array-like (ints in {0,1}). Second-stage state reached (0=X, 1=Y).
+    - action_2: array-like (ints in {0,1}). Second-stage choices within state.
+    - reward: array-like (floats in [0,1]). Outcome.
+    - stai: array-like with one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        lr: [0,1] — learning rate for MF values
+        beta: [0,10] — inverse temperature for both stages
+        bonus_scale: [0,1] — scale of the count-based exploration bonus
+        split_control: [0,1] — baseline fraction of bonus allocated to stage 1
+        anx_bias: [0,1] — how strongly anxiety shifts bonus from stage 2 to stage 1
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta, bonus_scale, split_control, anx_bias = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Visit counts for bonuses
+    n1 = np.zeros(2)         # first-stage actions
+    n2 = np.zeros((2, 2))    # second-stage actions per state
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    eps = 1e-12
+
+    for t in range(n_trials):
+        # Anxiety shifts bonus allocation: more to stage 1, less to stage 2
+        w1 = np.clip(split_control + anx_bias * stai_val, 0.0, 1.0)
+        w2 = np.clip(1.0 - split_control - anx_bias * stai_val, 0.0, 1.0)
+
+        # First-stage policy with count-based bonus
+        b1 = bonus_scale * w1 / np.sqrt(n1 + 1.0)  # per action bonus
+        logits1 = beta * ((q1 + b1) - np.max(q1 + b1))
+        probs1 = np.exp(logits1)
+        probs1 /= (np.sum(probs1) + eps)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with count-based bonus
+        s = state[t]
+        b2 = bonus_scale * w2 / np.sqrt(n2[s] + 1.0)  # per action in state s
+        logits2 = beta * ((q2[s] + b2) - np.max(q2[s] + b2))
+        probs2 = np.exp(logits2)
+        probs2 /= (np.sum(probs2) + eps)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Learning updates (pure MF with slight anxiety-damped rate for stability under high anxiety)
+        lr_eff = np.clip(lr * (1.0 - 0.2 * stai_val), 0.0, 1.0)
+
+        # Update Q2
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += lr_eff * pe2
+
+        # Update Q1 toward the obtained second-stage value
+        target1 = q2[s, a2]
+        pe1 = target1 - q1[a1]
+        q1[a1] += lr_eff * pe1
+
+        # Update counts
+        n1[a1] += 1.0
+        n2[s, a2] += 1.0
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)

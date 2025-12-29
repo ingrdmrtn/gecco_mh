@@ -1,0 +1,315 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Model 1: Surprise-gated hybrid (fixed transition model), dual temperatures.
+    
+    Core idea:
+    - First-stage action values are a weighted mix of model-based (MB) and model-free (MF) values.
+    - MB uses the known transition structure (common=0.7) and the current max Q at stage 2.
+    - MF credit assignment to stage-1 is gated by transition surprise: rare transitions down-weight MF eligibility.
+    - Separate softmax temperatures for each stage.
+
+    Parameters
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices (spaceships A=0, U=1).
+    state : array-like of int {0,1}
+        Second-stage states (planets X=0, Y=1).
+    action_2 : array-like of int {0,1}
+        Second-stage choices (aliens within the observed planet).
+    reward : array-like of float
+        Rewards received each trial.
+    model_parameters : iterable of 5 floats
+        [theta_q, beta1, beta2, omega_mb, kappa_s]
+        - theta_q:  [0,1] learning rate for both stage-2 values and stage-1 MF values
+        - beta1:    [0,10] inverse temperature for first-stage softmax
+        - beta2:    [0,10] inverse temperature for second-stage softmax
+        - omega_mb: [0,1] weight of the MB controller at stage 1 (1=fully MB, 0=fully MF)
+        - kappa_s:  [0,1] surprise gating strength; MF eligibility is multiplied by (1 - kappa_s) on rare transitions
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed first- and second-stage choices.
+    """
+    theta_q, beta1, beta2, omega_mb, kappa_s = model_parameters
+    n_trials = len(action_1)
+
+    # Known transition structure: rows=action (A=0,U=1), cols=state (X=0,Y=1)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Prob recording
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Action values
+    q1_mf = np.zeros(2)        # model-free first-stage values
+    q2 = np.zeros((2, 2))      # second-stage values: q2[state, action]
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-2 policy
+        logits2 = beta2 * q2[s, :]
+        logits2 -= np.max(logits2)
+        e2 = np.exp(logits2)
+        probs2 = e2 / np.sum(e2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Model-based stage-1 values from transition structure and current q2
+        max_q2 = np.max(q2, axis=1)        # max over actions per state
+        q1_mb = T @ max_q2                 # MB action values for stage 1
+
+        # Hybrid stage-1 values
+        q1 = omega_mb * q1_mb + (1.0 - omega_mb) * q1_mf
+
+        # Stage-1 policy
+        logits1 = beta1 * q1
+        logits1 -= np.max(logits1)
+        e1 = np.exp(logits1)
+        probs1 = e1 / np.sum(e1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Learning
+        r = reward[t]
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += theta_q * delta2
+
+        # Surprise indicator for the realized transition
+        # common if (A->X) or (U->Y)
+        is_common = ((a1 == 0 and s == 0) or (a1 == 1 and s == 1))
+        surprise = 0.0 if is_common else 1.0
+
+        # Surprise-gated MF eligibility for stage-1 update toward realized q2
+        elig = 1.0 - kappa_s * surprise
+        target1 = q2[s, a2]
+        delta1 = target1 - q1_mf[a1]
+        q1_mf[a1] += theta_q * elig * delta1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model 2: Model-free with dynamic exploration, choice-trace bias, and novelty bonus.
+    
+    Core idea:
+    - Purely model-free SARSA-like valuation without planning.
+    - Exploration temperature adapts with recent performance (better recent outcomes => more exploitation).
+    - A decaying choice-trace adds perseveration at each stage.
+    - A novelty bonus encourages choosing less-visited second-stage actions within the current state.
+
+    Parameters
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices.
+    state : array-like of int {0,1}
+        Second-stage states.
+    action_2 : array-like of int {0,1}
+        Second-stage choices.
+    reward : array-like of float
+        Rewards.
+    model_parameters : iterable of 5 floats
+        [eta_q, beta0, k_perf, tau_trace, bonus_nov]
+        - eta_q:     [0,1] learning rate for both stage-1 and stage-2 Q updates
+        - beta0:     [0,10] baseline inverse temperature used at both stages
+        - k_perf:    [0,1] gain controlling how much recent reward modulates temperature
+                       (beta_eff = beta0 * exp(k_perf * r_avg), where r_avg is a running average)
+        - tau_trace: [0,1] decay/persistence of choice-trace (higher means stronger, slower decay)
+        - bonus_nov: [0,1] weight of novelty bonus at stage 2; bonus scales as 1/sqrt(1+visits)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices at both stages.
+    """
+    eta_q, beta0, k_perf, tau_trace, bonus_nov = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Q-values
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Choice-trace biases (logit-space) for perseveration
+    trace1 = np.zeros(2)
+    trace2 = np.zeros((2, 2))  # per state
+
+    # Visit counts for novelty at stage 2
+    visits2 = np.ones((2, 2))  # start at 1 to avoid zero division; encourages mild initial exploration
+
+    # Running average of reward to modulate temperature (exponential moving average)
+    r_avg = 0.0
+    ema_alpha = 0.2  # fixed smoothing inside model (not a fitted parameter)
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Update dynamic inverse temperature based on recent reward
+        beta_eff = beta0 * np.exp(k_perf * r_avg)
+        beta_eff = max(1e-6, min(10.0, beta_eff))  # keep in a reasonable numeric range
+
+        # Stage-2 policy with novelty and trace
+        novelty_bonus = bonus_nov / np.sqrt(visits2[s, :])
+        logits2 = beta_eff * q2[s, :] + trace2[s, :] + novelty_bonus
+        logits2 -= np.max(logits2)
+        e2 = np.exp(logits2)
+        probs2 = e2 / np.sum(e2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Stage-1 policy with trace
+        logits1 = beta_eff * q1 + trace1
+        logits1 -= np.max(logits1)
+        e1 = np.exp(logits1)
+        probs1 = e1 / np.sum(e1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Observe reward and learn
+        r = reward[t]
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += eta_q * delta2
+
+        # Stage-1 TD update toward realized stage-2 value (SARSA-style)
+        target1 = q2[s, a2]
+        delta1 = target1 - q1[a1]
+        q1[a1] += eta_q * delta1
+
+        # Update visit counts for novelty
+        visits2[s, a2] += 1.0
+
+        # Update choice traces (decay all, boost chosen)
+        trace1 *= (1.0 - tau_trace)
+        trace1[a1] += tau_trace
+        trace2[s, :] *= (1.0 - tau_trace)
+        trace2[s, a2] += tau_trace
+
+        # Update running average reward
+        r_avg = (1.0 - ema_alpha) * r_avg + ema_alpha * r
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Model 3: Transition-learning hybrid with confidence-adaptive arbitration.
+    
+    Core idea:
+    - Learns both reward values and the transition model online.
+    - Model-based (MB) planning uses the learned transition matrix.
+    - Arbitration weight on MB vs MF adapts with transition confidence (lower entropy => higher confidence).
+    - Single softmax temperature for both stages.
+
+    Parameters
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices.
+    state : array-like of int {0,1}
+        Second-stage states.
+    action_2 : array-like of int {0,1}
+        Second-stage choices.
+    reward : array-like of float
+        Rewards.
+    model_parameters : iterable of 5 floats
+        [rho_q, rho_t, beta, psi0, gamma_c]
+        - rho_q:  [0,1] learning rate for reward-based Q updates (both stages)
+        - rho_t:  [0,1] learning rate for transition learning (per action, exponential moving average)
+        - beta:   [0,10] inverse temperature for both stages
+        - psi0:   [0,1] baseline MB weight when confidence is neutral
+        - gamma_c:[0,1] strength of confidence-based modulation of MB weight
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices at both stages.
+    """
+    rho_q, rho_t, beta, psi0, gamma_c = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Values
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))  # q2[state, action]
+
+    # Learned transition model T[a, s]; initialize near-agnostic (0.5/0.5)
+    T = np.full((2, 2), 0.5)
+
+    # Helper for stable logit transform of psi0
+    eps = 1e-12
+    def logit(p):
+        p = np.clip(p, eps, 1.0 - eps)
+        return np.log(p) - np.log(1.0 - p)
+
+    base_logit = logit(psi0)
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-2 policy
+        logits2 = beta * q2[s, :]
+        logits2 -= np.max(logits2)
+        e2 = np.exp(logits2)
+        probs2 = e2 / np.sum(e2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Model-based Q for stage 1 using learned transitions
+        max_q2 = np.max(q2, axis=1)
+        q1_mb = T @ max_q2
+
+        # Compute confidence from transition entropy (per action), then average
+        # Entropy H(p) in [0, ln2]; confidence = 1 - H/ln2 in [0,1]
+        H = -(T * np.log(np.clip(T, eps, 1.0))).sum(axis=1)
+        H_norm = H / np.log(2.0)
+        conf = 1.0 - np.mean(H_norm)
+
+        # Confidence-adaptive MB weight via logistic transform
+        w_logit = base_logit + gamma_c * (conf - 0.5) * 4.0  # scale factor 4 to span range
+        w = 1.0 / (1.0 + np.exp(-w_logit))
+        w = np.clip(w, 0.0, 1.0)
+
+        # Hybrid Q at stage 1
+        q1 = w * q1_mb + (1.0 - w) * q1_mf
+
+        # Stage-1 policy
+        logits1 = beta * q1
+        logits1 -= np.max(logits1)
+        e1 = np.exp(logits1)
+        probs1 = e1 / np.sum(e1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Observe reward
+        r = reward[t]
+
+        # Reward learning
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += rho_q * delta2
+
+        target1 = q2[s, a2]
+        delta1 = target1 - q1_mf[a1]
+        q1_mf[a1] += rho_q * delta1
+
+        # Transition learning (EMA toward observed state)
+        # For chosen action a1, move its transition row toward one-hot of observed state s
+        onehot = np.zeros(2)
+        onehot[s] = 1.0
+        T[a1, :] = (1.0 - rho_t) * T[a1, :] + rho_t * onehot
+        # Renormalize to guard against numeric drift
+        T[a1, :] /= T[a1, :].sum()
+
+    eps2 = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps2)) + np.sum(np.log(p_choice_2 + eps2)))
+    return nll

@@ -1,0 +1,276 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Adaptive-volatility model-free learner with surprise-gated learning rate and choice stickiness.
+    
+    Idea:
+    - Pure model-free values are learned at both stages.
+    - The learning rate is adapted online by reward surprise via a volatility gate:
+      eta_t = eta_base * sigmoid(kappa_vol * (abs(delta2) - h_vol)),
+      where delta2 is the second-stage TD error.
+    - Both stages include perseveration (stickiness) that biases repeating the last choice.
+    
+    Parameters (bounds):
+    - eta_base (0-1): Base learning rate for value updates (both stages).
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - h_vol (0-1): Surprise threshold for volatility gate (higher h_vol requires larger surprise to boost learning).
+    - kappa_vol (0-10 mapped implicitly; but keep within [0,1] per guardrail): Gain scaling the sensitivity to surprise.
+      Note: Even within [0,1], this gates learning adaptively; if provided near 1, gating is stronger.
+    - pi_stay (0-1): Stickiness strength added to the logit of the previously chosen action (both stages).
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien at the planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [eta_base, beta, h_vol, kappa_vol, pi_stay]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    eta_base, beta, h_vol, kappa_vol, pi_stay = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Q-values
+    Q1 = np.zeros(2)          # first-stage MF values over spaceships
+    Q2 = np.zeros((2, 2))     # second-stage MF values over aliens per planet
+
+    # Likelihood tracking
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Last choices for stickiness (None -> no bias on first trial)
+    last_a1 = None
+    last_a2 = np.array([None, None])  # track per state for second stage
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # First-stage policy with stickiness
+        logits1 = beta * Q1.copy()
+        if last_a1 is not None:
+            logits1[last_a1] += pi_stay
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with state-specific stickiness
+        logits2 = beta * Q2[s].copy()
+        if last_a2[s] is not None:
+            logits2[last_a2[s]] += pi_stay
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Compute second-stage TD error
+        delta2 = r - Q2[s, a2]
+
+        # Surprise-gated adaptive learning rate (volatility gate)
+        # eta_t increases when |delta2| exceeds h_vol, scaled by kappa_vol.
+        gate = 1.0 / (1.0 + np.exp(-kappa_vol * (abs(delta2) - h_vol)))
+        eta_t = eta_base * gate
+
+        # Second-stage update
+        Q2[s, a2] += eta_t * delta2
+
+        # First-stage MF update via eligibility trace = 1 (one-step TD from second stage)
+        Q1[a1] += eta_t * delta2
+
+        # Update stickiness memory
+        last_a1 = a1
+        last_a2[s] = a2
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Hybrid model-based/model-free with learned transitions and confirmation-biased outcome learning.
+    
+    Idea:
+    - Learn the transition function T via simple delta rule from observed planet given spaceship.
+    - Second-stage values Q2 are updated with asymmetric (confirmation-biased) learning rates:
+        if outcome >= expected => larger eta_pos; else smaller eta_neg.
+    - First-stage action values are a hybrid of:
+        Q1 = psi_hyb * Q1_MB + (1 - psi_hyb) * Q1_MF,
+      where Q1_MB uses the learned T and Q2, and Q1_MF is updated from second-stage TD error.
+    
+    Parameters (bounds):
+    - eta_val (0-1): Base learning rate for value updates (Q2 and MF Q1).
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - eta_tr (0-1): Learning rate for transition updates (rows of T).
+    - psi_hyb (0-1): Weight of model-based control; 0=MF only, 1=MB only.
+    - c_bias (0-1): Confirmation bias magnitude (makes eta_pos > eta_neg).
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien at the planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [eta_val, beta, eta_tr, psi_hyb, c_bias]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    eta_val, beta, eta_tr, psi_hyb, c_bias = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Initialize learned transition model T with common mapping bias
+    # Row 0 (A): P(X)=0.7, P(Y)=0.3; Row 1 (U): P(X)=0.3, P(Y)=0.7
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    Q1_mf = np.zeros(2)
+    Q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Compute model-based Q at stage 1 from learned T and Q2
+        max_Q2 = np.max(Q2, axis=1)
+        Q1_mb = T @ max_Q2
+
+        # Hybrid first-stage action values
+        Q1_hyb = psi_hyb * Q1_mb + (1.0 - psi_hyb) * Q1_mf
+
+        # First-stage policy
+        logits1 = beta * Q1_hyb
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy
+        logits2 = beta * Q2[s]
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Transition learning for the chosen first-stage action
+        # One-hot for observed state
+        obs = np.array([1.0, 0.0]) if s == 0 else np.array([0.0, 1.0])
+        T[a1] = (1.0 - eta_tr) * T[a1] + eta_tr * obs
+        # Keep row normalized (it already is by convex combo, but guard against num issues)
+        T[a1] = T[a1] / (np.sum(T[a1]) + eps)
+
+        # Second-stage TD error
+        delta2 = r - Q2[s, a2]
+
+        # Confirmation-biased learning rates
+        eta_pos = min(1.0, eta_val * (1.0 + c_bias))
+        eta_neg = max(0.0, min(1.0, eta_val * (1.0 - c_bias)))
+        eta_eff = eta_pos if delta2 >= 0.0 else eta_neg
+
+        # Update second-stage value
+        Q2[s, a2] += eta_eff * delta2
+
+        # MF first-stage update via eligibility trace (scaled by MF weight)
+        Q1_mf[a1] += (1.0 - psi_hyb) * eta_val * delta2
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Counterfactual-augmented hybrid with regret bias and surprise-weighted arbitration.
+    
+    Idea:
+    - Hybrid first-stage control combining model-based and model-free values.
+      The MB component uses the fixed common transition structure (A->X, U->Y).
+    - Second-stage includes counterfactual (fictive) learning: the unchosen alien's value
+      is updated toward the chosen alien's value (regret-based counterfactual).
+    - Regret sensitivity also shapes the second-stage policy by adding an opponent-comparison bias.
+    - Arbitration shifts toward MF on rare transitions via a surprise weight.
+    
+    Parameters (bounds):
+    - eta_q (0-1): Learning rate for chosen action at second stage.
+    - beta (0-10): Inverse temperature for softmax at both stages.
+    - eta_cf (0-1): Counterfactual learning rate for the unchosen second-stage action.
+    - kappa_regret (0-1): Strength of regret/competition bias added to second-stage logits.
+    - tau_sur (0-1): Surprise impact on arbitration; reduces MB weight on rare transitions.
+    
+    Inputs:
+    - action_1: array-like of ints in {0,1}, chosen spaceship (0=A, 1=U).
+    - state: array-like of ints in {0,1}, observed planet (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}, chosen alien at the planet.
+    - reward: array-like of floats/ints, obtained coins each trial.
+    - model_parameters: [eta_q, beta, eta_cf, kappa_regret, tau_sur]
+    
+    Returns:
+    - Negative log-likelihood of the observed choices at both stages.
+    """
+    eta_q, beta, eta_cf, kappa_regret, tau_sur = model_parameters
+    n_trials = len(action_1)
+    eps = 1e-10
+
+    # Fixed transition structure (common transitions)
+    T_fixed = np.array([[0.7, 0.3],
+                        [0.3, 0.7]], dtype=float)
+
+    Q1_mf = np.zeros(2)
+    Q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        a1 = action_1[t]
+        s = state[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based Q1 from fixed transitions and current Q2
+        max_Q2 = np.max(Q2, axis=1)
+        Q1_mb = T_fixed @ max_Q2
+
+        # Surprise-based arbitration weight: reduce MB after rare transition
+        # is_common = True iff spaceship matches planet (A->X or U->Y)
+        is_common = (a1 == s)
+        w_mb = 1.0 - (0.0 if is_common else tau_sur)  # 1 on common; 1 - tau_sur on rare
+        w_mb = np.clip(w_mb, 0.0, 1.0)
+
+        Q1_hyb = w_mb * Q1_mb + (1.0 - w_mb) * Q1_mf
+
+        # First-stage policy
+        logits1 = beta * Q1_hyb
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / (np.sum(probs1) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with regret/competition bias
+        # Add bias favoring the option estimated better than the other
+        comp = Q2[s, 1] - Q2[s, 0]
+        regret_bias = np.array([-kappa_regret * comp, kappa_regret * comp])
+        logits2 = beta * Q2[s] + regret_bias
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / (np.sum(probs2) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        # Second-stage updates: chosen action with eta_q
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += eta_q * delta2
+
+        # Counterfactual update: move unchosen toward the chosen's current value (regret/fictive)
+        a2_alt = 1 - a2
+        cf_error = Q2[s, a2] - Q2[s, a2_alt]
+        Q2[s, a2_alt] += eta_cf * cf_error
+
+        # MF first-stage update via eligibility trace (1-step TD)
+        Q1_mf[a1] += eta_q * delta2
+
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss

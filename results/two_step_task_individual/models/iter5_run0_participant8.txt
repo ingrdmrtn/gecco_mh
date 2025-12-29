@@ -1,0 +1,324 @@
+Below are three standalone cognitive models as Python functions. Each function:
+
+- Takes arrays: action_1, state, action_2, reward, and a vector of model_parameters.
+- Uses all parameters meaningfully (with bounds noted in each docstring).
+- Returns the negative log-likelihood of the observed first- and second-stage choices.
+- Uses only standard NumPy operations (assume numpy as np is already imported).
+
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """
+    Uncertainty-gated model-based control with learned transitions, MF backup, and reward-contingent stickiness.
+
+    Mechanism
+    - Learn first-stage transition probabilities T[a, s] via a delta rule (learning rate chi).
+    - Second-stage: standard model-free Q-learning for Q2 with learning rate alpha.
+    - First-stage: hybrid of model-based (MB) and model-free (MF) values with dynamic arbitration.
+        The MB weight is a convex combination of a neutral 0.5 baseline and the current
+        transition-confidence (lower entropy => higher confidence), controlled by psi:
+            w = (1 - psi)*0.5 + psi * mean_conf
+        where mean_conf is the mean across first-stage actions of (1 - entropy(T[a])).
+    - Reward-contingent stickiness at stage 1: add +tau to the last chosen first-stage action
+      only if the previous trial was rewarded (stay-if-rewarded bias).
+    - Policy at both stages via softmax with shared inverse temperature beta.
+
+    Parameters
+    ----------
+    action_1 : array-like of int in {0,1}
+        First-stage choices per trial: 0 = spaceship A, 1 = spaceship U.
+    state : array-like of int in {0,1}
+        Second-stage state reached: 0 = planet X, 1 = planet Y.
+    action_2 : array-like of int in {0,1}
+        Second-stage choices per trial: 0/1 correspond to the two aliens on the reached planet.
+    reward : array-like of float in {0,1}
+        Reward at the end of the trial (number of coins).
+    model_parameters : iterable of 5 floats
+        [alpha, beta, chi, psi, tau]
+        - alpha in [0,1]: learning rate for second-stage Q-learning and MF backup to stage 1.
+        - beta in [0,10]: inverse temperature for both stages.
+        - chi in [0,1]: learning rate for transition probability learning T[a, s].
+        - psi in [0,1]: arbitration sensitivity; how much transition confidence modulates MB weight.
+        - tau in [0,1]: reward-contingent stickiness added to preference of last first-stage action if previous reward was 1.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed stage-1 and stage-2 choices.
+    """
+    alpha, beta, chi, psi, tau = model_parameters
+    n_trials = len(action_1)
+
+    # Storage for choice probabilities
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Initialize: transitions, Q-values
+    # Start with agnostic transitions
+    T = np.ones((2, 2)) * 0.5  # row-stochastic
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    prev_a1 = -1
+    prev_r = 0.0
+
+    # Helper: binary entropy for a 2-outcome distribution p (length 2)
+    def entropy2(p_row):
+        p = np.clip(p_row, 1e-12, 1.0)
+        p /= np.sum(p)
+        return -(p[0] * np.log(p[0]) + p[1] * np.log(p[1]))
+
+    for t in range(n_trials):
+        s = state[t]
+        a1 = action_1[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Model-based action values at stage 1
+        v2 = np.max(q2, axis=1)  # value of each second-stage state
+        q1_mb = T @ v2
+
+        # Transition-confidence: 1 - normalized entropy where max entropy = ln(2)
+        conf = np.zeros(2)
+        for a in range(2):
+            H = entropy2(T[a, :])
+            conf[a] = 1.0 - (H / np.log(2.0))
+        mean_conf = np.mean(conf)
+
+        # Arbitration weight
+        w = (1.0 - psi) * 0.5 + psi * mean_conf
+        q1 = (1.0 - w) * q1_mf + w * q1_mb
+
+        # Reward-contingent stickiness on last a1
+        pref1 = q1.copy()
+        if prev_a1 in (0, 1) and prev_r > 0.5:
+            pref1[prev_a1] += tau
+
+        # Stage-1 policy
+        pref1 -= np.max(pref1)
+        probs1 = np.exp(beta * pref1)
+        probs1 /= np.sum(probs1)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy
+        pref2 = q2[s, :].copy()
+        pref2 -= np.max(pref2)
+        probs2 = np.exp(beta * pref2)
+        probs2 /= np.sum(probs2)
+        p_choice_2[t] = probs2[a2]
+
+        # Learning: stage 2 Q-learning
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # MF stage-1 backup toward second-stage chosen action value
+        target1 = q2[s, a2]
+        pe1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha * pe1
+
+        # Transition learning for chosen first-stage action
+        # Update toward a one-hot target of the observed state
+        target = np.array([0.0, 0.0])
+        target[s] = 1.0
+        T[a1, :] = (1.0 - chi) * T[a1, :] + chi * target
+        # Re-normalize row to be robust to numerical error
+        T[a1, :] /= (np.sum(T[a1, :]) + 1e-12)
+
+        prev_a1 = a1
+        prev_r = r
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """
+    Valence-asymmetric updating with eligibility trace and rare-transition-dependent stickiness.
+
+    Mechanism
+    - Second-stage: Q2 is updated with separate learning rates for positive and negative outcomes:
+        a_plus for r=1, a_minus for r=0.
+    - Eligibility trace: propagate a fraction (trace) of the second-stage prediction error back
+      to the selected first-stage action (purely model-free credit assignment).
+    - First-stage policy: softmax over MF Q1 only, with a stickiness term applied to the last
+      chosen first-stage action, but only on trials following a rare transition. The stickiness
+      magnitude equals rare_bias.
+    - Transition rarity is determined by the canonical mapping: A->X and U->Y are common,
+      cross-overs are rare.
+
+    Parameters
+    ----------
+    action_1 : array-like of int in {0,1}
+        First-stage choices per trial: 0 = spaceship A, 1 = spaceship U.
+    state : array-like of int in {0,1}
+        Second-stage state reached: 0 = planet X, 1 = planet Y.
+    action_2 : array-like of int in {0,1}
+        Second-stage choices per trial.
+    reward : array-like of float in {0,1}
+        Reward outcome.
+    model_parameters : iterable of 5 floats
+        [a_plus, a_minus, beta, trace, rare_bias]
+        - a_plus in [0,1]: learning rate for Q2 when r=1.
+        - a_minus in [0,1]: learning rate for Q2 when r=0.
+        - beta in [0,10]: inverse temperature for both stages.
+        - trace in [0,1]: eligibility trace strength for backing up PE2 into Q1 MF.
+        - rare_bias in [0,1]: stickiness magnitude added to last first-stage action, only
+          if the previous transition was rare (0=no effect).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices.
+    """
+    a_plus, a_minus, beta, trace, rare_bias = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    q1 = np.zeros(2)        # model-free Q at stage 1
+    q2 = np.zeros((2, 2))   # second-stage Q
+
+    prev_a1 = -1
+    prev_transition_rare = False
+
+    for t in range(n_trials):
+        s = state[t]
+        a1 = action_1[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Stage-1 preference with rare-dependent stickiness
+        pref1 = q1.copy()
+        if prev_a1 in (0, 1) and prev_transition_rare:
+            pref1[prev_a1] += rare_bias
+
+        pref1 -= np.max(pref1)
+        probs1 = np.exp(beta * pref1)
+        probs1 /= np.sum(probs1)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 softmax
+        pref2 = q2[s, :].copy()
+        pref2 -= np.max(pref2)
+        probs2 = np.exp(beta * pref2)
+        probs2 /= np.sum(probs2)
+        p_choice_2[t] = probs2[a2]
+
+        # Learning at stage 2 with valence-asymmetric alpha
+        lr2 = a_plus if r >= 0.5 else a_minus
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += lr2 * pe2
+
+        # Eligibility trace backup to stage 1 (pure MF)
+        q1[a1] += trace * pe2
+
+        # Determine whether current transition was rare
+        # Common if (A->X) or (U->Y), i.e., (a1 == s). Rare otherwise.
+        transition_rare = (a1 != s)
+
+        # Update "previous" markers for next trial
+        prev_a1 = a1
+        prev_transition_rare = transition_rare
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """
+    Hybrid MB/MF with dissociable temperatures and novelty-driven exploration at stage 2.
+
+    Mechanism
+    - Second-stage: standard Q-learning with learning rate alpha.
+    - First-stage: hybrid MB/MF combination with mixing weight mb_w.
+      MB component uses the canonical transition matrix (common=0.7, rare=0.3)
+      to compute expected values of first-stage actions from current Q2.
+    - Dissociable softmax temperatures at stage 1 (beta1) and stage 2 (beta2).
+    - Novelty bonus at stage 2: add an exploration bonus nu / sqrt(1 + N[s,a]) to the
+      immediate choice preference (not to the Q-values), where N[s,a] counts how many
+      times the alien (s,a) was chosen so far. This encourages trying less-visited aliens.
+
+    Parameters
+    ----------
+    action_1 : array-like of int in {0,1}
+        First-stage choices per trial.
+    state : array-like of int in {0,1}
+        Second-stage state per trial.
+    action_2 : array-like of int in {0,1}
+        Second-stage choice per trial.
+    reward : array-like of float in {0,1}
+        Outcome per trial.
+    model_parameters : iterable of 5 floats
+        [alpha, beta1, beta2, mb_w, nu]
+        - alpha in [0,1]: learning rate for Q2 updates and MF backup to Q1.
+        - beta1 in [0,10]: inverse temperature at stage 1.
+        - beta2 in [0,10]: inverse temperature at stage 2.
+        - mb_w in [0,1]: mixing weight for model-based values at stage 1.
+        - nu in [0,1]: strength of novelty bonus added to second-stage choice preference
+          as nu / sqrt(1 + visit_count).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta1, beta2, mb_w, nu = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Canonical transition matrix for the two-step task
+    T = np.array([[0.7, 0.3],   # A -> X with 0.7, Y with 0.3
+                  [0.3, 0.7]])  # U -> X with 0.3, Y with 0.7
+
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    visits = np.zeros((2, 2), dtype=float)  # counts for novelty bonus
+
+    for t in range(n_trials):
+        s = state[t]
+        a1 = action_1[t]
+        a2 = action_2[t]
+        r = reward[t]
+
+        # Stage-1 MB values and hybrid
+        v2 = np.max(q2, axis=1)
+        q1_mb = T @ v2
+        q1 = (1.0 - mb_w) * q1_mf + mb_w * q1_mb
+
+        # Stage-1 policy
+        pref1 = q1.copy()
+        pref1 -= np.max(pref1)
+        probs1 = np.exp(beta1 * pref1)
+        probs1 /= np.sum(probs1)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy with novelty bonus on preference
+        novelty_bonus = np.zeros(2)
+        novelty_bonus[0] = nu / np.sqrt(1.0 + visits[s, 0])
+        novelty_bonus[1] = nu / np.sqrt(1.0 + visits[s, 1])
+
+        pref2 = q2[s, :].copy() + novelty_bonus
+        pref2 -= np.max(pref2)
+        probs2 = np.exp(beta2 * pref2)
+        probs2 /= np.sum(probs2)
+        p_choice_2[t] = probs2[a2]
+
+        # Learning at stage 2
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # MF backup to stage 1 toward the realized second-stage value
+        target1 = q2[s, a2]
+        pe1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha * pe1
+
+        # Update novelty counts after the choice
+        visits[s, a2] += 1.0
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

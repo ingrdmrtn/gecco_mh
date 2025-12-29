@@ -1,0 +1,341 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Confidence-weighted MB/MF arbitration with anxiety-driven forgetting and lapses.
+
+    Core idea:
+    - Stage-1 action values are a trial-by-trial mixture of model-based (MB) and model-free (MF) estimates.
+      The mixing weight w_t is computed from the relative confidence of the MB and MF systems.
+    - Confidence is estimated online as the inverse of exponentially averaged squared prediction errors.
+    - Higher anxiety increases both lapse probability and forgetting of learned values, reducing stability.
+    - Stage-2 uses MF values only.
+    - MF updates use TD(0) at stage-2 and an eligibility trace to stage-1.
+
+    Parameters (model_parameters):
+    - alpha: reward learning rate in [0,1]
+    - beta: inverse temperature for softmax in [0,10]
+    - k_conf: confidence-to-weight sensitivity in [0,1]; scales how strongly relative confidence shifts w_t
+    - eta_forget: global forgetting rate in [0,1]; stronger forgetting with higher anxiety
+    - z_lapse: lapse scaling in [0,1]; effective lapse epsilon = z_lapse * stai
+
+    Inputs:
+    - action_1: array-like of ints in {0,1}; chosen spaceship (0=A, 1=U)
+    - state: array-like of ints in {0,1}; observed planet (0=X, 1=Y)
+    - action_2: array-like of ints in {0,1}; chosen alien on the observed planet (0 or 1)
+    - reward: array-like of floats in [0,1]; received coins
+    - stai: array-like with one float in [0,1]; participant's anxiety score
+    - model_parameters: tuple/list (alpha, beta, k_conf, eta_forget, z_lapse)
+
+    Returns:
+    - Negative log-likelihood of observed choices across both stages.
+    """
+    alpha, beta, k_conf, eta_forget, z_lapse = model_parameters
+    n_trials = len(action_1)
+    st = float(stai[0])
+
+    # Fixed transition structure (spaceship A=0 commonly -> X=0; U=1 commonly -> Y=1)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    # Value functions
+    Q1_mf = np.zeros(2)          # stage-1 MF
+    Q2 = np.zeros((2, 2))        # stage-2 MF per planet/state
+
+    # Confidence trackers: exponentially-weighted squared prediction error (lower is higher confidence)
+    v_mf = 1e-2                  # initial MF PE^2 average (scalar, for simplicity)
+    v_mb = 1e-2                  # initial MB PE^2 average (based on reward surprise downstream)
+
+    # Effective parameters modulated by anxiety
+    eps_lapse = np.clip(z_lapse * st, 0.0, 1.0)
+    # Anxiety increases forgetting: higher st -> larger effective forgetting
+    forget_eff = np.clip(eta_forget * (0.5 + 0.5 * st), 0.0, 1.0)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+    eps = 1e-10
+
+    for t in range(n_trials):
+        s = int(state[t])
+
+        # Model-based stage-1 values from current stage-2 MF values
+        max_Q2 = np.max(Q2, axis=1)        # best alien per planet
+        Q1_mb = T @ max_Q2                 # expected value via transitions
+
+        # Compute arbitration weight from relative confidence
+        # Confidence ~ 1 / (running PE^2); map difference to [0,1] via sigmoid-like transform
+        conf_mf = 1.0 / (v_mf + 1e-6)
+        conf_mb = 1.0 / (v_mb + 1e-6)
+        rel = conf_mb - conf_mf
+        # Sensitivity scaled by k_conf and reduced by anxiety (more anxiety -> flatter arbitration)
+        sens = 5.0 * k_conf * (1.0 - 0.5 * st)  # factor 5 sharpens but stays within [0,1] scaling intent
+        w_mb = 1.0 / (1.0 + np.exp(-sens * rel))  # in [0,1]
+
+        # Stage-1 policy
+        Q1 = w_mb * Q1_mb + (1.0 - w_mb) * Q1_mf
+        a1 = int(action_1[t])
+        pref1 = beta * (Q1 - np.max(Q1))
+        soft1 = np.exp(pref1) / (np.sum(np.exp(pref1)) + eps)
+        probs1 = (1.0 - eps_lapse) * soft1 + eps_lapse * 0.5
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy (MF only)
+        a2 = int(action_2[t])
+        pref2 = beta * (Q2[s] - np.max(Q2[s]))
+        soft2 = np.exp(pref2) / (np.sum(np.exp(pref2)) + eps)
+        probs2 = (1.0 - eps_lapse) * soft2 + eps_lapse * 0.5
+        p_choice_2[t] = probs2[a2]
+
+        r = float(reward[t])
+
+        # TD updates
+        # Stage-2 TD error and update
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha * delta2
+
+        # Stage-1 MF bootstrapping via eligibility-like update
+        delta1 = Q2[s, a2] - Q1_mf[a1]
+        Q1_mf[a1] += alpha * delta1
+
+        # Update confidence trackers with squared TD magnitudes
+        # MF confidence from stage-1 MF TD error
+        v_mf = (1.0 - eta_forget) * v_mf + eta_forget * (delta1 ** 2 + delta2 ** 2) * 0.5
+        # MB confidence from reward surprise at stage-2 (what MB ultimately predicts via max_Q2)
+        pred_mb = max_Q2[s]
+        v_mb = (1.0 - eta_forget) * v_mb + eta_forget * ((r - pred_mb) ** 2)
+
+        # Anxiety-driven forgetting applied after learning
+        Q1_mf *= (1.0 - forget_eff)
+        Q2 *= (1.0 - forget_eff)
+
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Risk/uncertainty-averse planning with anxiety-weighted stay/switch bias and eligibility.
+
+    Core idea:
+    - Stage-2 maintains MF estimates of each alien's mean reward AND an uncertainty (std) estimate.
+    - Utility for choice trades off mean vs. uncertainty: U = mean - rho * std, where rho increases with anxiety.
+    - Stage-1 is model-based over utilities (not raw means), plus a stay/switch bias:
+      after common transitions, bias to stay; after rare transitions, bias to switch, and this bias grows with anxiety.
+    - Stage-1 also carries a small MF component via an eligibility-like update.
+
+    Parameters (model_parameters):
+    - alpha: learning rate for both mean and uncertainty trackers in [0,1]
+    - beta: inverse temperature in [0,10]
+    - rho_base: baseline risk/uncertainty aversion in [0,1]; higher => more penalty on std
+    - k_bias: strength of stay/switch bias in [0,1]
+    - z_elig: eligibility strength for propagating stage-2 learning to stage-1 MF in [0,1]
+
+    Inputs:
+    - action_1: array-like of ints in {0,1}; chosen spaceship (0=A, 1=U)
+    - state: array-like of ints in {0,1}; observed planet (0=X, 1=Y)
+    - action_2: array-like of ints in {0,1}; chosen alien on the observed planet (0 or 1)
+    - reward: array-like of floats in [0,1]; received coins
+    - stai: array-like with one float in [0,1]; participant's anxiety score
+    - model_parameters: tuple/list (alpha, beta, rho_base, k_bias, z_elig)
+
+    Returns:
+    - Negative log-likelihood of observed choices across both stages.
+    """
+    alpha, beta, rho_base, k_bias, z_elig = model_parameters
+    n_trials = len(action_1)
+    st = float(stai[0])
+
+    # Transition structure
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    # Stage-2 mean rewards and uncertainty (std) per planet x alien
+    Q2_mean = np.zeros((2, 2))
+    Q2_m2 = np.zeros((2, 2))  # second moment for variance tracking
+    # Stage-1 MF value
+    Q1_mf = np.zeros(2)
+
+    # Effective risk aversion increases with anxiety
+    rho_eff = np.clip(rho_base + (1.0 - rho_base) * st, 0.0, 1.0)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+    eps = 1e-10
+
+    # For stay/switch bias dependent on transition commonness
+    last_a1 = None
+    last_common = None
+
+    for t in range(n_trials):
+        s = int(state[t])
+
+        # Compute std from mean and second moment (ensure non-negativity)
+        var = np.maximum(Q2_m2 - Q2_mean ** 2, 0.0)
+        std = np.sqrt(var)
+
+        # Utilities penalize uncertainty
+        U2 = Q2_mean - rho_eff * std
+
+        # Model-based stage-1 values from utilities
+        maxU2 = np.max(U2, axis=1)
+        Q1_mb = T @ maxU2
+
+        # Stay/switch bias term on logits at stage-1
+        bias = np.zeros(2)
+        if last_a1 is not None and last_common is not None:
+            # Bias magnitude grows with anxiety; direction: +stay after common, -stay (i.e., switch) after rare
+            mag = k_bias * (0.5 + 0.5 * st)
+            if last_common:
+                bias[last_a1] += mag
+            else:
+                bias[last_a1] -= mag  # encourages switch
+
+        # Combine MB utility with a small MF baseline via eligibility later; here policy uses MB + bias
+        a1 = int(action_1[t])
+        pref1 = Q1_mb + bias + 0.1 * Q1_mf  # small MF contribution to stabilize
+        pref1 = beta * (pref1 - np.max(pref1))
+        probs1 = np.exp(pref1) / (np.sum(np.exp(pref1)) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy uses utilities directly
+        a2 = int(action_2[t])
+        pref2 = beta * (U2[s] - np.max(U2[s]))
+        probs2 = np.exp(pref2) / (np.sum(np.exp(pref2)) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        r = float(reward[t])
+
+        # Update mean and second moment (EWMA) for chosen alien only
+        m_old = Q2_mean[s, a2]
+        Q2_mean[s, a2] = (1.0 - alpha) * Q2_mean[s, a2] + alpha * r
+        Q2_m2[s, a2] = (1.0 - alpha) * Q2_m2[s, a2] + alpha * (r ** 2)
+
+        # Stage-1 MF update via eligibility using change in expected utility
+        # Use the change in U2 for the visited state-action as the teaching signal
+        # Compute updated utility component for the visited pair
+        var_sa = max(Q2_m2[s, a2] - Q2_mean[s, a2] ** 2, 0.0)
+        std_sa = np.sqrt(var_sa)
+        u_new = Q2_mean[s, a2] - rho_eff * std_sa
+        u_old = m_old - rho_eff * np.sqrt(max((Q2_m2[s, a2] - (m_old ** 2)), 0.0))
+        deltaU = u_new - u_old
+        Q1_mf[a1] += z_elig * deltaU
+
+        # Track whether this trial's transition was common or rare for use next trial
+        # Common if T[a1, s] >= 0.5
+        last_common = (T[a1, s] >= 0.5)
+        last_a1 = a1
+
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Learned transition model with anxiety-dependent transition learning and reduced exploration.
+
+    Core idea:
+    - The agent learns the transition matrix T online via a simple delta rule.
+      Transition learning rate increases with anxiety, reflecting heightened sensitivity to surprising moves.
+    - Stage-2 values are MF, but include an exploration bonus proportional to state-action uncertainty;
+      anxiety reduces the bonus (more anxious => less exploration).
+    - Stage-1 uses an MB/MF mixture with a baseline weight w_init, then adapts weight toward MB
+      when observed transitions are predictable; this adaptation is attenuated by anxiety.
+
+    Parameters (model_parameters):
+    - alpha: reward learning rate in [0,1]
+    - beta: inverse temperature in [0,10]
+    - lrT: base transition learning rate in [0,1]
+    - k_bonus: exploration-bonus coefficient in [0,1]
+    - w_init: initial MB weight in [0,1]
+
+    Inputs:
+    - action_1: array-like of ints in {0,1}; chosen spaceship (0=A, 1=U)
+    - state: array-like of ints in {0,1}; observed planet (0=X, 1=Y)
+    - action_2: array-like of ints in {0,1}; chosen alien on the observed planet (0 or 1)
+    - reward: array-like of floats in [0,1]; received coins
+    - stai: array-like with one float in [0,1]; participant's anxiety score
+    - model_parameters: tuple/list (alpha, beta, lrT, k_bonus, w_init)
+
+    Returns:
+    - Negative log-likelihood of observed choices across both stages.
+    """
+    alpha, beta, lrT, k_bonus, w_init = model_parameters
+    n_trials = len(action_1)
+    st = float(stai[0])
+
+    # Initialize learned transition matrix near the known structure
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    # Stage-2 MF values and uncertainty tracker (counts-based)
+    Q2 = np.zeros((2, 2))
+    N2 = np.zeros((2, 2))  # visit counts to modulate uncertainty
+
+    # Stage-1 MF values
+    Q1_mf = np.zeros(2)
+
+    # Effective transition learning increases with anxiety
+    lrT_eff = np.clip(lrT * (0.5 + 0.5 * st), 0.0, 1.0)
+    # Effective exploration bonus decreases with anxiety
+    bonus_eff = k_bonus * (1.0 - st)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+    eps = 1e-10
+
+    # Adaptive MB weight
+    w_mb = np.clip(w_init, 0.0, 1.0)
+
+    for t in range(n_trials):
+        s = int(state[t])
+
+        # Compute exploration bonus for current state's aliens based on counts
+        # Use 1/sqrt(N) as an uncertainty proxy (0 if never visited -> high bonus)
+        unc = np.zeros(2)
+        for a in range(2):
+            unc[a] = 1.0 / np.sqrt(max(N2[s, a], 1.0))
+
+        # Stage-2 policy values include bonus
+        V2_pref = Q2[s] + bonus_eff * unc
+
+        # Stage-1 MB values from current learned transitions and stage-2 preferences (max over aliens)
+        max_V2 = np.max(Q2 + bonus_eff * np.where(N2 > 0, 1.0 / np.sqrt(np.maximum(N2, 1.0)), 1.0), axis=1)
+        Q1_mb = T @ max_V2
+
+        # Combine MB and MF for stage-1
+        Q1 = w_mb * Q1_mb + (1.0 - w_mb) * Q1_mf
+
+        # Stage-1 choice probability
+        a1 = int(action_1[t])
+        pref1 = beta * (Q1 - np.max(Q1))
+        probs1 = np.exp(pref1) / (np.sum(np.exp(pref1)) + eps)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 choice probability
+        a2 = int(action_2[t])
+        pref2 = beta * (V2_pref - np.max(V2_pref))
+        probs2 = np.exp(pref2) / (np.sum(np.exp(pref2)) + eps)
+        p_choice_2[t] = probs2[a2]
+
+        r = float(reward[t])
+
+        # Reward learning at stage-2 (MF)
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha * delta2
+        N2[s, a2] += 1.0
+
+        # Back up to stage-1 MF (eligibility via observed value)
+        target1 = Q2[s, a2]
+        Q1_mf[a1] += alpha * (target1 - Q1_mf[a1])
+
+        # Learn transition model T[a1] toward observed state s
+        # Update row a1 toward one-hot of observed state with lrT_eff
+        for sp in range(2):
+            target = 1.0 if sp == s else 0.0
+            T[a1, sp] = (1.0 - lrT_eff) * T[a1, sp] + lrT_eff * target
+        # Ensure row remains normalized
+        T[a1] /= np.sum(T[a1]) + eps
+
+        # Adapt MB weight based on predictability of this transition; anxiety dampens adaptation
+        # If the observed state had high predicted probability, increase w_mb; else decrease.
+        pred_p = T[a1, s]
+        shift = (pred_p - 0.5) * (1.0 - st) * 0.5  # capped small change, attenuated by anxiety
+        w_mb = np.clip(w_mb + shift, 0.0, 1.0)
+
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

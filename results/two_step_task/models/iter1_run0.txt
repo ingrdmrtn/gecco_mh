@@ -1,0 +1,295 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Hybrid MB/MF with learned transitions and exploration bonus.
+    
+    This model jointly learns second-stage values and first-stage transition
+    probabilities, and chooses at stage 1 using a mixture of model-based (MB)
+    and model-free (MF) values. It also adds an uncertainty (entropy) bonus
+    over the learned transition probabilities to encourage directed exploration.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (0: spaceship A, 1: spaceship U).
+    state : array-like of int (0 or 1)
+        Second-stage state reached (0: planet X, 1: planet Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices (0/1: one of two aliens on the visited planet).
+    reward : array-like of float (0 or 1)
+        Received reward (coins).
+    model_parameters : list or tuple
+        [alpha_q, alpha_t, beta, omega, xi]
+        - alpha_q ([0,1]): Learning rate for second-stage Q-values.
+        - alpha_t ([0,1]): Learning rate for transition probabilities T(a -> s).
+        - beta ([0,10]): Softmax inverse temperature for both stages.
+        - omega ([0,1]): Weight on model-based value at stage 1 (1 -> pure MB).
+        - xi ([0,1]): Weight of transition uncertainty (entropy) bonus at stage 1.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices at both stages.
+    """
+    alpha_q, alpha_t, beta, omega, xi = model_parameters
+    n_trials = len(action_1)
+
+    # Choice probabilities storage
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Initialize learned transitions T[a, s]; start uninformative
+    T = np.full((2, 2), 0.5)  # rows sum to ~1 through learning
+
+    # MF values
+    q1_mf = np.zeros(2)        # stage-1 cached values
+    q2 = np.zeros((2, 2))      # stage-2 values per state
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Model-based evaluation: expected max stage-2 value under learned T
+        max_q2 = np.max(q2, axis=1)  # shape (2,)
+        q1_mb = T @ max_q2           # shape (2,)
+
+        # Transition uncertainty bonus using entropy of T[a]
+        # Entropy H(p) = -sum p log p (natural units); define 0*log0 = 0 by eps stabilization
+        eps_h = 1e-12
+        H = -np.sum(T * np.log(T + eps_h), axis=1)  # shape (2,)
+
+        # Mixture MB/MF with exploration bonus
+        q1_mix = omega * q1_mb + (1.0 - omega) * q1_mf + xi * H
+
+        # Stage-1 policy
+        logits1 = beta * q1_mix
+        logits1 -= np.max(logits1)
+        soft1 = np.exp(logits1)
+        probs_1 = soft1 / np.sum(soft1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy conditioned on visited state
+        logits2 = beta * q2[s]
+        logits2 -= np.max(logits2)
+        soft2 = np.exp(logits2)
+        probs_2 = soft2 / np.sum(soft2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # Learning: update transitions for chosen action towards observed state
+        # One-hot target for the observed transition
+        target = np.array([1.0 if s == 0 else 0.0, 1.0 if s == 1 else 0.0])
+        T[a1] += alpha_t * (target - T[a1])
+        # Ensure numerical stability (stays in [0,1] and sums to 1 approximately)
+        T[a1] = np.clip(T[a1], 1e-6, 1.0)
+        T[a1] /= np.sum(T[a1])
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha_q * delta2
+
+        # Stage-1 MF TD update uses realized stage-2 value as bootstrap
+        td_target1 = q2[s, a2]
+        delta1 = td_target1 - q1_mf[a1]
+        q1_mf[a1] += alpha_q * delta1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model-free with dynamic associability and choice kernels.
+    
+    This model learns solely from experienced outcomes, but adapts its learning
+    rates via Pearce–Hall-like associability that tracks recent surprise (|TD error|).
+    It also includes stage-specific choice kernels that capture short-term
+    choice recency effects.
+
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (0: A, 1: U).
+    state : array-like of int (0 or 1)
+        Second-stage state (0: X, 1: Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices within the visited state.
+    reward : array-like of float (0 or 1)
+        Reward outcome.
+    model_parameters : list or tuple
+        [alpha0, phi, beta, k1, k2]
+        - alpha0 ([0,1]): Baseline learning-rate gain.
+        - phi ([0,1]): Associability update rate (higher -> faster tracking of surprise).
+                        Also used as decay for choice kernels.
+        - beta ([0,10]): Softmax inverse temperature for both stages.
+        - k1 ([0,1]): Strength of stage-1 choice kernel bias in logits.
+        - k2 ([0,1]): Strength of stage-2 choice kernel bias in logits.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha0, phi, beta, k1, k2 = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Q-values
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Associability (surprise-tracking) per value
+    A1 = np.zeros(2)
+    A2 = np.zeros((2, 2))
+
+    # Choice kernels (recency) for stage-1 and per-state stage-2
+    CK1 = np.zeros(2)
+    CK2 = np.zeros((2, 2))
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-1 policy with choice kernel bias
+        logits1 = beta * q1 + k1 * CK1
+        logits1 -= np.max(logits1)
+        soft1 = np.exp(logits1)
+        probs_1 = soft1 / np.sum(soft1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy with per-state choice kernel bias
+        logits2 = beta * q2[s] + k2 * CK2[s]
+        logits2 -= np.max(logits2)
+        soft2 = np.exp(logits2)
+        probs_2 = soft2 / np.sum(soft2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # TD updates with dynamic associability -> effective learning rate alpha_eff = alpha0 * A
+        # Stage-2 update
+        delta2 = r - q2[s, a2]
+        A2[s, a2] = (1.0 - phi) * A2[s, a2] + phi * abs(delta2)
+        alpha2_eff = np.clip(alpha0 * A2[s, a2], 0.0, 1.0)
+        q2[s, a2] += alpha2_eff * delta2
+
+        # Stage-1 bootstrap on realized stage-2 value
+        td_target1 = q2[s, a2]
+        delta1 = td_target1 - q1[a1]
+        A1[a1] = (1.0 - phi) * A1[a1] + phi * abs(delta1)
+        alpha1_eff = np.clip(alpha0 * A1[a1], 0.0, 1.0)
+        q1[a1] += alpha1_eff * delta1
+
+        # Update choice kernels: decay and reinforce chosen action
+        CK1 *= (1.0 - phi)
+        CK1[a1] += 1.0
+        CK2[s] *= (1.0 - phi)
+        CK2[s, a2] += 1.0
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Transition-dependent credit assignment with counterfactual leak and stage-specific temperatures.
+    
+    This model is purely model-free but modulates how much credit is assigned to
+    the first-stage chosen versus unchosen action depending on whether the observed
+    transition was common or rare. It also allows separate choice stochasticity
+    for stage 1 and stage 2, and includes a first-stage perseveration bias.
+
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (0: A, 1: U).
+    state : array-like of int (0 or 1)
+        Second-stage state (0: X, 1: Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices within the visited state.
+    reward : array-like of float (0 or 1)
+        Reward outcome.
+    model_parameters : list or tuple
+        [alpha, beta1, beta2, chi, zeta]
+        - alpha ([0,1]): Learning rate for value updates.
+        - beta1 ([0,10]): Softmax inverse temperature at stage 1.
+        - beta2 ([0,10]): Softmax inverse temperature at stage 2.
+        - chi ([0,1]): Credit weight for common transitions at stage-1 update.
+                        Rare-transition weight is (1 - chi). Also governs
+                        counterfactual leak to the unchosen action.
+        - zeta ([0,1]): Perseveration strength added to the previously chosen
+                        stage-1 action (stickiness).
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta1, beta2, chi, zeta = model_parameters
+    n_trials = len(action_1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    prev_a1 = None
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-1 perseveration bias
+        bias1 = np.zeros(2)
+        if prev_a1 is not None:
+            bias1[prev_a1] = 1.0
+
+        logits1 = beta1 * q1 + zeta * bias1
+        logits1 -= np.max(logits1)
+        soft1 = np.exp(logits1)
+        probs_1 = soft1 / np.sum(soft1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 choice
+        logits2 = beta2 * q2[s]
+        logits2 -= np.max(logits2)
+        soft2 = np.exp(logits2)
+        probs_2 = soft2 / np.sum(soft2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # TD stage-2
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Determine if transition was common given task structure:
+        # Common when (A->X) or (U->Y); rare otherwise.
+        is_common = (a1 == 0 and s == 0) or (a1 == 1 and s == 1)
+
+        # Stage-1 credit weights
+        w_chosen = chi if is_common else (1.0 - chi)
+        w_unchosen = 1.0 - w_chosen  # counterfactual leak
+
+        # Bootstrap value for the experienced path
+        v_boot = q2[s, a2]
+
+        # Update chosen first-stage action (weighted by transition type)
+        delta1_ch = v_boot - q1[a1]
+        q1[a1] += alpha * w_chosen * delta1_ch
+
+        # Counterfactual update to unchosen first-stage action
+        a1_uc = 1 - a1
+        delta1_uc = v_boot - q1[a1_uc]
+        q1[a1_uc] += alpha * w_unchosen * delta1_uc
+
+        prev_a1 = a1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

@@ -1,0 +1,324 @@
+Below are three standalone cognitive models, each returning the negative log-likelihood of the observed choices. They differ in mechanism and parameterization from the combinations you’ve already explored.
+
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Model 1: Model-based with learned transitions, uncertainty bonus, dual softmax temperatures, and lapse.
+    
+    Summary:
+    - Learns first-stage transition probabilities online via Dirichlet counts (no learning-rate parameter for transitions).
+    - Stage-1 values are model-based expectations (using learned transitions) plus an uncertainty bonus proportional to the entropy 
+      of the transition distribution for each spaceship (encouraging directed exploration).
+    - Stage-2 values are learned with a model-free delta rule.
+    - Uses separate inverse temperatures for stage 1 and stage 2 and a small lapse probability that mixes uniform choice.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices: 0 = spaceship A, 1 = spaceship U.
+    state : array-like of int (0 or 1)
+        Second-stage state reached: 0 = planet X, 1 = planet Y.
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices on the current state: 0/1 correspond to the two aliens available.
+    reward : array-like of float (typically 0 or 1)
+        Outcome received at the end of the trial.
+    model_parameters : sequence
+        [alpha, beta1, beta2, zeta_unc, epsilon]
+        - alpha (learning rate for second-stage values, [0,1]): MF update for Q at stage 2.
+        - beta1 (inverse temperature for stage 1, [0,10]).
+        - beta2 (inverse temperature for stage 2, [0,10]).
+        - zeta_unc (uncertainty bonus weight, [0,1]): bonus proportional to transition entropy per spaceship.
+        - epsilon (lapse rate, [0,1]): probability of random choice at each stage mixed with softmax.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed sequence of choices.
+    """
+    alpha, beta1, beta2, zeta_unc, epsilon = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize learned transition via Dirichlet(1,1) counts for each spaceship
+    counts = np.ones((2, 2))  # rows: actions (A,U), cols: states (X,Y)
+    # Stage-2 MF values (per state s, action a2)
+    q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        # Current learned transition probabilities
+        trans = counts / counts.sum(axis=1, keepdims=True)  # shape (2,2)
+        # Entropy per action (row), normalized by log(2) to be in [0,1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ent = -np.nansum(trans * np.log(trans + 1e-12), axis=1) / np.log(2.0)
+        ent = np.clip(ent, 0.0, 1.0)
+
+        # Model-based Stage 1 value using learned transitions and current q2
+        max_q2 = np.max(q2, axis=1)          # best value per state
+        q1_mb = trans @ max_q2               # expected value per spaceship
+
+        # Add uncertainty bonus (directed exploration)
+        q1_eff = q1_mb + zeta_unc * ent
+
+        # Stage 1 policy with lapse
+        q1_centered = q1_eff - np.max(q1_eff)
+        soft1 = np.exp(beta1 * q1_centered)
+        soft1 = soft1 / np.sum(soft1)
+        probs1 = (1 - epsilon) * soft1 + epsilon * 0.5
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 policy with lapse
+        s = state[t]
+        q2_eff = q2[s]
+        q2_centered = q2_eff - np.max(q2_eff)
+        soft2 = np.exp(beta2 * q2_centered)
+        soft2 = soft2 / np.sum(soft2)
+        probs2 = (1 - epsilon) * soft2 + epsilon * 0.5
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Update stage 2 values (MF)
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Update learned transitions via Dirichlet counts (no separate learning rate)
+        counts[a1, s] += 1.0
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model 2: Successor-like action-to-state mapping, mixed with fixed-structure MB, and first-stage perseveration.
+    
+    Summary:
+    - Learns an action->state mapping (successor-like row) via an exponential moving average (psi).
+      This forms an SR-style predictive representation over next states for each first-stage action.
+    - Combines this SR-based valuation with a fixed-structure model-based valuation using the known transition matrix.
+    - Uses a perseveration bias at stage 1 only (kappa1) that encourages repeating the last stage-1 action.
+    - Stage 2 uses MF learning with a single inverse temperature for both stages.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (spaceships).
+    state : array-like of int (0 or 1)
+        Reached second-stage state (planets).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices (aliens).
+    reward : array-like of float (typically 0 or 1)
+        Outcome received.
+    model_parameters : sequence
+        [alpha, beta, psi, w_sr, kappa1]
+        - alpha (learning rate for stage-2 MF values, [0,1]).
+        - beta (inverse temperature used at both stages, [0,10]).
+        - psi (SR mapping learning rate, [0,1]): EMA rate for action->state predictive mapping.
+        - w_sr (weight on SR-based value at stage 1, [0,1]): 1=SR only, 0=MB-only (fixed transition).
+        - kappa1 (first-stage perseveration weight, [0,1]).
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed sequence of choices.
+    """
+    alpha, beta, psi, w_sr, kappa1 = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed transition structure (commonly A->X, U->Y)
+    trans_fixed = np.array([[0.7, 0.3],
+                            [0.3, 0.7]])
+
+    # SR-like action->state mapping (rows sum to ~1 over time)
+    sr_map = np.ones((2, 2)) / 2.0  # start uninformative
+
+    # Stage-2 MF values
+    q2 = np.zeros((2, 2))
+
+    # Perseveration kernel for stage 1
+    pers1 = np.zeros(2)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        # Compute stage-1 value components
+        max_q2 = np.max(q2, axis=1)       # per state
+        q1_mb = trans_fixed @ max_q2      # MB using fixed structure
+        q1_sr = sr_map @ max_q2           # SR-like predicted value
+
+        # Mixture and perseveration
+        q1_eff = w_sr * q1_sr + (1 - w_sr) * q1_mb + kappa1 * pers1
+
+        # Stage 1 softmax
+        q1c = q1_eff - np.max(q1_eff)
+        ex1 = np.exp(beta * q1c)
+        probs1 = ex1 / np.sum(ex1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 softmax (state-conditional)
+        s = state[t]
+        q2s = q2[s].copy()
+        q2c = q2s - np.max(q2s)
+        ex2 = np.exp(beta * q2c)
+        probs2 = ex2 / np.sum(ex2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Update stage-2 MF values
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Update SR-like mapping for chosen action toward observed state
+        target = np.zeros(2)
+        target[s] = 1.0
+        sr_map[a1, :] = (1 - psi) * sr_map[a1, :] + psi * target
+
+        # Update perseveration
+        pers1[:] = 0.0
+        pers1[a1] = 1.0
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Model 3: Hybrid MB/MF with transition-dependent choice kernel, reward sensitivity, and stage-2 forgetting.
+    
+    Summary:
+    - Stage-2 values are MF with forgetting (decay) applied to all actions each trial (captures volatility/forgetful memory).
+    - Reward sensitivity parameter scales effective reward (utility compression/attenuation).
+    - Stage-1 values combine: 
+        (i) model-based (fixed transition matrix times max stage-2 values), 
+        (ii) model-free stage-1 values learned via bootstrapping from stage-2 (no eligibility trace),
+        (iii) transition-dependent bias at stage 1: after each trial, bias to repeat/switch the first-stage action depends 
+             on whether the previous transition was common or rare and whether it was rewarded (TD-like effect).
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (spaceships).
+    state : array-like of int (0 or 1)
+        Reached second-stage state (planets).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices (aliens).
+    reward : array-like of float (typically 0 or 1)
+        Outcome received.
+    model_parameters : sequence
+        [alpha, beta, phi, rho, zeta_tr]
+        - alpha (learning rate for MF updates, [0,1]): used for both q2 and q1_mf bootstrapping.
+        - beta (inverse temperature for both stages, [0,10]).
+        - phi (stage-2 forgetting/decay, [0,1]): higher means more decay of all q2 each trial.
+        - rho (reward sensitivity, [0,1]): scales reward before learning (effective utility = rho * reward).
+        - zeta_tr (transition-dependent kernel weight, [0,1]): magnitude of the stay/switch bias at stage 1.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed sequence of choices.
+    """
+    alpha, beta, phi, rho, zeta_tr = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed transition matrix (common transitions)
+    trans_fixed = np.array([[0.7, 0.3],
+                            [0.3, 0.7]])
+
+    # Stage-1 MF values
+    q1_mf = np.zeros(2)
+    # Stage-2 MF values with forgetting
+    q2 = np.zeros((2, 2))
+
+    # Transition-dependent choice kernel at stage 1
+    # Applied as a bias vector added to stage-1 values
+    td_kernel = np.zeros(2)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Helper to determine if a transition is common given action and state
+    def is_common(a1, s2):
+        # For action 0 (A), common to state 0 (X). For action 1 (U), common to state 1 (Y).
+        return (a1 == 0 and s2 == 0) or (a1 == 1 and s2 == 1)
+
+    prev_a1 = None
+    prev_common = None
+    prev_reward = None
+
+    for t in range(n_trials):
+        # Apply forgetting to all stage-2 action values
+        q2 *= (1.0 - phi)
+
+        # Compute MB component at stage 1
+        max_q2 = np.max(q2, axis=1)
+        q1_mb = trans_fixed @ max_q2
+
+        # Combine MB, MF, and transition-dependent kernel
+        q1_eff = q1_mb + q1_mf + zeta_tr * td_kernel
+
+        # Stage 1 softmax
+        q1c = q1_eff - np.max(q1_eff)
+        ex1 = np.exp(beta * q1c)
+        probs1 = ex1 / np.sum(ex1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 softmax
+        s = state[t]
+        q2s = q2[s].copy()
+        q2c = q2s - np.max(q2s)
+        ex2 = np.exp(beta * q2c)
+        probs2 = ex2 / np.sum(ex2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Effective reward with sensitivity
+        r_eff = rho * reward[t]
+
+        # Update stage-2 MF values
+        delta2 = r_eff - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Update stage-1 MF values via bootstrapping from observed second-stage action value
+        delta1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha * delta1
+
+        # Update transition-dependent kernel for next trial
+        # Classic interaction pattern:
+        # - If previous trial was rewarded after a common transition, bias to stay.
+        # - If rewarded after a rare transition, bias to switch.
+        # - If unrewarded after a common transition, bias to switch.
+        # - If unrewarded after a rare transition, bias to stay.
+        if prev_a1 is None:
+            td_kernel[:] = 0.0
+        else:
+            stay_preferred = None
+            if prev_reward > 0:
+                stay_preferred = prev_common  # stay if common+reward, switch if rare+reward
+            else:
+                stay_preferred = not prev_common  # stay if rare+no reward, switch if common+no reward
+
+            td_kernel[:] = 0.0
+            if stay_preferred:
+                td_kernel[prev_a1] = 1.0
+            else:
+                # place bias on the alternative (switch) action
+                td_kernel[1 - prev_a1] = 1.0
+
+        # Update memory of previous trial
+        c = is_common(a1, s)
+        prev_a1 = a1
+        prev_common = c
+        prev_reward = reward[t]
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

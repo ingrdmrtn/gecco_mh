@@ -52,7 +52,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
     n_starts = getattr(cfg.evaluation, "n_starts", 10)
 
     eval_metrics = []
-
+    parameter_estimates = []
     # --- Fit per participant ---
     for p in participants:
         df_p = df[df[data_cfg.id_column] == p].reset_index(drop=True)
@@ -62,6 +62,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
         inputs = [df_p[c].to_numpy() for c in input_cols]
 
         min_ll = np.inf
+        best_parameter_values = []
         for _ in range(n_starts):
             x0 = [np.random.uniform(lo, hi) for lo, hi in parameter_bounds]
             res = minimize(
@@ -72,9 +73,11 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
             )
             if res.fun < min_ll:
                 min_ll = res.fun
+                best_parameter_values = res.x
+
 
         eval_metrics.append(metric_func(min_ll, len(parameter_bounds), len(df_p)))
-
+        parameter_estimates.append(best_parameter_values)
     # --- Aggregate results ---
     mean_metric = float(np.mean(eval_metrics))
     print(f"[GeCCo] Mean {metric_name} = {mean_metric:.2f}")
@@ -84,4 +87,5 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
         "metric_value": mean_metric,
         "param_names": list(spec.param_names),
         "model_name": spec.name,
+        "parameter_values": parameter_estimates
     }

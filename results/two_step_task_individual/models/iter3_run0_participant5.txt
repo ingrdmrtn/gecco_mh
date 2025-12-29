@@ -1,0 +1,332 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Model 1: Successor-representation (SR) planning with MF backup and action stickiness.
+
+    Overview
+    - Learns second-stage (alien) values model-free.
+    - Learns a data-driven state-transition mapping via a simple SR (for this task, an
+      empirical transition matrix from spaceship -> planet).
+    - First-stage values blend model-based SR planning and model-free values.
+    - Action-stickiness bias encourages repeating the previous action at both stages.
+
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (spaceships A=0 or U=1).
+    state : array-like of int (0 or 1)
+        Reached second-stage state per trial (planets X=0 or Y=1).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial (aliens indices on planet: 0 or 1).
+    reward : array-like of float (0 or 1)
+        Binary coin outcome per trial.
+    model_parameters : iterable of floats
+        [alpha_q, beta, omega_sr, gamma_sr, kappa]
+        - alpha_q in [0,1]: learning rate for MF Q updates and SR transition updates.
+        - beta in [0,10]: inverse temperature for both stages.
+        - omega_sr in [0,1]: weight on SR-based (model-based) value at stage 1.
+        - gamma_sr in [0,1]: confidence sharpening of learned transitions;
+          effective transition = gamma_sr * learned + (1 - gamma_sr) * 0.5 (uniform).
+        - kappa in [0,1]: action stickiness added to the logit if repeating previous choice.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed stage-1 and stage-2 choices.
+    """
+    alpha_q, beta, omega_sr, gamma_sr, kappa = model_parameters
+    n_trials = len(action_1)
+
+    # Learned transition matrix from action (spaceship) to state (planet)
+    # Initialize to uniform (no prior knowledge).
+    T_learn = np.full((2, 2), 0.5)
+
+    # Model-free Q values
+    q1_mf = np.zeros(2)         # stage-1 MF Q over spaceships
+    q2 = np.full((2, 2), 0.5)   # stage-2 MF Q over aliens per planet
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # For stickiness: previous actions; initialize with None (-1) so no bias on first trial
+    prev_a1 = -1
+    prev_a2 = np.array([-1, -1])  # Track last choice per planet for stage 2
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-2 policy (with action stickiness at stage 2 for the reached planet)
+        logits2 = beta * q2[s, :].copy()
+        if prev_a2[s] != -1:
+            stick_vec2 = np.zeros(2)
+            stick_vec2[prev_a2[s]] = kappa
+            logits2 = logits2 + stick_vec2
+        # Softmax
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # SR-based model-based value at stage 1 from learned transitions
+        T_eff = gamma_sr * T_learn + (1.0 - gamma_sr) * 0.5  # convex blend with uniform
+        V_states = np.max(q2, axis=1)
+        q1_mb = T_eff @ V_states
+
+        # Blend MB (SR) and MF for stage 1
+        q1_net = omega_sr * q1_mb + (1.0 - omega_sr) * q1_mf
+
+        # Stage-1 policy (with stickiness)
+        logits1 = beta * q1_net.copy()
+        if prev_a1 != -1:
+            stick_vec1 = np.zeros(2)
+            stick_vec1[prev_a1] = kappa
+            logits1 = logits1 + stick_vec1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        r = reward[t]
+
+        # Learning updates
+
+        # Update learned transition (SR proxy): move row a1 toward one-hot of observed state
+        oh_s = np.array([1.0 if i == s else 0.0 for i in range(2)])
+        T_learn[a1, :] += alpha_q * (oh_s - T_learn[a1, :])
+
+        # Update stage-2 Q (MF)
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha_q * delta2
+
+        # Update stage-1 MF from realized second-stage chosen value (bootstrapped)
+        target1 = q2[s, a2]
+        delta1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha_q * delta1
+
+        # Update stickiness memory
+        prev_a1 = a1
+        prev_a2[s] = a2
+
+    eps = 1e-10
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model 2: Uncertainty-adaptive learning (Kalman-like) and arbitration.
+
+    Overview
+    - Stage-2 rewards are learned with a simple Kalman filter per state-action, maintaining
+      both mean and uncertainty (variance).
+    - Uncertainty adaptively reduces inverse temperature at stage 2 (exploration-by-uncertainty).
+    - Stage-1 values combine model-based planning (using the known transitions) and model-free
+      backup; the arbitration weight depends on overall uncertainty (more uncertainty -> less MB).
+    - Includes action stickiness at both stages.
+
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial.
+    state : array-like of int (0 or 1)
+        Reached second-stage state per trial.
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial.
+    reward : array-like of float (0 or 1)
+        Binary rewards.
+    model_parameters : iterable of floats
+        [v, s, beta, chi, kappa]
+        - v in [0,1]: process noise per trial (volatility) added to each Q2 variance.
+        - s in [0,1]: observation noise for rewards; larger means noisier feedback.
+        - beta in [0,10]: base inverse temperature for both stages.
+        - chi in [0,1]: uncertainty sensitivity; scales effects on arbitration and exploration.
+        - kappa in [0,1]: action stickiness added to logits if repeating previous choice.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    v, s_obs, beta, chi, kappa = model_parameters
+    n_trials = len(action_1)
+
+    # Known transition structure (commonly A->X and U->Y)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Stage-2 beliefs: means and variances
+    m2 = np.full((2, 2), 0.5)   # reward means
+    P2 = np.full((2, 2), 0.25)  # uncertainties (start moderately uncertain)
+
+    # Stage-1 MF Q
+    q1_mf = np.zeros(2)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    prev_a1 = -1
+    prev_a2 = np.array([-1, -1])
+
+    for t in range(n_trials):
+        # Diffuse uncertainty each trial (process noise) for all alien options
+        P2 = P2 + v
+
+        s = state[t]
+
+        # Uncertainty-adaptive temperature at stage 2
+        # Lower confidence -> lower beta (more exploration). Use per-action P2 for the reached state.
+        P_row = P2[s, :]
+        beta2_vec = beta * (1.0 - chi * np.clip(P_row, 0.0, 1.0))
+        beta2_vec = np.maximum(beta2_vec, 1e-3)  # prevent zero or negative temperature
+
+        # Compute logits separately per action using its own beta2
+        # Equivalent to scaling values; we implement by constructing logits vector.
+        logits2 = np.array([beta2_vec[0] * m2[s, 0], beta2_vec[1] * m2[s, 1]])
+        if prev_a2[s] != -1:
+            stick_vec2 = np.zeros(2)
+            stick_vec2[prev_a2[s]] = kappa
+            logits2 = logits2 + stick_vec2
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Model-based stage-1 using means
+        V_states = np.max(m2, axis=1)
+        q1_mb = T @ V_states
+
+        # Arbitration weight from uncertainty: more uncertainty -> rely less on MB
+        avg_unc = np.mean(P2)
+        w_mb = np.clip(1.0 - chi * avg_unc, 0.0, 1.0)
+        q1_net = w_mb * q1_mb + (1.0 - w_mb) * q1_mf
+
+        # Stage-1 policy with stickiness
+        logits1 = beta * q1_net.copy()
+        if prev_a1 != -1:
+            stick_vec1 = np.zeros(2)
+            stick_vec1[prev_a1] = kappa
+            logits1 = logits1 + stick_vec1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Observe reward and update Kalman filter for visited state-action
+        r = reward[t]
+        # Kalman gain
+        denom = P2[s, a2] + s_obs + 1e-12
+        K = P2[s, a2] / denom
+        # Mean and variance updates
+        m2[s, a2] = m2[s, a2] + K * (r - m2[s, a2])
+        P2[s, a2] = (1.0 - K) * P2[s, a2]
+
+        # Update stage-1 MF from updated second-stage mean (bootstrapped)
+        target1 = m2[s, a2]
+        q1_mf[a1] += (target1 - q1_mf[a1]) * 0.5  # conservative MF backup without extra params
+
+        # Update stickiness memory
+        prev_a1 = a1
+        prev_a2[s] = a2
+
+    eps = 1e-10
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Model 3: Pure model-free with transition-agnostic eligibility and novelty-driven choice kernel.
+
+    Overview
+    - No model-based planning; all value learning is model-free.
+    - Stage-1 receives an eligibility-trace credit assignment from the trial's outcome.
+    - Stage-2 includes a dynamic choice kernel that encourages returning to recently chosen aliens
+      (novelty/exploitation balance), integrated with Q-values.
+    - Action stickiness at both stages captures perseveration beyond the kernel.
+
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial.
+    state : array-like of int (0 or 1)
+        Reached second-stage state per trial.
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial.
+    reward : array-like of float (0 or 1)
+        Binary rewards.
+    model_parameters : iterable of floats
+        [alpha, beta, lambda_td, novelty, kappa]
+        - alpha in [0,1]: learning rate for MF Q updates at both stages.
+        - beta in [0,10]: inverse temperature for both stages.
+        - lambda_td in [0,1]: eligibility trace for crediting stage-1 with the outcome.
+        - novelty in [0,1]: strength of the choice kernel at stage 2; also serves as its
+          recency rate (larger = faster decay of unchosen, stronger boost for chosen).
+        - kappa in [0,1]: action stickiness added to logits if repeating previous choice.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, lambda_td, novelty, kappa = model_parameters
+    n_trials = len(action_1)
+
+    # Model-free Qs
+    q1 = np.zeros(2)              # stage-1 MF values
+    q2 = np.full((2, 2), 0.5)     # stage-2 MF values
+
+    # Stage-2 choice kernel for recency/novelty per planet
+    K2 = np.zeros((2, 2))         # centered via subtraction in logits
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    prev_a1 = -1
+    prev_a2 = np.array([-1, -1])
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Stage-2 policy: combine Q2 and centered kernel
+        centered_K = K2[s, :] - np.mean(K2[s, :])
+        logits2 = beta * (q2[s, :] + novelty * centered_K)
+        if prev_a2[s] != -1:
+            stick_vec2 = np.zeros(2)
+            stick_vec2[prev_a2[s]] = kappa
+            logits2 = logits2 + stick_vec2
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Stage-1 policy: pure MF with stickiness
+        logits1 = beta * q1.copy()
+        if prev_a1 != -1:
+            stick_vec1 = np.zeros(2)
+            stick_vec1[prev_a1] = kappa
+            logits1 = logits1 + stick_vec1
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Outcome
+        r = reward[t]
+
+        # Learning updates
+
+        # Stage-2 Q update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Stage-1 eligibility update: move q1[a1] toward the realized reward directly
+        q1[a1] += alpha * lambda_td * (r - q1[a1])
+
+        # Choice kernel dynamics at stage 2: recency with single parameter 'novelty'
+        # Decay all kernel entries for the reached planet, then boost chosen action.
+        K2[s, :] *= (1.0 - novelty)
+        K2[s, a2] += novelty
+
+        # Update stickiness memory
+        prev_a1 = a1
+        prev_a2[s] = a2
+
+    eps = 1e-10
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return log_loss

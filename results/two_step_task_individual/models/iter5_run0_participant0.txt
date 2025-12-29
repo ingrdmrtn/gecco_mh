@@ -1,0 +1,311 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Hybrid model-based/model-free controller with transition-surprise gated credit assignment.
+    
+    This model combines model-based planning with model-free values at stage 1. The model-free
+    credit assigned back to the first-stage choice is scaled by a transition-surprise gate:
+    rare transitions boost credit assignment while common transitions dampen it (or vice versa),
+    controlled by sigma. Stage-2 values are learned via standard TD; stage-1 model-based
+    action values use the known transition structure.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Observed second-stage state per trial (0=X, 1=Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial within the reached state.
+    reward : array-like of float/int (typically 0 or 1)
+        Obtained outcome per trial.
+    model_parameters : iterable of floats
+        [alpha1, alpha2, beta, omega, sigma]
+        - alpha1: stage-1 learning rate in [0,1]
+        - alpha2: stage-2 learning rate in [0,1]
+        - beta: inverse temperature (softmax) in [0,10]
+        - omega: model-based weight at stage 1 in [0,1]
+        - sigma: transition-surprise gain in [0,1]; scales eligibility depending on whether
+                 the observed transition was rare or common
+        
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed first- and second-stage choices.
+    """
+    alpha1, alpha2, beta, omega, sigma = model_parameters
+    n_trials = len(action_1)
+
+    # Known transition matrix: rows are a1 (A,U), cols are states (X,Y)
+    T_known = np.array([[0.7, 0.3],
+                        [0.3, 0.7]])
+
+    # Track choice probabilities
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Q-values
+    q1_mf = np.zeros(2)        # model-free values for A,U
+    q2 = np.zeros((2, 2))      # state-specific values: rows=state (X,Y), cols=actions (W,S or P,H)
+
+    for t in range(n_trials):
+        # Model-based backup for stage 1
+        max_q2 = np.max(q2, axis=1)         # value of each state
+        q1_mb = T_known @ max_q2            # plan via known transitions
+
+        # Hybrid stage-1 preferences
+        q1_hybrid = (1.0 - omega) * q1_mf + omega * q1_mb
+        pref1 = beta * (q1_hybrid - np.max(q1_hybrid))
+        probs_1 = np.exp(pref1) / np.sum(np.exp(pref1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy at reached state
+        s = state[t]
+        pref2 = beta * (q2[s, :] - np.max(q2[s, :]))
+        probs_2 = np.exp(pref2) / np.sum(np.exp(pref2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # Determine whether the transition was common or rare, given chosen a1
+        # Common state index for action A=0 is X=0; for U=1 is Y=1
+        common_state = a1  # because A->X (0->0), U->Y (1->1) are common
+        is_rare = 1.0 if s != common_state else 0.0
+
+        # Surprise-gated eligibility for credit assignment to stage 1
+        # Base eligibility = 0.5, modulated by sigma
+        base_e = 0.5
+        # If rare, up-weight; if common, down-weight (symmetric around base)
+        elig = base_e * (1.0 + sigma * (2.0 * is_rare - 1.0))
+        # Clamp to [0,1] to avoid numerical oddities
+        elig = max(0.0, min(1.0, elig))
+
+        # TD updates
+        # Stage-2 update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha2 * delta2
+
+        # Stage-1 model-free value updated toward the obtained second-stage value
+        # using gated eligibility
+        target1 = q2[s, a2]
+        delta1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha1 * elig * delta1
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model-based planner with Bayesian reward estimates (UCB bonus), learned transitions, and perseveration.
+    
+    Stage-2 reward probabilities are tracked with simple Beta-Bernoulli posteriors (one per state-action).
+    The policy uses the posterior mean plus an uncertainty bonus proportional to posterior standard deviation
+    (UCB-like). Transitions from first stage are learned online and used for planning at stage 1.
+    Perseveration biases both stages toward repeating the last action taken in that choice context.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Observed second-stage state per trial (0=X, 1=Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial within the reached state.
+    reward : array-like of float/int (typically 0 or 1)
+        Obtained outcome per trial.
+    model_parameters : iterable of floats
+        [beta, xi, phi, prior, chi]
+        - beta: inverse temperature (softmax) in [0,10]
+        - xi: exploration bonus weight on posterior std (UCB) in [0,1]
+        - phi: perseveration strength (adds bias to last choice) in [0,1]
+        - prior: symmetric Beta prior strength per arm, mapped to counts as prior*10 + 1 in [1,11] in [0,1] input
+        - chi: transition learning rate in [0,1] for updating T_hat rows toward observed state
+        
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed first- and second-stage choices.
+    """
+    beta, xi, phi, prior, chi = model_parameters
+    n_trials = len(action_1)
+
+    # Transition beliefs initialized neutral
+    T_hat = np.full((2, 2), 0.5)
+
+    # Beta prior hyperparameters (symmetric)
+    alpha0 = 1.0 + 10.0 * prior
+    beta0 = 1.0 + 10.0 * prior
+
+    # Posterior counts for each state-action
+    succ = np.zeros((2, 2))  # successes
+    fail = np.zeros((2, 2))  # failures
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None
+    last_a2 = [None, None]
+
+    for t in range(n_trials):
+        # Posterior means and stds for each state-action
+        post_a = alpha0 + succ
+        post_b = beta0 + fail
+        post_mean = post_a / (post_a + post_b)
+        post_var = (post_a * post_b) / (((post_a + post_b) ** 2) * (post_a + post_b + 1.0))
+        post_std = np.sqrt(post_var)
+
+        # Stage-1 planning via learned transitions using optimistic values (mean + xi*std)
+        q2_ucb = post_mean + xi * post_std
+        v_state = np.max(q2_ucb, axis=1)
+        q1_mb = T_hat @ v_state
+
+        # Perseveration bias at stage 1
+        bias1 = np.zeros(2)
+        if last_a1 is not None:
+            bias1[last_a1] += phi
+
+        pref1 = beta * q1_mb + bias1
+        pref1 -= np.max(pref1)
+        probs_1 = np.exp(pref1) / np.sum(np.exp(pref1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy at reached state with perseveration
+        s = state[t]
+        bias2 = np.zeros(2)
+        if last_a2[s] is not None:
+            bias2[last_a2[s]] += phi
+
+        pref2 = beta * q2_ucb[s, :] + bias2
+        pref2 -= np.max(pref2)
+        probs_2 = np.exp(pref2) / np.sum(np.exp(pref2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # Update transitions T_hat toward the observed state (row-wise)
+        onehot_s = np.array([1.0 if i == s else 0.0 for i in range(2)])
+        T_hat[a1, :] = (1.0 - chi) * T_hat[a1, :] + chi * onehot_s
+        # Normalize the updated row (for numerical safety)
+        row_sum = T_hat[a1, :].sum()
+        if row_sum > 0:
+            T_hat[a1, :] /= row_sum
+
+        # Update Beta posteriors for the chosen state-action arm
+        if r > 0:
+            succ[s, a2] += 1.0
+        else:
+            fail[s, a2] += 1.0
+
+        # Update perseveration traces
+        last_a1 = a1
+        last_a2[s] = a2
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Model-free learner with win–stay/lose–shift biases and value forgetting.
+    
+    The model maintains standard TD values for stage 2 and backs up a TD target to stage 1.
+    In addition, it includes:
+      - Win–stay bias: after a rewarded trial, bias toward repeating the previous action.
+      - Lose–shift bias: after an unrewarded trial, bias against repeating the previous action.
+      - Value forgetting/decay applied to all Q-values each trial.
+    Biases are applied separately at both stages; for stage 2 they are conditioned on the second-stage state.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Observed second-stage state per trial (0=X, 1=Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial within the reached state.
+    reward : array-like of float/int (typically 0 or 1)
+        Obtained outcome per trial.
+    model_parameters : iterable of floats
+        [alpha, beta, ws, ls, decay]
+        - alpha: learning rate for TD updates in [0,1]
+        - beta: inverse temperature (softmax) in [0,10]
+        - ws: win–stay bias strength in [0,1]
+        - ls: lose–shift bias strength in [0,1]
+        - decay: forgetting rate applied to Q-values each trial in [0,1]
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed first- and second-stage choices.
+    """
+    alpha, beta, ws, ls, decay = model_parameters
+    n_trials = len(action_1)
+
+    # Q-values
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None
+    last_a2 = [None, None]
+    last_r = None
+
+    for t in range(n_trials):
+        # Apply value decay
+        q1 *= (1.0 - decay)
+        q2 *= (1.0 - decay)
+
+        # Win-stay / lose-shift biases
+        bias1 = np.zeros(2)
+        if last_a1 is not None and last_r is not None:
+            if last_r > 0:
+                bias1[last_a1] += ws
+            else:
+                bias1[last_a1] -= ls
+
+        pref1 = beta * q1 + bias1
+        pref1 -= np.max(pref1)
+        probs_1 = np.exp(pref1) / np.sum(np.exp(pref1))
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        s = state[t]
+
+        bias2 = np.zeros(2)
+        if last_a2[s] is not None and last_r is not None:
+            if last_r > 0:
+                bias2[last_a2[s]] += ws
+            else:
+                bias2[last_a2[s]] -= ls
+
+        pref2 = beta * q2[s, :] + bias2
+        pref2 -= np.max(pref2)
+        probs_2 = np.exp(pref2) / np.sum(np.exp(pref2))
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # TD updates
+        # Stage-2
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Stage-1: back up obtained second-stage value (simple TD(1) without transitions)
+        target1 = q2[s, a2]
+        delta1 = target1 - q1[a1]
+        q1[a1] += alpha * delta1
+
+        # Update traces
+        last_a1 = a1
+        last_a2[s] = a2
+        last_r = r
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

@@ -1,0 +1,323 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Hybrid MB/MF with anxiety-gated arbitration by outcome uncertainty and stage-1 perseveration.
+
+    Overview
+    - Stage 2: Model-free Rescorla-Wagner on Q2(s, a2).
+    - Stage 1: Hybrid of model-based (using fixed transition matrix) and model-free Q1(a1).
+    - Arbitration: The weight on model-based control decreases with estimated outcome uncertainty
+      (running variance of stage-2 prediction errors). Anxiety (stai) amplifies this decrease.
+    - Perseveration: Bias to repeat the previous stage-1 action.
+
+    Parameters (all used, recommended bounds)
+    - alpha:   [0,1]   Learning rate for Q-values and PE variance tracker.
+    - beta:    [0,10]  Inverse temperature for both stages.
+    - w_mb0:   [0,1]   Baseline model-based weight when uncertainty is low.
+    - gamma_unc: [0,1] Strength by which uncertainty reduces model-based control, amplified by stai.
+    - kappa_bias: [0,1] Additive perseveration bias on stage-1 logits toward repeating previous a1.
+
+    Inputs
+    - action_1: int array (n_trials,), chosen spaceship per trial (0=A, 1=U).
+    - state:    int array (n_trials,), reached planet per trial (0=X, 1=Y).
+    - action_2: int array (n_trials,), chosen alien per trial (0/1).
+    - reward:   float array (n_trials,), coins obtained per trial in [0,1].
+    - stai:     float array with one element in [0,1], anxiety score.
+    - model_parameters: iterable/list/array with [alpha, beta, w_mb0, gamma_unc, kappa_bias].
+
+    Returns
+    - Negative log-likelihood (float) of observed stage-1 and stage-2 choices.
+    """
+    alpha, beta, w_mb0, gamma_unc, kappa_bias = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Known transition structure (A->X common, U->Y common)
+    T_known = np.array([[0.7, 0.3],
+                        [0.3, 0.7]], dtype=float)
+
+    # Initialize values
+    q2 = np.zeros((2, 2), dtype=float) + 0.5  # Stage-2 Q-values
+    q1_mf = np.zeros(2, dtype=float) + 0.0    # Stage-1 model-free values
+
+    # Uncertainty tracker: running variance proxy via squared PEs
+    v2 = np.zeros((2, 2), dtype=float) + 0.0
+
+    p_choice_1 = np.zeros(n_trials, dtype=float)
+    p_choice_2 = np.zeros(n_trials, dtype=float)
+
+    prev_a1 = None
+
+    # Helper: stable sigmoid and logit
+    def _clip01(x):
+        return min(1.0, max(0.0, x))
+    def _logit(p):
+        p = _clip01(p)
+        p = min(1.0 - 1e-8, max(1e-8, p))
+        return np.log(p / (1.0 - p))
+    def _sigmoid(z):
+        # guard overflow
+        z = np.clip(z, -60.0, 60.0)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    for t in range(n_trials):
+        a1 = int(action_1[t])
+        s = int(state[t])
+        a2 = int(action_2[t])
+        r = float(reward[t])
+
+        # Model-based stage-1 values from Q2
+        max_q2 = np.max(q2, axis=1)        # length-2 for states X, Y
+        q1_mb = T_known @ max_q2           # length-2 for actions A, U
+
+        # Arbitration weight based on uncertainty and anxiety
+        u = float(np.mean(v2))             # overall uncertainty proxy in [0, ~1]
+        z = _logit(_clip01(w_mb0)) - gamma_unc * stai * u
+        w_mb = _sigmoid(z)
+
+        # Combine MB and MF for stage-1 values
+        q1 = w_mb * q1_mb + (1.0 - w_mb) * q1_mf
+
+        # Stage-1 policy with perseveration bias
+        bias1 = np.zeros(2, dtype=float)
+        if prev_a1 is not None:
+            bias1[prev_a1] += kappa_bias
+
+        logits1 = beta * (q1 - np.max(q1)) + bias1
+        logits1 = logits1 - np.max(logits1)
+        probs1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy (no perseveration here; hybrid effect is at stage-1)
+        q2_s = q2[s]
+        logits2 = beta * (q2_s - np.max(q2_s))
+        logits2 = logits2 - np.max(logits2)
+        probs2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        p_choice_2[t] = probs2[a2]
+
+        # Learning
+        # Stage-2 PE and update
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # Update uncertainty proxy (running variance of PEs)
+        v2[s, a2] = (1.0 - alpha) * v2[s, a2] + alpha * (pe2 * pe2)
+
+        # Stage-1 model-free update toward realized stage-2 value
+        td1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha * td1
+
+        prev_a1 = a1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(nll)
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Model-based planner with learned transitions biased by anxiety, plus stay bias at both stages.
+
+    Overview
+    - Learns transition probabilities T(a1->s) via a simple delta rule.
+    - Stage 2 learns Q2(s, a2) via Rescorla-Wagner.
+    - Stage 1 uses purely model-based planning with the learned T.
+    - Anxiety flattens the learned transition structure by pulling T toward 0.5,
+      implemented via an anxiety-weighted shrinkage toward 0.5 after each transition update.
+      Higher stai -> more uncertainty about which next state follows.
+    - Stay bias (perseveration) applied at both stages.
+
+    Parameters (all used, recommended bounds)
+    - alpha:       [0,1]   Learning rate for Q2(s, a2).
+    - beta:        [0,10]  Inverse temperature.
+    - alpha_trans: [0,1]   Learning rate for transitions.
+    - mu_anx_comm: [0,1]   Strength of anxiety-driven shrinkage of T toward 0.5.
+    - rho_stay:    [0,1]   Additive perseveration bias for repeating previous action (both stages).
+
+    Inputs
+    - action_1: int array (n_trials,), chosen spaceship per trial (0=A, 1=U).
+    - state:    int array (n_trials,), reached planet per trial (0=X, 1=Y).
+    - action_2: int array (n_trials,), chosen alien per trial (0/1).
+    - reward:   float array (n_trials,), coins obtained per trial in [0,1].
+    - stai:     float array with one element in [0,1], anxiety score.
+    - model_parameters: iterable/list/array with [alpha, beta, alpha_trans, mu_anx_comm, rho_stay].
+
+    Returns
+    - Negative log-likelihood (float) of observed stage-1 and stage-2 choices.
+    """
+    alpha, beta, alpha_trans, mu_anx_comm, rho_stay = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Initialize transition estimates T[a, s], rows sum to 1
+    # Start with the canonical common structure
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    # Initialize Q2
+    q2 = np.zeros((2, 2), dtype=float) + 0.5
+
+    p_choice_1 = np.zeros(n_trials, dtype=float)
+    p_choice_2 = np.zeros(n_trials, dtype=float)
+
+    prev_a1 = None
+    prev_a2 = np.array([None, None], dtype=object)
+
+    for t in range(n_trials):
+        a1 = int(action_1[t])
+        s = int(state[t])
+        a2 = int(action_2[t])
+        r = float(reward[t])
+
+        # Stage-1 model-based planning using learned transitions
+        max_q2 = np.max(q2, axis=1)  # shape (2,)
+        q1_mb = T @ max_q2           # shape (2,)
+
+        # Stage-1 policy with stay bias
+        bias1 = np.zeros(2, dtype=float)
+        if prev_a1 is not None:
+            bias1[prev_a1] += rho_stay
+        logits1 = beta * (q1_mb - np.max(q1_mb)) + bias1
+        logits1 = logits1 - np.max(logits1)
+        probs1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy with state-specific stay bias
+        bias2 = np.zeros(2, dtype=float)
+        if prev_a2[s] is not None:
+            bias2[int(prev_a2[s])] += rho_stay
+        q2_s = q2[s]
+        logits2 = beta * (q2_s - np.max(q2_s)) + bias2
+        logits2 = logits2 - np.max(logits2)
+        probs2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        p_choice_2[t] = probs2[a2]
+
+        # Learning
+        # Q2 update
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # Transition learning for the chosen action a1:
+        # delta rule toward the actually observed next state s
+        for sp in (0, 1):
+            targ = 1.0 if sp == s else 0.0
+            T[a1, sp] += alpha_trans * (targ - T[a1, sp])
+        # Normalize to avoid drift
+        row_sum = T[a1, 0] + T[a1, 1]
+        if row_sum <= 0:
+            T[a1, :] = np.array([0.5, 0.5])
+        else:
+            T[a1, :] = T[a1, :] / row_sum
+
+        # Anxiety-driven shrinkage toward 0.5 (uncertainty about transitions)
+        shrink = mu_anx_comm * stai
+        T[a1, :] = (1.0 - shrink) * T[a1, :] + shrink * np.array([0.5, 0.5])
+
+        prev_a1 = a1
+        prev_a2[s] = a2
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(nll)
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """MB planner with anxiety-driven pruning of rare transitions and lapse, plus MF backup.
+
+    Overview
+    - Stage 2: Rescorla-Wagner learning on Q2(s, a2).
+    - Stage 1: Combines model-based value that prunes unlikely next states and a small MF backup.
+      Pruning reduces the contribution of the less likely next state in the MB backup.
+    - Anxiety modulates pruning strength (more anxious -> stronger pruning) and adds a small lapse
+      probability (more anxious -> more lapses).
+    - MF backup at stage-1 is updated toward realized Q2.
+
+    Parameters (all used, recommended bounds)
+    - alpha:       [0,1]   Learning rate for Q2 and stage-1 MF backup.
+    - beta:        [0,10]  Inverse temperature baseline.
+    - zeta_prune:  [0,1]   Baseline pruning strength (0=no pruning, 1=hard prune).
+    - omega_mb:    [0,1]   Weight on MB component in stage-1 values (1=fully MB).
+    - kappa_lapse: [0,1]   Baseline lapse rate; effective lapse increases with stai.
+
+    Inputs
+    - action_1: int array (n_trials,), chosen spaceship per trial (0=A, 1=U).
+    - state:    int array (n_trials,), reached planet per trial (0=X, 1=Y).
+    - action_2: int array (n_trials,), chosen alien per trial (0/1).
+    - reward:   float array (n_trials,), coins obtained per trial in [0,1].
+    - stai:     float array with one element in [0,1], anxiety score.
+    - model_parameters: iterable/list/array with [alpha, beta, zeta_prune, omega_mb, kappa_lapse].
+
+    Returns
+    - Negative log-likelihood (float) of observed stage-1 and stage-2 choices.
+    """
+    alpha, beta, zeta_prune, omega_mb, kappa_lapse = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Canonical transition probabilities
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]], dtype=float)
+
+    # Values
+    q2 = np.zeros((2, 2), dtype=float) + 0.5
+    q1_mf = np.zeros(2, dtype=float)
+
+    p_choice_1 = np.zeros(n_trials, dtype=float)
+    p_choice_2 = np.zeros(n_trials, dtype=float)
+
+    # Anxiety-modulated pruning and lapse settings
+    prune_strength = np.clip(zeta_prune * (1.0 + stai), 0.0, 1.0)  # cap to [0,1]
+    lapse_rate = np.clip(kappa_lapse * stai, 0.0, 0.5)             # keep lapse <= 0.5
+
+    for t in range(n_trials):
+        a1 = int(action_1[t])
+        s = int(state[t])
+        a2 = int(action_2[t])
+        r = float(reward[t])
+
+        # Stage-1 MB value with pruning:
+        # Down-weight the less likely next state by a factor (1 - prune_strength).
+        max_q2 = np.max(q2, axis=1)  # [Q*(X), Q*(Y)]
+        q1_mb = np.zeros(2, dtype=float)
+        for a in (0, 1):
+            p_common = T[a, 0] if a == 0 else T[a, 1]  # common prob for A->X, U->Y
+            # Identify common and rare next-state values
+            q_common = max_q2[0] if a == 0 else max_q2[1]
+            q_rare = max_q2[1] if a == 0 else max_q2[0]
+            # Effective mixing after pruning (rare contribution reduced)
+            w_common = p_common
+            w_rare = 1.0 - p_common
+            w_rare_eff = (1.0 - prune_strength) * w_rare
+            # renormalize
+            Z = w_common + w_rare_eff
+            if Z <= 1e-12:
+                mix = 0.5 * (q_common + q_rare)
+            else:
+                mix = (w_common * q_common + w_rare_eff * q_rare) / Z
+            q1_mb[a] = mix
+
+        # Hybrid stage-1 value: MB with pruning + MF backup
+        q1 = omega_mb * q1_mb + (1.0 - omega_mb) * q1_mf
+
+        # Stage-1 policy with lapse: mix softmax with uniform
+        logits1 = beta * (q1 - np.max(q1))
+        logits1 = logits1 - np.max(logits1)
+        soft1 = np.exp(logits1) / np.sum(np.exp(logits1))
+        probs1 = (1.0 - lapse_rate) * soft1 + lapse_rate * np.array([0.5, 0.5])
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy with the same lapse
+        q2_s = q2[s]
+        logits2 = beta * (q2_s - np.max(q2_s))
+        logits2 = logits2 - np.max(logits2)
+        soft2 = np.exp(logits2) / np.sum(np.exp(logits2))
+        probs2 = (1.0 - lapse_rate) * soft2 + lapse_rate * np.array([0.5, 0.5])
+        p_choice_2[t] = probs2[a2]
+
+        # Learning updates
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        td1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha * td1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(nll)

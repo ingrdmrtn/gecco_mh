@@ -1,0 +1,310 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Hybrid MB/MF with learned transition model, entropy-driven exploration, and anxiety-weighted arbitration.
+    
+    This model learns:
+      - Model-free (MF) Q-values at both stages from rewards.
+      - A model-based (MB) first-stage value via a learned transition matrix P(s'|a1).
+    First-stage choice uses a hybrid of MB and MF values. Arbitration weight (MB share) decreases with anxiety.
+    Additionally, an entropy bonus encourages exploration of first-stage actions whose transition models are uncertain;
+    this bonus increases with anxiety.
+    
+    Parameters (bounds)
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices (0=A, 1=U).
+    state : array-like of int {0,1}
+        Second-stage states visited (0=X, 1=Y).
+    action_2 : array-like of int {0,1}
+        Second-stage choices (X: 0=W,1=S; Y: 0=P,1=H).
+    reward : array-like of float in [0,1]
+        Reward outcome on each trial.
+    stai : array-like of float in [0,1]
+        Trait anxiety score; stai[0] is used.
+    model_parameters : array-like of 5 floats
+        [alpha_mf, alpha_tr, beta, w0, phi_surprise]
+        - alpha_mf in [0,1]: MF learning rate for both stages.
+        - alpha_tr in [0,1]: learning rate for the transition model P(s'|a1).
+        - beta in [0,10]: inverse temperature for softmax at both stages.
+        - w0 in [0,1]: baseline MB weight (share of MB in hybrid).
+        - phi_surprise in [0,1]: scale of the entropy-driven exploration bonus at stage 1.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed first- and second-stage choices.
+    """
+    alpha_mf, alpha_tr, beta, w0, phi_surprise = model_parameters
+    n_trials = len(action_1)
+    s = float(stai[0])
+
+    # Values
+    q1_mf = np.zeros(2)          # MF first-stage values
+    q2 = np.zeros((2, 2))        # MF second-stage values
+
+    # Learned transition model P(s'|a1); initialize as uninformative (0.5, 0.5)
+    T = np.full((2, 2), 0.5)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        # Model-based first-stage values via learned transition model
+        max_q2_per_state = np.max(q2, axis=1)  # shape (2,)
+        q1_mb = T @ max_q2_per_state           # shape (2,)
+
+        # Anxiety-weighted arbitration: higher anxiety shifts weight away from MB
+        w_mb = (1.0 - s) * w0 + s * 0.2  # floor MB weight to 0.2 when highly anxious
+        q1_hybrid = w_mb * q1_mb + (1.0 - w_mb) * q1_mf
+
+        # Entropy-driven exploration bonus over actions (uncertainty in transitions)
+        # H(p) = -sum p log p for the two-state transition row of each action
+        bonus = np.zeros(2)
+        for a in range(2):
+            p = np.clip(T[a], 1e-12, 1 - 1e-12)
+            H = -(p[0] * np.log(p[0]) + p[1] * np.log(p[1]))
+            bonus[a] = phi_surprise * (1.0 + s) * H
+
+        # First-stage policy
+        prefs1 = q1_hybrid + bonus
+        prefs1 -= np.max(prefs1)
+        probs1 = np.exp(beta * prefs1)
+        probs1 = probs1 / np.sum(probs1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy
+        st = state[t]
+        prefs2 = q2[st].copy()
+        prefs2 -= np.max(prefs2)
+        probs2 = np.exp(beta * prefs2)
+        probs2 = probs2 / np.sum(probs2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # MF learning at stage 2 from reward
+        r = reward[t]
+        pe2 = r - q2[st, a2]
+        q2[st, a2] += alpha_mf * pe2
+
+        # MF bootstrapping to stage 1 using the obtained second-stage value (SARSA(0))
+        pe1 = q2[st, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha_mf * pe1
+
+        # Update transition model for the chosen first-stage action toward observed state
+        target = np.array([1.0 if st == 0 else 0.0, 1.0 if st == 1 else 0.0])
+        T[a1] += alpha_tr * (target - T[a1])
+
+        # Keep rows normalized and within [eps, 1-eps] for stability
+        for a in range(2):
+            row = np.clip(T[a], 1e-6, 1.0)
+            row_sum = np.sum(row)
+            if row_sum > 0:
+                T[a] = row / row_sum
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Utility-transformed MF with eligibility trace modulated by transition rarity and anxiety, plus reward-contingent stickiness.
+    
+    This is a pure model-free controller that:
+      - Applies a concave utility transform to reward (risk sensitivity).
+      - Uses an eligibility trace to update first-stage values from second-stage outcomes.
+      - Reduces credit assignment after rare transitions, more strongly under higher anxiety.
+      - Adds a reward-contingent perseveration bias at stage 1 that grows with anxiety.
+    
+    Parameters (bounds)
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices (0=A, 1=U).
+    state : array-like of int {0,1}
+        Second-stage states visited (0=X, 1=Y).
+    action_2 : array-like of int {0,1}
+        Second-stage choices within the visited state.
+    reward : array-like of float in [0,1]
+        Received reward.
+    stai : array-like of float in [0,1]
+        Trait anxiety score; stai[0] is used.
+    model_parameters : array-like of 5 floats
+        [alpha, beta, rho0, lam, zeta0]
+        - alpha in [0,1]: learning rate for MF updates at both stages.
+        - beta in [0,10]: inverse temperature for softmax at both stages.
+        - rho0 in [0,1]: baseline risk sensitivity; higher yields more concavity via u = r^(1 - rho).
+        - lam in [0,1]: eligibility trace strength for crediting stage-1 after stage-2 outcomes.
+        - zeta0 in [0,1]: baseline reward-contingent perseveration at stage 1.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices over both stages.
+    """
+    alpha, beta, rho0, lam, zeta0 = model_parameters
+    n_trials = len(action_1)
+    s = float(stai[0])
+
+    # Risk sensitivity increases with anxiety
+    rho = rho0 + s * (1.0 - rho0)  # moves toward 1 as anxiety increases
+
+    # Reward-contingent perseveration strength increases with anxiety
+    zeta = zeta0 * (0.5 + s)  # min 0.5*zeta0 at low anxiety, up to ~1.5*zeta0 at high anxiety
+
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    last_a1 = None
+    last_reward = 0.0
+    last_common = True
+
+    for t in range(n_trials):
+        st = state[t]
+        a1 = action_1[t]
+        a2 = action_2[t]
+
+        # Determine whether the current transition is common or rare given task structure
+        # Common: A->X (0->0), U->Y (1->1)
+        is_common = (a1 == st)
+
+        # Reward-contingent perseveration bias at stage 1
+        bias1 = np.zeros(2)
+        if last_a1 is not None and last_common and last_reward > 0.0:
+            bias1[last_a1] += zeta
+
+        # Stage 1 policy
+        prefs1 = q1 + bias1
+        prefs1 -= np.max(prefs1)
+        probs1 = np.exp(beta * prefs1)
+        probs1 = probs1 / np.sum(probs1)
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 policy
+        prefs2 = q2[st].copy()
+        prefs2 -= np.max(prefs2)
+        probs2 = np.exp(beta * prefs2)
+        probs2 = probs2 / np.sum(probs2)
+        p_choice_2[t] = probs2[a2]
+
+        # Utility-transformed reward
+        r = reward[t]
+        u = r ** (1.0 - rho)
+
+        # Stage 2 MF update
+        pe2 = u - q2[st, a2]
+        q2[st, a2] += alpha * pe2
+
+        # Eligibility trace from stage 2 to stage 1.
+        # After rare transitions, reduce credit assignment; anxiety amplifies this reduction.
+        # eff_lam = lam for common; for rare: lam * (1 - 0.5*s)
+        eff_lam = lam if is_common else lam * (1.0 - 0.5 * s)
+        pe1 = q2[st, a2] - q1[a1]
+        q1[a1] += alpha * eff_lam * pe1
+
+        # Book-keeping for next-trial stickiness
+        last_a1 = a1
+        last_reward = r
+        last_common = is_common
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Adaptive learning-rate MF with MB hybrid, driven by uncertainty and anxiety.
+    
+    This model combines:
+      - MF Q-learning at stage 2 with an adaptive learning rate that increases with recent uncertainty (|PE|).
+      - MB evaluation at stage 1 using a fixed known transition matrix (common=0.7).
+      - Hybrid MB/MF arbitration where anxiety reduces MB reliance.
+      - Uncertainty bonus at stage 2 to encourage exploration of uncertain aliens, stronger under anxiety.
+    
+    Parameters (bounds)
+    ----------
+    action_1 : array-like of int {0,1}
+        First-stage choices (0=A, 1=U).
+    state : array-like of int {0,1}
+        Second-stage states (0=X, 1=Y).
+    action_2 : array-like of int {0,1}
+        Second-stage choices (X: 0=W,1=S; Y: 0=P,1=H).
+    reward : array-like of float in [0,1]
+        Rewards per trial.
+    stai : array-like of float in [0,1]
+        Trait anxiety score; stai[0] is used.
+    model_parameters : array-like of 5 floats
+        [alpha0, beta, kappa, w_mb0, xi_unc]
+        - alpha0 in [0,1]: base MF learning rate.
+        - beta in [0,10]: inverse temperature for softmax.
+        - kappa in [0,1]: uncertainty adaptation rate; also caps contribution to learning-rate modulation.
+        - w_mb0 in [0,1]: baseline MB weight in stage-1 hybrid.
+        - xi_unc in [0,1]: base scale of uncertainty-driven exploration at stage 2.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha0, beta, kappa, w_mb0, xi_unc = model_parameters
+    n_trials = len(action_1)
+    s = float(stai[0])
+
+    # Fixed transition matrix (common=0.7)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Values and uncertainty trackers
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+    uncert = np.zeros((2, 2))  # running estimate of uncertainty per state-action
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        # MB evaluation for stage 1
+        max_q2 = np.max(q2, axis=1)  # per state
+        q1_mb = T @ max_q2
+
+        # Anxiety reduces MB reliance
+        w_mb = w_mb0 * (1.0 - s) + 0.1 * s
+        q1_hybrid = w_mb * q1_mb + (1.0 - w_mb) * q1_mf
+
+        # Stage 1 policy
+        prefs1 = q1_hybrid.copy()
+        prefs1 -= np.max(prefs1)
+        probs1 = np.exp(beta * prefs1)
+        probs1 = probs1 / np.sum(probs1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 policy with uncertainty-driven exploration
+        st = state[t]
+        u_bonus_scale = xi_unc * (1.0 + s)  # stronger exploration under anxiety
+        prefs2 = q2[st] + u_bonus_scale * uncert[st]
+        prefs2 -= np.max(prefs2)
+        probs2 = np.exp(beta * prefs2)
+        probs2 = probs2 / np.sum(probs2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Adaptive MF learning at stage 2
+        pe2 = r - q2[st, a2]
+        # Update uncertainty as a leaky average of absolute PE
+        uncert[st, a2] = (1.0 - kappa) * uncert[st, a2] + kappa * abs(pe2)
+        # Learning rate increases with uncertainty and anxiety
+        eff_alpha = np.clip(alpha0 + s * uncert[st, a2], 0.0, 1.0)
+        q2[st, a2] += eff_alpha * pe2
+
+        # MF update at stage 1 via bootstrapping
+        pe1 = q2[st, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha0 * pe1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

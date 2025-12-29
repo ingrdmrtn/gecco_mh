@@ -21,10 +21,13 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     )
 
     if fit_type == "individual":
-
         individual_variability_feature = cfg.individual_difference.individual_feature
-        individual_variability_feature = data[individual_variability_feature][0]
-        individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
+        if individual_variability_feature == "None":
+            individual_variability_section = ""
+        else:
+
+            individual_variability_feature = data[individual_variability_feature][0]
+            individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
     else:
         individual_variability_section = ""
 
@@ -33,6 +36,15 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
         if (feedback_text and include_feedback)
         else ""
     )
+
+    if  fit_type == "individual":
+        introduce_data =  """
+Here is the participant data:
+        """
+    else:
+        introduce_data = """
+Here is the data from several participants:
+                """
 
     if cfg.llm.provider in ["openai", "claude", "gemini"]:
         # --- prompt layout for closed models ---
@@ -69,7 +81,7 @@ Here is example data from several participants:
 
 {task.description.strip()}
 
-Here's data from several participants:
+{introduce_data}
 {data_text.strip()}
 
 {goal_text.strip()}
@@ -77,8 +89,7 @@ Here's data from several participants:
 ### Implementation Guidelines
 {chr(10).join(guardrails)}
 
-### Initial Model Suggestion
-Consider the following code as a function template:
+### Initial Model Template
 {llm.template_model.strip()}
 
 Your function:

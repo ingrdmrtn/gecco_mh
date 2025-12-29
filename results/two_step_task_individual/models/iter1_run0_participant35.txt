@@ -1,0 +1,314 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """SR-MF model with asymmetric learning and lapse.
+    
+    This model learns a first-stage successor representation (SR; i.e., the
+    action-to-state transition probabilities) online, and uses it to compute
+    model-based (MB) first-stage values as SR @ max Q(s,a2). Second-stage
+    reward values are learned with asymmetric learning rates for positive
+    and negative prediction errors. A small lapse probability mixes the
+    softmax policy with a uniform choice, capturing occasional random choices.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Second-stage state reached per trial (0=planet X, 1=planet Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial on each planet.
+    reward : array-like of float
+        Outcome received (typically 0/1).
+    model_parameters : sequence of floats
+        [alpha_sr, alpha_pos, alpha_neg, beta, epsilon_lapse]
+        - alpha_sr in [0,1]: learning rate for the successor representation
+          p(state | first-stage action).
+        - alpha_pos in [0,1]: learning rate for positive RPEs at stage-2.
+        - alpha_neg in [0,1]: learning rate for negative RPEs at stage-2.
+        - beta in [0,10]: inverse temperature for softmax (both stages).
+        - epsilon_lapse in [0,1]: lapse probability; with probability epsilon_lapse
+          choices are random (uniform), otherwise softmax.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices across both stages.
+    """
+    alpha_sr, alpha_pos, alpha_neg, beta, epsilon_lapse = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize learned transition (SR) for first-stage actions -> states
+    # Start from mildly informative prior (can be uniform)
+    SR = np.array([[0.7, 0.3], [0.3, 0.7]], dtype=float)
+
+    # Second-stage MF values Q(s, a2)
+    q_s2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+        # Compute MB Q for first stage via SR @ max Q(s, a2)
+        max_q2 = np.max(q_s2, axis=1)  # shape (2,)
+        q1_mb = SR @ max_q2            # shape (2,)
+
+        # First-stage policy with softmax + lapse
+        logits1 = beta * q1_mb
+        logits1 -= np.max(logits1)
+        exp1 = np.exp(logits1)
+        soft1 = exp1 / np.sum(exp1)
+        probs1 = (1.0 - epsilon_lapse) * soft1 + epsilon_lapse * 0.5
+
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with softmax + lapse
+        s = state[t]
+        logits2 = beta * q_s2[s, :]
+        logits2 -= np.max(logits2)
+        exp2 = np.exp(logits2)
+        soft2 = exp2 / np.sum(exp2)
+        probs2 = (1.0 - epsilon_lapse) * soft2 + epsilon_lapse * 0.5
+
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Learn SR row for the chosen first-stage action via simple delta rule
+        # Move probability mass toward the actually visited state
+        SR[a1, :] = (1.0 - alpha_sr) * SR[a1, :]
+        SR[a1, s] += alpha_sr
+
+        # Second-stage asymmetric MF update
+        pe2 = r - q_s2[s, a2]
+        alpha_eff = alpha_pos if pe2 >= 0.0 else alpha_neg
+        q_s2[s, a2] += alpha_eff * pe2
+
+        # Keep SR rows normalized to probabilities (numerical hygiene)
+        row_sums = np.sum(SR, axis=1, keepdims=True)
+        SR = SR / np.clip(row_sums, 1e-12, None)
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Volatility-gated MB/MF arbitration with value decay and stage-2 stickiness.
+    
+    This model blends model-based (MB) and model-free (MF) control at the first stage,
+    with the arbitration weight adapting to an online estimate of reward volatility.
+    When recent reward prediction errors are large (high volatility), the model reduces
+    reliance on MB planning. MF values use a decay (forgetting) term. A stage-2
+    perseveration bias captures the tendency to repeat the previous second-stage action
+    within the same state.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Second-stage state reached per trial (0=planet X, 1=planet Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial on each planet.
+    reward : array-like of float
+        Outcome received (typically 0/1).
+    model_parameters : sequence of floats
+        [alpha_q, beta, kappa2, decay, phi_vol]
+        - alpha_q in [0,1]: learning rate for MF values (stage-2) and volatility trace.
+        - beta in [0,10]: inverse temperature for softmax (both stages).
+        - kappa2 in [0,1]: stage-2 perseveration bias toward repeating the previous
+          action on the same planet.
+        - decay in [0,1]: forgetting factor applied to MF values each trial
+          (1 means no decay; values move toward zero if decay<1).
+        - phi_vol in [0,1]: arbitration gain; effective MB weight is phi_vol*(1 - v),
+          where v is the running average of absolute RPE magnitude (volatility proxy).
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices across both stages.
+    """
+    alpha_q, beta, kappa2, decay, phi_vol = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed known transition structure for planning
+    T = np.array([[0.7, 0.3], [0.3, 0.7]], dtype=float)
+
+    # Values
+    q_s2 = np.zeros((2, 2))      # Q(s, a2) MF
+    q_s1_mf = np.zeros(2)        # First-stage MF values
+
+    # Volatility proxy (per state, per action2) to be conservative
+    v_trace = np.zeros((2, 2))
+
+    # Choice probabilities record
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Stage-2 perseveration: remember previous a2 per state
+    prev_a2 = [None, None]
+
+    for t in range(n_trials):
+        # MB evaluation for stage-1 via planning over T and current q_s2
+        max_q2 = np.max(q_s2, axis=1)  # per state
+        q1_mb = T @ max_q2
+
+        # Arbitration weight depends on current volatility level
+        # Use the volatility of the better action in each state to be conservative
+        v_per_state = np.max(v_trace, axis=1)  # volatility of best action per state
+        # Expected volatility per action via transition mixing
+        v_expected = T @ v_per_state  # shape (2,)
+        w_mb = phi_vol * (1.0 - np.clip(v_expected, 0.0, 1.0))  # in [0,phi_vol] subset of [0,1]
+
+        # Blend MB and MF for stage-1
+        q1_blend = w_mb * q1_mb + (1.0 - w_mb) * q_s1_mf
+
+        # First-stage policy
+        logits1 = beta * q1_blend
+        logits1 -= np.max(logits1)
+        exp1 = np.exp(logits1)
+        probs1 = exp1 / np.sum(exp1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with perseveration bias
+        s = state[t]
+        bias2 = np.zeros(2)
+        if prev_a2[s] is not None:
+            bias2[prev_a2[s]] = 1.0
+
+        logits2 = beta * q_s2[s, :] + kappa2 * bias2
+        logits2 -= np.max(logits2)
+        exp2 = np.exp(logits2)
+        probs2 = exp2 / np.sum(exp2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # MF decay toward zero
+        q_s2 *= decay
+        q_s1_mf *= decay
+
+        # Stage-2 update
+        pe2 = r - q_s2[s, a2]
+        q_s2[s, a2] += alpha_q * pe2
+
+        # Volatility trace update (abs RPE)
+        v_trace[s, a2] = (1.0 - alpha_q) * v_trace[s, a2] + alpha_q * abs(pe2)
+
+        # Eligibility to stage-1 MF (standard TD(1) credit assignment)
+        q_s1_mf[a1] += alpha_q * pe2
+
+        # Update perseveration memory
+        prev_a2[s] = a2
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Bayesian reward learning with risk-sensitive utility and dual-stage choice kernels.
+    
+    This model performs leaky Beta-Bernoulli learning of second-stage reward probabilities
+    for each state-action. The first-stage is model-based, computing expected utility of
+    the best second-stage action reachable via the fixed transition structure. Utility is
+    risk-sensitive via a concavity parameter applied to the expected reward. Choice kernels
+    (perseveration) operate at both stages, biasing toward repeating the previous choice.
+    
+    Parameters
+    ----------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices per trial (0=A, 1=U).
+    state : array-like of int (0 or 1)
+        Second-stage state reached per trial (0=planet X, 1=planet Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices per trial on each planet.
+    reward : array-like of float
+        Outcome received (typically 0/1).
+    model_parameters : sequence of floats
+        [eta, rho, beta, kappa1, kappa2]
+        - eta in [0,1]: leaky integration parameter for Beta counts; higher means faster
+          decay of past evidence.
+        - rho in [0,1]: risk sensitivity; expected utility is p^(1 - rho), with rho>0
+          producing concavity (risk aversion).
+        - beta in [0,10]: inverse temperature for softmax (both stages).
+        - kappa1 in [0,1]: first-stage perseveration toward repeating previous a1.
+        - kappa2 in [0,1]: second-stage perseveration toward repeating previous a2 within state.
+    
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices across both stages.
+    """
+    eta, rho, beta, kappa1, kappa2 = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed transition model for planning
+    T = np.array([[0.7, 0.3], [0.3, 0.7]], dtype=float)
+
+    # Leaky Beta counts for each (state, action2)
+    succ = np.ones((2, 2))  # start with Beta(1,1) uninformative prior
+    fail = np.ones((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    prev_a1 = None
+    prev_a2 = [None, None]
+
+    for t in range(n_trials):
+        # Compute current expected reward probabilities
+        p_hat = succ / np.clip(succ + fail, 1e-12, None)
+
+        # Risk-sensitive expected utility for second-stage actions
+        # For binary rewards in [0,1], use power utility u(p) = p^(1 - rho)
+        u_s2 = np.power(np.clip(p_hat, 0.0, 1.0), 1.0 - rho)
+
+        # First-stage MB values: expected utility of best second-stage action
+        best_u_per_state = np.max(u_s2, axis=1)
+        q1_mb = T @ best_u_per_state
+
+        # Add first-stage perseveration bias
+        bias1 = np.zeros(2)
+        if prev_a1 is not None:
+            bias1[prev_a1] = 1.0
+
+        logits1 = beta * q1_mb + kappa1 * bias1
+        logits1 -= np.max(logits1)
+        exp1 = np.exp(logits1)
+        probs1 = exp1 / np.sum(exp1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Second-stage policy with perseveration bias
+        s = state[t]
+        bias2 = np.zeros(2)
+        if prev_a2[s] is not None:
+            bias2[prev_a2[s]] = 1.0
+
+        logits2 = beta * u_s2[s, :] + kappa2 * bias2
+        logits2 -= np.max(logits2)
+        exp2 = np.exp(logits2)
+        probs2 = exp2 / np.sum(exp2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Leaky Beta updates for observed (s, a2)
+        # Decay past evidence, then add current outcome
+        succ *= (1.0 - eta)
+        fail *= (1.0 - eta)
+        succ[s, a2] += r
+        fail[s, a2] += (1.0 - r)
+
+        # Update perseveration memories
+        prev_a1 = a1
+        prev_a2[s] = a2
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

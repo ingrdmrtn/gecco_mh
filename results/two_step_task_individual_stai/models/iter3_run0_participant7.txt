@@ -1,0 +1,310 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Uncertainty-weighted arbitration with learned transitions, anxiety-modulated planning and lapse.
+
+    Core ideas:
+    - Learn second-stage Q-values model-free and first-stage model-free via bootstrapping from stage-2.
+    - Learn the transition matrix online; per-action arbitration weight is 1 - entropy(row), i.e., rely more on MB when the row is certain.
+    - Anxiety reduces reliance on model-based control when transitions are uncertain and increases lapse (irreducible noise).
+    
+    Parameters (model_parameters):
+    - alpha_r: [0,1] reward learning rate (for both stages and bootstrapping).
+    - beta: [0,10] inverse temperature for both stages.
+    - alpha_T0: [0,1] base transition learning rate (per-trial delta-rule on T).
+    - k_unc: [0,1] anxiety sensitivity; effective MB weight is scaled by (1 - k_unc * stai).
+    - lapse: [0,1] base lapse rate; effective lapse increases with anxiety.
+    
+    Inputs:
+    - action_1: int array {0,1}, first-stage choices (0=A, 1=U).
+    - state: int array {0,1}, observed second-stage state (0=X, 1=Y).
+    - action_2: int array {0,1}, second-stage choices (0=left/alien0, 1=right/alien1).
+    - reward: float array, obtained coins.
+    - stai: array-like with a single float in [0,1], trait anxiety.
+    - model_parameters: tuple/list of 5 floats (alpha_r, beta, alpha_T0, k_unc, lapse).
+    
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices.
+    """
+    alpha_r, beta, alpha_T0, k_unc, lapse = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Initialize learned transition matrix (rows: first-stage actions; cols: states)
+    T = np.full((2, 2), 0.5)  # start uncertain, will learn toward 0.7/0.3 structure via experience
+    # Stage-2 and stage-1 MF values
+    Q2 = np.zeros((2, 2))  # Q2[state, action]
+    Q1_mf = np.zeros(2)    # MF value for first-stage actions
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    eps = 1e-12
+
+    # Effective transition learning rate can be dampened by anxiety (more anxious -> slower to learn structure)
+    alpha_T = alpha_T0 * (1.0 - 0.5 * stai)
+
+    # Effective lapse increases with anxiety
+    lapse_eff = min(1.0, lapse * (0.5 + stai))
+
+    for t in range(n_trials):
+        # Compute per-action transition uncertainty via entropy (normalized to [0,1])
+        # H(p) = -sum p log p / log(2); if p ~ [0.5,0.5] then H=1; if p ~ [1,0] then H=0.
+        H_rows = np.zeros(2)
+        for a in range(2):
+            p_row = np.clip(T[a], eps, 1.0)
+            H = -np.sum(p_row * np.log(p_row)) / np.log(2.0)
+            H_rows[a] = H  # already in [0,1] for binary
+        
+        # Model-based Q1 via current transition beliefs
+        max_Q2 = np.max(Q2, axis=1)  # best at each state
+        Q1_mb = T @ max_Q2
+
+        # Arbitration weight per action: rely more on MB when entropy low; anxiety reduces MB reliance
+        w_vec = (1.0 - H_rows) * (1.0 - k_unc * stai)  # element-wise per action
+        w_vec = np.clip(w_vec, 0.0, 1.0)
+        Q1 = w_vec * Q1_mb + (1.0 - w_vec) * Q1_mf
+
+        # First-stage policy with lapse
+        q1c = Q1 - np.max(Q1)
+        probs_1_soft = np.exp(beta * q1c)
+        probs_1_soft = probs_1_soft / np.sum(probs_1_soft)
+        probs_1 = (1.0 - lapse_eff) * probs_1_soft + lapse_eff * 0.5
+        a1 = action_1[t]
+        p_choice_1[t] = np.clip(probs_1[a1], eps, 1.0)
+
+        # Second-stage policy with lapse
+        s = state[t]
+        q2c = Q2[s] - np.max(Q2[s])
+        probs_2_soft = np.exp(beta * q2c)
+        probs_2_soft = probs_2_soft / np.sum(probs_2_soft)
+        probs_2 = (1.0 - lapse_eff) * probs_2_soft + lapse_eff * 0.5
+        a2 = action_2[t]
+        p_choice_2[t] = np.clip(probs_2[a2], eps, 1.0)
+
+        # Outcomes
+        r = reward[t]
+
+        # Learn transitions from observed a1 -> s
+        # Move the chosen action's row toward one-hot of observed state.
+        target = np.array([0.0, 0.0])
+        target[s] = 1.0
+        T[a1] = (1.0 - alpha_T) * T[a1] + alpha_T * target
+        # Ensure normalization (should already hold, but safeguard numerical drift)
+        T[a1] = T[a1] / np.sum(T[a1])
+
+        # TD learning at stage 2
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha_r * delta2
+
+        # Stage-1 MF bootstraps from updated stage-2 value
+        boot = Q2[s, a2]
+        delta1 = boot - Q1_mf[a1]
+        Q1_mf[a1] += alpha_r * delta1
+
+    nll = -(np.sum(np.log(p_choice_1)) + np.sum(np.log(p_choice_2)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Hybrid MB/MF with anxiety-shaped utility curvature and choice stickiness.
+
+    Core ideas:
+    - Stage-2 values learned with a utility transform u(r) = sign(r) * |r|^rho_eff.
+    - Anxiety increases concavity (reduces rho_eff), making the agent more risk-averse/sensitive.
+    - Stage-1 decision is a mixture of model-based (fixed transitions) and model-free values,
+      where MB weight w = 1 - stai (higher anxiety -> less planning).
+    - Choice stickiness bias encourages repeating previous actions; stickiness grows with anxiety.
+
+    Parameters (model_parameters):
+    - alpha: [0,1] learning rate for both stages.
+    - beta0: [0,10] base inverse temperature.
+    - rho0: [0,1] baseline utility curvature exponent.
+    - k_rho: [0,1] strength of anxiety impact on curvature; rho_eff = rho0 * (1 - k_rho * stai).
+    - stick: [0,1] baseline stickiness coefficient added to logits; scaled by (1 + stai).
+
+    Inputs:
+    - action_1: int array {0,1}, first-stage choice.
+    - state: int array {0,1}, second-stage state.
+    - action_2: int array {0,1}, second-stage choice.
+    - reward: float array, obtained coins.
+    - stai: array-like with a single float in [0,1], trait anxiety.
+    - model_parameters: tuple/list of 5 params (alpha, beta0, rho0, k_rho, stick).
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices.
+    """
+    alpha, beta0, rho0, k_rho, stick = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Fixed known transition structure (common=0.7)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Values
+    Q2 = np.zeros((2, 2))
+    Q1_mf = np.zeros(2)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Anxiety-modulated parameters
+    rho_eff = max(1e-6, rho0 * (1.0 - k_rho * stai))
+    w = np.clip(1.0 - stai, 0.0, 1.0)  # MB weight
+    stick_eff = stick * (1.0 + stai)   # stronger repetition with anxiety
+
+    # Track previous actions for stickiness
+    prev_a1 = -1
+    prev_a2_by_state = np.array([-1, -1])
+
+    eps = 1e-12
+
+    for t in range(n_trials):
+        # Model-based Q1
+        max_Q2 = np.max(Q2, axis=1)
+        Q1_mb = T @ max_Q2
+
+        # Hybrid Q1
+        Q1 = w * Q1_mb + (1.0 - w) * Q1_mf
+
+        # Add stickiness bias to first-stage logits
+        bias1 = np.zeros(2)
+        if prev_a1 in [0, 1]:
+            bias1[prev_a1] += stick_eff
+
+        q1_logits = beta0 * (Q1 - np.max(Q1)) + bias1
+        probs_1 = np.exp(q1_logits - np.max(q1_logits))
+        probs_1 = probs_1 / np.sum(probs_1)
+        a1 = action_1[t]
+        p_choice_1[t] = np.clip(probs_1[a1], eps, 1.0)
+
+        # Second stage policy with state-dependent stickiness
+        s = state[t]
+        bias2 = np.zeros(2)
+        if prev_a2_by_state[s] in [0, 1]:
+            bias2[prev_a2_by_state[s]] += stick_eff
+
+        q2_logits = beta0 * (Q2[s] - np.max(Q2[s])) + bias2
+        probs_2 = np.exp(q2_logits - np.max(q2_logits))
+        probs_2 = probs_2 / np.sum(probs_2)
+        a2 = action_2[t]
+        p_choice_2[t] = np.clip(probs_2[a2], eps, 1.0)
+
+        # Observe reward; transform via utility
+        r = reward[t]
+        sign_r = 1.0 if r >= 0.0 else -1.0
+        u = sign_r * (abs(r) ** rho_eff)
+
+        # TD learning at stage 2 (on utility)
+        delta2 = u - Q2[s, a2]
+        Q2[s, a2] += alpha * delta2
+
+        # Stage-1 MF update via bootstrapped utility value
+        boot = Q2[s, a2]
+        delta1 = boot - Q1_mf[a1]
+        Q1_mf[a1] += alpha * delta1
+
+        # Update stickiness memory
+        prev_a1 = a1
+        prev_a2_by_state[s] = a2
+
+    nll = -(np.sum(np.log(p_choice_1)) + np.sum(np.log(p_choice_2)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Adaptive learning via Pearce-Hall associability, anxiety-coupled, with MB/MF hybrid and repetition bias.
+
+    Core ideas:
+    - Learning rates adapt to recent surprise: alpha_t = clip(alpha0 + k_pe * stai * |delta2_prev|, 0,1).
+      Anxiety amplifies PE-driven associability, enabling faster adaptation under surprising outcomes.
+    - Stage-1 decision is a fixed hybrid of MB (known transitions) and MF.
+    - Action repetition bias at both stages captures perseveration independent of value.
+
+    Parameters (model_parameters):
+    - alpha0: [0,1] base learning rate when no surprise.
+    - beta: [0,10] inverse temperature for both stages.
+    - k_pe: [0,1] scale of PE-driven associability; multiplied by stai.
+    - w_mb: [0,1] fixed weight on model-based control at stage 1.
+    - bias_rep: [0,1] repetition bias coefficient added to logits.
+
+    Inputs:
+    - action_1: int array {0,1}, first-stage choice.
+    - state: int array {0,1}, second-stage state.
+    - action_2: int array {0,1}, second-stage choice.
+    - reward: float array, obtained coins.
+    - stai: array-like with a single float in [0,1], trait anxiety.
+    - model_parameters: tuple/list of 5 params (alpha0, beta, k_pe, w_mb, bias_rep).
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices.
+    """
+    alpha0, beta, k_pe, w_mb, bias_rep = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Known transitions
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    Q2 = np.zeros((2, 2))
+    Q1_mf = np.zeros(2)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Repetition memory
+    prev_a1 = -1
+    prev_a2_by_state = np.array([-1, -1])
+
+    # Previous unsigned PE for associability
+    prev_abs_pe = 0.0
+
+    eps = 1e-12
+
+    for t in range(n_trials):
+        # Dynamic learning rate from previous surprise (Pearce-Hall style)
+        alpha_t = alpha0 + k_pe * stai * prev_abs_pe
+        alpha_t = np.clip(alpha_t, 0.0, 1.0)
+
+        # Hybrid stage-1 value
+        max_Q2 = np.max(Q2, axis=1)
+        Q1_mb = T @ max_Q2
+        Q1 = w_mb * Q1_mb + (1.0 - w_mb) * Q1_mf
+
+        # First-stage logits with repetition bias
+        bias1 = np.zeros(2)
+        if prev_a1 in [0, 1]:
+            bias1[prev_a1] += bias_rep
+        q1_logits = beta * (Q1 - np.max(Q1)) + bias1
+        probs_1 = np.exp(q1_logits - np.max(q1_logits))
+        probs_1 = probs_1 / np.sum(probs_1)
+        a1 = action_1[t]
+        p_choice_1[t] = np.clip(probs_1[a1], eps, 1.0)
+
+        # Second-stage logits with state-specific repetition bias
+        s = state[t]
+        bias2 = np.zeros(2)
+        if prev_a2_by_state[s] in [0, 1]:
+            bias2[prev_a2_by_state[s]] += bias_rep
+        q2_logits = beta * (Q2[s] - np.max(Q2[s])) + bias2
+        probs_2 = np.exp(q2_logits - np.max(q2_logits))
+        probs_2 = probs_2 / np.sum(probs_2)
+        a2 = action_2[t]
+        p_choice_2[t] = np.clip(probs_2[a2], eps, 1.0)
+
+        # Outcome and learning
+        r = reward[t]
+        delta2 = r - Q2[s, a2]
+        Q2[s, a2] += alpha_t * delta2
+
+        boot = Q2[s, a2]
+        delta1 = boot - Q1_mf[a1]
+        Q1_mf[a1] += alpha_t * delta1
+
+        # Update memories
+        prev_abs_pe = abs(delta2)
+        prev_a1 = a1
+        prev_a2_by_state[s] = a2
+
+    nll = -(np.sum(np.log(p_choice_1)) + np.sum(np.log(p_choice_2)))
+    return nll

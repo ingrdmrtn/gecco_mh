@@ -1,0 +1,284 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Hybrid planning with anxiety-modulated temperature and transition-contingent bias.
+    The agent blends model-free and model-based values at the first stage. Anxiety increases choice determinism (inverse temperature)
+    and amplifies a transition-contingent bias to repeat after common transitions and switch after rare transitions.
+
+    Parameters
+    - action_1: array-like of ints in {0,1}. First-stage choices (0=A, 1=U).
+    - state: array-like of ints in {0,1}. Second-stage state reached (0=X, 1=Y).
+    - action_2: array-like of ints in {0,1}. Second-stage choices within state (0/1).
+    - reward: array-like of floats in [0,1]. Coins received.
+    - stai: array-like containing one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        alpha: [0,1] — learning rate for both stages
+        beta_base: [0,10] — base inverse temperature
+        plan_gain: [0,1] — weight on model-based (transition-expected) values at stage 1
+        rare_bias: [0,1] — strength of transition-contingent perseveration (+after common, −after rare)
+        anx_beta: [0,1] — degree to which anxiety scales beta (higher stai -> higher beta)
+
+    Returns
+    - Negative log-likelihood of observed first- and second-stage choices.
+    """
+    alpha, beta_base, plan_gain, rare_bias, anx_beta = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    # Fixed transition structure: rows are actions (A=0, U=1); cols are states (X=0, Y=1)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Values
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Likelihood storage
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Transition-contingent perseveration memory
+    last_a1 = None
+    last_common = None  # whether the last transition was common (True) or rare (False)
+
+    eps = 1e-12
+    for t in range(n_trials):
+        # Effective inverse temperature with anxiety scaling
+        beta = beta_base * (1.0 + anx_beta * stai_val)
+
+        # Model-based component at stage 1: expect max over second-stage actions under transitions
+        max_q2 = np.max(q2, axis=1)  # values of states X and Y
+        q1_mb = T @ max_q2  # expected values for A and U
+
+        # Combine MF and MB at stage 1
+        q1 = (1.0 - plan_gain) * q1_mf + plan_gain * q1_mb
+
+        # Transition-contingent perseveration bias from previous trial
+        bias = np.zeros(2)
+        if last_a1 is not None and last_common is not None:
+            # If last transition was common, bias to repeat; if rare, bias to switch
+            signed_bias = rare_bias * (1.0 + stai_val) * (1.0 if last_common else -1.0)
+            bias[last_a1] += signed_bias
+
+        # Stage 1 policy
+        logits1 = q1 + bias
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(beta * logits1)
+        denom1 = np.sum(probs1) + eps
+        probs1 /= denom1
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 policy (pure MF on current state's Q-values)
+        s = state[t]
+        logits2 = q2[s].copy()
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(beta * logits2)
+        denom2 = np.sum(probs2) + eps
+        probs2 /= denom2
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Learning updates
+        # Stage 2 MF update
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # Stage 1 MF update toward the obtained second-stage action value (SARSA-style backup)
+        target1 = q2[s, a2]
+        pe1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha * pe1
+
+        # Update memory for transition type
+        # Common if (A->X) or (U->Y); rare otherwise
+        last_common = (a1 == s)  # because A=0->X=0, U=1->Y=1
+        last_a1 = a1
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Pearce–Hall associability with anxiety-modulated learning rate and stickiness.
+    The agent adapts its learning rate trial-by-trial based on recent surprise (absolute prediction error).
+    Anxiety increases the associability gain and decreases effective temperature (more randomness).
+    A choice stickiness term biases repeating the previous action at each stage.
+
+    Parameters
+    - action_1: array-like of ints in {0,1}. First-stage choices (0=A,1=U).
+    - state: array-like of ints in {0,1}. Second-stage state reached (0=X,1=Y).
+    - action_2: array-like of ints in {0,1}. Second-stage choices within state (0/1).
+    - reward: array-like of floats in [0,1]. Coins received.
+    - stai: array-like containing one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        alpha_min: [0,1] — baseline learning rate floor
+        beta: [0,10] — inverse temperature when stai=0
+        k_ph: [0,1] — associability gain scaling (how much surprise boosts learning rate)
+        stickiness: [0,1] — tendency to repeat previous choices at each stage
+        anx_temp: [0,1] — how much anxiety reduces effective beta (increases randomness)
+
+    Returns
+    - Negative log-likelihood of observed choices at both stages.
+    """
+    alpha_min, beta_base, k_ph, stickiness, anx_temp = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    # Values
+    q1 = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Associability (surprise trace) per second-stage state
+    assoc = np.zeros(2)  # for states X and Y
+
+    # Likelihood storage
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Stickiness memory
+    last_a1 = None
+    last_a2 = np.array([None, None], dtype=object)
+
+    eps = 1e-12
+    for t in range(n_trials):
+        # Effective temperature decreases with anxiety (more randomness): beta_eff = beta / (1 + anx_temp*stai)
+        beta_eff = beta_base / (1.0 + anx_temp * stai_val)
+
+        # Stage 1 logits with stickiness
+        logits1 = q1.copy()
+        if last_a1 is not None:
+            logits1[last_a1] += stickiness
+        logits1 -= np.max(logits1)
+        probs1 = np.exp(beta_eff * logits1)
+        probs1 /= (np.sum(probs1) + eps)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 logits with stickiness within current state
+        s = state[t]
+        logits2 = q2[s].copy()
+        if last_a2[s] is not None:
+            logits2[last_a2[s]] += stickiness * 0.5  # weaker stickiness at stage 2
+        logits2 -= np.max(logits2)
+        probs2 = np.exp(beta_eff * logits2)
+        probs2 /= (np.sum(probs2) + eps)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # Surprise (PE) at stage 2
+        pe2 = r - q2[s, a2]
+        # Update associability trace for current state (slow decay and accumulation of |PE|)
+        assoc[s] = 0.9 * assoc[s] + 0.1 * abs(pe2)
+
+        # Trial-specific learning rate with anxiety-amplified associability
+        lr_t = alpha_min + k_ph * assoc[s] * (1.0 + stai_val)
+        lr_t = 0.0 if lr_t < 0.0 else (1.0 if lr_t > 1.0 else lr_t)
+
+        # Stage 2 update
+        q2[s, a2] += lr_t * pe2
+
+        # Stage 1 update towards the obtained second-stage value (SARSA-style)
+        target1 = q2[s, a2]
+        pe1 = target1 - q1[a1]
+        q1[a1] += lr_t * pe1
+
+        # Update stickiness memory
+        last_a1 = a1
+        last_a2[s] = a2
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Adaptive strategy gating: anxiety and reward-rate modulated MB/MF mixture.
+    The agent mixes model-based and model-free control at stage 1 with a dynamic gate w_t in [0,1].
+    The gate increases with recent reward rate and with anxiety (anxious participants rely more on the structured model).
+    Stage 2 is model-free. Reward rate is tracked by an exponential moving average.
+
+    Parameters
+    - action_1: array-like of ints in {0,1}. First-stage choices (0=A,1=U).
+    - state: array-like of ints in {0,1}. Second-stage state reached (0=X,1=Y).
+    - action_2: array-like of ints in {0,1}. Second-stage choices within state (0/1).
+    - reward: array-like of floats in [0,1]. Coins received.
+    - stai: array-like containing one float in [0,1]. Anxiety score.
+    - model_parameters: iterable of 5 floats
+        alpha: [0,1] — learning rate for MF values
+        beta: [0,10] — inverse temperature
+        gate_bias: [0,1] — baseline tendency toward model-based control (mapped to logits)
+        rr_sensitivity: [0,1] — weight of reward-rate on the gate
+        anx_gate: [0,1] — how strongly anxiety shifts the gate toward model-based
+
+    Returns
+    - Negative log-likelihood of observed choices at both stages.
+    """
+    alpha, beta, gate_bias, rr_sensitivity, anx_gate = model_parameters
+    n_trials = len(action_1)
+    stai_val = float(stai[0])
+
+    # Transition matrix
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Values
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    # Reward-rate tracker
+    rr = 0.5  # initialize at neutral 0.5
+    rr_decay = 0.9  # fixed forgetting (outside parameter budget)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    eps = 1e-12
+    for t in range(n_trials):
+        # Compute model-based action values
+        max_q2 = np.max(q2, axis=1)  # state values
+        q1_mb = T @ max_q2
+
+        # Gate combining MF and MB at stage 1: w_t = sigmoid(logit(gate_bias) + rr_sensitivity*(rr-0.5) + anx_gate*stai)
+        # Map gate_bias in [0,1] to logit space safely
+        gb = min(max(gate_bias, eps), 1.0 - eps)
+        logit_gb = np.log(gb) - np.log(1.0 - gb)
+        gate_logit = logit_gb + rr_sensitivity * (rr - 0.5) + anx_gate * stai_val
+        w_t = 1.0 / (1.0 + np.exp(-gate_logit))
+        w_t = 0.0 if w_t < 0.0 else (1.0 if w_t > 1.0 else w_t)
+
+        q1 = (1.0 - w_t) * q1_mf + w_t * q1_mb
+
+        # Stage 1 policy
+        logits1 = q1 - np.max(q1)
+        probs1 = np.exp(beta * logits1)
+        probs1 /= (np.sum(probs1) + eps)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage 2 policy (MF)
+        s = state[t]
+        logits2 = q2[s] - np.max(q2[s])
+        probs2 = np.exp(beta * logits2)
+        probs2 /= (np.sum(probs2) + eps)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        # Outcome
+        r = reward[t]
+
+        # MF learning updates
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        target1 = q2[s, a2]
+        pe1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha * pe1
+
+        # Update reward-rate estimate
+        rr = rr_decay * rr + (1.0 - rr_decay) * r
+
+    neg_ll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return float(neg_ll)

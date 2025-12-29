@@ -1,0 +1,323 @@
+def cognitive_model1(action_1, state, action_2, reward, stai, model_parameters):
+    """Uncertainty-arbitrated hybrid (MB/MF) with anxiety-modulated temperature.
+    
+    Idea:
+    - Stage-2 Q-values (q2) learned via TD.
+    - Stage-1 action values are a hybrid of model-based planning (via fixed transitions)
+      and model-free cached values (q1_mf).
+    - Arbitration weight w_mb increases with outcome uncertainty and decreases with anxiety.
+      Anxiety also reduces effective inverse temperature (more exploration).
+    - Outcome uncertainty is tracked as an exponentially weighted variance of rewards at Stage-2.
+    
+    Parameters (total=5):
+    - alpha: [0,1] Learning rate for reward values (both stages).
+    - beta: [0,10] Base inverse temperature for both stages.
+    - omega0: [0,1] Baseline model-based weight (prior preference for planning).
+    - k_unc: [0,1] Sensitivity to uncertainty for increasing MB control.
+    - anx_temp: [0,1] Strength with which anxiety down-scales beta; also enters arbitration.
+    
+    Anxiety use:
+    - Effective temperature: beta_eff = beta * (1 - anx_temp * stai), applied to both stages.
+    - Arbitration: w_mb = clip(sigmoid(logit(omega0) + k_unc*U - anx_temp*stai), 0, 1),
+      where U is the mean uncertainty across available second-stage choices.
+    
+    Inputs:
+    - action_1: array of ints in {0,1}, chosen Stage-1 spaceship per trial.
+    - state: array of ints in {0,1}, observed second-stage planet per trial.
+    - action_2: array of ints in {0,1}, chosen alien per observed planet per trial.
+    - reward: array of floats in [0,1], received coins per trial.
+    - stai: array-like with a single float in [0,1], trait anxiety score.
+    - model_parameters: iterable of length 5 in the order (alpha, beta, omega0, k_unc, anx_temp).
+    
+    Returns:
+    - Negative log-likelihood of the observed Stage-1 and Stage-2 choices.
+    """
+    alpha, beta, omega0, k_unc, anx_temp = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Fixed transition structure: rows are actions at Stage-1 (A=0,U=1), cols are states (X=0,Y=1)
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Probabilities of chosen actions
+    p1 = np.zeros(n_trials)
+    p2 = np.zeros(n_trials)
+
+    # Stage-2 values and uncertainty trackers
+    q2 = 0.5 * np.ones((2, 2))  # q2[state, action]
+    m = 0.5 * np.ones((2, 2))   # running mean reward per state-action
+    v = 0.25 * np.ones((2, 2))  # running variance estimate per state-action
+
+    # Stage-1 model-free cached values
+    q1_mf = np.zeros(2)
+
+    # Helper: logistic transform and its inverse (for stable mapping to [0,1])
+    def logit(x):
+        eps = 1e-8
+        x = np.clip(x, eps, 1 - eps)
+        return np.log(x) - np.log(1 - x)
+
+    def sigmoid(z):
+        # numerically stable
+        z = np.clip(z, -50, 50)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Model-based Stage-1 Q via planning over T and current q2
+        mb_q1 = T @ np.max(q2, axis=1)
+
+        # Compute a global uncertainty signal for arbitration: average variance of the two actions available in state s
+        U = 0.5 * (np.mean(v[0]) + np.mean(v[1]))
+        # Arbitration weight combining prior, uncertainty and anxiety
+        w_raw = logit(omega0) + k_unc * U - anx_temp * stai
+        w_mb = sigmoid(w_raw)
+        w_mb = float(np.clip(w_mb, 0.0, 1.0))
+
+        # Effective temperature downscaled by anxiety
+        beta_eff = beta * (1.0 - anx_temp * stai)
+        beta_eff = max(1e-6, beta_eff)
+
+        # Stage-1 policy from hybrid values
+        q1_hyb = w_mb * mb_q1 + (1.0 - w_mb) * q1_mf
+        z1 = beta_eff * (q1_hyb - np.max(q1_hyb))
+        probs1 = np.exp(z1)
+        probs1 /= np.sum(probs1)
+        a1 = action_1[t]
+        p1[t] = probs1[a1]
+
+        # Stage-2 policy
+        z2 = beta_eff * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(z2)
+        probs2 /= np.sum(probs2)
+        a2 = action_2[t]
+        p2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Update reward variance (uncertainty) per state-action with exponential estimator
+        # First update running mean, then variance (mean-squared deviation)
+        m_prev = m[s, a2]
+        m[s, a2] = (1 - alpha) * m[s, a2] + alpha * r
+        v[s, a2] = (1 - alpha) * v[s, a2] + alpha * (r - m_prev) ** 2
+
+        # TD updates
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # Model-free Stage-1 update toward observed Stage-2 chosen value
+        # Use the chosen q2-value as target (one-step TD)
+        pe1 = q2[s, a2] - q1_mf[a1]
+        q1_mf[a1] += alpha * pe1
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p1 + eps)) + np.sum(np.log(p2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, stai, model_parameters):
+    """Transition-learning MB control with prospect-style utility, eligibility trace, and anxiety modulation.
+    
+    Idea:
+    - Learn the transition model T via a simple delta-rule (alpha_t).
+    - Use utility-transformed rewards r^gamma instead of raw r; anxiety makes utility more concave (risk-averse).
+    - TD learning at Stage-2 with learning rate alpha_r.
+    - Propagate Stage-2 prediction errors to Stage-1 model-free values via an eligibility trace lambda.
+    
+    Parameters (total=5):
+    - alpha_r: [0,1] Learning rate for reward values (q2).
+    - alpha_t: [0,1] Learning rate for the transition model T.
+    - beta: [0,10] Inverse temperature for both stages.
+    - lam: [0,1] Eligibility trace weight for backpropagating Stage-2 PE to Stage-1.
+    - risk: [0,1] Base risk parameter; smaller => more concave utility. Anxiety skews toward concavity.
+    
+    Anxiety use:
+    - Utility curvature: gamma_eff = risk*(1 - stai) + 0.5*stai (interpolates toward 0.5 under high anxiety).
+    - Eligibility strength: lambda_eff = lam * (1 - 0.5*stai) (higher anxiety reduces credit assignment to Stage-1).
+    - Temperature scaling: beta_eff = beta * (1 - 0.3*stai) (moderate exploration increase with anxiety).
+    
+    Inputs:
+    - action_1: array of ints in {0,1}.
+    - state: array of ints in {0,1}.
+    - action_2: array of ints in {0,1}.
+    - reward: array of floats in [0,1].
+    - stai: array-like with a single float in [0,1].
+    - model_parameters: iterable (alpha_r, alpha_t, beta, lam, risk).
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_r, alpha_t, beta, lam, risk = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Learned transition model; initialize near-common but not deterministic
+    T = np.array([[0.6, 0.4],
+                  [0.4, 0.6]], dtype=float)
+
+    # Values
+    q2 = 0.5 * np.ones((2, 2))
+    q1_mf = np.zeros(2)
+
+    p1 = np.zeros(n_trials)
+    p2 = np.zeros(n_trials)
+
+    # Anxiety-modulated parameters
+    beta_eff = beta * (1.0 - 0.3 * stai)
+    beta_eff = max(1e-6, beta_eff)
+    gamma_eff = risk * (1.0 - stai) + 0.5 * stai
+    gamma_eff = float(np.clip(gamma_eff, 0.01, 1.0))
+    lambda_eff = lam * (1.0 - 0.5 * stai)
+    lambda_eff = float(np.clip(lambda_eff, 0.0, 1.0))
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Model-based Q1 using learned transitions
+        mb_q1 = T @ np.max(q2, axis=1)
+
+        # Combine MB plan with MF cached q1 via simple average that is implicitly regulated by transition learning
+        q1 = 0.5 * (mb_q1 + q1_mf)
+
+        # Stage-1 policy
+        z1 = beta_eff * (q1 - np.max(q1))
+        probs1 = np.exp(z1)
+        probs1 /= np.sum(probs1)
+        a1 = action_1[t]
+        p1[t] = probs1[a1]
+
+        # Stage-2 policy
+        z2 = beta_eff * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(z2)
+        probs2 /= np.sum(probs2)
+        a2 = action_2[t]
+        p2[t] = probs2[a2]
+
+        # Observe utility-transformed reward
+        r = reward[t]
+        u = (r ** gamma_eff)
+
+        # TD at Stage-2
+        pe2 = u - q2[s, a2]
+        q2[s, a2] += alpha_r * pe2
+
+        # Eligibility-trace update to Stage-1 model-free values
+        q1_mf[a1] += alpha_r * lambda_eff * pe2
+
+        # Learn transitions: move predicted distribution for chosen a1 toward observed state s (one-hot)
+        target = np.array([0.0, 0.0])
+        target[s] = 1.0
+        T[a1, :] = (1 - alpha_t) * T[a1, :] + alpha_t * target
+        # Re-normalize to guard against drift
+        T[a1, :] = T[a1, :] / np.sum(T[a1, :])
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p1 + eps)) + np.sum(np.log(p2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, stai, model_parameters):
+    """Anxiety-gated novelty exploration with lapse and planning.
+    
+    Idea:
+    - Hybrid policy with planning over fixed transitions and MF caching of Stage-1 values.
+    - Add a novelty bonus (count-based) to both stages, but anxiety gates the bonus:
+      more novelty at Stage-1 when anxious, less at Stage-2 (cautious exploitation when outcomes are close).
+    - Include a lapse probability that grows with anxiety, mixing softmax with uniform.
+    
+    Parameters (total=5):
+    - alpha: [0,1] Learning rate for q2 and MF q1 updates.
+    - beta: [0,10] Base inverse temperature.
+    - nu: [0,1] Base novelty bonus strength.
+    - kappa_a: [0,1] Temperature anxiety gain: beta_eff = beta * exp(kappa_a*(0.5 - stai)).
+    - lapse: [0,1] Baseline lapse that is amplified by anxiety.
+    
+    Anxiety use:
+    - Temperature: beta_eff as above; higher anxiety (stai>0.5) lowers beta, increasing exploration.
+    - Novelty bonuses: nu1 = nu * (1 + stai) at Stage-1; nu2 = nu * (1 - stai) at Stage-2.
+    - Lapse: lapse_eff = lapse * (0.5 + 0.5*stai) applied at both stages.
+    
+    Inputs:
+    - action_1: array of ints in {0,1}.
+    - state: array of ints in {0,1}.
+    - action_2: array of ints in {0,1}.
+    - reward: array of floats in [0,1].
+    - stai: array-like with a single float in [0,1].
+    - model_parameters: iterable (alpha, beta, nu, kappa_a, lapse).
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta, nu, kappa_a, lapse = model_parameters
+    n_trials = len(action_1)
+    stai = float(stai[0])
+
+    # Fixed transitions
+    T = np.array([[0.7, 0.3],
+                  [0.3, 0.7]])
+
+    # Values
+    q2 = 0.5 * np.ones((2, 2))
+    q1_mf = np.zeros(2)
+
+    # Visit counts for novelty
+    c1 = np.ones(2)        # counts for Stage-1 actions (start at 1 to avoid div by zero)
+    c2 = np.ones((2, 2))   # counts for state-action at Stage-2
+
+    p1 = np.zeros(n_trials)
+    p2 = np.zeros(n_trials)
+
+    # Anxiety-modulated components
+    beta_eff = beta * np.exp(kappa_a * (0.5 - stai))
+    beta_eff = float(max(1e-6, beta_eff))
+    nu1 = nu * (1.0 + stai)
+    nu2 = nu * (1.0 - stai)
+    lapse_eff = lapse * (0.5 + 0.5 * stai)
+    lapse_eff = float(np.clip(lapse_eff, 0.0, 1.0))
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Novelty bonuses
+        bonus1 = nu1 * (1.0 / np.sqrt(c1))
+        bonus2_s = nu2 * (1.0 / np.sqrt(c2[s]))
+
+        # Hybrid Stage-1 values with MB plan plus MF cache, then add novelty bonus
+        mb_q1 = T @ np.max(q2, axis=1)
+        q1 = 0.5 * (mb_q1 + q1_mf) + bonus1
+
+        # Stage-1 policy with lapse
+        z1 = beta_eff * (q1 - np.max(q1))
+        soft1 = np.exp(z1)
+        soft1 /= np.sum(soft1)
+        probs1 = (1.0 - lapse_eff) * soft1 + lapse_eff * 0.5
+        a1 = action_1[t]
+        p1[t] = probs1[a1]
+
+        # Stage-2 policy with novelty and lapse
+        q2_aug = q2[s] + bonus2_s
+        z2 = beta_eff * (q2_aug - np.max(q2_aug))
+        soft2 = np.exp(z2)
+        soft2 /= np.sum(soft2)
+        probs2 = (1.0 - lapse_eff) * soft2 + lapse_eff * 0.5
+        a2 = action_2[t]
+        p2[t] = probs2[a2]
+
+        # Outcome and learning
+        r = reward[t]
+        pe2 = r - q2[s, a2]
+        q2[s, a2] += alpha * pe2
+
+        # Simple MF update at Stage-1 toward current state's best q2
+        target1 = q2[s, a2]
+        q1_mf[a1] += alpha * (target1 - q1_mf[a1])
+
+        # Update counts for novelty
+        c1[a1] += 1.0
+        c2[s, a2] += 1.0
+
+    eps = 1e-12
+    nll = -(np.sum(np.log(p1 + eps)) + np.sum(np.log(p2 + eps)))
+    return nll

@@ -1,0 +1,300 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Dyna-style hybrid with learned transitions, planning-to-cache, and action bias.
+
+    Mechanisms
+    ----------
+    - Stage-2 model-free learning of alien values (Q2).
+    - Stage-1 model-free cache (Q1_MF) updated from experienced return and additionally
+      "planned" toward the current model-based value (Q1_MB) via a planning-to-cache gain.
+    - Online learning of the transition model T(a1 -> state), used to compute Q1_MB.
+    - Stable first-stage action bias that prefers spaceship A vs U.
+
+    Parameters (model_parameters)
+    -----------------------------
+    [alpha, beta, plan, talpha, bias]
+      - alpha in [0,1]: learning rate for Q-value updates (both stages).
+      - beta in [0,10]: inverse temperature for softmax at both stages.
+      - plan in [0,1]: planning-to-cache gain. Scales how strongly Q1_MF is nudged toward Q1_MB each trial.
+      - talpha in [0,1]: transition learning rate for updating T.
+      - bias in [0,1]: magnitude of stable choice bias at stage 1 favoring spaceship A (action 0).
+                       Implemented as additive logits [+bias, -bias].
+
+    Inputs
+    ------
+    action_1 : array-like of int (0 or 1)
+        First-stage choices (0 = spaceship A, 1 = spaceship U).
+    state : array-like of int (0 or 1)
+        Reached planet on each trial (0 = planet X, 1 = planet Y).
+    action_2 : array-like of int (0 or 1)
+        Second-stage choices on the reached planet (0/1 for the two aliens).
+    reward : array-like of float (typically 0 or 1)
+        Coins received on each trial.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    alpha, beta, plan, talpha, bias = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize learned transition model as uniform and Q-values at zero
+    T = np.ones((2, 2)) * 0.5  # rows: a1 (A,U), cols: state (X,Y)
+    q1_mf = np.zeros(2)        # stage-1 cached action values
+    q2 = np.zeros((2, 2))      # stage-2 values per state and alien action
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+
+        # Compute model-based first-stage values from current T and Q2
+        max_q2 = np.max(q2, axis=1)       # value of best alien on each planet
+        q1_mb = T @ max_q2                # expected value per spaceship
+
+        # Combine MF cache and bias for action selection at stage 1
+        a_bias = np.array([+bias, -bias])
+        logits1 = beta * (q1_mf + q1_mb + a_bias - np.max(q1_mf + q1_mb + a_bias))
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / np.sum(probs1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy on reached planet
+        s = state[t]
+        logits2 = beta * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / np.sum(probs2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Stage-1 model-free TD(0) toward the obtained second-stage value (bootstrapped)
+        target1_mf = q2[s, a2]
+        delta1_mf = target1_mf - q1_mf[a1]
+        q1_mf[a1] += alpha * delta1_mf
+
+        # Planning-to-cache: softly align Q1_MF toward model-based value Q1_MB
+        # This transfers current model-based evaluation into cached values.
+        delta1_plan = q1_mb[a1] - q1_mf[a1]
+        q1_mf[a1] += plan * alpha * delta1_plan
+
+        # Update transition beliefs for the chosen action using talpha
+        # Move probability mass toward observed state and away from the other
+        T[a1, s] = (1 - talpha) * T[a1, s] + talpha * 1.0
+        T[a1, 1 - s] = (1 - talpha) * T[a1, 1 - s] + talpha * 0.0
+
+        # Renormalize row to protect against drift (numerical stability)
+        row_sum = np.sum(T[a1])
+        if row_sum > 0:
+            T[a1] = T[a1] / row_sum
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Model-free with dual-stage perseveration and value forgetting, plus MB guidance.
+
+    Mechanisms
+    ----------
+    - Stage-2 model-free learning of alien values (Q2).
+    - Stage-1 action values include both a cached MF component (Q1_MF) and MB guidance via
+      current Q2 (using fixed transition matrix with common-rare structure).
+    - Both stages include choice perseveration kernels (carry-over of last chosen action).
+    - Value forgetting toward a neutral prior (0.5) at both stages.
+
+    Parameters (model_parameters)
+    -----------------------------
+    [alpha, beta, persev1, persev2, forget]
+      - alpha in [0,1]: learning rate for Q-value updates.
+      - beta in [0,10]: inverse temperature at both stages.
+      - persev1 in [0,1]: strength of first-stage perseveration kernel.
+      - persev2 in [0,1]: strength of second-stage perseveration kernel.
+      - forget in [0,1]: per-trial decay toward 0.5 for all Q-values (both stages).
+
+    Inputs
+    ------
+    action_1 : array-like of int (0 or 1)
+    state : array-like of int (0 or 1)
+    action_2 : array-like of int (0 or 1)
+    reward : array-like of float (0 or 1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    alpha, beta, persev1, persev2, forget = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed transition structure (common = 0.7)
+    T_fixed = np.array([[0.7, 0.3],  # A -> X (0.7), Y (0.3)
+                        [0.3, 0.7]]) # U -> X (0.3), Y (0.7)
+
+    # Initialize Q-values and perseveration kernels
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+    K1 = np.zeros(2)
+    K2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+
+        # Compute MB guidance from fixed transition
+        max_q2 = np.max(q2, axis=1)
+        q1_mb = T_fixed @ max_q2
+
+        # Stage-1 policy with perseveration
+        logits1 = beta * (q1_mf + q1_mb + persev1 * K1 - np.max(q1_mf + q1_mb + persev1 * K1))
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / np.sum(probs1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 policy with perseveration on the reached planet
+        s = state[t]
+        logits2 = beta * (q2[s] + persev2 * K2[s] - np.max(q2[s] + persev2 * K2[s]))
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / np.sum(probs2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Stage-1 TD(0) toward the obtained stage-2 chosen value (bootstrapped)
+        target1 = q2[s, a2]
+        delta1 = target1 - q1_mf[a1]
+        q1_mf[a1] += alpha * delta1
+
+        # Update perseveration traces (last choice traces)
+        K1 *= (1 - alpha)
+        K1[a1] += alpha
+
+        K2 *= (1 - alpha)
+        K2[s, a2] += alpha
+
+        # Forgetting toward neutral prior 0.5
+        q1_mf = (1 - forget) * q1_mf + forget * 0.5
+        q2 = (1 - forget) * q2 + forget * 0.5
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Surprise-weighted arbitration with learned transitions.
+
+    Mechanisms
+    ----------
+    - Stage-2 model-free learning (Q2).
+    - Online learning of transition model T(a1 -> state).
+    - Dynamic arbitration between model-based (MB) and model-free (MF) first-stage values,
+      where MB weight increases with transition surprise (mismatch between predicted and observed state).
+    - Surprise is computed as absolute prediction error on the transition probability for the observed state.
+
+    Parameters (model_parameters)
+    -----------------------------
+    [alpha, beta, mb0, gain, talpha]
+      - alpha in [0,1]: learning rate for Q values (both stages).
+      - beta in [0,10]: inverse temperature for softmax at both stages.
+      - mb0 in [0,1]: baseline weight on model-based control at stage 1.
+      - gain in [0,1]: scaling of additional MB weight as a function of transition surprise.
+      - talpha in [0,1]: transition learning rate for updating T.
+
+    Inputs
+    ------
+    action_1 : array-like of int (0 or 1)
+    state : array-like of int (0 or 1)
+    action_2 : array-like of int (0 or 1)
+    reward : array-like of float (0 or 1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    alpha, beta, mb0, gain, talpha = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize transitions and Q-values
+    T = np.ones((2, 2)) * 0.5
+    q1_mf = np.zeros(2)
+    q2 = np.zeros((2, 2))
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    for t in range(n_trials):
+
+        # Compute MB values from current transition beliefs
+        max_q2 = np.max(q2, axis=1)
+        q1_mb = T @ max_q2
+
+        # Combine MB and MF with a dynamic weight that will be set after observing transition.
+        # For action selection we use the PRE-TRANSITION weight expectation: use last known weight proxy per action
+        # Here we approximate by using baseline mb0 for policy before seeing the transition.
+        w_pre = np.clip(mb0, 0.0, 1.0)
+        q1_combined = (1 - w_pre) * q1_mf + w_pre * q1_mb
+
+        logits1 = beta * (q1_combined - np.max(q1_combined))
+        probs1 = np.exp(logits1)
+        probs1 = probs1 / np.sum(probs1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs1[a1]
+
+        # Stage-2 action policy
+        s = state[t]
+        logits2 = beta * (q2[s] - np.max(q2[s]))
+        probs2 = np.exp(logits2)
+        probs2 = probs2 / np.sum(probs2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs2[a2]
+
+        r = reward[t]
+
+        # Stage-2 TD update
+        delta2 = r - q2[s, a2]
+        q2[s, a2] += alpha * delta2
+
+        # Compute transition surprise for chosen action and observed state
+        p_obs = T[a1, s]
+        surprise = np.abs(1.0 - p_obs)  # larger when predicted probability for observed state is low
+
+        # Dynamic arbitration weight after seeing the transition
+        w = np.clip(mb0 + gain * surprise, 0.0, 1.0)
+
+        # Update the MF first-stage value toward the realized second-stage chosen value
+        target1_mf = q2[s, a2]
+        delta1_mf = target1_mf - q1_mf[a1]
+        q1_mf[a1] += alpha * delta1_mf
+
+        # Additionally, a model-based update: move MF cache toward MB value weighted by w
+        delta1_mbpush = (q1_mb[a1] - q1_mf[a1])
+        q1_mf[a1] += w * alpha * delta1_mbpush
+
+        # Update transition beliefs using talpha
+        T[a1, s] = (1 - talpha) * T[a1, s] + talpha * 1.0
+        T[a1, 1 - s] = (1 - talpha) * T[a1, 1 - s] + talpha * 0.0
+
+        # Renormalize for numerical stability
+        row_sum = np.sum(T[a1])
+        if row_sum > 0:
+            T[a1] = T[a1] / row_sum
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

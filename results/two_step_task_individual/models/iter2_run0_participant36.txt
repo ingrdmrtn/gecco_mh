@@ -1,0 +1,308 @@
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    """Asymmetric-learning model-free controller with value decay and transition-contingent credit assignment bias.
+
+    Core idea:
+    - Purely model-free learning at both stages with sign-asymmetric learning at stage 2.
+    - Adds value decay toward a neutral prior (0.5) to capture forgetting/drift.
+    - First-stage choice policy includes a transition-contingent bias that depends on whether
+      the last experienced transition for each first-stage action was common vs. rare and whether it was rewarded.
+
+    Parameters (with suggested bounds):
+    - alpha_pos: [0, 1]
+        Learning rate applied when the second-stage prediction error is positive (better-than-expected outcomes).
+    - alpha_neg: [0, 1]
+        Learning rate applied when the second-stage prediction error is negative (worse-than-expected outcomes).
+    - beta: [0, 10]
+        Inverse temperature for softmax choice policy (both stages).
+    - decay: [0, 1]
+        Per-trial value decay toward 0.5 for both stage-1 and stage-2 Q-values.
+    - tau: [0, 1]
+        Strength of transition-contingent bias at stage 1. The bias favors repeating an action
+        when its last rewarded transition was common, and disfavors when it was rare (and analogous
+        signed effects when not rewarded).
+
+    Inputs:
+    - action_1: array-like of ints in {0, 1}, first-stage choices per trial (0=A, 1=U).
+    - state: array-like of ints in {0, 1}, second-stage states per trial (0=planet X, 1=planet Y).
+    - action_2: array-like of ints in {0, 1}, second-stage choices per trial within the encountered state.
+    - reward: array-like of floats/ints (typically 0/1), outcome per trial.
+    - model_parameters: iterable [alpha_pos, alpha_neg, beta, decay, tau].
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices under the model.
+    """
+    alpha_pos, alpha_neg, beta, decay, tau = model_parameters
+    n_trials = len(action_1)
+
+    # Transition structure (fixed, used only to classify common/rare for bias bookkeeping)
+    # A commonly -> X, U commonly -> Y
+    def is_common(a1, s2):
+        return (a1 == 0 and s2 == 0) or (a1 == 1 and s2 == 1)
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Q-values initialized at 0.5 to be consistent with decay toward 0.5
+    q_stage1_mf = np.full(2, 0.5)        # Q at stage 1 for actions [A, U]
+    q_stage2_mf = np.full((2, 2), 0.5)   # Q at stage 2 for states [X, Y] and actions [0,1]
+
+    # Track, for each first-stage action, the last observed (common vs. rare) and reward
+    last_common_by_action = [None, None]   # True/False or None
+    last_reward_by_action = [None, None]   # 1/0 or None
+
+    for t in range(n_trials):
+        # Apply decay toward 0.5 before computing policy (captures forgetting/drift)
+        q_stage1_mf = (1 - decay) * q_stage1_mf + decay * 0.5
+        q_stage2_mf = (1 - decay) * q_stage2_mf + decay * 0.5
+
+        s = state[t]
+
+        # Stage-1: transition-contingent bias from last experiences
+        bias1 = np.zeros(2)
+        for a in (0, 1):
+            if last_common_by_action[a] is not None and last_reward_by_action[a] is not None:
+                # Encodes sign by both commonality and reward:
+                # +tau if (common and rewarded) or (rare and not rewarded)
+                # -tau if (rare and rewarded) or (common and not rewarded)
+                common_sign = 1.0 if last_common_by_action[a] else -1.0
+                reward_sign = 1.0 if last_reward_by_action[a] > 0 else -1.0
+                bias1[a] = tau * (common_sign * reward_sign)
+
+        logits1 = beta * (q_stage1_mf + bias1)
+        logits1 -= np.max(logits1)
+        probs_1 = np.exp(logits1)
+        probs_1 /= np.sum(probs_1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * q_stage2_mf[s]
+        logits2 -= np.max(logits2)
+        probs_2 = np.exp(logits2)
+        probs_2 /= np.sum(probs_2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # Updates
+        # Stage-2 MF update with asymmetric learning rate
+        pe2 = r - q_stage2_mf[s, a2]
+        alpha2 = alpha_pos if pe2 >= 0 else alpha_neg
+        q_stage2_mf[s, a2] += alpha2 * pe2
+
+        # Stage-1 MF update bootstrapping toward updated second-stage action value
+        pe1 = q_stage2_mf[s, a2] - q_stage1_mf[a1]
+        # Use the same asymmetry as stage-2, keyed to the outcome-driven PE sign
+        q_stage1_mf[a1] += (alpha_pos if pe2 >= 0 else alpha_neg) * pe1
+
+        # Book-keeping for transition-contingent bias
+        last_common_by_action[a1] = is_common(a1, s)
+        last_reward_by_action[a1] = r
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model2(action_1, state, action_2, reward, model_parameters):
+    """Adaptive arbitration with learned transitions and eligibility trace.
+
+    Core idea:
+    - Learns the state-transition probabilities online (rather than assuming them).
+    - First-stage values combine model-based planning (using learned transitions) and
+      model-free values via an adaptive arbitration weight that grows with transition confidence.
+    - Model-free learning at both stages; stage-1 MF receives an eligibility-trace component.
+
+    Parameters (with suggested bounds):
+    - alpha: [0, 1]
+        Learning rate for model-free value updates (both stages).
+    - beta: [0, 10]
+        Inverse temperature for softmax choice policy (both stages).
+    - kappa: [0, 1]
+        Learning rate for updating the transition matrix from experienced transitions.
+    - zeta: [0, 1]
+        Arbitration sensitivity. Stage-1 MB weight is w_t = zeta * mean_confidence,
+        where confidence reflects how peaky the learned transition distributions are.
+    - psi: [0, 1]
+        Eligibility-trace strength propagating outcome information to stage-1 MF values.
+
+    Inputs:
+    - action_1: array-like of ints in {0, 1}, first-stage choices per trial (0=A, 1=U).
+    - state: array-like of ints in {0, 1}, second-stage states per trial (0=planet X, 1=planet Y).
+    - action_2: array-like of ints in {0, 1}, second-stage choices per trial within the encountered state.
+    - reward: array-like of floats/ints (typically 0/1), outcome per trial.
+    - model_parameters: iterable [alpha, beta, kappa, zeta, psi].
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices under the model.
+    """
+    alpha, beta, kappa, zeta, psi = model_parameters
+    n_trials = len(action_1)
+
+    # Initialize learned transition matrix to uniform uncertainty
+    T_hat = np.full((2, 2), 0.5)  # rows: a1 in {A,U}, cols: s2 in {X,Y}
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    q_stage1_mf = np.zeros(2)        # stage-1 MF Q
+    q_stage2_mf = np.zeros((2, 2))   # stage-2 MF Q
+
+    for t in range(n_trials):
+        s = state[t]
+
+        # Compute planning values from learned transitions
+        max_q_stage2 = np.max(q_stage2_mf, axis=1)     # value of best action in each second-stage state
+        q_stage1_mb = T_hat @ max_q_stage2             # model-based value per first-stage action
+
+        # Confidence of each action's transition row: 0 (uncertain) .. 1 (certain)
+        conf_rows = np.abs(T_hat[:, 0] - 0.5) * 2.0
+        mean_conf = 0.5 * (conf_rows[0] + conf_rows[1])
+        w_t = np.clip(zeta * mean_conf, 0.0, 1.0)      # adaptive MB weight
+
+        q1_combined = w_t * q_stage1_mb + (1.0 - w_t) * q_stage1_mf
+
+        # Stage-1 policy
+        logits1 = beta * q1_combined
+        logits1 -= np.max(logits1)
+        probs_1 = np.exp(logits1)
+        probs_1 /= np.sum(probs_1)
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        # Stage-2 policy
+        logits2 = beta * q_stage2_mf[s]
+        logits2 -= np.max(logits2)
+        probs_2 = np.exp(logits2)
+        probs_2 /= np.sum(probs_2)
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        r = reward[t]
+
+        # Model-free updates
+        delta2 = r - q_stage2_mf[s, a2]
+        q_stage2_mf[s, a2] += alpha * delta2
+
+        delta1 = q_stage2_mf[s, a2] - q_stage1_mf[a1]
+        # eligibility trace term propagates the stage-2 prediction error
+        q_stage1_mf[a1] += alpha * (delta1 + psi * delta2)
+
+        # Transition learning for chosen first-stage action from observed state
+        # Row update toward one-hot of the observed next state
+        if s == 0:
+            T_hat[a1, 0] += kappa * (1.0 - T_hat[a1, 0])
+            T_hat[a1, 1] += kappa * (0.0 - T_hat[a1, 1])
+        else:
+            T_hat[a1, 0] += kappa * (0.0 - T_hat[a1, 0])
+            T_hat[a1, 1] += kappa * (1.0 - T_hat[a1, 1])
+
+        # Normalization (guard against drift)
+        row_sum = T_hat[a1, 0] + T_hat[a1, 1]
+        if row_sum > 0:
+            T_hat[a1] /= row_sum
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll
+
+
+def cognitive_model3(action_1, state, action_2, reward, model_parameters):
+    """Volatility-sensitive exploration with UCB bonus, forgetting, and lapse.
+
+    Core idea:
+    - Second-stage action values are learned model-free, while maintaining an
+      exponentially weighted estimate of reward variance per state-action.
+    - The choice policy includes an uncertainty bonus (UCB-like) that encourages
+      exploration in high-variance options.
+    - First-stage values are computed model-based from the bonus-augmented
+      second-stage values using the fixed transition structure.
+    - Includes per-trial forgetting toward 0.5 and a choice lapse rate that
+      mixes softmax with uniform random choice.
+
+    Parameters (with suggested bounds):
+    - alpha: [0, 1]
+        Learning rate for updating second-stage reward expectations and variance.
+    - beta: [0, 10]
+        Inverse temperature for softmax choice policy (both stages).
+    - c: [0, 1]
+        Scale of the uncertainty (UCB) bonus added to second-stage action values.
+    - f: [0, 1]
+        Per-trial forgetting rate toward 0.5 for both stage-1 and stage-2 values.
+    - xi: [0, 1]
+        Lapse probability: with probability xi, choices are uniform random; with 1 - xi, softmax policy applies.
+
+    Inputs:
+    - action_1: array-like of ints in {0, 1}, first-stage choices per trial (0=A, 1=U).
+    - state: array-like of ints in {0, 1}, second-stage states per trial (0=planet X, 1=planet Y).
+    - action_2: array-like of ints in {0, 1}, second-stage choices per trial within the encountered state.
+    - reward: array-like of floats/ints (typically 0/1), outcome per trial.
+    - model_parameters: iterable [alpha, beta, c, f, xi].
+
+    Returns:
+    - Negative log-likelihood of the observed first- and second-stage choices under the model.
+    """
+    alpha, beta, c, f, xi = model_parameters
+    n_trials = len(action_1)
+
+    # Fixed transition matrix: A->[X,Y]=[0.7,0.3], U->[X,Y]=[0.3,0.7]
+    transition_matrix = np.array([[0.7, 0.3],
+                                  [0.3, 0.7]])
+
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Initialize Q-values and running moments for variance
+    q_stage1 = np.full(2, 0.5)
+    q_stage2 = np.full((2, 2), 0.5)
+    m2 = np.full((2, 2), 0.25)  # second moment E[r^2], start with 0.25 for Bernoulli(0.5)
+    # (since r in {0,1}, r^2 = r, so initial 0.25 works with m=0.5 to give var=0.25)
+
+    for t in range(n_trials):
+        # Apply forgetting toward 0.5
+        q_stage1 = (1 - f) * q_stage1 + f * 0.5
+        q_stage2 = (1 - f) * q_stage2 + f * 0.5
+        m2 = (1 - alpha) * m2 + alpha * m2  # no forgetting distinct from alpha; keep as is
+
+        s = state[t]
+
+        # Compute variance and UCB bonus for current second-stage state
+        var_sa = np.clip(m2 - q_stage2 ** 2, 0.0, None)
+        bonus = c * np.sqrt(np.maximum(var_sa, 1e-8))
+
+        # Stage-2 policy with UCB bonus and lapse
+        logits2 = beta * (q_stage2[s] + bonus[s])
+        logits2 -= np.max(logits2)
+        softmax2 = np.exp(logits2)
+        softmax2 /= np.sum(softmax2)
+        probs_2 = (1 - xi) * softmax2 + xi * 0.5
+        a2 = action_2[t]
+        p_choice_2[t] = probs_2[a2]
+
+        # Stage-1 model-based values using bonus-augmented second-stage values
+        max_q2_bonus = np.max(q_stage2 + bonus, axis=1)
+        q_stage1_mb = transition_matrix @ max_q2_bonus
+
+        logits1 = beta * q_stage1_mb
+        logits1 -= np.max(logits1)
+        softmax1 = np.exp(logits1)
+        softmax1 /= np.sum(softmax1)
+        probs_1 = (1 - xi) * softmax1 + xi * 0.5
+        a1 = action_1[t]
+        p_choice_1[t] = probs_1[a1]
+
+        r = reward[t]
+
+        # Update second-stage mean (Q) and second moment (m2) with exponential recency weighting
+        prev_q = q_stage2[s, a2]
+        q_stage2[s, a2] += alpha * (r - q_stage2[s, a2])
+        m2[s, a2] += alpha * ((r * r) - m2[s, a2])
+
+        # Optional stage-1 bootstrapped update toward the current MB target (kept simple, MF-free)
+        target1 = q_stage1_mb[a1]
+        q_stage1[a1] += alpha * (target1 - q_stage1[a1])
+
+    eps = 1e-10
+    nll = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+    return nll

@@ -8,10 +8,11 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     4. Guardrails
     5. Template model
     """
-    task, llm, evaluation = cfg.task, cfg.llm, cfg.evaluation
+    task, llm, evaluation, metadata = cfg.task, cfg.llm, cfg.evaluation, cfg.metadata
     guardrails = getattr(llm, "guardrails", [])
     include_feedback = getattr(llm, "include_feedback", False)
     fit_type = getattr(evaluation, "fit_type")
+    metadata = getattr(metadata, "flag", False)
 
     # Format goal section dynamically
     names = [f"`cognitive_model{i+1}`" for i in range(llm.models_per_iteration)]
@@ -37,14 +38,12 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
         else ""
     )
 
-    if  fit_type == "individual":
-        introduce_data =  """
-Here is the participant data:
-        """
-    else:
-        introduce_data = """
-Here is the data from several participants:
-                """
+    metadata_section = (
+        f"### Metadata\n{cfg.metadata.description.strip()}" 
+        if metadata 
+        else "")
+
+    introduce_data =  """Here is the participant data: """ if  fit_type == "individual" else """Here is the data from several participants: """ 
 
     if cfg.llm.provider in ["openai", "claude", "gemini"]:
         # --- prompt layout for closed models ---
@@ -58,8 +57,10 @@ Here is the data from several participants:
 # individual_variability_section
 {individual_variability_section}
 
-### Example Participant Data
-Here is example data from several participants:
+{metadata_section}
+
+### Participant Data
+{introduce_data}
 {data_text.strip()}
 
 ### Your Task

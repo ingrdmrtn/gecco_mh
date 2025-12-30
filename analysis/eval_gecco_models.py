@@ -54,63 +54,69 @@ for run in range(max_independent_runs):
             'prob_stay_common_not_rewarded':[],
             'prob_stay_rare_not_rewarded':[]}
 
-    for idx, p in enumerate(participants):
+    try:
+
+        for idx, p in enumerate(participants):
 
 
-        df_participant = df[df.participant==p].reset_index()
+            df_participant = df[df.participant==p].reset_index()
 
-        best_parameters = fit_res['parameter_values'][idx]
-        reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
-                                                                    np.array(df_participant.reward_p_s0_1),
-                                                                    np.array(df_participant.reward_p_s1_0),
-                                                                    np.array(df_participant.reward_p_s1_1))
-        stai = df_participant['stai'][0]
-        n_trials = df_participant.shape[0]
-        participant_simulation_model = open(f'{best_simulated_model_path}simulation_model.txt', 'r')
-        participant_simulation_model = participant_simulation_model.read()
-        participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
+            best_parameters = fit_res['parameter_values'][idx]
+            reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
+                                                                        np.array(df_participant.reward_p_s0_1),
+                                                                        np.array(df_participant.reward_p_s1_0),
+                                                                        np.array(df_participant.reward_p_s1_1))
+            stai = df_participant['stai'][0]
+            n_trials = df_participant.shape[0]
+            participant_simulation_model = open(f'{best_simulated_model_path}simulation_model.txt', 'r')
+            participant_simulation_model = participant_simulation_model.read()
+            participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
 
-        exec(participant_simulation_model, globals())
-        model_func = globals()['simulate_model']
+            exec(participant_simulation_model, globals())
+            model_func = globals()['simulate_model']
 
-        parameter_names  = extract_parameter_names(participant_simulation_model)
-        # make sure stai is passed to the model function depending on how stai_score is taken in by the function
-        simulation_pars = [best_parameters[idx] for idx, name in enumerate(fit_res["param_names"])]
-        stage1_choice, state2, stage2_choice, reward = model_func(
-            n_trials,
-            simulation_pars,
-            *[globals()[name] for name in simulation_columns],
-            stai_score = stai, ## was hand coded
-        )
-        
-
-
-        (prob_stay_common_rewarded,
-        prob_stay_rare_rewarded,
-        prob_stay_common_not_rewarded,
-        prob_stay_rare_not_rewarded) = compute_stay_probabilities(stage1_choice, state2, reward)
-
-        p_stay['prob_stay_common_rewarded'].append(prob_stay_common_rewarded)
-        p_stay['prob_stay_rare_rewarded'].append(prob_stay_rare_rewarded)
-        p_stay['prob_stay_common_not_rewarded'].append(prob_stay_common_not_rewarded)
-        p_stay['prob_stay_rare_not_rewarded'].append(prob_stay_rare_not_rewarded)
+            parameter_names  = extract_parameter_names(participant_simulation_model)
+            # make sure stai is passed to the model function depending on how stai_score is taken in by the function
+            simulation_pars = [best_parameters[idx] for idx, name in enumerate(fit_res["param_names"])]
+            stage1_choice, state2, stage2_choice, reward = model_func(
+                n_trials,
+                simulation_pars,
+                *[globals()[name] for name in simulation_columns],
+                stai_score = stai, ## was hand coded
+            )
+            
 
 
+            (prob_stay_common_rewarded,
+            prob_stay_rare_rewarded,
+            prob_stay_common_not_rewarded,
+            prob_stay_rare_not_rewarded) = compute_stay_probabilities(stage1_choice, state2, reward)
 
-    ppcs = pd.DataFrame(p_stay)
-    ppcs.to_csv(f'ppcs_model{model}_split{split}_run{run}.csv')
+            p_stay['prob_stay_common_rewarded'].append(prob_stay_common_rewarded)
+            p_stay['prob_stay_rare_rewarded'].append(prob_stay_rare_rewarded)
+            p_stay['prob_stay_common_not_rewarded'].append(prob_stay_common_not_rewarded)
+            p_stay['prob_stay_rare_not_rewarded'].append(prob_stay_rare_not_rewarded)
 
 
 
-    figure, axis  = plt.subplots()
-    axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
-                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
-                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
-                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
+        ppcs = pd.DataFrame(p_stay)
+        ppcs.to_csv(f'ppcs_model{model}_split{split}_run{run}.csv')
 
-    axis.set_xticks(np.arange(4))
-    axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-    figure.savefig(f'ppcs_model{model}_split{split}_run{run}.png')
+
+
+        figure, axis  = plt.subplots()
+        axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
+                            np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
+                            np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
+                            np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
+
+        axis.set_xticks(np.arange(4))
+        axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
+        figure.savefig(f'ppcs_model{model}_split{split}_run{run}.png')
+
+    except Exception as e:
+        print(f"Error during simulation for run {run}: {e}")
+        continue
 
 print('stop')
 

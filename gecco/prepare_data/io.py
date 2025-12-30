@@ -20,18 +20,7 @@ def load_data(path, input_columns=None):
             else df[input_columns]
     return df
 
-def split_by_participant(df, id_col, splits_cfg):
-    """
-    Split data into prompt/eval/test sets based on participant IDs.
-    Works whether splits_cfg is a dict or SimpleNamespace.
-    """
-    # 👇 handle both dicts and namespaces
-    if not isinstance(splits_cfg, dict):
-        splits_cfg = vars(splits_cfg)  # convert SimpleNamespace to dict
-    unique_ids = sorted(np.unique(df[id_col].values).tolist())
-    n = len(unique_ids)
-
-    def parse_split(value):
+def parse_split(value, unique_ids: List[int]=None):
         if isinstance(value, list):
             return value
         elif isinstance(value, str):
@@ -48,9 +37,20 @@ def split_by_participant(df, id_col, splits_cfg):
         else:
             raise ValueError(f"Unsupported split format: {value}")
 
-    prompt_ids = parse_split(splits_cfg.get("prompt", []))
-    eval_ids = parse_split(splits_cfg.get("eval", []))
-    test_ids = parse_split(splits_cfg.get("test", []))
+def split_by_participant(df, id_col, splits_cfg):
+    """
+    Split data into prompt/eval/test sets based on participant IDs.
+    Works whether splits_cfg is a dict or SimpleNamespace.
+    """
+    # 👇 handle both dicts and namespaces
+    if not isinstance(splits_cfg, dict):
+        splits_cfg = vars(splits_cfg)  # convert SimpleNamespace to dict
+    unique_ids = sorted(np.unique(df[id_col].values).tolist())
+    n = len(unique_ids)
+
+    prompt_ids = parse_split(splits_cfg.get("prompt", []), unique_ids)
+    eval_ids = parse_split(splits_cfg.get("eval", []), unique_ids)
+    test_ids = parse_split(splits_cfg.get("test", []), unique_ids)
 
     used = set((prompt_ids or []) + (eval_ids or []))
     if test_ids is None:

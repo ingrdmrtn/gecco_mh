@@ -87,5 +87,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
         "metric_value": mean_metric,
         "param_names": list(spec.param_names),
         "model_name": spec.name,
-        "parameter_values": parameter_estimates
+        "parameter_values": parameter_estimates,
+        "eval_metrics": eval_metrics
+
     }

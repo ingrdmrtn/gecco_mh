@@ -14,7 +14,7 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 def main():
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata.yaml")
+    cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata_stai.yaml")
     data_cfg = cfg.data
     metadata = cfg.metadata.flag
     max_independent_runs  = cfg.loop.max_independent_runs

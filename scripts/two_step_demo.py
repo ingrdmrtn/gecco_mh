@@ -28,12 +28,13 @@ def main():
         df_prompt,
         id_col=data_cfg.id_column,
         template=data_cfg.narrative_template,
+        fit_type=getattr(cfg.evaluation, "fit_type", "group"),
         max_trials=getattr(data_cfg, "max_prompt_trials", None),
         value_mappings=getattr(data_cfg, "value_mappings", None)  # 👈 add this
     )
 
     # --- Build prompt builder ---
-    prompt_builder = PromptBuilderWrapper(cfg, data_text)
+    prompt_builder = PromptBuilderWrapper(cfg, data_text, df_prompt)
 
     # --- Load LLM ---
     model, tokenizer = load_llm(cfg.llm.provider, cfg.llm.base_model)

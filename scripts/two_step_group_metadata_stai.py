@@ -3,7 +3,7 @@
 import os, sys, numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from pathlib import Path
-
+from gecco.prompt_builder.simulation_prompt import simulation_prompt
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prepare_data.data2text import get_data2text_function
@@ -64,12 +64,24 @@ def main():
             global_best_model = best_model
             global_best_params = best_params
 
-            # --- Print final results ---
-            print("\n[🏁 GeCCo] Search complete.")
-            print(f"Best model parameters: {', '.join(best_params)}")
-            print(f"Best mean BIC: {best_bic:.2f}")
-            print(f"Best params: {', '.join(global_best_params)}")
+        # --- Print results for a run ---
+        print("\n[🏁 GeCCo] Run complete.")
+        print(f"Best model parameters: {', '.join(best_params)}")
+        print(f"Best mean BIC: {best_bic:.2f}")
+        print(f"Best params: {', '.join(global_best_params)}")
+        if cfg.llm.do_simulation == "True":
+            from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
+            simulation_prompt_text = simulation_prompt(
+                global_best_model,
+                cfg.llm.simulation_template,
+            )
+            simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
+            simulation_dir = search.results_dir / "simulation"
+            simulation_dir.mkdir(parents=True, exist_ok=True)
+            simulation_file = simulation_dir / f"simulation_model.txt"
+            with open(simulation_file, "w") as f:
+                f.write(simulation_text)
 
     # --- Print final results ---
     print("\n[🏁 GeCCo] Search complete.")

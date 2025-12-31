@@ -12,7 +12,7 @@ project_root = Path(__file__).resolve().parents[1]
 
 
 model = 'group_metadata_stai'
-split = 'test'
+split = 'all'
 cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata_stai.yaml")
 
 
@@ -21,9 +21,13 @@ metadata = cfg.metadata.flag
 max_independent_runs  = cfg.loop.max_independent_runs
 
 df = load_data(data_cfg.path)
-splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-df_test = splits[split]
-participants = parse_split(getattr(cfg.data.splits, split, None), df.participant.unique().tolist())
+if split == 'all':
+    participants = df.participant.unique().tolist()
+    df_test = df
+else:
+    splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
+    df_test = splits[split]
+    participants = parse_split(getattr(cfg.data.splits, split, None), df.participant.unique().tolist())
 
 best_model_path = f'{project_root}/results/{cfg.task.name}{"_" + cfg.evaluation.fit_type if cfg.evaluation.fit_type=="individual" else ""}/models/'
 best_simulated_model_path = f'{project_root}/results/{cfg.task.name}{"_" + cfg.evaluation.fit_type if cfg.evaluation.fit_type=="individual" else ""}/simulation/'

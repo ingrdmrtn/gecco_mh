@@ -1,3 +1,5 @@
+from google.genai import types
+
 class FeedbackGenerator:
     """
     Base feedback handler for guiding the LLM between iterations.
@@ -110,6 +112,26 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 ],
             )
             decoded = resp.output_text.strip()
+
+            return decoded
+
+        elif "gemini" in provider:
+            reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
+
+            print(
+                f"[GeCCo] Using Gemini model '{self.cfg.llm.base_model}' "
+                f"(reasoning={reasoning_effort})"
+            )
+            resp = self.model.models.generate_content(
+                model=self.cfg.llm.base_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                       temperature=self.cfg.llm.temperature,
+                       system_instruction=self.cfg.llm.system_prompt,
+                       thinking_config=types.ThinkingConfig(thinking_level=reasoning_effort),
+                )
+            )
+            decoded = resp.text.strip()
 
             return decoded
         # -----------------------------

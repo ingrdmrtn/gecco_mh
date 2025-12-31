@@ -1,0 +1,17 @@
+#!/bin/bash -l
+#SBATCH --partition=ailab
+#SBATCH -J gecco
+#SBATCH -N 1
+#SBATCH --error=logs/%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --gres=gpu:1
+#SBATCH --mem=400G
+#SBATCH -t 12:00:00
+#SBATCH -c 64
+#SBATCH --mail-user=akshay.jagadish@princeton.edu
+
+cd ~/gecco-1/
+module purge
+module load anaconda3/2025.12 
+conda activate gecco
+python scripts/two_step_group_metadata_stai.py

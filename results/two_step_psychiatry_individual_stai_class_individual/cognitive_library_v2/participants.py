@@ -147,7 +147,7 @@ PARTICIPANT_SPECS = {
     },
     "p37": {
         "class": "ParticipantModel1",
-        "primitives": ['helper::compute_mb_values', 'helper::softmax', 'modulation::inverse_linear', 'policy::mb_mf_mixture', 'value_update::td_stage1', 'value_update::td_stage2'],
+        "primitives": ['helper::compute_mb_values', 'helper::softmax', 'modulation::inverse_linear', 'policy::mb_mf_mixture', 'value_update::separate_mf_td1', 'value_update::td_stage2'],
         "parameters": ['alpha', 'beta', 'w_base'],
         "stai_modulation": "inverse_linear",
         "bic": 457.02,

@@ -24,73 +24,104 @@ from participants import PARTICIPANT_SPECS
 # ============================================================
 # BASE CLASS (matching the original exactly)
 # ============================================================
+from abc import ABC, abstractmethod
 
-class CognitiveModelBase:
-    """Base class for cognitive models in a two-step task."""
+class CognitiveModelBase(ABC):
+    """
+    Base class for cognitive models in a two-step task.
     
+    Override methods to implement participant-specific cognitive strategies.
+    """
+
     def __init__(self, n_trials: int, stai: float, model_parameters: tuple):
+        # Task structure
         self.n_trials = n_trials
         self.n_choices = 2
         self.n_states = 2
         self.stai = stai
         
+        # Transition matrix
         self.T = np.array([[0.7, 0.3], [0.3, 0.7]])
+        
+        # Choice probability sequences
         self.p_choice_1 = np.zeros(n_trials)
         self.p_choice_2 = np.zeros(n_trials)
+        
+        # Value representations
         self.q_stage1 = np.zeros(self.n_choices)
         self.q_stage2 = np.zeros((self.n_states, self.n_choices))
         
+        # Trial tracking
         self.trial = 0
         self.last_action1 = None
         self.last_action2 = None
         self.last_state = None
         self.last_reward = None
         
+        # Initialize
         self.unpack_parameters(model_parameters)
         self.init_model()
 
+    @abstractmethod
     def unpack_parameters(self, model_parameters: tuple) -> None:
+        """Unpack model_parameters into named attributes."""
         pass
 
     def init_model(self) -> None:
+        """Initialize model state. Override to set up additional variables."""
         pass
 
     def policy_stage1(self) -> np.ndarray:
-        return P.softmax(self.q_stage1, getattr(self, 'beta', 1.0))
+        """Compute stage-1 action probabilities. Override to customize."""
+        return self.softmax(self.q_stage1, self.beta)
 
     def policy_stage2(self, state: int) -> np.ndarray:
-        return P.softmax(self.q_stage2[state], getattr(self, 'beta', 1.0))
+        """Compute stage-2 action probabilities. Override to customize."""
+        return self.softmax(self.q_stage2[state], self.beta)
 
     def value_update(self, action_1: int, state: int, action_2: int, reward: float) -> None:
-        alpha = getattr(self, 'alpha', 0.1)
+        """Update values after observing outcome. Override to customize."""
         delta_2 = reward - self.q_stage2[state, action_2]
-        self.q_stage2[state, action_2] += alpha * delta_2
+        self.q_stage2[state, action_2] += self.alpha * delta_2
+        
         delta_1 = self.q_stage2[state, action_2] - self.q_stage1[action_1]
-        self.q_stage1[action_1] += alpha * delta_1
+        self.q_stage1[action_1] += self.alpha * delta_1
 
     def pre_trial(self) -> None:
+        """Called before each trial. Override to add computations."""
         pass
 
     def post_trial(self, action_1: int, state: int, action_2: int, reward: float) -> None:
+        """Called after each trial. Override to add computations."""
         self.last_action1 = action_1
         self.last_action2 = action_2
         self.last_state = state
         self.last_reward = reward
 
     def run_model(self, action_1, state, action_2, reward) -> float:
+        """Run model over all trials. Usually don't override."""
         for self.trial in range(self.n_trials):
+            a1, s = int(action_1[self.trial]), int(state[self.trial])
+            a2, r = int(action_2[self.trial]), float(reward[self.trial])
+            
             self.pre_trial()
-            self.p_choice_1[self.trial] = self.policy_stage1()[action_1[self.trial]]
-            self.p_choice_2[self.trial] = self.policy_stage2(state[self.trial])[action_2[self.trial]]
-            self.value_update(action_1[self.trial], state[self.trial], action_2[self.trial], reward[self.trial])
-            self.post_trial(action_1[self.trial], state[self.trial], action_2[self.trial], reward[self.trial])
+            self.p_choice_1[self.trial] = self.policy_stage1()[a1]
+            self.p_choice_2[self.trial] = self.policy_stage2(s)[a2]
+            self.value_update(a1, s, a2, r)
+            self.post_trial(a1, s, a2, r)
         
         return self.compute_nll()
     
     def compute_nll(self) -> float:
+        """Compute negative log-likelihood."""
         eps = 1e-12
         return -(np.sum(np.log(self.p_choice_1 + eps)) + np.sum(np.log(self.p_choice_2 + eps)))
-
+    
+    def softmax(self, values: np.ndarray, beta: float) -> np.ndarray:
+        """Softmax action selection."""
+        centered = values - np.max(values)
+        exp_vals = np.exp(beta * centered)
+        return exp_vals / np.sum(exp_vals)
 
 def make_cognitive_model(ModelClass):
     """Create function interface from model class."""
@@ -133,89 +164,90 @@ def reconstruct_model(participant_id: str) -> type:
             # Initialize habit trace if needed (p44-style)
             if hasattr(self, 'habit_weight'):
                 self.habit = np.zeros(self.n_choices)
+            # Initialize separate MF values ONLY for models that explicitly need it
+            # p37 uses separate_mf_td1, p43 uses separate_mf_td0 (both need q_mf)
+            if "value_update::separate_mf_td1" in primitives_used or "value_update::separate_mf_td0" in primitives_used:
+                self.q_mf = np.zeros(self.n_choices)
         
         def _get_perseveration_bonus(self) -> float:
-            """Calculate perseveration bonus based on STAI modulation and parameters."""
+            """Calculate perseveration bonus using primitives for modulation."""
             
-            # Pattern: stickiness_base + anxiety_stick * stai (multiplicative additive)
+            # Pattern: base + slope * stai (additive modulation)
             if hasattr(self, 'stickiness_base') and hasattr(self, 'anxiety_stick'):
-                return self.stickiness_base + self.anxiety_stick * self.stai
+                return P.stai_additive(self.stickiness_base, self.anxiety_stick, self.stai)
             
-            # Pattern: stick_base + stick_stai_slope * stai
             if hasattr(self, 'stick_base') and hasattr(self, 'stick_stai_slope'):
-                return self.stick_base + self.stick_stai_slope * self.stai
+                return P.stai_additive(self.stick_base, self.stick_stai_slope, self.stai)
             
-            # Pattern: stick_base + stick_stai * stai
             if hasattr(self, 'stick_base') and hasattr(self, 'stick_stai'):
-                return self.stick_base + self.stick_stai * self.stai
+                return P.stai_additive(self.stick_base, self.stick_stai, self.stai)
             
-            # Pattern: pers_base + stai_pers * stai
             if hasattr(self, 'pers_base') and hasattr(self, 'stai_pers'):
-                return self.pers_base + self.stai_pers * self.stai
+                return P.stai_additive(self.pers_base, self.stai_pers, self.stai)
             
-            # Pattern: p_base + p_slope * stai
             if hasattr(self, 'p_base') and hasattr(self, 'p_slope'):
-                return self.p_base + self.p_slope * self.stai
+                return P.stai_additive(self.p_base, self.p_slope, self.stai)
             
-            # Pattern: phi * (1 + stai) for inverse_division, phi * stai for multiplicative
+            # Pattern: phi with inverse_division modulation
             if hasattr(self, 'phi'):
                 if stai_mod == "inverse_division":
-                    return self.phi / (1.0 + self.stai)
+                    return P.stai_inverse_division(self.phi, self.stai)
                 else:
+                    # phi * (1 + stai) for other cases
                     return self.phi * (1.0 + self.stai)
             
-            # Pattern: raw perseveration (NOT STAI-modulated, like p24)
+            # Pattern: raw perseveration (no STAI modulation)
             if hasattr(self, 'perseveration'):
                 return self.perseveration
             
-            # Pattern: stick_sensitivity * stai (p30)
+            # Pattern: stick_sensitivity * stai (multiplicative)
             if hasattr(self, 'stick_sensitivity'):
-                return self.stick_sensitivity * self.stai
+                return P.stai_multiplicative(self.stick_sensitivity, self.stai)
             
-            # Pattern: single param * stai (multiplicative)
+            # Pattern: single param with modulation based on stai_mod
             for attr in ['stickiness', 'stickiness_factor', 'stick_factor',
                          'pers_k', 'persev_w', 'p_scale', 'cling_factor', 'rho', 'k', 'k_anx',
                          'k_stick', 'win_bonus']:
                 if hasattr(self, attr):
                     param = getattr(self, attr)
                     if stai_mod == "multiplicative":
-                        return param * self.stai
+                        return P.stai_multiplicative(param, self.stai)
                     elif stai_mod == "inverse_linear":
-                        return param * (1.0 - self.stai)
+                        return P.stai_inverse_linear(param, self.stai)
                     elif stai_mod == "inverse_division":
-                        return param / (1.0 + self.stai)
-                    elif stai_mod == "custom":
-                        return param * self.stai
+                        return P.stai_inverse_division(param, self.stai)
                     else:
-                        return param * self.stai
+                        return P.stai_multiplicative(param, self.stai)
             
             return 0.0
         
         def _get_win_stay_bonus(self) -> float:
-            """Calculate win-stay bonus."""
+            """Calculate win-stay bonus using multiplicative modulation."""
             for attr in ['win_bonus', 'cling_factor', 'p_scale']:
                 if hasattr(self, attr):
-                    return getattr(self, attr) * self.stai
+                    return P.stai_multiplicative(getattr(self, attr), self.stai)
             return 0.0
         
         def _get_mb_weight(self) -> float:
-            """Calculate model-based weight (usually reduced by anxiety)."""
+            """Calculate model-based weight using inverse_linear modulation."""
             if hasattr(self, 'w_max'):
-                return self.w_max * (1.0 - self.stai)
+                return P.stai_inverse_linear(self.w_max, self.stai)
             if hasattr(self, 'w_base'):
-                return self.w_base * (1.0 - self.stai)
+                return P.stai_inverse_linear(self.w_base, self.stai)
             return 0.5
         
         def _get_decay_rate(self) -> float:
             """Calculate memory decay rate."""
             if hasattr(self, 'decay_base') and hasattr(self, 'decay_stai'):
-                return self.decay_base + self.decay_stai * self.stai
+                return P.stai_additive(self.decay_base, self.decay_stai, self.stai)
             if hasattr(self, 'habit_weight'):
-                return self.habit_weight * self.stai
+                return P.stai_multiplicative(self.habit_weight, self.stai)
             return 0.0
         
         def policy_stage1(self) -> np.ndarray:
-            q = self.q_stage1.copy()
+            # Use q_mf if it exists (for separate MF/MB models), otherwise q_stage1
+            q_mf = self.q_mf if hasattr(self, 'q_mf') else self.q_stage1
+            q = q_mf.copy()
             beta = getattr(self, 'beta', 1.0)
             
             # Apply MB/MF mixture if in primitives
@@ -275,8 +307,29 @@ def reconstruct_model(participant_id: str) -> type:
                 # Stage 1 update (use same effective_alpha)
                 delta_1 = self.q_stage2[state, action_2] - self.q_stage1[action_1]
                 self.q_stage1[action_1] += effective_alpha * delta_1
+            
+            elif "value_update::separate_mf_td1" in primitives_used:
+                # p37 pattern: Separate MF values with TD(1) / Monte Carlo style update
+                # Stage 2: standard TD update
+                delta_2 = reward - self.q_stage2[state, action_2]
+                self.q_stage2[state, action_2] += alpha * delta_2
+                
+                # Stage 1 MF: TD(1) uses reward directly (not bootstrapped)
+                delta_1 = reward - self.q_mf[action_1]
+                self.q_mf[action_1] += alpha * delta_1
+            
+            elif hasattr(self, 'q_mf'):
+                # p43 pattern: Separate MF values but TD(0) bootstrapped update
+                # Stage 2: standard TD update  
+                delta_2 = reward - self.q_stage2[state, action_2]
+                self.q_stage2[state, action_2] += alpha * delta_2
+                
+                # Stage 1 MF: TD(0) uses q_stage2 value (bootstrapped)
+                delta_1 = self.q_stage2[state, action_2] - self.q_mf[action_1]
+                self.q_mf[action_1] += alpha * delta_1
+            
             else:
-                # Standard TD update
+                # Standard TD update using q_stage1
                 self.q_stage2, _ = P.td_update_stage2(
                     self.q_stage2, state, action_2, reward, alpha
                 )

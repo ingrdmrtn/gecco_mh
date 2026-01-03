@@ -133,7 +133,7 @@ PARTICIPANT_SPECS = {
     },
     "p35": {
         "class": "ParticipantModel3",
-        "primitives": ['helper::softmax', 'modulation::multiplicative', 'policy::perseveration_bonus', 'policy::win_stay_bonus', 'value_update::td_stage1', 'value_update::td_stage2'],
+        "primitives": ['helper::softmax', 'modulation::multiplicative', 'policy::win_stay_bonus', 'value_update::td_stage1', 'value_update::td_stage2'],
         "parameters": ['alpha', 'beta', 'cling_factor'],
         "stai_modulation": "multiplicative",
         "bic": 283.02,
@@ -196,7 +196,7 @@ PARTICIPANT_SPECS = {
     },
     "p44": {
         "class": "ParticipantModel1",
-        "primitives": ['decay::eligibility_trace', 'decay::memory_decay', 'helper::softmax', 'modulation::multiplicative', 'value_update::td_stage1', 'value_update::td_stage2'],
+        "primitives": ['helper::softmax', 'modulation::multiplicative', 'value_update::td_stage1', 'value_update::td_stage2', 'habit::habit_trace'],
         "parameters": ['alpha', 'beta', 'habit_weight'],
         "stai_modulation": "multiplicative",
         "bic": 402.74,

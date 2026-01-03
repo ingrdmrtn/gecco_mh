@@ -27,7 +27,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
             individual_variability_section = ""
         else:
 
-            individual_variability_feature = data[individual_variability_feature][0]
+            individual_variability_feature = data[individual_variability_feature][0].item()
             individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
     else:
         individual_variability_section = ""
@@ -54,7 +54,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {task.name}
 {task.description.strip()}
 
-# individual_variability_section
+{"### Individual Variability" if individual_variability_section else ""}
 {individual_variability_section}
 
 {metadata_section}
@@ -63,14 +63,20 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {introduce_data}
 {data_text.strip()}
 
-### Your Task
-{goal_text.strip()}
+
+### Base Class (DO NOT MODIFY)
+{llm.abstract_base_model.strip()}
+
+### Template Model
+{llm.template_model.strip()}
 
 ### Guardrails
 {chr(10).join(guardrails)}
 
-### Template Model (for reference only — do not reuse its logic)
-{llm.template_model.strip()}
+{f"### Diversity Requirement\n{chr(10).join(llm.diversity_requirement)}" if llm.diversity_requirement else ""}
+
+### Your Task
+{goal_text.strip()}
 
 {feedback_section}
 """.strip()

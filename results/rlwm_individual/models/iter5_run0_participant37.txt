@@ -1,0 +1,303 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with cross-state generalization and perseveration, modulated by load and age.
+
+    Idea:
+    - Standard Q-learning over state-action values.
+    - When learning in a state, updates generalize to neighboring states according to
+      an exponential kernel over state distance. The breadth of generalization depends
+      on set size (load) and is broader in older adults.
+    - Decisions also include a perseveration bias toward repeating the last chosen action,
+      capturing age-related increased reliance on response habits.
+
+    Parameters (model_parameters):
+    - alpha: Learning rate in [0,1]
+    - beta: Inverse temperature (>0), internally scaled (x10) for sharper policies
+    - gen_strength: Magnitude of generalization update to other states (>=0)
+    - gen_width: Base width for generalization kernel (>0)
+    - persev: Perseveration bias added to the last chosen action's logit (can be >=0)
+    - age_shift: Scales generalization width and perseveration when older (>=0)
+
+    Inputs:
+    - states: array of state indices per trial
+    - actions: array of chosen actions per trial (0..2), may contain invalid codes
+    - rewards: array of rewards per trial (assume 0/1; negative values treated as missing)
+    - blocks: array of block indices per trial
+    - set_sizes: array of set sizes (3 or 6) per trial
+    - age: array-like with single entry, participant age
+    - model_parameters: tuple/list of six parameters described above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta, gen_strength, gen_width, persev, age_shift = model_parameters
+    # Clamp/transform parameters to safe ranges
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    gen_strength = max(0.0, gen_strength)
+    gen_width = max(1e-6, gen_width)
+    persev = max(0.0, persev)
+    age_shift = max(0.0, age_shift)
+
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nS = int(block_set_sizes[0])
+        Q = np.zeros((nS, nA))
+
+        last_action = None  # for perseveration across trials within a block
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r_raw = block_rewards[t]
+            # Treat negative rewards as missing (e.g., no response)
+            valid_reward = 1 if r_raw > 0 else 0
+            valid_trial = (0 <= a < nA) and (r_raw >= 0)
+
+            ss = float(block_set_sizes[t])
+
+            # Prepare logits with perseveration bias
+            logits = beta * Q[s, :].copy()
+            if last_action is not None and 0 <= last_action < nA:
+                persev_eff = persev * (1.0 + age_shift * older) * (ss / 6.0)
+                logits[last_action] += persev_eff
+
+            # Softmax
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+            if valid_trial and Z > 0:
+                p = exps[a] / max(Z, eps)
+            else:
+                p = 1.0 / nA
+            total_loglik += np.log(max(p, eps))
+
+            # Learning
+            if valid_trial:
+                r = float(valid_reward)
+                pe = r - Q[s, a]
+                # Update chosen state-action
+                Q[s, a] += alpha * pe
+
+                # Cross-state generalization of the chosen action's update
+                # Generalization width increases with age and decreases with load (larger set -> narrower),
+                # but older adults counteract that via age_shift.
+                width_eff = gen_width * (1.0 + age_shift * older) * (3.0 / ss)
+                if nS > 1 and gen_strength > 0.0:
+                    for sp in range(nS):
+                        if sp == s:
+                            continue
+                        dist = abs(sp - s)
+                        kern = np.exp(-dist / max(width_eff, 1e-6))
+                        Q[sp, a] += alpha * gen_strength * kern * pe
+
+                last_action = a
+            else:
+                # On invalid trials, no learning; reset perseveration anchor to this invalid action if in range
+                last_action = a if (0 <= a < nA) else last_action
+
+    return -total_loglik
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Mixture of RL and load-/age-gated episodic retrieval with recall noise and lapses.
+
+    Idea:
+    - RL: standard Q-learning capturing gradual acquisition.
+    - Episodic cache: when a state receives reward=1, store the action as a one-shot memory.
+      At decision time, with a retrieval probability that depends on set size and age,
+      the agent follows the cached action (with some recall noise).
+    - Overall policy is a mixture between episodic and RL, plus a small lapse to uniform.
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate [0,1]
+    - beta: RL inverse temperature (>0), internally scaled (x10)
+    - rec_base: Base retrieval drive for episodic memory (can be positive or negative)
+    - rec_age_gain: Additive boost to retrieval when older (>=0)
+    - noise: Recall noise for episodic policy in [0,1]; 0=perfect recall, 1=uniform
+    - lapse: Lapse probability in [0,1] to choose uniformly at random
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays as specified
+    - model_parameters: tuple/list with six entries described above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta, rec_base, rec_age_gain, noise, lapse = model_parameters
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    rec_age_gain = max(0.0, rec_age_gain)
+    noise = min(max(noise, 0.0), 1.0)
+    lapse = min(max(lapse, 0.0), 1.0)
+
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nS = int(block_set_sizes[0])
+        Q = np.zeros((nS, nA))
+
+        # Episodic cache: -1 means unknown; otherwise stores an action index
+        cache = -1 * np.ones(nS, dtype=int)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r_raw = block_rewards[t]
+            ss = float(block_set_sizes[t])
+
+            # Compute RL policy
+            logits = beta * Q[s, :]
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+            p_rl = exps / max(Z, eps)
+
+            # Episodic retrieval weight: decreases with load; boosted by age in older adults
+            # Here we subtract (set_size-3) to penalize at larger set sizes.
+            w_retrieve = sigmoid(rec_base - (ss - 3.0) + rec_age_gain * older)
+
+            # Episodic policy with recall noise
+            if cache[s] >= 0:
+                epi = np.ones(nA) * (noise / nA)
+                epi[cache[s]] += (1.0 - noise)
+                p_epi = epi / np.sum(epi)
+            else:
+                p_epi = np.ones(nA) / nA  # no memory yet
+
+            # Mixture with lapse
+            p_mix = (1.0 - lapse) * (w_retrieve * p_epi + (1.0 - w_retrieve) * p_rl) + lapse * (np.ones(nA) / nA)
+
+            # Likelihood
+            if 0 <= a < nA:
+                p = p_mix[a]
+            else:
+                # Invalid/missed action -> assume uniform emission
+                p = 1.0 / nA
+            total_loglik += np.log(max(p, eps))
+
+            # Learning and caching
+            if 0 <= a < nA and r_raw >= 0:
+                r = 1.0 if r_raw > 0 else 0.0
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+                # Update episodic cache on rewarded outcomes
+                if r >= 0.5:
+                    cache[s] = a
+
+    return -total_loglik
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Asymmetric learning with surprise-dependent decision noise and age-/load-modulated credit spread.
+
+    Idea:
+    - Two learning rates for positive and negative prediction errors (PEs).
+    - Decision noise (inverse temperature) adapts to surprise: larger unsigned PE -> more noise (lower beta).
+    - Credit spreads to non-chosen actions within a state: penalize alternatives when chosen is rewarded,
+      or raise alternatives when chosen is unrewarded. Spread magnitude increases with load and in older adults.
+
+    Parameters (model_parameters):
+    - alpha_pos: Learning rate for positive PEs in [0,1]
+    - alpha_neg: Learning rate for negative PEs in [0,1]
+    - beta: Base inverse temperature (>0), internally scaled (x10)
+    - spread: Base magnitude of credit spread to non-chosen actions (>=0)
+    - load_sens: How much spread increases with set size/load (>=0)
+    - age_fac: Additional multiplicative factor on spread for older adults (>=0)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays as specified
+    - model_parameters: tuple/list with six entries described above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, beta, spread, load_sens, age_fac = model_parameters
+    alpha_pos = min(max(alpha_pos, 0.0), 1.0)
+    alpha_neg = min(max(alpha_neg, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    spread = max(0.0, spread)
+    load_sens = max(0.0, load_sens)
+    age_fac = max(0.0, age_fac)
+
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nS = int(block_set_sizes[0])
+        Q = np.zeros((nS, nA))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r_raw = block_rewards[t]
+            if r_raw < 0 or not (0 <= a < nA):
+                # Invalid trial: uniform likelihood, no learning
+                total_loglik += np.log(1.0 / nA)
+                continue
+
+            r = 1.0 if r_raw > 0 else 0.0
+            ss = float(block_set_sizes[t])
+
+            # Compute PE for current policy and adaptive beta
+            pe = r - Q[s, a]
+            surprise = abs(pe)
+            beta_eff = beta / (1.0 + surprise)  # more surprise -> lower beta (higher noise)
+
+            # Softmax with adaptive beta
+            logits = beta_eff * Q[s, :]
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+            p = exps[a] / max(Z, eps)
+            total_loglik += np.log(max(p, eps))
+
+            # Learning: asymmetric updates
+            if pe >= 0:
+                Q[s, a] += alpha_pos * pe
+            else:
+                Q[s, a] += alpha_neg * pe
+
+            # Credit spread to non-chosen actions in the same state
+            # Spread increases with load (larger set size) and in older adults.
+            spread_eff = spread * (1.0 + load_sens * ((ss - 3.0) / 3.0)) * (1.0 + age_fac * older)
+            if spread_eff > 0:
+                # Distribute opposite-signed credit to other actions
+                others = [aa for aa in range(nA) if aa != a]
+                for ao in others:
+                    # Move alternatives in the opposite direction of the chosen update
+                    Q[s, ao] -= (spread_eff * pe) / (len(others) if len(others) > 0 else 1.0)
+
+    return -total_loglik

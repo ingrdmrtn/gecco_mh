@@ -1,0 +1,291 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + reward-triggered chunking (one-shot memory) with age- and load-modulated encoding and decay.
+
+    Idea:
+    - Two systems contribute to choice:
+      (i) Model-free RL Q-values updated by prediction errors.
+      (ii) A chunked associative memory that "locks in" a state→action mapping after reward,
+          then decays with interference. The chunk acts as a strong policy prior for that state.
+    - The probability of forming/strengthening a chunk is higher for younger adults and for smaller set sizes.
+    - Chunk traces decay over time, more so in larger sets (more interference).
+
+    Parameters (model_parameters): 6 total
+    - alpha: (0,1) RL learning rate.
+    - beta: >0, inverse temperature for RL softmax (scaled internally by 6.0).
+    - chunk_rate_base: (0,1), baseline probability/strength increment to form/strengthen a chunk on a rewarded trial.
+    - chunk_age_shift: real, multiplicative shift of chunk rate by age group: rate *= (1 + chunk_age_shift*age_group),
+                       where age_group = +1 (younger, <45) or -1 (older, >=45).
+    - chunk_size_slope: >=0, scaling such that effective chunk rate *= (3.0 / nS) ** chunk_size_slope.
+    - chunk_decay: (0,1), per-trial decay of chunk strengths within a block (interference/forgetting).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: 1D arrays of equal length
+    - age: array-like with a single numeric value (years)
+    - model_parameters: list/tuple as specified above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta, chunk_rate_base, chunk_age_shift, chunk_size_slope, chunk_decay = model_parameters
+    beta = max(1e-6, beta) * 6.0
+    chunk_rate_base = np.clip(chunk_rate_base, 0.0, 1.0)
+    chunk_decay = np.clip(chunk_decay, 0.0, 1.0)
+    chunk_size_slope = max(0.0, float(chunk_size_slope))
+
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        nS = int(set_sizes[mask][0])
+
+        # RL values
+        Q = np.zeros((nS, nA))
+
+        # Chunk memory:
+        # - For each state, we track a preferred action and a chunk strength in [0,1].
+        # - strength acts as a mixture weight with RL.
+        chunk_pref = -np.ones(nS, dtype=int)  # -1 means no chunk yet
+        chunk_strength = np.zeros(nS, dtype=float)
+
+        # Effective chunk formation rate this block
+        rate_size = (3.0 / float(nS)) ** chunk_size_slope
+        chunk_rate = chunk_rate_base * (1.0 + chunk_age_shift * age_group) * rate_size
+        # Keep in reasonable range
+        chunk_rate = float(np.clip(chunk_rate, 0.0, 1.0))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Build RL policy
+            logits_rl = beta * (Q[s, :] - np.max(Q[s, :]))
+            pi_rl = np.exp(logits_rl)
+            pi_rl = pi_rl / np.sum(pi_rl)
+
+            # Build chunk policy (peaked on preferred action if present)
+            if chunk_pref[s] >= 0 and chunk_strength[s] > 0.0:
+                pref = chunk_pref[s]
+                # Sharp but bounded distribution toward the preferred action
+                # Concentration kappa fixed to avoid extra parameter
+                kappa = 8.0
+                base = np.ones(nA) / nA
+                bump = np.zeros(nA)
+                bump[pref] = 1.0
+                pi_chunk = (1 - 1.0 / kappa) * bump + (1.0 / kappa) * base
+            else:
+                pi_chunk = np.ones(nA) / nA
+
+            # Mixture by current chunk strength
+            w = float(np.clip(chunk_strength[s], 0.0, 1.0))
+            pi = w * pi_chunk + (1.0 - w) * pi_rl
+            pi = np.maximum(pi, 1e-12)
+            pi = pi / np.sum(pi)
+
+            total_log_p += np.log(float(pi[a]))
+
+            # Learning updates
+            # RL update
+            Q[s, a] += alpha * (r - Q[s, a])
+
+            # Chunk decay (interference) across all states each trial
+            chunk_strength *= (1.0 - chunk_decay)
+
+            # Chunk formation/strengthening on rewarded trials
+            if r > 0.0:
+                if chunk_pref[s] < 0:
+                    # create a chunk linking s -> a
+                    chunk_pref[s] = a
+                    chunk_strength[s] = max(chunk_strength[s], chunk_rate)
+                else:
+                    if chunk_pref[s] == a:
+                        # strengthen existing chunk toward 1
+                        chunk_strength[s] = chunk_strength[s] + chunk_rate * (1.0 - chunk_strength[s])
+                    else:
+                        # switch preference with some probability: adopt the newly rewarded action
+                        # switch probability grows with chunk_rate and inversely with current strength
+                        switch_p = chunk_rate * (1.0 - chunk_strength[s])
+                        if switch_p > np.random.rand():
+                            chunk_pref[s] = a
+                        # in any case, move strength toward the currently rewarded mapping
+                        chunk_strength[s] = chunk_strength[s] + chunk_rate * (1.0 - chunk_strength[s])
+
+    return -total_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Surprise-adaptive RL with action inertia biased by age and load.
+
+    Idea:
+    - Q-learning with a learning rate that increases with surprise |r - Q|.
+    - Choices are influenced by an 'inertia' bias to repeat the last action within a state.
+    - Inertia magnitude is modulated by age group and set size (more inertia for younger
+      and smaller sets, or as specified by parameters).
+
+    Parameters (model_parameters): 6 total
+    - alpha_base: (0,1), baseline RL learning rate.
+    - beta_base: >0, base inverse temperature (scaled internally by 6.0).
+    - surprise_gain: >=0, scales learning rate by surprise: alpha_eff = alpha_base * (1 + surprise_gain*|PE|).
+    - inertia_base: >=0, baseline inertia bias added to last action's logit.
+    - age_inertia_shift: real, multiplicative shift on inertia by age group: inertia *= (1 + age_inertia_shift*age_group),
+                         age_group = +1 (younger, <45) or -1 (older, >=45).
+    - size_inertia_slope: real, exponent that scales inertia by (3/nS)**size_inertia_slope.
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: 1D arrays of equal length
+    - age: array-like with a single numeric value (years)
+    - model_parameters: list/tuple as specified above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_base, beta_base, surprise_gain, inertia_base, age_inertia_shift, size_inertia_slope = model_parameters
+    beta_base = max(1e-6, beta_base) * 6.0
+    surprise_gain = max(0.0, float(surprise_gain))
+    inertia_base = max(0.0, float(inertia_base))
+    size_inertia_slope = float(size_inertia_slope)
+
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = np.zeros((nS, nA))
+        last_action = -np.ones(nS, dtype=int)
+
+        # Inertia magnitude for this block
+        inertia_mag = inertia_base * (1.0 + age_inertia_shift * age_group) * (3.0 / float(nS)) ** size_inertia_slope
+        # Keep finite
+        inertia_mag = float(max(0.0, inertia_mag))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            logits = beta_base * (Q[s, :] - np.max(Q[s, :]))
+
+            # Add inertia bias to repeating the last within-state action
+            if last_action[s] >= 0:
+                logits[last_action[s]] += inertia_mag
+
+            pi = np.exp(logits)
+            pi = pi / np.sum(pi)
+            p = max(1e-12, float(pi[a]))
+            total_log_p += np.log(p)
+
+            # Update last action after observing choice
+            last_action[s] = a
+
+            # Surprise-adaptive learning rate
+            pe = r - Q[s, a]
+            alpha_eff = alpha_base * (1.0 + surprise_gain * abs(float(pe)))
+            alpha_eff = float(np.clip(alpha_eff, 0.0, 1.0))
+
+            Q[s, a] += alpha_eff * pe
+
+    return -total_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Leaky evidence accumulation per state-action (Dirichlet-Beta inspired) with exploration bonus and age-size modulated leak.
+
+    Idea:
+    - For each state and action, track successes and attempts with exponential leak to capture interference/forgetting.
+    - Expected reward for each action is the posterior mean: (prior_succ + succ) / (prior_conc + attempts).
+    - Add a directed exploration bonus inversely proportional to sqrt(attempts+1).
+    - Leak rate increases with set size and varies by age group.
+
+    Parameters (model_parameters): 6 total
+    - beta: >0, inverse temperature for softmax over action values (scaled internally by 6.0).
+    - prior_conc: >0, symmetric prior pseudo-count total per action (split equally into success/failure).
+    - leak_base: (0,1), baseline per-trial leak applied to both successes and attempts.
+    - leak_age_shift: real, multiplicative shift on leak by age group: leak *= (1 + leak_age_shift*age_group),
+                      age_group = +1 (younger, <45) or -1 (older, >=45).
+    - leak_size_slope: >=0, scales leak by (nS/3)**leak_size_slope (more leak in larger sets).
+    - explore_bonus: >=0, magnitude of directed exploration term 1/sqrt(attempts+1).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: 1D arrays of equal length
+    - age: array-like with a single numeric value (years)
+    - model_parameters: list/tuple as specified above
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    beta, prior_conc, leak_base, leak_age_shift, leak_size_slope, explore_bonus = model_parameters
+    beta = max(1e-6, float(beta)) * 6.0
+    prior_conc = max(1e-6, float(prior_conc))
+    leak_base = np.clip(leak_base, 0.0, 1.0)
+    leak_size_slope = max(0.0, float(leak_size_slope))
+    explore_bonus = max(0.0, float(explore_bonus))
+
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Success and attempt counts with leak
+        succ = np.zeros((nS, nA), dtype=float)
+        att = np.zeros((nS, nA), dtype=float)
+
+        # Effective leak for this block
+        leak = leak_base * (1.0 + leak_age_shift * age_group) * (float(nS) / 3.0) ** leak_size_slope
+        leak = float(np.clip(leak, 0.0, 0.5))
+
+        prior_succ = 0.5 * prior_conc
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Compute posterior mean reward estimates
+            denom = prior_conc + att[s, :]
+            denom = np.maximum(denom, 1e-8)
+            Q = (prior_succ + succ[s, :]) / denom
+
+            # Directed exploration
+            U = explore_bonus / np.sqrt(1.0 + att[s, :])
+
+            logits = beta * (Q + U - np.max(Q + U))
+            pi = np.exp(logits)
+            pi = pi / np.sum(pi)
+            p = max(1e-12, float(pi[a]))
+            total_log_p += np.log(p)
+
+            # Apply leak to all state-action counts (within block, per trial)
+            succ *= (1.0 - leak)
+            att *= (1.0 - leak)
+
+            # Update chosen action counts with current outcome
+            att[s, a] += 1.0
+            succ[s, a] += r
+
+    return -total_log_p

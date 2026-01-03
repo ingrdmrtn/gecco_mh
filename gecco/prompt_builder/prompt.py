@@ -22,13 +22,13 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     )
 
     if fit_type == "individual":
-        individual_variability_feature = cfg.individual_difference.individual_feature
+        individual_variability_feature = cfg.metadata.individual_feature
         if individual_variability_feature == "None":
             individual_variability_section = ""
         else:
 
             individual_variability_feature = data[individual_variability_feature][0]
-            individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
+            individual_variability_section = cfg.metadata.description.format(individual_feature = individual_variability_feature)
     else:
         individual_variability_section = ""
 
@@ -48,6 +48,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     if cfg.llm.provider in ["openai", "claude", "gemini"]:
         # --- prompt layout for closed models ---
 
+# {metadata_section}
 
         prompt = f"""
 ### Task Description
@@ -57,7 +58,6 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 # individual_variability_section
 {individual_variability_section}
 
-{metadata_section}
 
 ### Participant Data
 {introduce_data}

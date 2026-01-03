@@ -1,0 +1,280 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with age- and load-modulated forgetting and novelty bonus.
+
+    Mechanism:
+    - Model-free Q-learning within each block with per-trial forgetting toward the prior (uniform).
+    - The forgetting rate (rho) is modulated by age group and set size: larger rho -> more drift to prior.
+    - A state-level novelty bonus (inverse of visit count) is added to action values and weighted by the
+      same modulatory factor, capturing greater reliance on novelty under higher forgetting.
+    - Action selection via softmax on Q + novelty bonus.
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State indices per trial (0..set_size-1 within block).
+    actions : 1D array-like of int
+        Chosen actions per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary feedback per trial.
+    blocks : 1D array-like of int
+        Block indices per trial.
+    set_sizes : 1D array-like of int
+        Set size for each trial; constant within a block (3 or 6).
+    age : 1D array-like of float
+        Participant age; age[0] used. Older group if >=45.
+    model_parameters : tuple/list
+        (alpha, beta, rho0, age_slope, load_slope)
+        - alpha: learning rate for Q-learning (0..1).
+        - beta: inverse temperature for softmax.
+        - rho0: baseline forgetting logit; transformed by sigmoid to (0,1) per block.
+        - age_slope: additive effect on forgetting logit for older group (>=45).
+        - load_slope: effect of set size (centered at 3) on forgetting logit; positive means more forgetting at larger set sizes.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta, rho0, age_slope, load_slope = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Initialize
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        visits = np.zeros(nS)  # state visit counts for novelty
+
+        # Compute forgetting rate for this block from logits
+        # load term: (nS-3) is 0 at 3, 3 at 6; sign determined by load_slope
+        rho_logit = rho0 + age_slope * is_older + load_slope * (nS - 3)
+        rho = 1.0 / (1.0 + np.exp(-rho_logit))  # in (0,1)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Novelty bonus for state s
+            nov = 1.0 / np.sqrt(1.0 + visits[s])  # decreases with more visits
+            bonus = rho * nov  # same modulatory gate that controls forgetting
+
+            # Softmax over Q + novelty bonus (same bonus to all actions encourages exploration)
+            V_s = Q[s, :] + bonus
+            V_centered = V_s - np.max(V_s)
+            p_vec = np.exp(beta * V_centered)
+            p_vec = p_vec / np.sum(p_vec)
+            p_choice = max(p_vec[a], 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # Q-learning update
+            td = r - Q[s, a]
+            Q[s, a] += alpha * td
+
+            # Per-trial forgetting toward uniform prior (drift)
+            Q[s, :] = (1.0 - rho) * Q[s, :] + rho * (1.0 / nA)
+
+            # Update visit counts
+            visits[s] += 1.0
+
+    return -float(total_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid RL–WM with age- and load-dependent working-memory capacity and lapses.
+
+    Mechanism:
+    - Model-free Q-learning operates continuously.
+    - In parallel, a one-shot working-memory (WM) cache stores the most recently rewarded action per state.
+      Retrieval is capacity-limited: effective WM weight declines when set size exceeds capacity.
+    - Older group has a penalty on capacity.
+    - Policy is a mixture between WM (deterministic to cached action when available) and RL softmax.
+      The mixture weight depends on effective capacity and a lapse parameter.
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State indices per trial (0..set_size-1 within block).
+    actions : 1D array-like of int
+        Chosen action indices per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary feedback per trial.
+    blocks : 1D array-like of int
+        Block index for each trial.
+    set_sizes : 1D array-like of int
+        Set size per trial (constant within block).
+    age : 1D array-like of float
+        Participant age; age[0] used; older group if >=45.
+    model_parameters : tuple/list
+        (alpha, beta, k_cap_base, age_penalty, epsilon)
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL softmax.
+        - k_cap_base: baseline WM capacity (in items) for younger group.
+        - age_penalty: capacity reduction applied if older (>=45).
+        - epsilon: lapse/noise level in WM channel (also scales down WM weight).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta, k_cap_base, age_penalty, epsilon = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Initialize RL and WM store: wm[s] = cached action or -1 if none
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        wm = -1 * np.ones(nS, dtype=int)
+
+        # Effective capacity for this block
+        K = max(1.0, float(k_cap_base - age_penalty * is_older))
+        # Weight of WM as a function of overload: 1 if nS <= K, declines if nS > K
+        overload = max(0.0, nS - K)
+        wm_weight = 1.0 / (1.0 + overload)  # simple hyperbolic drop with overload
+        # Incorporate lapse into WM effectiveness
+        wm_weight *= (1.0 - np.clip(epsilon, 0.0, 1.0))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            V_s = Q[s, :]
+            V_centered = V_s - np.max(V_s)
+            p_rl_vec = np.exp(beta * V_centered)
+            p_rl_vec = p_rl_vec / np.sum(p_rl_vec)
+
+            # WM policy: if cached action exists, choose it; else uniform
+            if wm[s] >= 0:
+                p_wm_vec = np.zeros(nA)
+                p_wm_vec[wm[s]] = 1.0
+            else:
+                p_wm_vec = np.ones(nA) / nA
+
+            # Mixture
+            p_vec = wm_weight * p_wm_vec + (1.0 - wm_weight) * p_rl_vec
+            p_choice = max(p_vec[a], 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # RL update
+            td = r - Q[s, a]
+            Q[s, a] += alpha * td
+
+            # WM update: store rewarded action; clear on zero reward
+            if r >= 0.5:
+                wm[s] = a
+            else:
+                # Failures degrade WM trace in high load more strongly
+                if nS > K and np.random.uniform() < (overload / (overload + 1.0)):
+                    wm[s] = -1  # drop trace with probability under overload
+
+    return -float(total_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with surprise-gated gain and age/load-modulated global action inertia.
+
+    Mechanism:
+    - Standard Q-learning within each block.
+    - A global action inertia kernel J (independent of state) captures tendency to repeat recent actions.
+      J decays across trials and is updated after each choice.
+    - The influence of inertia is stronger for older adults and under lower set size (fewer items to juggle).
+    - The softmax gain (beta) is dynamically amplified by surprise (|r - Q|), scaled by an age/load factor.
+      This captures focused exploitation after surprising feedback.
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State indices per trial.
+    actions : 1D array-like of int
+        Chosen action indices per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary rewards per trial.
+    blocks : 1D array-like of int
+        Block indices per trial.
+    set_sizes : 1D array-like of int
+        Set size per trial (constant within block).
+    age : 1D array-like of float
+        Participant age; age[0] used; older group if >=45.
+    model_parameters : tuple/list
+        (alpha, beta, eta, tau, gain)
+        - alpha: Q-learning rate (0..1).
+        - beta: baseline inverse temperature.
+        - eta: strength of updating the inertia kernel J after each choice.
+        - tau: decay factor of J per trial (0..1); smaller means faster decay.
+        - gain: scales surprise-dependent amplification of beta.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta, eta, tau, gain = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        J = np.zeros(nA)  # global action inertia
+
+        # Age/load modulation for inertia strength
+        inertia_scale = (1.0 + 0.5 * is_older) * (3.0 / float(max(1, nS)))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Surprise-gated dynamic beta
+            surprise = abs(r - Q[s, a])
+            beta_t = beta * (1.0 + gain * surprise * inertia_scale)
+
+            # Policy: softmax over Q plus inertia bias
+            logits = beta_t * (Q[s, :] - np.max(Q[s, :])) + (eta * inertia_scale) * J
+            # Softmax
+            logits = logits - np.max(logits)
+            p_vec = np.exp(logits)
+            p_vec = p_vec / np.sum(p_vec)
+            p_choice = max(p_vec[a], 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # Q-learning update
+            td = r - Q[s, a]
+            Q[s, a] += alpha * td
+
+            # Inertia update: decay then add to chosen action
+            J *= tau
+            J[a] += 1.0
+
+    return -float(total_log_p)

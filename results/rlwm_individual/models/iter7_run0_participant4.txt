@@ -1,0 +1,286 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited working memory (WM) mixture with age- and load-dependent gating and confidence leak.
+
+    Mechanism
+    - Model-free RL (state-action Q-learning) runs within each block.
+    - In parallel, a simple WM store for each state holds the most recently rewarded action and a confidence
+      weight that decays as a function of load relative to an age-dependent capacity.
+    - Decision policy is a mixture of WM and RL, with mixture weight increasing when capacity >= load.
+      WM contributes a peaked distribution on the stored action scaled by its current confidence.
+    - Includes a small lapse component for random responding.
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State index per trial (0..set_size-1 within a block).
+    actions : 1D array-like of int
+        Chosen action per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary reward feedback per trial.
+    blocks : 1D array-like of int
+        Block index per trial.
+    set_sizes : 1D array-like of int
+        Set size per trial (constant within each block; typically 3 or 6).
+    age : 1D array-like of float
+        Participant age; age[0] used to define group (<45 younger, >=45 older).
+    model_parameters : tuple/list
+        (lr, inv_temp, cap_young, cap_old, lapse)
+        - lr: learning rate for Q-learning (0..1).
+        - inv_temp: inverse temperature for softmax (higher = more deterministic).
+        - cap_young: WM capacity parameter for younger participants (in "slots").
+        - cap_old: WM capacity parameter for older participants (in "slots").
+        - lapse: lapse probability mixing a uniform random policy (0..1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, inv_temp, cap_young, cap_old, lapse = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Initialize RL and WM structures
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        # WM: for each state, store an action index and a confidence in [0,1]
+        wm_action = -1 * np.ones(nS, dtype=int)      # -1 = empty
+        wm_conf = np.zeros(nS)                       # confidence weight
+
+        # Determine age-dependent capacity and load-dependent mixture weight
+        cap = cap_old if is_older else cap_young
+        load_ratio = nS / max(1.0, cap)  # >1 means load exceeds capacity
+        # WM mixture weight decreases as load exceeds capacity; squashed to [0,1]
+        wm_mix = 1.0 / (1.0 + np.exp(load_ratio - 1.0))  # ~0.73 when load=cap; drops when load>cap
+
+        # Confidence leak per trial scales with how overloaded WM is
+        forget_rate = 1.0 - 1.0 / max(1.0, load_ratio)   # 0 when load<=cap; increases when overloaded
+        forget_rate = min(max(forget_rate, 0.0), 1.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Build WM policy for this state
+            if wm_action[s] >= 0 and wm_conf[s] > 0.0:
+                p_wm = (1.0 - wm_conf[s]) * (1.0 / nA) * np.ones(nA)
+                p_wm[wm_action[s]] += wm_conf[s]
+            else:
+                p_wm = (1.0 / nA) * np.ones(nA)
+
+            # RL softmax policy
+            q_s = Q[s, :]
+            q_center = q_s - np.max(q_s)
+            expv = np.exp(inv_temp * q_center)
+            p_rl = expv / np.sum(expv)
+
+            # Mixture with lapse
+            p_mix = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_choice = (1.0 - lapse) * p_mix[a] + lapse * (1.0 / nA)
+            p_choice = max(p_choice, 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # RL update
+            td = r - Q[s, a]
+            Q[s, a] += lr * td
+
+            # WM update: confidence leak and possibly overwrite on reward
+            wm_conf[s] *= (1.0 - forget_rate)
+            if r >= 0.5:
+                wm_action[s] = a
+                wm_conf[s] = 1.0  # one-shot strengthening on rewarded outcome
+
+    return -float(total_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Adaptive learning-rate RL with volatility tracking, age bias, load-scaled volatility, and stay tendency.
+
+    Mechanism
+    - Q-learning with a dynamic learning rate per state that increases with estimated volatility.
+    - Volatility is tracked as an exponentially smoothed unsigned prediction error; smoothing adapts with load.
+    - Age bias shifts the baseline learning rate (older vs. younger) in opposite directions.
+    - Action selection uses softmax over Q plus a stay-bias that favors repeating the last action in the same state.
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State index per trial (0..set_size-1 within a block).
+    actions : 1D array-like of int
+        Chosen action per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary reward feedback per trial.
+    blocks : 1D array-like of int
+        Block index per trial.
+    set_sizes : 1D array-like of int
+        Set size per trial (constant within block).
+    age : 1D array-like of float
+        Participant age; age[0] used to set group indicator (<45 younger, >=45 older).
+    model_parameters : tuple/list
+        (lr_baseline, inv_temp, meta_gain, age_bias, stay_bias)
+        - lr_baseline: base learning rate scale (mapped via sigmoid to (0,1)).
+        - inv_temp: inverse temperature for softmax over action values.
+        - meta_gain: weight by which volatility inflates/deflates the learning rate.
+        - age_bias: additive bias to learning rate pre-sigmoid (+ for older, - for younger is achieved by ± sign).
+        - stay_bias: additive bias in the policy favoring repeating the last action in the same state.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_baseline, inv_temp, meta_gain, age_bias, stay_bias = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+    age_term = age_bias if is_older else -age_bias
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        vol = 0.5 * np.ones(nS)              # volatility per state in [0,1]-ish
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Load-scaled smoothing: larger sets produce slower updates to volatility
+        # smoothing factor in (0,1]: higher = faster adaptation
+        smooth = 1.0 / float(nS)             # 1/3 vs 1/6 for set sizes 3 vs 6
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Dynamic learning rate from baseline + volatility + age, passed through sigmoid
+            lr_pre = lr_baseline + meta_gain * (vol[s] - 0.5) + age_term
+            lr_t = 1.0 / (1.0 + np.exp(-lr_pre))  # (0,1)
+
+            # Policy: softmax over Q with stay bias on last action for this state
+            logits = Q[s, :].copy()
+            if last_action[s] >= 0:
+                logits[last_action[s]] += stay_bias
+            logits -= np.max(logits)
+            p = np.exp(inv_temp * logits)
+            p /= np.sum(p)
+
+            p_choice = max(p[a], 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += lr_t * pe
+
+            # Volatility update: unsigned PE smoothing with load-scaled rate
+            vol[s] = (1.0 - smooth) * vol[s] + smooth * abs(pe)
+
+            # Update last action memory for stay bias
+            last_action[s] = a
+
+    return -float(total_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-bonus RL with age- and load-modulated exploration bonus.
+
+    Mechanism
+    - Standard Q-learning within each block.
+    - Policy uses softmax over augmented values: Q + bonus_weight * U, where U is an uncertainty term
+      that decreases with visits to a state-action pair (U = 1/sqrt(N+1)).
+    - The exploration bonus weight increases/decreases with age group and cognitive load (set size).
+      Here, older adults are modeled as less uncertainty-driven (negative age scaling reduces bonus),
+      and higher load increases the reliance on the heuristic bonus (positive load scaling).
+
+    Parameters
+    ----------
+    states : 1D array-like of int
+        State index per trial (0..set_size-1 within a block).
+    actions : 1D array-like of int
+        Chosen action per trial (0..2).
+    rewards : 1D array-like of {0,1}
+        Binary reward feedback per trial.
+    blocks : 1D array-like of int
+        Block index per trial.
+    set_sizes : 1D array-like of int
+        Set size per trial (constant within block).
+    age : 1D array-like of float
+        Participant age; age[0] used to determine group (<45 younger, >=45 older).
+    model_parameters : tuple/list
+        (alpha, tau_base, bonus_base, age_scale, load_scale)
+        - alpha: Q-learning rate (0..1).
+        - tau_base: inverse temperature for softmax over augmented values.
+        - bonus_base: base weight for the uncertainty bonus (>=0).
+        - age_scale: multiplicative modulation by age group; effective weight multiplied by (1 - age_scale) if older,
+                     and by (1 + age_scale) if younger.
+        - load_scale: multiplicative modulation by load; effective weight multiplied by (1 + load_scale * load_index),
+                      where load_index = (set_size - 3) / 3 (0 for 3, 1 for 6).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, tau_base, bonus_base, age_scale, load_scale = model_parameters
+    age_value = age[0]
+    is_older = 1 if age_value >= 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        N = np.zeros((nS, nA))  # visit counts for uncertainty
+
+        # Compute age- and load-modulated bonus weight for this block
+        load_index = max(0.0, (nS - 3) / 3.0)  # 0 for 3, 1 for 6
+        age_multiplier = (1.0 - age_scale) if is_older else (1.0 + age_scale)
+        load_multiplier = (1.0 + load_scale * load_index)
+        bonus_weight = bonus_base * age_multiplier * load_multiplier
+        bonus_weight = max(bonus_weight, 0.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Uncertainty term from counts
+            U = 1.0 / np.sqrt(N[s, :] + 1.0)
+            V = Q[s, :] + bonus_weight * U
+
+            V -= np.max(V)
+            p = np.exp(tau_base * V)
+            p /= np.sum(p)
+
+            p_choice = max(p[a], 1e-12)
+            total_log_p += np.log(p_choice)
+
+            # Update counts and Q-values
+            N[s, a] += 1.0
+            td = r - Q[s, a]
+            Q[s, a] += alpha * td
+
+    return -float(total_log_p)

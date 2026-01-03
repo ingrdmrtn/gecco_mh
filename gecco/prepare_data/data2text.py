@@ -44,59 +44,70 @@ def narrative(
 
 def get_data2text_function(name):
     if name == "narrative":
-        def data2text(df, id_col, template, fit_type, metadata=None, max_trials=None, value_mappings=None):
-            """
-            Convert participant trial data into a narrative string.
-            Generic across tasks — assumes only participant ID and trial rows.
+        def data2text(df, id_col, template, fit_type,
+                      metadata=None, max_trials=None, max_blocks=None,
+                      value_mappings=None):
 
-            Args:
-                df: pandas.DataFrame (rows = trials)
-                id_col: column name identifying participants
-                template: str, user-specified text format with placeholders (e.g., {choice}, {reward})
-                max_trials: optional int, limit number of trials per participant
-                value_mappings: optional dict[col -> mapping_dict], applied only to existing cols
-            """
             narratives = []
+            has_blocks = "blocks" in df.columns  # ✅ FIXED
 
             for pid in df[id_col].unique():
-                sub = df[df[id_col] == pid].head(max_trials or len(df))
+                sub = df[df[id_col] == pid]
                 trial_lines = []
 
-                for _, row in sub.iterrows():
-                    vals = dict(row)
+                if has_blocks and max_trials is not None:
+                    grouped = sub.groupby("blocks", sort=True)
 
-                    # Apply user-defined mappings if provided
-                    if value_mappings:
-                        # Convert from SimpleNamespace (if needed)
-                        if not isinstance(value_mappings, dict):
-                            value_mappings = vars(value_mappings)
+                    # ✅ LIMIT NUMBER OF BLOCKS
+                    for i, (block_id, block_df) in enumerate(grouped):
+                        if max_blocks is not None and i >= max_blocks:
+                            break
 
-                        for col, mapping in value_mappings.items():
-                            if not isinstance(mapping, dict):
-                                mapping = vars(mapping)
-                            if col in vals:
-                                key = str(int(vals[col])) if isinstance(vals[col], (int, float)) else str(vals[col])
-                                vals[col] = mapping.get(key, vals[col])
+                        block_df = block_df.head(max_trials)
 
-                    try:
-                        line = template.format(**vals)
-                        trial_lines.append(line)
-                    except KeyError as e:
-                        print(f"[⚠️ GeCCo] Missing column {e} in template for participant {pid}")
-                        continue
+                        for _, row in block_df.iterrows():
+                            vals = dict(row)
 
-                # Join participant's trials
+                            if value_mappings:
+                                if not isinstance(value_mappings, dict):
+                                    value_mappings = vars(value_mappings)
+
+                                for col, mapping in value_mappings.items():
+                                    if not isinstance(mapping, dict):
+                                        mapping = vars(mapping)
+                                    if col in vals:
+                                        key = (
+                                            str(int(vals[col]))
+                                            if isinstance(vals[col], (int, float))
+                                            else str(vals[col])
+                                        )
+                                        vals[col] = mapping.get(key, vals[col])
+
+                            try:
+                                trial_lines.append(template.format(**vals))
+                            except KeyError as e:
+                                print(
+                                    f"[⚠️ GeCCo] Missing column {e} in template "
+                                    f"for participant {pid}, block {block_id}"
+                                )
+
+                else:
+                    # Fallback behavior
+                    sub = sub.head(max_trials or len(sub))
+                    for _, row in sub.iterrows():
+                        vals = dict(row)
+                        try:
+                            trial_lines.append(template.format(**vals))
+                        except KeyError:
+                            continue
+
                 participant_text = "\n".join(trial_lines)
 
                 if fit_type == "individual":
                     narratives.append(f"Participant data:\n{participant_text}\n")
                 else:
-                    if metadata:
-                        # Format metadata for this participant
-                        participant_id_plus_metadata = metadata.format(participant_id=pid, **vals)
-                        narratives.append(f"{participant_id_plus_metadata}\n{participant_text}\n")
-                    else:
-                        narratives.append(f"Participant {pid}:\n{participant_text}\n")
+                    narratives.append(f"Participant {pid}:\n{participant_text}\n")
 
             return "\n".join(narratives)
+
         return data2text

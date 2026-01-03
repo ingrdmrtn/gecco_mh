@@ -1,0 +1,398 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited Working Memory mixture with age- and load-dependent weighting.
+
+    This model mixes a standard RL softmax policy with a working memory (WM) policy.
+    WM has a limited effective capacity and decays over time; its influence decreases with set size
+    and decreases further for older adults.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial within a block (0..nS-1 for that block).
+    actions : array-like of int
+        Chosen actions on each trial. Valid actions are 0,1,2. Invalid actions are treated as lapses.
+    rewards : array-like of float
+        Observed feedback on each trial. Will be clipped to {0,1}.
+    blocks : array-like of int
+        Block indices per trial.
+    set_sizes : array-like of int
+        Set size (number of distinct states in the current block) for each trial.
+    age : array-like or scalar
+        Participant age; used to determine age group (older >= 45).
+    model_parameters : sequence (length = 5)
+        alpha : RL learning rate (0..1).
+        beta : Inverse temperature for RL (positive). Internally scaled.
+        k_wm : Nominal WM capacity (in items, positive).
+        wm_decay : WM decay per trial (0..1).
+        lapse : Lapse probability (0..0.5), adds uniform random responding.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    alpha, beta, k_wm, wm_decay, lapse = model_parameters
+
+    # Effective scaling
+    beta_eff_base = max(1e-6, beta) * 5.0  # scale beta to a higher effective range
+    k_wm = max(1e-6, k_wm)
+    wm_decay = min(max(wm_decay, 0.0), 1.0)
+    lapse = min(max(lapse, 0.0), 0.5)
+
+    # Age group effect
+    age_val = age[0] if hasattr(age, "__len__") else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    # Older adults: reduced effective WM capacity and higher decision noise
+    # Scale capacity down by 30% if older; increase stochasticity by reducing beta by 20%
+    k_wm_age = k_wm * (1.0 - 0.3 * is_older)
+    beta_age_scale = 1.0 - 0.2 * is_older
+    beta_eff_base *= max(0.1, beta_age_scale)
+
+    nA = 3
+    eps = 1e-12
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = np.asarray(actions)[idx]
+        block_rewards = np.asarray(rewards)[idx]
+        block_states = np.asarray(states)[idx]
+        block_set_sizes = np.asarray(set_sizes)[idx]
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL Q-values and WM traces
+        Q = np.zeros((nS, nA), dtype=float)
+        # WM trace W holds preference strengths; initialize uniform
+        W = np.ones((nS, nA), dtype=float) / nA
+        # Keep track of the last rewarded action per state to mimic one-trial storage
+        last_correct = -np.ones(nS, dtype=int)  # -1 means unknown
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            set_sz = float(block_set_sizes[t])
+
+            # Compute load-dependent WM weight: saturating by capacity and penalized by age
+            # Base load effect: capacity/share of set size
+            wm_load = min(1.0, max(0.0, k_wm_age / max(1.0, set_sz)))
+            # Additional age penalty for WM influence under higher load
+            # More penalty when set size > capacity
+            overload = max(0.0, (set_sz - k_wm_age) / max(1.0, set_sz))
+            wm_weight = wm_load * (1.0 - 0.25 * is_older * overload)
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            # RL policy
+            Qs = Q[s, :]
+            # numerically stable softmax
+            beta_eff = beta_eff_base
+            Qs_center = Qs - np.max(Qs)
+            expQ = np.exp(beta_eff * Qs_center)
+            p_rl = expQ / np.sum(expQ)
+
+            # WM policy
+            # Decayed trace W guides a softmax with a high beta
+            W[s, :] = (1.0 - wm_decay) * W[s, :]
+            # If reward received, push W toward the chosen action; if no reward, mildly suppress it
+            if r > 0.5:
+                # strengthen memory for the chosen action
+                # Move W[s] toward one-hot at a with step size proportional to (1 - current prob)
+                eta = 0.7
+                target = np.zeros(nA); target[a] = 1.0
+                W[s, :] = (1 - eta) * W[s, :] + eta * target
+                last_correct[s] = a
+            else:
+                # gentle suppression to avoid overconfidence in incorrect choice
+                eta_neg = 0.2
+                supp = np.zeros(nA); supp[a] = 1.0
+                W[s, :] = (1 - eta_neg) * W[s, :] + eta_neg * (1.0 / nA) * np.ones(nA)
+
+            # Construct WM softmax with a strong gain; if we know last correct, bias further
+            beta_wm = 10.0 * beta_eff  # WM assumed sharp when active
+            Ws_center = W[s, :] - np.max(W[s, :])
+            p_wm = np.exp(beta_wm * Ws_center)
+            p_wm = p_wm / np.sum(p_wm)
+
+            # If we have a recalled correct action, spike WM distribution towards it
+            if last_correct[s] >= 0:
+                lc = last_correct[s]
+                spike = np.zeros(nA); spike[lc] = 1.0
+                p_wm = 0.8 * p_wm + 0.2 * spike
+
+            # Mixture with lapse
+            if a < 0 or a >= nA:
+                # invalid action treated as pure lapse
+                p_choice = 1.0 / nA
+                total_logp += np.log(max(eps, p_choice))
+                # skip learning on invalid trials to avoid contaminating parameters
+                continue
+
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_choice = (1.0 - lapse) * p_mix[a] + lapse * (1.0 / nA)
+            total_logp += np.log(max(eps, p_choice))
+
+            # RL update
+            delta = r - Q[s, a]
+            Q[s, a] += alpha * delta
+
+    return -float(total_logp)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning rates + perseveration bias + limited WM cue,
+    with age- and load-dependent modulation of WM and perseveration.
+
+    Policy is a softmax over Q plus a dynamic perseveration bias for repeating recent actions.
+    A lightweight WM cue recalls the last rewarded action for each state; its influence scales
+    inversely with set size and is reduced for older adults.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial within a block (0..nS-1).
+    actions : array-like of int
+        Chosen actions on each trial (0,1,2). Invalid actions are treated as lapses.
+    rewards : array-like of float
+        Feedback per trial. Will be clipped to {0,1}.
+    blocks : array-like of int
+        Block indices per trial.
+    set_sizes : array-like of int
+        Set size for each trial.
+    age : array-like or scalar
+        Participant age; older group is age >= 45.
+    model_parameters : sequence (length = 6)
+        alpha_pos : Learning rate for positive outcomes.
+        alpha_neg : Learning rate for negative outcomes.
+        beta : Base inverse temperature (scaled internally).
+        persev_strength : Strength of perseveration bias.
+        wm_base : Base WM weight scaling factor.
+        lapse : Lapse probability.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of the observed actions.
+    """
+    alpha_pos, alpha_neg, beta, persev_strength, wm_base, lapse = model_parameters
+
+    beta = max(1e-6, beta) * 5.0
+    lapse = min(max(lapse, 0.0), 0.5)
+    wm_base = max(0.0, wm_base)
+    persev_strength = max(0.0, persev_strength)
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    # Age effects:
+    # - Older adults: reduced WM weight and increased perseveration tendency, slightly lower beta
+    wm_age_scale = 1.0 - 0.4 * is_older
+    persev_age_scale = 1.0 + 0.3 * is_older
+    beta *= (1.0 - 0.15 * is_older)
+
+    nA = 3
+    eps = 1e-12
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = np.asarray(actions)[idx]
+        block_rewards = np.asarray(rewards)[idx]
+        block_states = np.asarray(states)[idx]
+        block_set_sizes = np.asarray(set_sizes)[idx]
+        nS = int(block_set_sizes[0])
+
+        # Q-values
+        Q = np.zeros((nS, nA), dtype=float)
+
+        # Perseveration bias vector over actions (state-independent bias that carries across trials within block)
+        # We also keep a last action per state for a state-dependent bump
+        pers_bias = np.zeros(nA, dtype=float)
+        last_action_state = -np.ones(nS, dtype=int)
+
+        # Lightweight WM store: last rewarded action per state
+        last_rewarded = -np.ones(nS, dtype=int)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            set_sz = float(block_set_sizes[t])
+
+            # Load- and age-dependent WM weight
+            wm_weight = wm_base * (1.0 / max(1.0, set_sz)) * wm_age_scale
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            # Perseveration strength (age-enhanced)
+            pers_gain = persev_strength * persev_age_scale
+
+            # RL softmax logits
+            logits = beta * Q[s, :]
+
+            # Add perseveration bias:
+            # - global bias for repeating most recent action overall (pers_bias)
+            # - small state-dependent bump to repeat last action seen in this state
+            logits = logits + pers_gain * pers_bias
+            if last_action_state[s] >= 0:
+                bump = np.zeros(nA); bump[last_action_state[s]] = 1.0
+                logits = logits + 0.5 * pers_gain * bump
+
+            # WM cue: if we have a last rewarded action for this state, add a targeted bump
+            if last_rewarded[s] >= 0:
+                wm_logits = np.zeros(nA); wm_logits[last_rewarded[s]] = 1.0
+            else:
+                wm_logits = np.zeros(nA)
+
+            # Combine RL + WM logits by convex combination in probability space
+            # To do this stably, compute softmax for both then mix
+            # RL policy
+            logits_rl = logits - np.max(logits)
+            p_rl = np.exp(logits_rl); p_rl = p_rl / np.sum(p_rl)
+
+            # WM policy as a peaked distribution at the stored action, otherwise uniform
+            if last_rewarded[s] >= 0:
+                p_wm = 0.9 * wm_logits + 0.1 * (1.0 / nA) * np.ones(nA)
+            else:
+                p_wm = (1.0 / nA) * np.ones(nA)
+
+            # Mix with lapse
+            if a < 0 or a >= nA:
+                p_choice = 1.0 / nA
+                total_logp += np.log(max(eps, p_choice))
+                # no updates on invalid trials
+                continue
+
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_choice = (1.0 - lapse) * p_mix[a] + lapse * (1.0 / nA)
+            total_logp += np.log(max(eps, p_choice))
+
+            # Learning updates
+            delta = r - Q[s, a]
+            lr = alpha_pos if delta >= 0.0 else alpha_neg
+            Q[s, a] += lr * delta
+
+            # Update perseveration traces:
+            # Decay toward zero; then add bump for the chosen action
+            pers_bias *= 0.8
+            pers_vec = np.zeros(nA); pers_vec[a] = 1.0
+            pers_bias = pers_bias + 0.5 * pers_vec
+            last_action_state[s] = a
+
+            # Update WM store if rewarded
+            if r > 0.5:
+                last_rewarded[s] = a
+
+    return -float(total_logp)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with adaptive inverse temperature via volatility tracking and age-dependent forgetting.
+
+    This model uses a standard Q-learning value update, but adapts decision noise (beta)
+    based on a running estimate of environmental volatility from recent prediction errors.
+    It also includes value forgetting within a block. Age modulates the meta-learning rate,
+    forgetting, exploration, and lapse.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial within a block.
+    actions : array-like of int
+        Chosen actions per trial (0,1,2). Invalid actions are treated as lapses.
+    rewards : array-like of float
+        Rewards per trial, clipped to {0,1}.
+    blocks : array-like of int
+        Block indices per trial.
+    set_sizes : array-like of int
+        Set size per trial; used to scale decision noise under higher load.
+    age : array-like or scalar
+        Participant age; older group is age >= 45.
+    model_parameters : sequence (length = 6)
+        alpha : RL learning rate.
+        beta0 : Baseline inverse temperature (scaled internally).
+        meta_lr : Learning rate for volatility tracking (0..1).
+        q_forget : Per-trial Q forgetting rate (0..1).
+        lapse : Lapse probability (0..0.5).
+        load_sensitivity : How strongly larger set sizes reduce beta.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta0, meta_lr, q_forget, lapse, load_sensitivity = model_parameters
+
+    beta0 = max(1e-6, beta0) * 5.0
+    meta_lr = min(max(meta_lr, 0.0), 1.0)
+    q_forget = min(max(q_forget, 0.0), 1.0)
+    lapse = min(max(lapse, 0.0), 0.5)
+    load_sensitivity = max(0.0, load_sensitivity)
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    # Age effects:
+    # - Older: slower/less flexible volatility tracking, more forgetting, higher lapse, lower beta
+    meta_lr_eff = meta_lr * (1.0 - 0.4 * is_older)
+    q_forget_eff = q_forget * (1.0 + 0.4 * is_older)
+    lapse_eff = min(0.9, lapse * (1.0 + 0.5 * is_older))
+    beta0_eff = beta0 * (1.0 - 0.2 * is_older)
+
+    nA = 3
+    eps = 1e-12
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = np.asarray(actions)[idx]
+        block_rewards = np.asarray(rewards)[idx]
+        block_states = np.asarray(states)[idx]
+        block_set_sizes = np.asarray(set_sizes)[idx]
+        nS = int(block_set_sizes[0])
+
+        # Initialize Q values
+        Q = np.zeros((nS, nA), dtype=float)
+        # Volatility tracker per state-action or state? We'll track per state to be data-efficient
+        vol = np.zeros(nS, dtype=float)  # running average of |delta| per state
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            set_sz = float(block_set_sizes[t])
+
+            # Forgetting within block
+            Q *= (1.0 - q_forget_eff)
+
+            # Adaptive beta: reduced by both load and volatility
+            load_factor = 1.0 + load_sensitivity * (max(1.0, set_sz) - 1.0) / 5.0  # normalize by range to ~[1..]
+            beta_t = beta0_eff / load_factor
+            # Further attenuate beta under high volatility at the current state
+            beta_t = beta_t / (1.0 + 2.0 * vol[s])
+            beta_t = max(1e-4, beta_t)
+
+            # Policy
+            if a < 0 or a >= nA:
+                # invalid action: pure lapse likelihood
+                p_choice = 1.0 / nA
+                total_logp += np.log(max(eps, p_choice))
+                # skip updates
+                continue
+
+            logits = beta_t * Q[s, :]
+            logits = logits - np.max(logits)
+            p = np.exp(logits); p = p / np.sum(p)
+            p_choice = (1.0 - lapse_eff) * p[a] + lapse_eff * (1.0 / nA)
+            total_logp += np.log(max(eps, p_choice))
+
+            # Learning
+            delta = r - Q[s, a]
+            Q[s, a] += alpha * delta
+
+            # Update volatility estimate for this state
+            vol[s] = (1.0 - meta_lr_eff) * vol[s] + meta_lr_eff * abs(delta)
+
+    return -float(total_logp)

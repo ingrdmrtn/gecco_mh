@@ -1,7 +1,7 @@
 # engine/run_fit.py
 import numpy as np
 from scipy.optimize import minimize
-from gecco.offline_evaluation.utils import build_model_spec_from_llm_output
+from gecco.offline_evaluation.utils import build_model_spec
 from gecco.offline_evaluation.evaluation_functions import aic as _aic, bic as _bic
 
 def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
@@ -30,9 +30,12 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
             "model_name": str
         }
     """
-
-    # --- Extract model spec ---
-    spec = build_model_spec_from_llm_output(code_text, expected_func_name=expected_func_name)
+    # --- Build model specification from code ---
+    spec = build_model_spec(
+        code_text, 
+        expected_func_name=expected_func_name,
+        cfg=cfg  # Pass config so it can extract base class
+    )
 
     # --- Prepare metric function ---
     metric_name = cfg.evaluation.metric.upper()
@@ -40,8 +43,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
     metric_func = metric_map.get(metric_name, _bic)
 
     # --- Load the model function from code ---
-    exec(code_text, globals())
-    model_func = globals()[spec.name]
+    model_func =  spec.func
 
     # --- Data + fit configuration ---
     data_cfg = cfg.data

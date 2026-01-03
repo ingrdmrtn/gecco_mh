@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from gecco.offline_evaluation.fit_generated_models import run_fit
-from gecco.utils import extract_full_function
+from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 from google.genai import types
@@ -147,7 +147,8 @@ class GeCCoModelSearch:
 
             for i in range(1, self.cfg.llm.models_per_iteration + 1):
                 func_name = f"cognitive_model{i}"
-                func_code = extract_full_function(code_text, func_name)
+                func_code = extract_model_code(code_text, i)
+
                 if not func_code:
                     continue
 

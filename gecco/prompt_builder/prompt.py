@@ -13,6 +13,8 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     include_feedback = getattr(llm, "include_feedback", False)
     fit_type = getattr(evaluation, "fit_type")
     metadata = getattr(metadata, "flag", False)
+    abstract_base_model = getattr(llm, "abstract_base_model", None)
+    diversity_requirement = getattr(llm, "diversity_requirement", None)
 
     # Format goal section dynamically
     names = [f"`cognitive_model{i+1}`" for i in range(llm.models_per_iteration)]
@@ -64,8 +66,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {data_text.strip()}
 
 
-### Base Class (DO NOT MODIFY)
-{llm.abstract_base_model.strip()}
+{"### Base Class (DO NOT MODIFY) " + abstract_base_model.strip() if abstract_base_model else ""}
 
 ### Template Model
 {llm.template_model.strip()}
@@ -73,7 +74,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 ### Guardrails
 {chr(10).join(guardrails)}
 
-{f"### Diversity Requirement\n{chr(10).join(llm.diversity_requirement)}" if llm.diversity_requirement else ""}
+{f"### Diversity Requirement\n{chr(10).join(diversity_requirement)}" if diversity_requirement else ""}
 
 ### Your Task
 {goal_text.strip()}

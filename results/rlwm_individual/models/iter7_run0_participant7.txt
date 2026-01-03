@@ -1,0 +1,256 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Mixture of RL and WSLS (win-stay/lose-shift) with age- and set-size–dependent arbitration.
+
+    Idea:
+    - Two action-selection systems run in parallel:
+      (i) Model-free RL with softmax;
+      (ii) A WSLS heuristic that repeats the last action in a state after a reward,
+           and switches away otherwise.
+    - The mixture weight for WSLS is a logistic function of age group and set size:
+      younger adults and smaller set sizes favor WSLS more (configurable by parameters).
+
+    Parameters (model_parameters):
+    - alpha: (0,1), learning rate for RL Q-updates.
+    - beta: >0, base inverse temperature for RL softmax (internally scaled).
+    - wsls_weight_base: real, baseline logit for WSLS mixture weight.
+    - age_wsls_shift: real, additive shift on the WSLS logit for age group (younger=+1, older=-1).
+    - size_wsls_slope: real, slope on the WSLS logit for set size effect using factor (3.0/nS).
+
+    Inputs:
+    - states: array of state indices (T,)
+    - actions: array of chosen actions (T,) in {0,1,2}
+    - rewards: array of rewards (T,) in {0,1}
+    - blocks: array of block indices (T,)
+    - set_sizes: array of set sizes per trial (T,), in {3,6}
+    - age: array-like with a single numeric age in years.
+    - model_parameters: list/tuple [alpha, beta, wsls_weight_base, age_wsls_shift, size_wsls_slope]
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the mixture model.
+    """
+    alpha, beta, wsls_weight_base, age_wsls_shift, size_wsls_slope = model_parameters
+    beta = max(1e-6, beta) * 6.0
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+        # RL values
+        Q = np.zeros((nS, nA))
+        # WSLS memory per state: last action and last reward
+        last_a = -np.ones(nS, dtype=int)
+        last_r = np.zeros(nS)
+
+        # Mixture weight for this block (depends on set size and age)
+        # Logistic transform to [0,1]
+        logit_w = wsls_weight_base + age_wsls_shift * age_group + size_wsls_slope * (3.0 / float(nS))
+        w_wsls = 1.0 / (1.0 + np.exp(-logit_w))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            logits = beta * (Q[s, :] - np.max(Q[s, :]))
+            pi_rl = np.exp(logits)
+            pi_rl = pi_rl / np.sum(pi_rl)
+
+            # WSLS policy for this state
+            pi_wsls = np.ones(nA) / nA
+            if last_a[s] != -1:
+                if last_r[s] >= 0.5:
+                    # win: repeat last action
+                    pi_wsls = np.zeros(nA)
+                    pi_wsls[last_a[s]] = 1.0
+                else:
+                    # loss: switch away from last action, uniform over others
+                    pi_wsls = np.ones(nA) / (nA - 1.0)
+                    pi_wsls[last_a[s]] = 0.0
+
+            # Mixture
+            pi = w_wsls * pi_wsls + (1.0 - w_wsls) * pi_rl
+            p = max(1e-12, float(pi[a]))
+            total_log_p += np.log(p)
+
+            # Update memory and RL
+            last_a[s] = a
+            last_r[s] = r
+            Q[s, a] += alpha * (r - Q[s, a])
+
+    return -total_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with dynamically learned temperature from outcome-consistency, modulated by age and set size.
+
+    Idea:
+    - A standard model-free RL updates Q-values.
+    - A per-state confidence trace estimates outcome consistency (EWMA of reward).
+    - The inverse temperature scales with:
+        base beta_init,
+        age group,
+        set size (3/nS),
+        and the current state's confidence (higher confidence -> more exploitation).
+    - A small lapse rate mixes with a uniform policy.
+
+    Parameters (model_parameters):
+    - alpha: (0,1), learning rate for Q updates.
+    - beta_init: >0, base inverse temperature before modulations (internally scaled).
+    - beta_size_age_gain: real, gain that multiplies age_group and set-size factor (3/nS) to modulate temperature.
+    - beta_learn_rate: (0,1), learning rate for the confidence trace per state.
+    - lapse: (0,0.5), probability of random choice each trial (softens extreme predictions).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays (T,)
+    - age: array-like with a single numeric age in years.
+    - model_parameters: [alpha, beta_init, beta_size_age_gain, beta_learn_rate, lapse]
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    alpha, beta_init, beta_size_age_gain, beta_learn_rate, lapse = model_parameters
+    beta_init = max(1e-6, beta_init) * 6.0
+    beta_learn_rate = np.clip(beta_learn_rate, 1e-6, 1.0)
+    lapse = np.clip(lapse, 0.0, 0.49)
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_set_sizes = set_sizes[mask]
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        # Confidence trace per state in [0,1], initialized at 0.5 (uncertain)
+        conf = 0.5 * np.ones(nS)
+
+        # Static modulation from age and set size
+        mod = 1.0 + beta_size_age_gain * age_group * (3.0 / float(nS))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Dynamic inverse temperature for this state
+            beta_eff = beta_init * mod * (1.0 + conf[s])  # ranges from ~beta_init*mod to 2*beta_init*mod
+            beta_eff = max(1e-6, beta_eff)
+
+            # Softmax policy with lapse
+            logits = beta_eff * (Q[s, :] - np.max(Q[s, :]))
+            pi = np.exp(logits)
+            pi = pi / np.sum(pi)
+            pi = (1.0 - lapse) * pi + lapse * (np.ones(nA) / nA)
+
+            p = max(1e-12, float(pi[a]))
+            total_log_p += np.log(p)
+
+            # Update Q and confidence
+            Q[s, a] += alpha * (r - Q[s, a])
+            conf[s] += beta_learn_rate * (r - conf[s])  # EWMA of recent correctness in this state
+
+    return -total_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces and intra-state action generalization, with age and set-size effects.
+
+    Idea:
+    - Temporal eligibility traces allow credit to persist across trials within a block.
+    - Within a visited state, eligibility is assigned not only to the chosen action (1.0)
+      but also to non-chosen actions via a generalization weight g (sharing credit/blame).
+    - The trace decay (lambda) depends on age group, and generalization depends on set size.
+      Younger adults may sustain traces more (or less) depending on parameters; larger sets
+      reduce generalization via the size slope.
+
+    Parameters (model_parameters):
+    - alpha: (0,1), learning rate for value updates.
+    - beta: >0, inverse temperature for action selection (internally scaled).
+    - lambda_base: real, base logit for eligibility decay; mapped to (0,1) via sigmoid.
+    - age_lambda_shift: real, shift applied to lambda logit by age group (younger=+1, older=-1).
+    - gen_base: real, base logit for intra-state generalization g; mapped to (0,1).
+    - size_gen_slope: real, slope for set-size effect on g using (3.0/nS).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays (T,)
+    - age: array-like with a single numeric age in years.
+    - model_parameters: [alpha, beta, lambda_base, age_lambda_shift, gen_base, size_gen_slope]
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, lambda_base, age_lambda_shift, gen_base, size_gen_slope = model_parameters
+    beta = max(1e-6, beta) * 6.0
+    age_years = float(age[0])
+    age_group = 1.0 if age_years < 45.0 else -1.0
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_set_sizes = set_sizes[mask]
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        E = np.zeros((nS, nA))  # eligibility traces
+
+        # Compute block-specific parameters
+        lam = sigmoid(lambda_base + age_lambda_shift * age_group)  # (0,1)
+        lam = np.clip(lam, 1e-6, 0.9999)
+        g = sigmoid(gen_base + size_gen_slope * (3.0 / float(nS)))  # (0,1), more generalization with smaller sets
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Action selection
+            logits = beta * (Q[s, :] - np.max(Q[s, :]))
+            pi = np.exp(logits)
+            pi = pi / np.sum(pi)
+
+            p = max(1e-12, float(pi[a]))
+            total_log_p += np.log(p)
+
+            # TD error
+            delta = r - Q[s, a]
+
+            # Update eligibilities: decay all, then set current state's pattern with generalization
+            E *= lam
+            # Zero current state's eligibilities and set pattern
+            E[s, :] = 0.0
+            E[s, a] = 1.0
+            for a_other in range(nA):
+                if a_other != a:
+                    E[s, a_other] = max(E[s, a_other], g / (nA - 1.0))
+
+            # Value update with traces and generalization
+            Q += alpha * delta * E
+
+    return -total_log_p

@@ -1,0 +1,352 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-driven RL with age- and load-modulated temperature and omission bias.
+
+    Idea:
+    - Q-learning with separate learning rates for positive and negative prediction errors.
+    - Inverse temperature decreases with set size (load) and with age (older group noisier).
+    - Omission probability grows with action uncertainty, set size, and an age-sensitive bias.
+      The model treats omissions (-2) as chosen when the omission policy is high.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial (0 or 1). Negative values denote invalid trials and are ignored in learning.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6). Constant within a block.
+    age : array-like of float/int
+        Participant age; used to determine age group (older if >=45).
+    model_parameters : list/tuple of length 5
+        [alpha_pos, alpha_neg, beta, kappa_load, omit_bias]
+        - alpha_pos: RL learning rate for positive prediction errors (0..1).
+        - alpha_neg: RL learning rate for negative prediction errors (0..1).
+        - beta: base inverse temperature for softmax (>0).
+        - kappa_load: load sensitivity scaling temperature drop as set size increases (>=0).
+        - omit_bias: baseline omission bias transformed by sigmoid; interacts with age and load.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices (including omissions).
+    """
+    alpha_pos, alpha_neg, beta, kappa_load, omit_bias = model_parameters
+    age_val = float(age[0])
+    older = 1.0 if age_val >= 45 else 0.0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Initialize Q-values (uniform)
+        Q = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective inverse temperature: decreases with load and age
+        load_term = 1.0 + kappa_load * max(0, (nS - 3))
+        age_term = 1.0 + 0.4 * older  # older participants slightly noisier
+        beta_eff = beta / (load_term * age_term)
+        beta_eff = max(beta_eff, 1e-6)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Softmax over Q
+            Qs = Q[s].copy()
+            Qs = Qs - np.max(Qs)
+            logits = beta_eff * Qs
+            probs = np.exp(logits - np.max(logits))
+            probs = probs / np.sum(probs)
+
+            # Uncertainty measure: 1 - max action probability
+            unc = 1.0 - np.max(probs)
+
+            # Omission propensity via sigmoid of bias + age + load, scaled by uncertainty
+            # More uncertainty -> higher omission; older and larger set size increase baseline
+            base_omit = 1.0 / (1.0 + np.exp(-(omit_bias + 0.7 * older + 0.3 * max(0, nS - 3))))
+            p_omit = base_omit * unc
+            p_omit = min(max(p_omit, 0.0), 0.95)  # cap for numerical stability
+
+            # Choice likelihood
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * probs[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning (ignore invalid trials r<0 or omissions)
+            if (a >= 0) and (r >= 0):
+                pe = r - Q[s, a]
+                lr = alpha_pos if pe >= 0 else alpha_neg
+                Q[s, a] += lr * pe
+
+    return neg_log_lik
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Bayesian evidence accumulation with age- and load-dependent precision, forgetting, and lapses.
+
+    Idea:
+    - For each state-action, maintain Beta(success, failure) evidence for reward propensity.
+    - Choice policy is softmax over posterior means, with inverse temperature scaled by
+      an effective precision (concentration) that decreases with set size and in older adults.
+    - Include exponential forgetting of evidence to capture interference across items.
+    - Lapses split into omissions and random responding, both age-amplified.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial (0 or 1). Negative values denote invalid trials and are ignored in updating.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6). Constant within a block.
+    age : array-like of float/int
+        Participant age; older group (>=45) has lower precision and higher lapse.
+    model_parameters : list/tuple of length 5
+        [beta, conc_base, cap_slope, forget, lapse_age]
+        - beta: base inverse temperature for softmax (>0).
+        - conc_base: baseline concentration (pseudo-count sum) per state-action (>0).
+        - cap_slope: precision drop per additional item beyond 3 (>=0).
+        - forget: forgetting rate per trial (0..1), applied to all Beta parameters.
+        - lapse_age: baseline logit for lapse; transformed to probability and amplified by age.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices (including omissions and lapses).
+    """
+    beta, conc_base, cap_slope, forget, lapse_age = model_parameters
+    age_val = float(age[0])
+    older = 1.0 if age_val >= 45 else 0.0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Age-modulated lapse
+    base_lapse = 1.0 / (1.0 + np.exp(-lapse_age))
+    lapse_eff_mult = 1.0 + 0.3 * older  # older lapse a bit more
+    # We keep lapse bounded away from 1
+    base_lapse = min(max(base_lapse * lapse_eff_mult, 0.0), 0.5)
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Effective concentration and temperature modulation by set size and age
+        conc_eff = conc_base / (1.0 + cap_slope * max(0, (nS - 3)))
+        conc_eff *= (0.85 if older > 0.5 else 1.0)
+        conc_eff = max(conc_eff, 1e-3)
+
+        beta_eff = beta * conc_eff
+        beta_eff = max(beta_eff, 1e-6)
+
+        # Initialize Beta priors per state-action: alpha_succ, beta_fail
+        alpha_succ = (conc_eff / nA) * np.ones((nS, nA))
+        beta_fail = (conc_eff / nA) * np.ones((nS, nA))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Posterior mean for each action
+            means = alpha_succ[s] / (alpha_succ[s] + beta_fail[s])
+            means = np.clip(means, 0.0, 1.0)
+
+            # Softmax policy over means
+            m = means - np.max(means)
+            logits = beta_eff * m
+            pol = np.exp(logits - np.max(logits))
+            pol = pol / np.sum(pol)
+
+            # Lapse split
+            p_omit = 0.5 * base_lapse
+            p_rand = 0.5 * base_lapse
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - base_lapse) * pol[a] + p_rand * (1.0 / nA)
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Update with forgetting (ignore invalid reward codes)
+            # Forgetting moves parameters toward zero (loss of evidence).
+            alpha_succ *= (1.0 - forget)
+            beta_fail *= (1.0 - forget)
+
+            if (a >= 0) and (r >= 0):
+                # Add current evidence
+                alpha_succ[s, a] += r
+                beta_fail[s, a] += (1.0 - r)
+
+            # Floor to avoid degeneracy
+            alpha_succ = np.maximum(alpha_succ, 1e-6)
+            beta_fail = np.maximum(beta_fail, 1e-6)
+
+    return neg_log_lik
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + success-persistence heuristic with age- and load-gated meta-control and omission-by-entropy.
+
+    Idea:
+    - RL: standard Q-learning.
+    - Heuristic: when a state just yielded reward with an action, persist in repeating that action;
+      decays otherwise. The heuristic produces a peaked distribution whose sharpness is 'persist'.
+    - Meta-control: mixture weight between heuristic and RL depends on set size and age via a bias.
+    - Omission: probability grows with the entropy of the mixed policy and with an age-dependent rate.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial (0 or 1). Negative values denote invalid trials and are ignored in learning.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6). Constant within a block.
+    age : array-like of float/int
+        Participant age; older group (>=45) reduces heuristic reliance and increases omission rate.
+    model_parameters : list/tuple of length 5
+        [alpha, beta, persist, mix_bias, omit_rate]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL softmax (>0).
+        - persist: strength of success-persistence (0..1) shaping heuristic sharpness.
+        - mix_bias: meta-control bias for heuristic vs RL, passed through sigmoid; reduced by load/age.
+        - omit_rate: baseline omission rate scaled by policy entropy and age.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, persist, mix_bias, omit_rate = model_parameters
+    age_val = float(age[0])
+    older = 1.0 if age_val >= 45 else 0.0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Helper to compute entropy (natural log)
+    def entropy(p):
+        p_safe = np.clip(p, eps, 1.0)
+        return -np.sum(p_safe * np.log(p_safe))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # RL Q-values
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        # Heuristic memory: track last rewarded action and confidence per state
+        last_good = -np.ones(nS, dtype=int)  # -1 means unknown
+        conf = np.zeros(nS)  # 0..1, grows on success, decays otherwise
+
+        # Load- and age-gated mixture weight (sigmoid)
+        gate_input = mix_bias - 0.5 * max(0, (nS - 3)) - 0.5 * older
+        w_h = 1.0 / (1.0 + np.exp(-gate_input))  # weight on heuristic
+
+        # Omission scaling with age
+        omit_scale = omit_rate * (1.0 + 0.4 * older)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            q_s = Q[s].copy()
+            q_s -= np.max(q_s)
+            rl_logits = beta * q_s
+            rl = np.exp(rl_logits - np.max(rl_logits))
+            rl = rl / np.sum(rl)
+
+            # Heuristic policy
+            if last_good[s] >= 0 and conf[s] > 0:
+                peak = last_good[s]
+                sharp = 1e-3 + 6.0 * (persist * conf[s])  # scale sharpness by persist and confidence
+                base = np.ones(nA) / nA
+                # Create a peaked distribution around 'peak'
+                h = base.copy()
+                h[peak] = h[peak] + sharp
+                h = np.maximum(h, eps)
+                h = h / np.sum(h)
+            else:
+                h = np.ones(nA) / nA
+
+            # Mixed policy
+            pol = w_h * h + (1.0 - w_h) * rl
+            pol = np.maximum(pol, eps)
+            pol = pol / np.sum(pol)
+
+            # Omission probability increases with policy entropy
+            H = entropy(pol)
+            H_max = np.log(nA)
+            p_omit = omit_scale * (H / H_max)
+            p_omit = min(max(p_omit, 0.0), 0.5)
+
+            # Likelihood
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * pol[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Updates
+            if (a >= 0) and (r >= 0):
+                # RL update
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+
+                # Heuristic memory update
+                # Success increases confidence and sets last_good; failure decays confidence
+                if r > 0.5:
+                    last_good[s] = a
+                    conf[s] = min(1.0, (1.0 - 0.2) * conf[s] + 0.5 + 0.2 * (1.0 - persist) * (1.0 - conf[s]))
+                else:
+                    conf[s] = max(0.0, 0.8 * conf[s])
+            else:
+                # Passive decay on invalid/omission
+                conf[s] = max(0.0, 0.9 * conf[s])
+
+    return neg_log_lik

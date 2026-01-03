@@ -1,0 +1,400 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid RL + capacity-limited working memory with perseveration and lapses, modulated by age and set size.
+
+    The model blends:
+    - Incremental RL (Q-learning) with softmax.
+    - A working-memory (WM) store that rapidly encodes rewarded stimulus-action pairs and decays toward uniform.
+    - A perseveration bias to repeat the last action in the current state.
+    - Lapses that cover omissions and random responding.
+
+    Age and load effects:
+    - Older adults and larger set sizes reduce the effective WM weight and increase perseveration influence.
+    - RL temperature is modestly reduced for larger set sizes.
+
+    Parameters
+    ----------
+    states : array-like (int)
+        State index per trial within block (0..nS-1).
+    actions : array-like (int)
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
+    rewards : array-like (float/int)
+        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission timeouts).
+    blocks : array-like (int)
+        Block index per trial. Values reset at each block.
+    set_sizes : array-like (int)
+        Set size (3 or 6) for the block/trial.
+    age : array-like (float/int)
+        Participant age; older group (>=45) down-weights WM and increases perseveration.
+    model_parameters : list/tuple of length 5
+        [alpha, beta, wm_gain, perseveration, lapse]
+        - alpha: RL learning rate (0-1).
+        - beta: inverse temperature for RL softmax (>0).
+        - wm_gain: baseline WM influence and learning strength (>0).
+        - perseveration: baseline bias to repeat last action (>=0).
+        - lapse: lapse probability (0-1). Half to omissions, half to random action.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    alpha, beta, wm_gain, perseveration, lapse = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Age and load modulators
+    age_wm_mult = 0.75 if older else 1.0
+    age_persev_mult = 1.25 if older else 1.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        load_wm_mult = 1.2 if nS <= 3 else 0.6   # WM is more impactful in low load
+        load_temp_mult = 1.0 if nS <= 3 else 0.85
+        load_persev_mult = 1.0 if nS <= 3 else 1.2
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        # WM preference matrix per state-action; starts uniform
+        W = (1.0 / nA) * np.ones((nS, nA))
+        # Last action per state for perseveration
+        last_act = -1 * np.ones(nS, dtype=int)
+
+        # Effective weights
+        wm_weight = wm_gain * age_wm_mult * load_wm_mult
+        wm_weight = max(0.0, min(1.0, wm_weight))  # interpret wm_gain as mixture weight (bounded)
+        beta_eff = max(1e-6, beta * load_temp_mult)
+        kappa = max(0.0, perseveration * age_persev_mult * load_persev_mult)
+
+        # WM decay toward uniform each trial step size
+        # Faster decay at higher load and for older adults
+        wm_decay = 0.10 * (1.0 + 0.5 * older) * (1.0 + (nS - 3) / 3.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            rl_logits = beta_eff * Qs
+
+            # WM policy: soft one-hot around the strongest WM entry for this state
+            Ws = W[s].copy()
+            Ws = np.maximum(Ws, eps)
+            Ws /= np.sum(Ws)
+            # Use a sharpness for WM to approach a delta when confident
+            beta_wm = 5.0 * wm_gain  # internal sharpness increases with wm_gain
+            wm_logits = beta_wm * (Ws - np.max(Ws))
+
+            # Perseveration bias: add kappa to the logit of the last action in this state
+            persev_bias = np.zeros(nA)
+            if last_act[s] >= 0:
+                persev_bias[last_act[s]] += kappa
+
+            # Combine RL and WM as mixture in probability space; implement via logits -> probs
+            rl_probs = np.exp(rl_logits - np.max(rl_logits))
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            wm_probs = np.exp(wm_logits - np.max(wm_logits))
+            wm_probs = wm_probs / np.sum(wm_probs)
+
+            mix_probs = wm_weight * wm_probs + (1.0 - wm_weight) * rl_probs
+
+            # Apply perseveration as a multiplicative bias on probabilities
+            persev_mult = np.exp(persev_bias)
+            mix_probs = mix_probs * persev_mult
+            mix_probs = mix_probs / np.sum(mix_probs)
+
+            # Lapses: split between omissions and random choices
+            p_omit = lapse * 0.5
+            p_rand = lapse * 0.5
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - lapse) * mix_probs[a] + p_rand * (1.0 / nA)
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning updates only if a valid action and reward observed
+            if (a >= 0) and (r >= 0):
+                # RL Q-learning
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+
+                # WM update: drift toward a one-hot at chosen action if rewarded,
+                # slight suppression if not rewarded. Then decay toward uniform.
+                if r > 0.5:
+                    # Move probability mass toward chosen action proportional to wm_gain
+                    delta_w = wm_gain * (1.0 - W[s, a])
+                    W[s, a] += delta_w
+                    # renormalize and dampen others
+                    others = [i for i in range(nA) if i != a]
+                    if len(others) > 0:
+                        total_other = np.sum(W[s, others])
+                        if total_other > 0:
+                            scale = (1.0 - W[s, a]) / total_other
+                            W[s, others] *= scale
+                else:
+                    # Nudge away from chosen action on errors
+                    W[s, a] = max(0.0, W[s, a] * (1.0 - 0.5 * wm_gain))
+                    # renormalize
+                    W[s] = np.maximum(W[s], eps)
+                    W[s] /= np.sum(W[s])
+
+                # Decay WM toward uniform
+                W[s] = (1.0 - wm_decay) * W[s] + wm_decay * (np.ones(nA) / nA)
+                W[s] = np.maximum(W[s], eps)
+                W[s] /= np.sum(W[s])
+
+                # Update last action for perseveration
+                last_act[s] = a
+
+    return neg_log_lik
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Asymmetric-learning-rate RL with value decay, uncertainty-driven omissions, and age/load modulation.
+
+    The model includes:
+    - Q-learning with separate learning rates for positive and negative prediction errors.
+    - Value decay toward uniform baseline to capture forgetting/interference (stronger with higher load and age).
+    - Softmax choice with inverse temperature modulated by set size.
+    - Omission policy driven by uncertainty (entropy of action distribution) via a logistic transform.
+      Older adults and higher set sizes increase the sensitivity to uncertainty-driven omissions.
+
+    Parameters
+    ----------
+    states : array-like (int)
+        State index per trial within block (0..nS-1).
+    actions : array-like (int)
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
+    rewards : array-like (float/int)
+        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission timeouts).
+    blocks : array-like (int)
+        Block index per trial. Values reset at each block.
+    set_sizes : array-like (int)
+        Set size (3 or 6) for the block/trial.
+    age : array-like (float/int)
+        Participant age; older group (>=45) forgets faster and omits more under uncertainty.
+    model_parameters : list/tuple of length 5
+        [alpha_pos, alpha_neg, beta, decay, omit_bias]
+        - alpha_pos: learning rate for positive prediction errors (0-1).
+        - alpha_neg: learning rate for negative prediction errors (0-1).
+        - beta: baseline inverse temperature (>0).
+        - decay: baseline value decay rate toward uniform per trial (0-1).
+        - omit_bias: baseline bias toward omissions; higher values increase omission probability.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    alpha_pos, alpha_neg, beta, decay, omit_bias = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Modulators
+        beta_eff = beta * (1.0 if nS <= 3 else 0.85)
+        decay_eff = decay * (1.0 + 0.5 * older) * (1.0 + (nS - 3) / 3.0)  # more decay with age and size
+        decay_eff = min(0.99, max(0.0, decay_eff))
+
+        # Omission sensitivity to uncertainty (entropy): stronger in older and at larger set sizes
+        entropy_scale = 1.0 + 0.3 * older + 0.3 * (nS - 3) / 3.0
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Softmax over Q for acting (non-omit)
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            logits = beta_eff * Qs
+            probs = np.exp(logits)
+            probs = probs / np.sum(probs)
+
+            # Entropy of the action distribution
+            H = -np.sum(probs * np.log(np.maximum(probs, eps)))
+
+            # Omission probability driven by entropy
+            # p_omit = sigmoid(omit_bias + entropy_scale * H)
+            x = omit_bias + entropy_scale * H
+            p_omit = 1.0 / (1.0 + np.exp(-x))
+            p_omit = min(0.99, max(0.0, p_omit))
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * probs[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning and decay (only if valid action and reward observed)
+            if (a >= 0) and (r >= 0):
+                pe = r - Q[s, a]
+                lr = alpha_pos if pe >= 0 else alpha_neg
+                Q[s, a] += lr * pe
+
+            # Global decay toward uniform baseline each step (state-local decay)
+            # Apply decay to the state visited on this trial to reflect interference
+            baseline = (1.0 / nA)
+            Q[s] = (1.0 - decay_eff) * Q[s] + decay_eff * baseline
+
+    return neg_log_lik
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Bayesian hypothesis-tracking per state with noisy feedback, plus perseveration and lapses,
+    modulated by age and set size.
+
+    For each state, the model maintains posterior beliefs over which of the 3 actions is the
+    unique correct one. Beliefs are updated via Bayes' rule assuming:
+      P(r=1 | chosen=a, correct=k) = theta_c if a==k else (1 - theta_c).
+    Choices arise from a softmax over the posterior with a perseveration bias toward repeating
+    the last action in that state. Lapses allow omissions and random actions.
+
+    Age and load effects:
+    - Older adults and larger set sizes reduce the effective inverse temperature (noisier choices).
+    - Older adults increase perseveration bias and lapse probability impact.
+
+    Parameters
+    ----------
+    states : array-like (int)
+        State index per trial within block (0..nS-1).
+    actions : array-like (int)
+        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
+    rewards : array-like (float/int)
+        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission timeouts).
+    blocks : array-like (int)
+        Block index per trial. Values reset at each block.
+    set_sizes : array-like (int)
+        Set size (3 or 6) for the block/trial.
+    age : array-like (float/int)
+        Participant age; older group (>=45) has lower precision and stronger perseveration.
+    model_parameters : list/tuple of length 5
+        [beta, theta_c, prior_conf, perseveration, lapse]
+        - beta: baseline inverse temperature (>0) for softmax over beliefs.
+        - theta_c: feedback reliability if correct action is chosen (0.5-1).
+                   Incorrect action reliability is set to (1 - theta_c).
+        - prior_conf: concentration of the symmetric prior over correct actions (>0);
+                      larger values make the prior flatter in effect (more inertia).
+        - perseveration: bias added to the last action's logit in a state (>=0).
+        - lapse: lapse probability (0-1). Half to omissions, half to random action.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    beta, theta_c, prior_conf, perseveration, lapse = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Bounds/sanity
+    theta_c = min(max(theta_c, 0.5 + 1e-6), 1.0 - 1e-6)
+    prior_conf = max(prior_conf, 1e-6)
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Age/load modulation
+        beta_eff = beta * (0.9 if older else 1.0) * (1.0 if nS <= 3 else 0.85)
+        beta_eff = max(beta_eff, 1e-6)
+        kappa = perseveration * (1.2 if older else 1.0) * (1.0 if nS <= 3 else 1.2)
+        p_rand = lapse * 0.5
+        p_omit = lapse * 0.5
+
+        # Initialize log posterior per state over candidate correct actions
+        # Start with symmetric prior: Dirichlet(prior_conf/nA) => equal prior over actions
+        log_post = np.zeros((nS, nA)) - np.log(nA) * prior_conf
+        last_act = -1 * np.ones(nS, dtype=int)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Compute belief over correct action in state s
+            lp = log_post[s].copy()
+            # Normalize to probabilities
+            lp = lp - np.max(lp)
+            post = np.exp(lp)
+            post = post / np.sum(post)
+
+            # Choice probabilities from beliefs (softmax with perseveration bias)
+            logits = beta_eff * post  # using probabilities as preferences
+            # Recenter to improve numerical stability
+            logits = logits - np.max(logits)
+            if last_act[s] >= 0:
+                logits[last_act[s]] += kappa
+            pi = np.exp(logits)
+            pi = pi / np.sum(pi)
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - lapse) * pi[a] + p_rand * (1.0 / nA)
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Update beliefs only on valid action and reward
+            if (a >= 0) and (r >= 0):
+                # Likelihoods for each hypothesis k (which action is correct)
+                # If k == a: P(r) = theta_c^r * (1-theta_c)^(1-r)
+                # Else:      P(r) = (1-theta_c)^r * (theta_c)^(1-r)
+                # Compute log-likelihood increment per k
+                ll_inc = np.zeros(nA)
+                for k in range(nA):
+                    if k == a:
+                        p = theta_c
+                    else:
+                        p = 1.0 - theta_c
+                    p = min(max(p, 1e-6), 1.0 - 1e-6)
+                    ll_inc[k] = r * np.log(p) + (1.0 - r) * np.log(1.0 - p)
+
+                # Update log posterior with likelihood and mild prior pull (inverse of prior_conf)
+                log_post[s] = log_post[s] + ll_inc + (-1.0 / max(prior_conf, 1e-6)) * (log_post[s] - np.mean(log_post[s]))
+
+                last_act[s] = a
+
+    return neg_log_lik

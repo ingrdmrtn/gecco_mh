@@ -1,0 +1,328 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Slot-based working memory (WM) with LRU maintenance + model-free RL arbitration.
+
+    Mechanism:
+    - RL: standard Q-learning per state-action with inverse-temperature beta.
+    - WM: a limited number of state-action "slots" (K_eff) per block store the last rewarded action
+      for a state. WM is maintained with an LRU (least-recently-used) policy. A rehearsal parameter
+      controls per-encounter survival of a stored item.
+    - Arbitration: the probability of relying on WM for a stored state is w = (K_eff / nS) * retention,
+      where retention reflects rehearsal survival. Otherwise mix falls back on RL.
+    - Age: effective capacity scales with age. Younger: K_eff = K_base * age_capacity_mult.
+            Older:   K_eff = K_base / max(age_capacity_mult, eps).
+      Thus younger adults have effectively higher WM capacity for a given K_base when age_capacity_mult > 1.
+    - Load: larger set size (nS = 6) reduces the WM contribution because K_eff / nS shrinks.
+
+    Parameters
+    ----------
+    states : array-like of int
+        Trial-wise state indices (0..nS-1 within each block).
+    actions : array-like of int
+        Trial-wise chosen actions (0..2).
+    rewards : array-like of float
+        Trial-wise rewards (0 or 1).
+    blocks : array-like of int
+        Block index for each trial.
+    set_sizes : array-like of int
+        Set size for each trial's block (3 or 6).
+    age : array-like of float
+        Participant age; age[0] determines age group (<45 younger, >=45 older).
+    model_parameters : tuple/list of floats
+        (alpha, beta, K_base, rehearsal, age_capacity_mult)
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL softmax (>0).
+        - K_base: baseline WM slot count (can be fractional; effective slots are clipped to [0, nS]).
+        - rehearsal: probability that a stored WM item survives on each encounter (0..1).
+        - age_capacity_mult: scales WM capacity by age group (younger multiply; older divide).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions under the model.
+    """
+    alpha, beta, K_base, rehearsal, age_capacity_mult = model_parameters
+    age_val = age[0]
+    is_older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        b_states = states[mask]
+        b_actions = actions[mask]
+        b_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # RL values
+        Q = np.zeros((nS, nA))
+
+        # WM store: for each state, store action if in WM; -1 indicates not stored
+        wm_action = -1 * np.ones(nS, dtype=int)
+        # LRU order: we track a "time" stamp for each state; larger is more recent
+        wm_time = -1 * np.ones(nS, dtype=int)
+        current_time = 0
+
+        # Age-modulated effective capacity
+        cap_scale = (1.0 / max(age_capacity_mult, eps)) if is_older else age_capacity_mult
+        K_eff = np.clip(K_base * cap_scale, 0.0, float(nS))
+
+        for t in range(len(b_states)):
+            s = int(b_states[t])
+            a = int(b_actions[t])
+            r = float(b_rewards[t])
+
+            # RL policy
+            logits = beta * (Q[s, :] - np.max(Q[s, :]))
+            p_rl = np.exp(logits)
+            p_rl = p_rl / (np.sum(p_rl) + eps)
+
+            # WM retention check for this state (applies only if currently stored)
+            in_wm = wm_action[s] >= 0
+            retained = 0.0
+            p_wm = np.ones(nA) / float(nA)
+            if in_wm:
+                # Retention: with probability 'rehearsal', the memory remains strong (delta-like)
+                # We model this as a probability mass on the stored action
+                retained = np.clip(rehearsal, 0.0, 1.0)
+                p_wm = retained * np.eye(nA)[wm_action[s]] + (1.0 - retained) * (np.ones(nA) / float(nA))
+
+            # Arbitration weight: proportional to capacity share K_eff/nS
+            w = np.clip((K_eff / float(nS)) * (retained if in_wm else 0.0), 0.0, 1.0)
+
+            p = w * p_wm + (1.0 - w) * p_rl
+            total_loglik += np.log(p[a] + eps)
+
+            # Update RL
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+            # Update WM store using LRU and reward:
+            # - If rewarded, store this state->action in WM.
+            # - If not rewarded, do nothing (could keep or evict based on LRU pressure).
+            if r > 0.0:
+                # If capacity exceeded, evict least-recently-used among those currently stored.
+                # Count how many are stored
+                stored_idx = np.where(wm_action >= 0)[0]
+                if len(stored_idx) >= int(np.floor(K_eff + eps)) and len(stored_idx) > 0:
+                    # evict the smallest time stamp among stored
+                    oldest = stored_idx[np.argmin(wm_time[stored_idx])]
+                    wm_action[oldest] = -1
+                    wm_time[oldest] = -1
+                wm_action[s] = a
+                current_time += 1
+                wm_time[s] = current_time
+            else:
+                # On an error, we can still refresh recency if the item is present
+                if wm_action[s] >= 0:
+                    current_time += 1
+                    wm_time[s] = current_time
+
+    return -float(total_loglik)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Volatility-adaptive Q-learning: learning rate and exploration adapt to inferred volatility,
+    with age- and load-modulated volatility sensitivity.
+
+    Mechanism:
+    - Maintain per-state running estimates of mean PE (m) and PE variance (v) via an exponential filter.
+    - Volatility proxy is sqrt(v) (scale of recent surprise).
+    - Learning rate increases with volatility; inverse temperature decreases with volatility.
+      alpha_t = sigmoid(alpha0 + k_vol * vol_adj), beta_t = beta0 * exp(-k_vol * vol_adj)
+    - Age: volatility sensitivity scaled by age group. Older adults weigh volatility less (divide by bias),
+      younger weigh more (multiply by bias).
+    - Load: larger set size increases perceived volatility via an additive bias.
+
+    Parameters
+    ----------
+    states : array-like of int
+        Trial-wise state indices (0..nS-1 within each block).
+    actions : array-like of int
+        Trial-wise chosen actions (0..2).
+    rewards : array-like of float
+        Trial-wise rewards (0 or 1).
+    blocks : array-like of int
+        Block index for each trial.
+    set_sizes : array-like of int
+        Set size for each trial's block (3 or 6).
+    age : array-like of float
+        Participant age; age[0] determines age group (<45 younger, >=45 older).
+    model_parameters : tuple/list of floats
+        (alpha0, beta0, k_vol, age_vol_bias, load_vol_bias)
+        - alpha0: base learning-rate logit (maps via sigmoid to (0,1)).
+        - beta0: base inverse temperature (>0).
+        - k_vol: base sensitivity to volatility (>0 increases adaptation).
+        - age_vol_bias: scales k_vol by age group (younger multiply; older divide).
+        - load_vol_bias: additive bias to volatility proxy for nS=6 vs 3 (applied as * (nS-3)/3).
+          Positive values make the model perceive more volatility under higher load.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions under the model.
+    """
+    alpha0, beta0, k_vol, age_vol_bias, load_vol_bias = model_parameters
+    age_val = age[0]
+    is_older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    # Helper for sigmoid
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        b_states = states[mask]
+        b_actions = actions[mask]
+        b_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = np.zeros((nS, nA))
+        # Running estimates of PE mean and variance per state
+        m = np.zeros(nS)   # mean PE
+        v = np.zeros(nS)   # variance of PE
+        # Smoothing parameter for running stats; use moderate smoothing
+        rho = 0.2
+
+        # Age and load modulation for volatility sensitivity
+        k_scale = (1.0 / max(age_vol_bias, eps)) if is_older else age_vol_bias
+        k_eff = k_vol * k_scale
+        load_adj = load_vol_bias * max((nS - 3), 0) / 3.0
+
+        for t in range(len(b_states)):
+            s = int(b_states[t])
+            a = int(b_actions[t])
+            r = float(b_rewards[t])
+
+            # Current volatility proxy
+            vol = np.sqrt(max(v[s], 0.0)) + load_adj
+            vol = max(vol, 0.0)
+
+            # Adaptive alpha and beta
+            alpha_t = sigmoid(alpha0 + k_eff * vol)
+            beta_t = beta0 * np.exp(-k_eff * vol)
+
+            # Policy
+            logits = beta_t * (Q[s, :] - np.max(Q[s, :]))
+            p = np.exp(logits)
+            p = p / (np.sum(p) + eps)
+
+            total_loglik += np.log(p[a] + eps)
+
+            # TD update
+            pe = r - Q[s, a]
+            Q[s, a] += alpha_t * pe
+
+            # Update running stats for volatility
+            # Update mean
+            m_old = m[s]
+            m[s] = (1 - rho) * m[s] + rho * pe
+            # Update variance (Welford-like exponential)
+            v[s] = (1 - rho) * v[s] + rho * (pe - m_old) * (pe - m[s])
+
+    return -float(total_loglik)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Habit-RL mixture with global recency-weighted action habit, modulated by load and age.
+
+    Mechanism:
+    - RL: standard per-state Q-learning with inverse temperature beta.
+    - Habit: maintain global action propensities H[a] over the block using an exponential recency
+      accumulator with decay lambda. The habit policy p_h ∝ H.
+    - Arbitration: mixture p = (1 - w_h) * p_rl + w_h * p_h, where w_h increases with set size (load)
+      and with age (older rely more on habit; younger less).
+    - Age: habit reliance weight scaled by age_habit_bias (older multiply; younger divide).
+    - Rewards update only the RL system; habit updates from choices only (model-free action repetition).
+
+    Parameters
+    ----------
+    states : array-like of int
+        Trial-wise state indices (0..nS-1 within each block).
+    actions : array-like of int
+        Trial-wise chosen actions (0..2).
+    rewards : array-like of float
+        Trial-wise rewards (0 or 1).
+    blocks : array-like of int
+        Block index for each trial.
+    set_sizes : array-like of int
+        Set size for each trial's block (3 or 6).
+    age : array-like of float
+        Participant age; age[0] determines age group (<45 younger, >=45 older).
+    model_parameters : tuple/list of floats
+        (alpha, beta, habit_gain, recency_decay, age_habit_bias)
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL softmax (>0).
+        - habit_gain: base weight scaling for habit (0..1 typical).
+        - recency_decay: exponential decay for habit accumulator (0..1), higher = slower forgetting.
+        - age_habit_bias: scales habit weight by age (older multiply; younger divide).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions under the model.
+    """
+    alpha, beta, habit_gain, recency_decay, age_habit_bias = model_parameters
+    age_val = age[0]
+    is_older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        b_states = states[mask]
+        b_actions = actions[mask]
+        b_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = np.zeros((nS, nA))
+        H = np.ones(nA) / float(nA)  # start with uniform habit strength
+
+        # Load-based scaling of habit weight: heavier load -> more habit reliance
+        load_scale = 1.0 + (max(nS - 3, 0) / 3.0)
+        # Age modulation: older multiply by age_habit_bias; younger divide
+        age_scale = (age_habit_bias if is_older else (1.0 / max(age_habit_bias, eps)))
+        w_base = np.clip(habit_gain * load_scale * age_scale, 0.0, 5.0)  # cap before squashing
+
+        # Squash to [0,1) using logistic transform to ensure valid weight
+        def squash(x):
+            return 1.0 / (1.0 + np.exp(-x))  # in (0,1)
+
+        w_habit = squash(w_base)
+
+        lam = np.clip(recency_decay, 0.0, 1.0)
+
+        for t in range(len(b_states)):
+            s = int(b_states[t])
+            a = int(b_actions[t])
+            r = float(b_rewards[t])
+
+            # RL policy
+            logits = beta * (Q[s, :] - np.max(Q[s, :]))
+            p_rl = np.exp(logits)
+            p_rl = p_rl / (np.sum(p_rl) + eps)
+
+            # Habit policy
+            H = lam * H
+            H[a] += (1.0 - lam)  # increment chosen action more strongly
+            p_h = H / (np.sum(H) + eps)
+
+            # Mixture
+            p = (1.0 - w_habit) * p_rl + w_habit * p_h
+            total_loglik += np.log(p[a] + eps)
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+    return -float(total_loglik)

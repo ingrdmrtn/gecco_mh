@@ -95,7 +95,7 @@ def main():
 
                 simulation_prompt_text = simulation_prompt(
                     global_best_model,
-                    cfg.llm.simulation_template,
+                    cfg
                 )
                 simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
                 simulation_dir = search.results_dir / "simulation"
@@ -165,7 +165,7 @@ def main():
 
             simulation_prompt_text = simulation_prompt(
                 global_best_model,
-                cfg.llm.simulation_template,
+                cfg,
             )
             simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
             simulation_dir = search.results_dir / "simulation"

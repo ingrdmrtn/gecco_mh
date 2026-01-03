@@ -1,0 +1,361 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid RL+Working-Memory with load- and age-dependent arbitration.
+
+    This model mixes a standard Rescorla-Wagner RL policy with a simple working-memory (WM)
+    policy that stores the most recently rewarded action per state. The arbitration weight
+    favoring WM declines with set size (load) and is modulated by age group.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial (0-indexed within the block).
+    actions : array-like of int
+        Chosen actions (0,1,2). If action is outside {0,1,2}, the trial is treated as a lapse.
+    rewards : array-like of float
+        Trial feedback (0 or 1). If reward is not in {0,1}, the trial is treated as a lapse.
+    blocks : array-like of int
+        Block index for each trial. Learning and WM reset at block boundaries.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial; used to determine number of states in the block and load.
+    age : array-like of float
+        Participant age (single-element array). Age group: younger (<45) vs older (>=45) modulates WM emphasis.
+    model_parameters : list or tuple of floats (length 6)
+        [alpha, beta_base, wm_weight_base, wm_setsize_slope, age_effect, lapse]
+        - alpha: RL learning rate in (0,1)
+        - beta_base: base inverse temperature before scaling; converted to effective beta = 10*sigmoid(beta_base)
+        - wm_weight_base: baseline WM weight before modulation
+        - wm_setsize_slope: how much WM weight decreases as set size increases
+        - age_effect: additive WM bias by age group (+ for younger, - for older)
+        - lapse: lapse probability in [0,1]; with lapse, choices are uniform
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed actions under the model.
+    """
+    alpha, beta_base, wm_weight_base, wm_setsize_slope, age_effect, lapse = model_parameters
+    # Constrain parameters to sensible ranges via squashing where appropriate
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    beta = 10.0 * sigmoid(beta_base)
+    alpha = np.clip(alpha, 1e-6, 1.0)
+    lapse = np.clip(lapse, 1e-6, 0.5)  # keep small but >0
+
+    age_val = age[0]
+    is_younger = 1.0 if age_val < 45 else 0.0
+    is_older = 1.0 - is_younger
+
+    nA = 3
+    total_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        Q = np.zeros((nS, nA))  # RL values start neutral
+        W = (1.0 / nA) * np.ones((nS, nA))  # WM policy starts uniform
+
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+            load = int(block_set_sizes[t])
+
+            # Compute WM arbitration weight as a logistic function of base, load, and age
+            # Higher set size reduces WM; younger age increases WM (positive age_effect for younger)
+            wm_logits = wm_weight_base - wm_setsize_slope * (load - 3) + age_effect * (is_younger - is_older)
+            w_wm = sigmoid(wm_logits)
+
+            # Lapse handling or invalid trial: uniform probability, no learning
+            invalid_action = (a < 0) or (a >= nA)
+            invalid_reward = not (r == 0 or r == 1)
+
+            if invalid_action or invalid_reward:
+                p_choice = 1.0 / nA
+                total_log_p += np.log(np.maximum((1 - lapse) * p_choice + lapse * (1.0 / nA), eps))
+                # Do not update on invalid trials
+                continue
+
+            # RL policy
+            q_s = Q[s, :]
+            # Stable softmax probability of chosen action
+            max_q = np.max(beta * q_s)
+            exp_q = np.exp(beta * q_s - max_q)
+            p_rl_vec = exp_q / np.sum(exp_q)
+            p_rl = p_rl_vec[a]
+
+            # WM policy (probability taken directly from W row)
+            p_wm = W[s, a]
+
+            # Mixture with lapse
+            p_total = (1 - lapse) * (w_wm * p_wm + (1 - w_wm) * p_rl) + lapse * (1.0 / nA)
+            total_log_p += np.log(np.maximum(p_total, eps))
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+            # WM update:
+            # If rewarded, store chosen action as the remembered one (near one-hot).
+            # If not rewarded, forget toward uniform; forgetting increases with load and older age.
+            # Derive a small forgetting rate from the same parameters to keep total params <=6.
+            base_forget = sigmoid(wm_weight_base + age_effect * (is_older - is_younger) + wm_setsize_slope * (load - 3))
+            f = 0.05 + 0.45 * base_forget  # f in [0.05, 0.5]
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Make it slightly soft to avoid zeros
+                W[s, :] = (1 - 1e-3) * one_hot + (1e-3) * (1.0 / nA)
+            else:
+                W[s, :] = (1 - f) * W[s, :] + f * (1.0 / nA)
+
+    return -float(total_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with valence-asymmetric learning and age-modulated perseveration; exploration depends on load.
+
+    The agent learns Q-values with separate learning rates for gains and losses. Action selection
+    includes a perseveration bias to repeat the previous action in the same state; this bias is
+    modulated by age group. Inverse temperature decreases with set size (higher load -> more exploration).
+    A lapse component captures random responding and also absorbs invalid trials.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial (0-indexed within the block).
+    actions : array-like of int
+        Chosen actions (0,1,2). If action is outside {0,1,2}, the trial is treated as a lapse.
+    rewards : array-like of float
+        Trial feedback (0 or 1). If reward is not in {0,1}, the trial is treated as a lapse.
+    blocks : array-like of int
+        Block index for each trial. Learning and perseveration memory reset at block boundaries.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial; used to set exploration level.
+    age : array-like of float
+        Participant age (single-element array). Age group modulates perseveration bias.
+    model_parameters : list or tuple of floats (length 6)
+        [alpha_pos, alpha_neg, beta_base, beta_setsize_slope, perseveration_age_effect, lapse]
+        - alpha_pos: learning rate for positive prediction errors (rewards)
+        - alpha_neg: learning rate for negative prediction errors (non-rewards)
+        - beta_base: base inverse temperature; effective beta = 10*sigmoid(beta_base - beta_setsize_slope*(setsize-3))
+        - beta_setsize_slope: how strongly load reduces beta (more load => more exploration)
+        - perseveration_age_effect: base perseveration strength; enhanced/reduced by age group
+        - lapse: lapse probability in [0,1]; with lapse, choices are uniform
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed actions under the model.
+    """
+    alpha_pos, alpha_neg, beta_base, beta_setsize_slope, perseveration_age_effect, lapse = model_parameters
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    alpha_pos = np.clip(alpha_pos, 1e-6, 1.0)
+    alpha_neg = np.clip(alpha_neg, 1e-6, 1.0)
+    lapse = np.clip(lapse, 1e-6, 0.5)
+
+    age_val = age[0]
+    is_younger = 1.0 if age_val < 45 else 0.0
+    is_older = 1.0 - is_younger
+
+    nA = 3
+    total_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        # Track last action per state for perseveration
+        last_action = -np.ones(nS, dtype=int)
+
+        # derive perseveration strength; increase for older if parameter negative, for younger if positive
+        # kappa >= 0
+        kappa_base = perseveration_age_effect
+        kappa = np.maximum(0.0, kappa_base + 0.5 * (is_older - is_younger) * np.abs(kappa_base))
+
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+            load = int(block_set_sizes[t])
+
+            invalid_action = (a < 0) or (a >= nA)
+            invalid_reward = not (r == 0 or r == 1)
+
+            # Effective beta decreases with load
+            beta_eff = 10.0 * sigmoid(beta_base - beta_setsize_slope * (load - 3))
+
+            if invalid_action or invalid_reward:
+                p_choice = 1.0 / nA
+                total_log_p += np.log(np.maximum((1 - lapse) * p_choice + lapse * (1.0 / nA), eps))
+                continue
+
+            q_s = Q[s, :].copy()
+
+            # Add perseveration bias to last chosen action in this state
+            if last_action[s] >= 0:
+                q_s[last_action[s]] += kappa
+
+            # Softmax over biased values
+            max_q = np.max(beta_eff * q_s)
+            exp_q = np.exp(beta_eff * q_s - max_q)
+            p_vec = exp_q / np.sum(exp_q)
+            p_a = p_vec[a]
+
+            p_total = (1 - lapse) * p_a + lapse * (1.0 / nA)
+            total_log_p += np.log(np.maximum(p_total, eps))
+
+            # RL update with valence-specific alphas
+            pe = r - Q[s, a]
+            lr = alpha_pos if pe >= 0 else alpha_neg
+            Q[s, a] += lr * pe
+
+            # Update perseveration memory
+            last_action[s] = a
+
+    return -float(total_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-gated arbitration between RL and episodic (one-shot) memory, with age and load effects.
+
+    The agent learns RL Q-values and an episodic store that captures the most recently rewarded
+    action for each state. Arbitration weight favoring episodic control increases when state-level
+    uncertainty is low, decreases with set size, and is modulated by age group. Uncertainty is driven
+    by the magnitude of recent prediction errors and decays over time.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State indices on each trial (0-indexed within the block).
+    actions : array-like of int
+        Chosen actions (0,1,2). If action is outside {0,1,2}, the trial is treated as a lapse.
+    rewards : array-like of float
+        Trial feedback (0 or 1). If reward is not in {0,1}, the trial is treated as a lapse.
+    blocks : array-like of int
+        Block index for each trial. Learning and episodic memory reset at block boundaries.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial; used to modulate arbitration.
+    age : array-like of float
+        Participant age (single-element array). Younger group favors episodic control via age_effect.
+    model_parameters : list or tuple of floats (length 6)
+        [alpha, beta_base, omega_base, age_effect, decay_u, lapse]
+        - alpha: RL learning rate
+        - beta_base: base inverse temperature; effective beta = 10*sigmoid(beta_base)
+        - omega_base: baseline arbitration bias toward episodic memory (positive -> more episodic)
+        - age_effect: additive episodic bias by age group (+ for younger, - for older)
+        - decay_u: uncertainty decay/update rate in (0,1)
+        - lapse: lapse probability in [0,1]; with lapse, choices are uniform
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed actions under the model.
+    """
+    alpha, beta_base, omega_base, age_effect, decay_u, lapse = model_parameters
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    alpha = np.clip(alpha, 1e-6, 1.0)
+    beta = 10.0 * sigmoid(beta_base)
+    decay_u = np.clip(decay_u, 1e-6, 1.0)
+    lapse = np.clip(lapse, 1e-6, 0.5)
+
+    age_val = age[0]
+    is_younger = 1.0 if age_val < 45 else 0.0
+    is_older = 1.0 - is_younger
+
+    nA = 3
+    total_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        # Episodic memory: distribution over actions per state; starts uniform
+        E = (1.0 / nA) * np.ones((nS, nA))
+        # State uncertainty in [0,1], start high (uncertain)
+        U = np.ones(nS)
+
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+            load = int(block_set_sizes[t])
+
+            # Lapse or invalid trial handling
+            invalid_action = (a < 0) or (a >= nA)
+            invalid_reward = not (r == 0 or r == 1)
+
+            # Arbitration: more episodic when omega high, uncertainty low, and load low; age modulates
+            # Scale uncertainty contribution: when U is low, favor episodic; when high, favor RL
+            arb_logit = omega_base + age_effect * (is_younger - is_older) - 1.0 * (load - 3) - 5.0 * U[s]
+            w_epi = sigmoid(arb_logit)
+
+            if invalid_action or invalid_reward:
+                p_choice = 1.0 / nA
+                total_log_p += np.log(np.maximum((1 - lapse) * p_choice + lapse * (1.0 / nA), eps))
+                # Do not update learning on invalid trials
+                continue
+
+            # RL policy
+            q_s = Q[s, :]
+            max_q = np.max(beta * q_s)
+            exp_q = np.exp(beta * q_s - max_q)
+            p_rl_vec = exp_q / np.sum(exp_q)
+            p_rl = p_rl_vec[a]
+
+            # Episodic policy: probability directly from E row
+            p_epi = E[s, a]
+
+            # Mixture with lapse
+            p_total = (1 - lapse) * (w_epi * p_epi + (1 - w_epi) * p_rl) + lapse * (1.0 / nA)
+            total_log_p += np.log(np.maximum(p_total, eps))
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+            # Uncertainty update: decays toward |PE| (higher PE -> higher uncertainty)
+            U[s] = (1 - decay_u) * U[s] + decay_u * np.minimum(1.0, np.abs(pe))
+
+            # Episodic update: store last rewarded action; if unrewarded, gently diffuse toward uniform
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                E[s, :] = (1 - 1e-3) * one_hot + (1e-3) * (1.0 / nA)
+            else:
+                # Diffuse toward uniform with a rate coupled to uncertainty (more uncertain -> faster diffusion)
+                f = 0.05 + 0.45 * U[s]
+                E[s, :] = (1 - f) * E[s, :] + f * (1.0 / nA)
+
+    return -float(total_log_p)

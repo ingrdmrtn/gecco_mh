@@ -1,0 +1,313 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited working memory (WM) mixture model with age-sensitive WM capacity and decay.
+    
+    Core idea:
+    - Choices arise from a mixture of RL and WM policies.
+    - WM has limited capacity; its contribution declines with set size, more gently for younger participants.
+    - WM associations decay toward uniform over time; successful rewards refresh the corresponding association.
+    - A small lapse rate accounts for random responding and invalid trials are skipped from likelihood.
+    
+    Parameters (model_parameters):
+    - alpha: RL learning rate (0..1)
+    - beta: inverse temperature for RL softmax; internally scaled by 10 for dynamic range
+    - K: baseline WM capacity (in number of items)
+    - phi: WM refresh strength (how strongly a rewarded action overwrites WM) (0..1)
+    - w0: baseline WM weight (0..1), before capacity and set-size scaling
+    - epsilon: lapse probability (0..1), probability of random choice
+    
+    Inputs:
+    - states: array of state indices per trial (within-block state indices starting at 0)
+    - actions: array of chosen action indices per trial (0,1,2). Trials with invalid action (<0 or >=3) are skipped.
+    - rewards: array of rewards per trial (0/1). Negative values denote invalid/missed trials and are skipped.
+    - blocks: array of block indices per trial
+    - set_sizes: array of set size for the block for each trial (3 or 6)
+    - age: array-like with a single value, the participant's age
+    - model_parameters: tuple/list with parameters in the order specified above
+    
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    alpha, beta, K, phi, w0, epsilon = model_parameters
+    beta *= 10.0
+    age_val = age[0]
+    # Define age group: younger (<45) vs older (>=45). This participant is 22 -> younger.
+    is_older = 1 if age_val >= 45 else 0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL Q-values and WM associative store
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        WM = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM capacity adjusted by age (younger: slightly higher effective capacity; older: slightly lower)
+        # We do not add extra parameters for age; we use a principled adjustment.
+        K_eff = max(1.0, K + (1.0 if is_older == 0 else -1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # Skip invalid/missed trials from the likelihood and updates except for passive decay
+            invalid = (a < 0) or (a >= nA) or (r < 0)
+
+            # Compute RL policy
+            Q_s = Q[s, :]
+            # Numerically stable softmax probability for chosen action:
+            if not invalid:
+                z = Q_s - np.max(Q_s)
+                expz = np.exp(beta * z)
+                p_rl = expz[a] / np.sum(expz)
+            else:
+                p_rl = 1.0 / nA  # unused; placeholder
+
+            # WM decay toward uniform each trial
+            WM[s, :] = (1.0 - (1.0 - phi) * 0.0) * WM[s, :]  # no per-trial global decay term across all states
+            # Apply a small passive decay toward uniform for the current state (dependent on set size)
+            # Larger sets decay faster as maintenance is harder
+            decay_strength = min(1.0, 0.05 * (nS / 3.0))
+            WM[s, :] = (1.0 - decay_strength) * WM[s, :] + decay_strength * (1.0 / nA)
+
+            # WM policy: probability of chosen action is the WM association weight for that action
+            if not invalid:
+                p_wm = max(1e-12, WM[s, a])  # ensure numerical stability
+            else:
+                p_wm = 1.0 / nA  # placeholder
+
+            # Mixture weight: declines as set size exceeds capacity; younger suffer less from set-size
+            # wm_weight = w0 * saturating capacity function
+            load_ratio = nS / max(1.0, K_eff)
+            wm_weight = w0 * (1.0 / (1.0 + (load_ratio - 1.0) * (2.0 if is_older else 1.0)))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            if not invalid:
+                # Combine policies with lapse
+                p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+                p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+                log_p += np.log(max(p_total, 1e-12))
+
+                # RL update
+                delta = r - Q_s[a]
+                Q[s, a] += alpha * delta
+
+                # WM update on rewarded trials: refresh/overwrite toward one-hot
+                # On errors, WM drifts slightly toward uniform (already applied above)
+                if r > 0:
+                    onehot = np.zeros(nA)
+                    onehot[a] = 1.0
+                    WM[s, :] = (1.0 - phi) * WM[s, :] + phi * onehot
+            else:
+                # For invalid trials, we do not update Q or WM using reward; passive decay already applied.
+                continue
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with set-size- and age-modulated learning rate plus state-conditional perseveration bias.
+    
+    Core idea:
+    - Choices follow a softmax over Q-values with an added perseveration bias toward the last action
+      taken in the current state.
+    - Learning rate decreases with set size (higher load slows learning), and is adjusted by age group.
+    - A lapse rate captures random responding; invalid trials are skipped from likelihood and updates.
+    
+    Parameters (model_parameters):
+    - alpha0: base learning rate (0..1)
+    - alpha_size: scaling of learning rate decrease per extra item beyond 3 (>=0)
+    - alpha_age: multiplicative adjustment for older group (can be negative to reduce LR for older)
+    - beta: inverse temperature for softmax; internally scaled by 10
+    - kappa: perseveration strength added to chosen action if it matches last action in state
+    - epsilon: lapse probability (0..1)
+    
+    Inputs:
+    - states: array of state indices per trial
+    - actions: array of chosen actions per trial (0,1,2). Invalid actions (<0 or >=3) are skipped.
+    - rewards: array of rewards per trial (0/1). Negative denotes invalid/missed and skipped.
+    - blocks: array of block indices per trial
+    - set_sizes: array of set sizes (3 or 6)
+    - age: array-like with a single value, participant's age
+    - model_parameters: tuple/list with parameters in the order specified above
+    
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    alpha0, alpha_size, alpha_age, beta, kappa, epsilon = model_parameters
+    beta *= 10.0
+    age_val = age[0]
+    is_older = 1 if age_val >= 45 else 0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        # Track last action per state for perseveration; initialize as -1 (none)
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Effective learning rate for this block depends on set size and age group
+        size_factor = 1.0 + alpha_size * max(0, nS - 3)
+        age_factor = 1.0 + alpha_age * is_older
+        alpha_eff = alpha0 / max(1e-6, size_factor)
+        alpha_eff *= max(0.0, age_factor)  # do not allow negative LR
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            invalid = (a < 0) or (a >= nA) or (r < 0)
+            Q_s = Q[s, :]
+
+            if not invalid:
+                # Add perseveration bonus to the previously chosen action in this state
+                bias = np.zeros(nA)
+                if last_action[s] >= 0 and last_action[s] < nA:
+                    bias[last_action[s]] += kappa
+
+                z = (Q_s + bias) - np.max(Q_s + bias)
+                expz = np.exp(beta * z)
+                p = expz[a] / np.sum(expz)
+                # Lapse mixture
+                p_total = (1.0 - epsilon) * p + epsilon * (1.0 / nA)
+                log_p += np.log(max(p_total, 1e-12))
+
+                # RL update
+                delta = r - Q_s[a]
+                Q[s, a] += alpha_eff * delta
+
+                # Update last action for perseveration
+                last_action[s] = a
+            else:
+                # Skip invalid trials (no updates, no likelihood)
+                continue
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Gated WM vs RL with asymmetric RL learning and age-sensitive WM gating.
+    
+    Core idea:
+    - A WM gate determines the probability of relying on WM vs RL each trial.
+    - WM stores the last rewarded action for each state; if none stored, WM policy is uniform.
+    - The WM gate probability declines with set size and more steeply for older participants.
+    - RL uses asymmetric learning rates for positive and negative prediction errors and includes forgetting.
+    
+    Parameters (model_parameters):
+    - alpha_pos: RL learning rate for positive PE (0..1)
+    - alpha_neg: RL learning rate for negative PE (0..1)
+    - beta: inverse temperature for RL softmax; internally scaled by 10
+    - gate0: baseline WM gate probability at set size 3 (0..1)
+    - gate_size: slope controlling how gate decreases with set size (>0 means stronger decline)
+    - forget: RL forgetting rate toward 0 each time the state is visited (0..1)
+    
+    Inputs:
+    - states: array of state indices per trial
+    - actions: array of chosen actions per trial (0,1,2). Invalid actions (<0 or >=3) are skipped.
+    - rewards: array of rewards per trial (0/1). Negative denotes invalid/missed and skipped.
+    - blocks: array of block indices per trial
+    - set_sizes: array of set sizes (3 or 6)
+    - age: array-like with a single value, participant's age
+    - model_parameters: tuple/list with parameters in the order specified above
+    
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    alpha_pos, alpha_neg, beta, gate0, gate_size, forget = model_parameters
+    beta *= 10.0
+    age_val = age[0]
+    is_older = 1 if age_val >= 45 else 0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        Q = np.zeros((nS, nA))
+        # WM store: -1 indicates no stored rewarded action yet for that state
+        wm_store = -1 * np.ones(nS, dtype=int)
+
+        # Gate probability depends on set size and age
+        # Older participants have a stronger decline with set size.
+        size_factor = max(0, nS - 3)
+        age_mult = 1.5 if is_older else 1.0
+        gate = gate0 / (1.0 + gate_size * age_mult * size_factor)
+        gate = np.clip(gate, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            invalid = (a < 0) or (a >= nA) or (r < 0)
+
+            # RL policy
+            Q_s = Q[s, :]
+            if not invalid:
+                z = Q_s - np.max(Q_s)
+                expz = np.exp(beta * z)
+                p_rl = expz[a] / np.sum(expz)
+            else:
+                p_rl = 1.0 / nA  # placeholder
+
+            # WM policy: if we have a stored rewarded action for this state, pick it deterministically
+            if wm_store[s] >= 0 and wm_store[s] < nA:
+                p_wm = 1.0 if (not invalid and a == wm_store[s]) else (0.0 if not invalid else 1.0 / nA)
+            else:
+                # No stored association: WM behaves uniformly
+                p_wm = 1.0 / nA if not invalid else 1.0 / nA
+
+            if not invalid:
+                p_total = gate * p_wm + (1.0 - gate) * p_rl
+                p_total = max(p_total, 1e-12)
+                log_p += np.log(p_total)
+
+                # RL forgetting toward 0 on each visit to the state
+                Q[s, :] *= (1.0 - forget)
+
+                # RL update with asymmetric learning rates
+                pe = r - Q_s[a]
+                lr = alpha_pos if pe >= 0 else alpha_neg
+                Q[s, a] += lr * pe
+
+                # WM store update only on rewarded outcomes
+                if r > 0:
+                    wm_store[s] = a
+            else:
+                continue
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

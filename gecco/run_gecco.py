@@ -186,6 +186,15 @@ class GeCCoModelSearch:
                         )
                         with open(best_model_file, "w") as f:
                             f.write(func_code)
+                        
+                        # save best model bic
+                        best_bic_file = (
+                            self.results_dir / "bics" / f"best_bic_{run_idx}.json"
+                            if self.cfg.evaluation.fit_type != "individual"
+                            else self.results_dir / "bics" / f"best_bic_{run_idx}_participant{self.df.participant[0]}.json"
+                        )
+                        with open(best_bic_file, "w") as f:
+                            json.dump({"bic": mean_metric}, f)
 
                     # ✅ stop if ANY model beats baseline
                     if baseline_bic is not None and mean_metric < baseline_bic:

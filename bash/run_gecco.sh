@@ -6,12 +6,12 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --gres=gpu:1
 #SBATCH --mem=400G
-#SBATCH -t 12:00:00
-#SBATCH -c 64
+#SBATCH -t 04:00:00
+#SBATCH -c 32
 #SBATCH --mail-user=akshay.jagadish@princeton.edu
 
 cd ~/gecco-1/
 module purge
 module load anaconda3/2025.12 
 conda activate gecco
-python scripts/two_step_group_metadata_stai.py
+python scripts/two_step_individual_stai_class.py

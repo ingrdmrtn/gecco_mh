@@ -24,7 +24,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     )
 
     if fit_type == "individual":
-        individual_variability_feature = cfg.metadata.individual_feature
+        individual_variability_feature = cfg.individual_difference.individual_feature
         if individual_variability_feature == "None":
             individual_variability_section = ""
         else:

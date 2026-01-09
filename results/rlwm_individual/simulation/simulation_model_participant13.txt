@@ -1,121 +1,90 @@
-def simulate_model(stimulus, blocks, set_sizes, correct_answer, age, parameters):
+def simulate_model(stimulus, blocks, set_sizes, correct_answer, parameters):
     """
-    Simulate choices and rewards using the Actor-Critic Go/NoGo model with:
-    - separate Go/NoGo channels
-    - age-modulated NoGo learning (older >= 45)
-    - set-size-scaled learning rate
-    - choice inertia bias
-    - softmax policy with lapse
+    Simulate choices and rewards using:
+      - RL: tabular Q-learning with softmax; Q-values globally forget toward uniform.
+      - WM: one-shot storage upon reward; competitive decay scales up with set size (interference).
+      - Mixture: constant wm_weight scaled down by interference from set size.
 
-    Inputs
-    - stimulus: array-like, state identity per trial (can be arbitrary labels per block)
-    - blocks: array-like, block index per trial
-    - set_sizes: array-like, block set size per trial (e.g., 3 or 6)
-    - correct_answer: array-like, correct action per trial (0..2)
-    - age: float or array-like, participant age (older if age >= 45)
+    Inputs:
+    - stimulus: array of state indices per trial (0..nS-1 within a block)
+    - blocks: array of block index per trial
+    - set_sizes: array of set size per trial (constant within a block)
+    - correct_answer: array of correct action per trial (0..nA-1)
+    - parameters: [lr, softmax_beta, wm_weight, wm_one_shot, interference, q_forget]
 
-    Returns
-    - simulated_actions: int array, chosen action per trial (0..2)
-    - simulated_rewards: int array, reward per trial (0/1)
+    Returns:
+    - simulated_actions: array of chosen actions per trial
+    - simulated_rewards: array of binary rewards per trial
     """
+    import numpy as np
 
-    alpha_p, beta_p, nogo_age_gain_p, size_lr_scale_p, inertia_bias_p, lapse_p = parameters
-
-    # Squash/transform to working ranges as in the fitting code
-    alpha = 1.0 / (1.0 + np.exp(-alpha_p))
-    beta = (1.0 / (1.0 + np.exp(-beta_p))) * 12.0
-    lapse = (1.0 / (1.0 + np.exp(-lapse_p))) * 0.3
-    size_lr_scale = size_lr_scale_p
-    nogo_age_gain = np.exp(nogo_age_gain_p)
-    inertia_bias = inertia_bias_p
-
-    # Age group
-    age_val = float(age[0] if hasattr(age, "__len__") else age)
-    older = 1 if age_val >= 45 else 0
-    nogo_gain_eff_factor = 1.0 + (nogo_age_gain - 1.0) * older
-
-    # Setup
-    n_trials = len(stimulus)
+    lr, softmax_beta, wm_weight, wm_one_shot, interference, q_forget = parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM policy
     nA = 3
-    eps = 1e-12
 
+    n_trials = len(stimulus)
     simulated_actions = np.zeros(n_trials, dtype=int)
     simulated_rewards = np.zeros(n_trials, dtype=int)
 
-    # Iterate by block
-    unique_blocks = np.unique(blocks)
-    tr_global = 0  # index within full sequence (used for writing outputs)
+    # Iterate blocks
+    for b in np.unique(blocks):
+        block_indices = np.where(blocks == b)[0]
+        block_states = stimulus[block_indices].astype(int)
+        block_correct = correct_answer[block_indices].astype(int)
+        # Set size for this block (assumed constant within block, as in fitting code)
+        nS = int(set_sizes[block_indices][0])
 
-    for b in unique_blocks:
-        block_idx = np.where(blocks == b)[0]
-        block_states_raw = np.asarray(stimulus[block_idx])
-        block_correct = np.asarray(correct_answer[block_idx])
-        block_set_sizes = np.asarray(set_sizes[block_idx])
-        # Block set size (assumed constant within block)
-        nS = int(block_set_sizes[0])
+        # Initialize RL and WM value tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
 
-        # Remap potentially arbitrary state labels within this block to 0..nS-1
-        unique_states = np.unique(block_states_raw)
-        # If the provided set size doesn't match the number of unique states, we still remap by observed states
-        # but learning-rate scaling will use the provided nS (as in the fitting code).
-        state_to_idx = {s: i for i, s in enumerate(unique_states)}
-        nS_eff = len(unique_states)
+        # Block-level effective mixture weight and base WM decay (interference-scaled)
+        wm_weight_eff_block = wm_weight / (1.0 + interference * max(0.0, float(nS - 1)))
+        wm_weight_eff_block = np.clip(wm_weight_eff_block, 0.0, 1.0)
+        base_wm_decay = np.clip(interference * (float(nS) / 6.0), 0.0, 1.0)
 
-        # Determine per-state correct action (take the first occurrence within the block for each state)
-        state_correct_action = np.zeros(nS_eff, dtype=int)
-        for s_raw in unique_states:
-            s_m = state_to_idx[s_raw]
-            first_pos = np.where(block_states_raw == s_raw)[0][0]
-            state_correct_action[s_m] = int(block_correct[first_pos])
+        for t, tr in enumerate(block_indices):
+            s = int(block_states[t])
 
-        # Initialize Go/NoGo actor channels and critic
-        G = np.zeros((nS_eff, nA), dtype=float)
-        N = np.zeros((nS_eff, nA), dtype=float)
-        Q = np.zeros((nS_eff, nA), dtype=float)
+            # Current policies
+            Q_s = q[s, :]
+            W_s = w[s, :]
 
-        # Last action per state for inertia
-        last_action = -np.ones(nS_eff, dtype=int)
+            # RL softmax probabilities
+            q_logits = softmax_beta * (Q_s - np.max(Q_s))
+            p_rl = np.exp(q_logits)
+            p_rl /= np.sum(p_rl)
 
-        # Learning-rate scaling by set size (from model)
-        lr_scale = (3.0 / float(nS)) ** size_lr_scale
-        alpha_eff = np.clip(alpha * lr_scale, 0.0, 1.0)
+            # WM softmax probabilities
+            w_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            p_wm = np.exp(w_logits)
+            p_wm /= np.sum(p_wm)
 
-        # Simulate trial-by-trial
-        for t in range(len(block_idx)):
-            s_raw = block_states_raw[t]
-            s = state_to_idx[s_raw]
-
-            # Preferences: Go - NoGo, plus inertia for last action in this state
-            pref = G[s, :] - N[s, :]
-            if last_action[s] >= 0:
-                pref[last_action[s]] += inertia_bias
-
-            # Softmax with temperature and lapse
-            pref = pref - np.max(pref)  # stabilize
-            pi = np.exp(beta * pref)
-            pi = pi / (np.sum(pi) + eps)
-            pi = (1.0 - lapse) * pi + lapse * (1.0 / nA)
+            # Mixture policy
+            p_total = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            p_total /= np.sum(p_total)
 
             # Sample action
-            a = int(np.random.choice(nA, p=pi))
-            simulated_actions[block_idx[t]] = a
+            a = int(np.random.choice(nA, p=p_total))
+            simulated_actions[tr] = a
 
-            # Reward based on correctness
-            correct_a = state_correct_action[s]
-            r = 1 if a == correct_a else 0
-            simulated_rewards[block_idx[t]] = r
+            # Determine reward (correct if chosen action equals correct answer on this trial)
+            r = 1 if a == int(block_correct[t]) else 0
+            simulated_rewards[tr] = r
 
-            # Critic update and Actor Go/NoGo update
-            pe = r - Q[s, a]
-            Q[s, a] += alpha_eff * pe
-            if pe >= 0.0:
-                G[s, a] += alpha_eff * pe
-            else:
-                N[s, a] += alpha_eff * (-pe) * nogo_gain_eff_factor
+            # RL forgetting toward uniform, then TD update
+            q[s, :] = (1.0 - q_forget) * q[s, :] + q_forget * (1.0 / nA)
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
 
-            # Update inertia memory
-            last_action[s] = a
-
-            tr_global += 1
+            # WM competitive decay, then one-shot write on rewarded trials
+            w[s, :] = (1.0 - base_wm_decay) * w[s, :] + base_wm_decay * w_0[s, :]
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_one_shot) * w[s, :] + wm_one_shot * target
 
     return simulated_actions, simulated_rewards

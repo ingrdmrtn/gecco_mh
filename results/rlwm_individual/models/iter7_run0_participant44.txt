@@ -1,0 +1,292 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with load- and age-scaled WM temperature (precision) and decay.
+
+    Idea:
+    - RL learns Q-values with learning rate lr and softmax_beta (scaled by 10).
+    - WM stores an action-probability distribution per state (w). On reward, it sharpens toward the chosen action.
+      On non-reward, it decays toward uniform.
+    - Under higher load (set size 6) and in older adults, WM is noisier (lower inverse temperature) and forgets faster.
+    - Mixture policy: p_total = wm_weight * p_wm + (1 - wm_weight) * p_rl, with wm_weight reduced under higher load.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Baseline WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by 10)
+    - wm_temp_base: Baseline WM precision scaling (>0). Larger -> sharper WM policy.
+    - age_temp_penalty: Additional WM noise factor applied if older (>=45), increases WM temperature denominator.
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block id per trial
+    - set_sizes: set size per trial (3 or 6)
+    - age: array-like with single participant age
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_temp_base, age_temp_penalty = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # base WM precision (very deterministic if no noise)
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-dependent scalars
+        load_scale = 3.0 / float(nS)  # 1.0 for 3, 0.5 for 6 (down-weights WM under load)
+        wm_mix = np.clip(wm_weight * load_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: load- and age-adjusted effective temperature
+            # Higher nS and older age increase noise (reduce effective beta).
+            noise_scale = (nS / 3.0) * (1.0 + age_temp_penalty * older)
+            beta_wm_eff = softmax_beta_wm * (wm_temp_base / (1.0 + noise_scale))
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update
+            if r > 0.5:
+                # Sharpen WM toward chosen action, stronger when WM is precise
+                alpha_w = np.clip(0.5 * (wm_temp_base / (1.0 + noise_scale)), 0.0, 1.0)
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                w[s, :] = (1.0 - alpha_w) * W_s + alpha_w * peaked
+            else:
+                # Forget toward uniform faster under load and age
+                decay = np.clip(0.2 + 0.3 * (nS / 3.0) * (1.0 + 0.5 * older), 0.0, 1.0)
+                w[s, :] = (1.0 - decay) * W_s + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with retrieval failures and age-dependent retrieval and decay.
+
+    Idea:
+    - RL learns Q-values as usual.
+    - WM stores the last rewarded mapping per state (probability distribution). On reward, it updates to a
+      near one-hot code; on non-reward, it decays toward uniform.
+    - WM policy is subject to retrieval failure: with some probability, WM retrieval fails and defaults to uniform.
+      Retrieval failure increases with load and in older adults.
+    - Action selection is a mixture between RL and WM, with WM weight reduced under load.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Baseline WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by 10)
+    - retrieval_fail_base: Base probability scale of WM retrieval failure (>=0). Larger -> more failures.
+    - decay_base: Base decay for WM on non-reward (0..1).
+    - age_retrieval_increase: Factor increasing retrieval failure in older adults (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, retrieval_fail_base, decay_base, age_retrieval_increase = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        load_scale = 3.0 / float(nS)  # WM down-weighted under load
+        wm_mix = np.clip(wm_weight * load_scale, 0.0, 1.0)
+
+        # Retrieval failure probability increases with set size and age
+        fail_prob = np.clip(retrieval_fail_base * (nS / 3.0) * (1.0 + age_retrieval_increase * older), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with retrieval failure modeled as mixture with uniform
+            p_wm_core = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_uniform = 1.0 / nA
+            p_wm = (1.0 - fail_prob) * p_wm_core + fail_prob * p_uniform
+
+            # Mixture
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update
+            if r > 0.5:
+                # One-shot strengthening toward chosen action
+                alpha_w = 0.8  # strong binding on reward
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                w[s, :] = (1.0 - alpha_w) * W_s + alpha_w * peaked
+            else:
+                # Decay toward uniform, stronger under load
+                decay = np.clip(decay_base * (nS / 3.0) * (1.0 + 0.5 * older), 0.0, 1.0)
+                w[s, :] = (1.0 - decay) * W_s + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with proactive interference (confusability) that grows with load and age.
+
+    Idea:
+    - RL learns Q-values with standard softmax.
+    - WM stores per-state action distributions, but before using WM for choice, the distribution is contaminated by
+      the average WM distribution of other states (interference).
+      Interference increases with set size and with older age.
+    - WM is down-weighted under high load in the arbitration mixture.
+    - WM updates toward one-hot on reward, and gently forgets on non-reward.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Baseline WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by 10)
+    - confusability_base: Base interference strength (0..1), scales with load
+    - age_confusability_gain: Additional multiplicative increase in interference for older adults (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, confusability_base, age_confusability_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        load_scale = 3.0 / float(nS)
+        wm_mix = np.clip(wm_weight * load_scale, 0.0, 1.0)
+
+        # Interference coefficient increases with load and age
+        confusability = np.clip(confusability_base * (nS / 3.0) * (1.0 + age_confusability_gain * older), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+
+            # Compute interference-contaminated WM distribution for the current state
+            if nS > 1:
+                # Mean of other states
+                others = [i for i in range(nS) if i != s]
+                W_mean = np.mean(w[others, :], axis=0) if len(others) > 0 else w[s, :].copy()
+            else:
+                W_mean = w[s, :].copy()
+
+            W_s_clean = w[s, :].copy()
+            W_s_eff = (1.0 - confusability) * W_s_clean + confusability * W_mean
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy using interfered distribution
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s_eff - W_s_eff[a])))
+
+            # Mixture
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update
+            if r > 0.5:
+                alpha_w = 0.6
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                w[s, :] = (1.0 - alpha_w) * W_s_clean + alpha_w * peaked
+            else:
+                decay = 0.25 * (nS / 3.0) * (1.0 + 0.5 * older)
+                decay = np.clip(decay, 0.0, 1.0)
+                w[s, :] = (1.0 - decay) * W_s_clean + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

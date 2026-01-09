@@ -1,0 +1,312 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with age- and load-modulated lapse and WM engagement.
+
+    Idea:
+    - RL updates Q-values with learning rate lr.
+    - WM stores a probabilistic policy per state that becomes peaked on rewarded actions, 
+      but lapses/decays toward uniform as a function of cognitive load (set size) and age.
+    - Arbitration mixes WM and RL policies. WM contribution decreases with set size (load) 
+      and increases with lower lapse. Older adults have both higher lapse and reduced WM weight.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: baseline WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature; internally scaled by 10
+    - lapse_base: base lapse/forgetting rate for WM (0..1)
+    - older_lapse_gain: multiplier increasing lapse when older (>=0)
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block id per trial
+    - set_sizes: set size per trial (3 or 6)
+    - age: array-like with single participant age
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, lapse_base, older_lapse_gain = model_parameters
+    softmax_beta *= 10.0  # higher upper bound per template
+    softmax_beta_wm = 50.0  # very deterministic WM policy
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (softmax over WM distribution)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Load- and age-modulated WM mixture with lapse
+            load_scale = 3.0 / float(nS)  # 1 for set=3, 0.5 for set=6
+            lapse_t = np.clip(lapse_base * (nS / 3.0) * (1.0 + older_lapse_gain * older), 0.0, 1.0)
+            wm_mix = wm_weight * load_scale * (1.0 - 0.4 * older) * (1.0 - lapse_t)
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update: toward one-hot on reward, lapsing toward uniform otherwise
+            if r > 0.5:
+                alpha_w = np.clip(1.0 - lapse_t, 0.0, 1.0)
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                w[s, :] = (1.0 - alpha_w) * W_s + alpha_w * peaked
+            else:
+                # Lapse/decay to uniform; greater under higher load and for older adults
+                decay = lapse_t
+                w[s, :] = (1.0 - decay) * W_s + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with reliability-based arbitration and age-modulated temperature.
+
+    Idea:
+    - RL updates Q-values with rate lr; older adults have reduced effective temperature (more noise).
+    - WM stores a probability distribution per state that is sharpened by reward and mildly decays otherwise.
+    - Arbitration weight is dynamic, based on running reliability of RL vs WM on that state.
+      Reliability updated by a delta rule comparing predicted choice probability with outcome.
+    - WM and RL reliabilities compete to determine mixture.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature base; internally scaled by 10 and reduced by age penalty
+    - wm_weight_base: baseline WM weighting factor (0..1)
+    - reliability_lr: learning rate for updating reliabilities (0..1)
+    - older_temp_penalty: scales reduction of temperature for older adults (0..1)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays per trial
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, reliability_lr, older_temp_penalty = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize values and reliabilities
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        rel_rl = 0.5 * np.ones(nS)
+        rel_wm = 0.5 * np.ones(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # Age-modulated RL temperature
+            beta_eff = softmax_beta * (1.0 - older_temp_penalty * older)
+            beta_eff = max(beta_eff, 1e-3)
+
+            # RL and WM policies
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Reliability-based arbitration, scaled by load
+            load_scale = 3.0 / float(nS)
+            # Convert reliabilities to a mixing proportion
+            rel_total = rel_wm[s] + rel_rl[s] + eps
+            wm_rel_share = rel_wm[s] / rel_total
+            wm_mix = np.clip(wm_weight_base * load_scale * wm_rel_share, 0.0, 1.0)
+
+            # Mixture and likelihood
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update: reward sharpens, otherwise mild decay influenced by load and age
+            if r > 0.5:
+                alpha_w = 0.7  # fast sharpening
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                w[s, :] = (1.0 - alpha_w) * W_s + alpha_w * peaked
+            else:
+                decay = 0.1 + 0.3 * (nS - 3) / 3.0 + 0.3 * older * older_temp_penalty
+                decay = np.clip(decay, 0.0, 1.0)
+                w[s, :] = (1.0 - decay) * W_s + decay * w_0[s, :]
+
+            # Update reliabilities based on prediction quality for the chosen action
+            # Treat r as the "success" and p as predicted success likelihood for selected policy
+            rel_rl[s] += reliability_lr * (r - p_rl)
+            rel_wm[s] += reliability_lr * (r - p_wm)
+            rel_rl[s] = np.clip(rel_rl[s], 0.0, 1.0)
+            rel_wm[s] = np.clip(rel_wm[s], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning rates + WM with interference, age- and load-modulated.
+
+    Idea:
+    - RL has separate learning rates for positive vs negative prediction errors.
+    - WM stores action tendencies per state that are sharpened by reward and inhibited on non-reward.
+    - WM suffers interference (blurring toward uniform) that increases with set size and more so in older adults.
+    - Arbitration mixes WM and RL with reduced WM reliance under higher load and in older age.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive prediction errors (0..1)
+    - lr_neg: RL learning rate for negative prediction errors (0..1)
+    - softmax_beta: RL inverse temperature; internally scaled by 10
+    - wm_weight_base: baseline WM mixture weight (0..1)
+    - interference_base: base WM interference rate (0..1)
+    - age_interf_gain: gain on interference for older adults (>=0)
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block id per trial
+    - set_sizes: set size per trial (3 or 6)
+    - age: array-like with single participant age
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, wm_weight_base, interference_base, age_interf_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age = age[0]
+    older = 1.0 if age >= 45 else 0.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Interference rate depends on load and age
+        gamma_interf = np.clip(interference_base * (nS / 3.0) * (1.0 + age_interf_gain * older), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration: WM weight reduced by load and age
+            load_scale = 3.0 / float(nS)
+            wm_mix = np.clip(wm_weight_base * load_scale * (1.0 - 0.5 * older), 0.0, 1.0)
+
+            # Mixture
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - q[s, a]
+            lr_eff = lr_pos if pe >= 0.0 else lr_neg
+            q[s, a] += lr_eff * pe
+
+            # WM update:
+            if r > 0.5:
+                # Sharpen toward chosen action
+                alpha_w = 1.0 - gamma_interf
+                peaked = (1.0 / nA) * np.ones(nA)
+                peaked[a] = 1.0
+                peaked /= np.sum(peaked)
+                new_W = (1.0 - alpha_w) * W_s + alpha_w * peaked
+                # Apply interference blur toward uniform
+                w[s, :] = (1.0 - gamma_interf) * new_W + gamma_interf * w_0[s, :]
+            else:
+                # Inhibit the chosen action and redistribute mass to others; then apply interference
+                eta = 0.5 * (1.0 - gamma_interf)  # inhibition strength
+                inhibited = W_s.copy()
+                drop = eta * inhibited[a]
+                inhibited[a] = (1.0 - eta) * inhibited[a]
+                # redistribute drop equally to other actions
+                for aa in range(nA):
+                    if aa != a:
+                        inhibited[aa] += drop / (nA - 1)
+                # Normalize to guard against drift
+                inhibited = np.maximum(inhibited, eps)
+                inhibited = inhibited / np.sum(inhibited)
+                w[s, :] = (1.0 - gamma_interf) * inhibited + gamma_interf * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

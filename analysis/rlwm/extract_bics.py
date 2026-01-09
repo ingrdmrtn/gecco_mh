@@ -7,7 +7,7 @@ from gecco.prepare_data.io import load_data, split_by_participant
 
 
 project_root = Path(__file__).resolve().parents[2]
-cfg = load_config(project_root / "config" / "rlwm_individual_age.yaml")
+cfg = load_config(project_root / "config" / "rlwm_individual.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -20,7 +20,7 @@ results_dir = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit
 young_participants = list(df[df.age < 45].participant.unique()[:15])
 old_participants = list(df[df.age > 45].participant.unique()[:15])
 all_participants = young_participants + old_participants
-
+all_participants = all_participants[:10]
 
 gecco_bics = []
 baseline_bics = []
@@ -65,7 +65,7 @@ for p in all_participants:
 
 
 gecco_individual_bics = pd.DataFrame({'bic':gecco_bics})
-gecco_individual_bics.to_csv('individual_age_bics.csv')
+gecco_individual_bics.to_csv('individual_bics.csv')
 
 baseline_bics_df = pd.DataFrame({'bic':baseline_bics})
 baseline_bics_df.to_csv('baseline_bics.csv')

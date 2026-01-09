@@ -1,3 +1,4 @@
+import numpy as np
 def build_prompt(cfg, data_text, data, feedback_text=None):
     """
     Construct the structured LLM prompt for cognitive model generation.
@@ -24,13 +25,13 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     )
 
     if fit_type == "individual":
-        individual_variability_feature = cfg.individual_difference.individual_feature
+        individual_variability_feature = cfg.metadata.individual_difference
         if individual_variability_feature == "None":
             individual_variability_section = ""
         else:
 
-            individual_variability_feature = data[individual_variability_feature][0].item()
-            individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
+            individual_variability_feature = np.array(data[individual_variability_feature])[0]
+            individual_variability_section = cfg.metadata.description.format(individual_feature = individual_variability_feature)
     else:
         individual_variability_section = ""
 

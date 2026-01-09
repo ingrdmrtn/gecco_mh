@@ -1,0 +1,285 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with entropy-gated arbitration and value decay + load-sensitive WM precision.
+
+    Idea:
+    - Decisions are a mixture of a slow RL system and a fast WM system.
+    - Arbitration weight for WM increases when RL is uncertain (high entropy) and WM is certain (low entropy).
+    - RL values decay slightly toward uniform each trial (captures forgetting/interference).
+    - WM has high precision but suffers under higher set size (lower effective softmax inverse temperature).
+
+    Parameters:
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: wm_weight_base (float in [0,1]) Base weight on WM policy before arbitration.
+    - model_parameters[2]: softmax_beta (float >= 0) RL inverse temperature (internally scaled by 10).
+    - model_parameters[3]: wm_beta_base (float >= 0) Base WM inverse temperature scale (multiplies a fixed large beta).
+    - model_parameters[4]: uncert_slope (float) Slope for entropy-based arbitration; larger favors WM when RL uncertain.
+    - model_parameters[5]: decay_Q (float in [0,1]) Per-trial RL value decay toward uniform (forgetting/interference).
+
+    Returns:
+    - Negative log-likelihood of the observed actions.
+    """
+    lr, wm_weight_base, softmax_beta, wm_beta_base, uncert_slope, decay_Q = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm_base = 50.0  # very deterministic baseline
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-sensitive WM precision: larger set size reduces WM beta
+        wm_beta = wm_beta_base * softmax_beta_wm_base / (1.0 + (nS - 1))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :].copy()
+            p_wm = 1.0 / np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+
+            # Entropy-gated arbitration:
+            # Compute full RL and WM choice distributions to estimate certainty (entropy)
+            # RL distribution
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_exp = np.exp(rl_logits)
+            rl_probs = rl_exp / np.sum(rl_exp)
+            # WM distribution
+            wm_logits = wm_beta * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            wm_probs = wm_exp / np.sum(wm_exp)
+
+            # Entropies (Shannon)
+            eps = 1e-12
+            H_rl = -np.sum(rl_probs * np.log(rl_probs + eps))
+            H_wm = -np.sum(wm_probs * np.log(wm_probs + eps))
+
+            # Arbitration weight bounded in [0,1] via sigmoid
+            arb_signal = wm_weight_base + uncert_slope * (H_rl - H_wm)
+            wm_weight = 1.0 / (1.0 + np.exp(-arb_signal))
+
+            # Mixture policy
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update with decay toward uniform
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            # Apply small global decay toward uniform for this state
+            q[s, :] = (1.0 - decay_Q) * q[s, :] + decay_Q * (1.0 / nA)
+
+            # WM updating: rewarded outcomes overwrite strongly, non-reward relax toward baseline
+            if r > 0.5:
+                tiny = 1e-6
+                w[s, :] = tiny
+                w[s, a] = 1.0 - (nA - 1) * tiny
+            else:
+                relax = 0.05
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with small eligibility trace and episodic WM: last rewarded pair store with confusability.
+
+    Idea:
+    - RL updates chosen state-action; also includes a light generalization to same state (eligibility on that SA only).
+    - WM stores the most recent rewarded action per state with replacement probability; under larger sets,
+      WM is confusable across states: the retrieved WM for state s is blended with other states' WM with strength chi.
+    - Mixture of RL and WM is controlled by a fixed weight; include small global lapse to uniform.
+
+    Parameters:
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: softmax_beta (float >= 0) RL inverse temperature (internally scaled by 10).
+    - model_parameters[2]: wm_weight_base (float in [0,1]) Fixed WM mixture weight.
+    - model_parameters[3]: chi (float in [0,1]) WM confusability strength across states; increases with set size naturally.
+    - model_parameters[4]: wm_replace_prob (float in [0,1]) Probability to replace WM entry on rewarded trials.
+    - model_parameters[5]: lapse (float in [0,1]) Global lapse probability to choose uniformly at random.
+
+    Returns:
+    - Negative log-likelihood of the observed actions.
+    """
+    lr, softmax_beta, wm_weight_base, chi, wm_replace_prob, lapse = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Episodic WM will encode a peaked distribution per state when rewarded
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Construct confusable WM for current state:
+            # Blend the target state's WM with the average of other states using chi.
+            if nS > 1:
+                others = [i for i in range(nS) if i != s]
+                mean_other = np.mean(w[others, :], axis=0)
+                W_eff_s = (1.0 - chi) * w[s, :] + chi * mean_other
+            else:
+                W_eff_s = w[s, :]
+
+            p_wm_clean = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_eff_s - W_eff_s[a])))
+
+            # Mixture with fixed weight and global lapse
+            p_mix = wm_weight_base * p_wm_clean + (1.0 - wm_weight_base) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update (no global decay; simple TD)
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: on reward, with probability wm_replace_prob, overwrite to peaked; else light relaxation
+            if r > 0.5:
+                # stochastic replacement modeled deterministically via expected update strength
+                rep = wm_replace_prob
+                peaked = np.full(nA, 1e-6)
+                peaked[a] = 1.0 - (nA - 1) * 1e-6
+                w[s, :] = (1.0 - rep) * w[s, :] + rep * peaked
+            else:
+                # relax toward uniform baseline
+                relax = 0.05
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    PE-gated WM updating with load-modulated arbitration and WM decay; standard RL.
+
+    Idea:
+    - RL does standard TD learning.
+    - WM updates are gated by the magnitude of positive prediction errors: large positive surprise writes to WM.
+      Negative or small PE produce only decay toward baseline.
+    - Arbitration weight declines with set size (load), but is boosted by recent success encoded in WM certainty.
+    - WM decays per trial toward uniform with a rate parameter.
+
+    Parameters:
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: softmax_beta (float >= 0) RL inverse temperature (internally scaled by 10).
+    - model_parameters[2]: wm_weight_0 (float in [0,1]) Base WM weight at minimal load.
+    - model_parameters[3]: pe_gate (float >= 0) Sensitivity of WM gating to positive PE magnitude.
+    - model_parameters[4]: load_gain (float >= 0) Strength by which larger set sizes reduce WM weight.
+    - model_parameters[5]: wm_decay (float in [0,1]) Per-trial decay of WM toward uniform baseline.
+
+    Returns:
+    - Negative log-likelihood of the observed actions.
+    """
+    lr, softmax_beta, wm_weight_0, pe_gate, load_gain, wm_decay = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-based baseline WM weight reduction
+        base_wm_weight = 1.0 / (1.0 + load_gain * max(0, nS - 1))
+        base_wm_weight *= wm_weight_0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy from current w
+            W_s = w[s, :].copy()
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute WM certainty (low entropy -> higher certainty) to modulate arbitration
+            wm_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            eps = 1e-12
+            H_wm = -np.sum(wm_probs * np.log(wm_probs + eps))
+            certainty = 1.0 - (H_wm / np.log(nA))  # in [0,1]
+
+            wm_weight = np.clip(base_wm_weight * (1.0 + certainty), 0.0, 1.0)
+
+            # Mixture policy
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay each trial for the current state
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            # PE-gated WM strengthening on positive surprise
+            if delta > 0.0 and r > 0.5:
+                gate = 1.0 - np.exp(-pe_gate * delta)
+                peaked = np.full(nA, 1e-6)
+                peaked[a] = 1.0 - (nA - 1) * 1e-6
+                w[s, :] = (1.0 - gate) * w[s, :] + gate * peaked
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

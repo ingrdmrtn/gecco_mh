@@ -1,6 +1,6 @@
 
 import os, sys, re, glob, numpy as np, pandas as pd
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from pathlib import Path
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant, parse_split
@@ -11,11 +11,12 @@ from gecco.utils import *
 import matplotlib.pyplot as plt
 
 
-project_root = Path(__file__).resolve().parents[1]
-cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata_stai.yaml")
+# project_root = Path(__file__).resolve().parents[1]
+project_root = Path('/home/aj9225/gecco-1')
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini2.5pro.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
-participants = parse_split(cfg.data.splits.eval, df.participant.unique().tolist())
+participants = df.participant.unique()
 
 
 def compute_stay_probabilities(choice_1, state, reward):
@@ -59,7 +60,7 @@ p_stay = {'prob_stay_common_rewarded':[],
           'prob_stay_common_not_rewarded':[],
           'prob_stay_rare_not_rewarded':[]}
 
-for idx, p in enumerate(participants):
+for idx, p in enumerate(participants[18:]):
 
     print(p)
     df_participant = df[df.participant==p].reset_index()

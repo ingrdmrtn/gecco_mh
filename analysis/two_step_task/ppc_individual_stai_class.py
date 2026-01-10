@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 # project_root = Path(__file__).resolve().parents[1]
 # hard code project root for analysis scripts
 project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini2.5pro.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -23,7 +23,7 @@ metric_map = {"AIC": _aic, "BIC": _bic}
 metric_func = metric_map.get(metric_name, _bic)
 
 best_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/models/'
-best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/models/simulation/'
+best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/simulation/'
 simulation_columns  = cfg.data.simulation_columns
 
 p_stay = {'prob_stay_common_rewarded':[],
@@ -90,7 +90,9 @@ for p in participants[18:]:
     participant_model = participant_model.read()    
     participant_simulation_model = open(f'{best_simulated_models}simulation_model_participant{p}.txt', 'r')
     participant_simulation_model = participant_simulation_model.read()
-    participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
+    participant_simulation_model = re.search(r"```(?:\s*python)?\s*(.*?)```", participant_simulation_model, flags=re.DOTALL | re.IGNORECASE)
+    participant_simulation_model = participant_simulation_model.group(1) if participant_simulation_model else ModelClass
+    # participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
     
 
 
@@ -126,7 +128,7 @@ for p in participants[18:]:
 
 
 ppcs = pd.DataFrame(p_stay)
-ppcs.to_csv(f'ppcs_individual_{cfg.task.name}_{cfg.evaluation.fit_type}.csv')
+ppcs.to_csv(project_root / "analysis/two_step_task" / f'ppcs_individual_{cfg.task.name}_{cfg.evaluation.fit_type}.csv')
 
 
 
@@ -138,7 +140,7 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
 
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig(f'ppcs_individual_{cfg.task.name}_{cfg.evaluation.fit_type}.png')
+figure.savefig(project_root / "analysis/two_step_task" / f'ppcs_individual_{cfg.task.name}_{cfg.evaluation.fit_type}.png')
 
 print('stop')
 

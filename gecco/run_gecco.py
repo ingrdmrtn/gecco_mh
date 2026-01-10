@@ -88,13 +88,25 @@ class GeCCoModelSearch:
                 f"(reasoning={reasoning_effort})"
             )
 
+            config_args = {
+                "temperature": self.cfg.llm.temperature,
+                "system_instruction": self.cfg.llm.system_prompt,
+            }
+
+            if reasoning_effort:
+                assert reasoning_effort in ["low", "medium", "high"], \
+                    f"Invalid reasoning_effort: {reasoning_effort}. Choose from 'low', 'medium', 'high', or False."
+                assert "flash" not in self.cfg.llm.base_model.lower(), \
+                    "Reasoning effort is not supported for Gemini Flash models."
+                config_args["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=reasoning_effort
+                )
+
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                       temperature=self.cfg.llm.temperature,
-                       system_instruction=self.cfg.llm.system_prompt,
-                       thinking_config=types.ThinkingConfig(thinking_level=reasoning_effort),
+                    **config_args
                 )
             )
             decoded = resp.text.strip()

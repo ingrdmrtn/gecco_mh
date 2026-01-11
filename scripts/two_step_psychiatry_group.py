@@ -73,7 +73,7 @@ def main():
 
             simulation_prompt_text = simulation_prompt(
                 best_model,
-                cfg.llm.simulation_template,
+                cfg,
             )
             simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
             simulation_dir = search.results_dir / "simulation"
@@ -81,12 +81,6 @@ def main():
             simulation_file = simulation_dir / f"simulation_model_run{r}.txt"
             with open(simulation_file, "w") as f:
                 f.write(simulation_text)
-   
-        results_dir = search.results_dir
-        best_model_file = results_dir / "models" / f"best_model_run{r}.txt"
-        with open(best_model_file, "r") as f:
-            best_model = f.read()
-            
         # fit the best model to test data: (1) report BIC, (2) save best params, (3) save simulation
         print("\n Fitting best model to test data...")
         try:

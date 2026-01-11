@@ -72,7 +72,7 @@ def compute_stay_probabilities(choice_1, state, reward):
 
 
 
-for p in participants:
+for p in participants[14:]:
 
     print(p)
     df_participant = df[df.participant==p].reset_index()
@@ -126,7 +126,8 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title('GeCCo Individual with STAI (function) - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
 figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_individual_stai.png')

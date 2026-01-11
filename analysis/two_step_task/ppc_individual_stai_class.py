@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 # project_root = Path(__file__).resolve().parents[1]
 # hard code project root for analysis scripts
 project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini2.5pro.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -73,7 +73,7 @@ def compute_stay_probabilities(choice_1, state, reward):
 
 
 
-for p in participants[18:]:
+for p in participants[14:]:
 
     print(p)
     df_participant = df[df.participant==p].reset_index()
@@ -137,7 +137,8 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title('GeCCo Individual with STAI (Class) - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
 figure.savefig(project_root / "analysis/two_step_task" / f'ppcs_individual_{cfg.task.name}_{cfg.evaluation.fit_type}.png')

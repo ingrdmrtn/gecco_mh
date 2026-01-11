@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini2.5pro.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini-2.5-pro.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -60,7 +60,7 @@ p_stay = {'prob_stay_common_rewarded':[],
           'prob_stay_common_not_rewarded':[],
           'prob_stay_rare_not_rewarded':[]}
 
-for idx, p in enumerate(participants[18:]):
+for idx, p in enumerate(participants[14:]):
 
     print(p)
     df_participant = df[df.participant==p].reset_index()
@@ -89,7 +89,7 @@ for idx, p in enumerate(participants[18:]):
 
 
 ppcs = pd.DataFrame(p_stay)
-ppcs.to_csv('ppcs_humans.csv')
+ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_humans.csv')
 
 
 
@@ -98,9 +98,10 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title('Humans - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig('ppcs_humans.png')
+figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_humans.png')
 
 print('stop')

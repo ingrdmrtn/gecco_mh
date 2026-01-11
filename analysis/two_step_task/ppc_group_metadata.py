@@ -127,7 +127,8 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title('GeCCo Group w/ STAI as metadata (Function) - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
 figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_group_metadata.png')

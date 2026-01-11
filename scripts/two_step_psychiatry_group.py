@@ -81,6 +81,7 @@ def main():
             simulation_file = simulation_dir / f"simulation_model_run{r}.txt"
             with open(simulation_file, "w") as f:
                 f.write(simulation_text)
+    
         # fit the best model to test data: (1) report BIC, (2) save best params, (3) save simulation
         print("\n Fitting best model to test data...")
         try:
@@ -94,6 +95,8 @@ def main():
             print(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
             
             # save best model bic
+            results_dir = search.results_dir
+            results_dir.mkdir(parents=True, exist_ok=True)
             best_bic_file = (
                 results_dir / "bics" / f"best_bic_on_test_run{r}.json"
             )

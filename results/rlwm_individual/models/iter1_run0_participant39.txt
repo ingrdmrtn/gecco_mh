@@ -1,0 +1,343 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture with recency-weighted WM and per-state perseveration.
+
+    Mechanisms
+    - RL: standard delta rule with softmax.
+    - WM: stores recently rewarded action for each state; effective WM trace decays
+      with time-since-last-visit (recency) within a block.
+    - Arbitration: fixed WM weight but WM precision declines with set size.
+    - Perseveration: within each state, a bias to repeat the most recent action.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within a block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within a block).
+    model_parameters : tuple/list of 6 floats
+        lr : RL learning rate in [0,1].
+        wm_weight : Mixture weight for WM in [0,1] (blockwise constant).
+        softmax_beta : Base inverse temperature for RL (rescaled internally by *10).
+        wm_recency_lambda : Recency retention parameter in [0,1]; WM decays as lambda^dt.
+        perseveration_kappa : Strength added to the last-chosen action within a state (>=0).
+        wm_beta_scale : Scale in (0,1]; WM precision scales as (wm_beta_scale)^(nS-1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_recency_lambda, perseveration_kappa, wm_beta_scale = model_parameters
+    softmax_beta *= 10  # higher upper bound as in template
+    softmax_beta_wm = 50  # base deterministic WM policy
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # For recency and perseveration
+        last_seen = -1 * np.ones(nS, dtype=int)  # last trial index per state
+        prev_action = -1 * np.ones(nS, dtype=int)
+
+        # WM precision decreases with set size
+        beta_wm_eff = softmax_beta_wm * (max(1e-6, wm_beta_scale) ** max(0, nS - 1))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+
+            # Add perseveration bias to RL values for the last chosen action within this state.
+            if prev_action[s] >= 0:
+                Q_s[prev_action[s]] += perseveration_kappa
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Recency-weighted WM trace for the currently visited state
+            if last_seen[s] >= 0:
+                dt = t - last_seen[s]
+                rec = (wm_recency_lambda ** dt)
+                W_s_eff = rec * w[s, :] + (1.0 - rec) * w_0[s, :]
+            else:
+                W_s_eff = w[s, :]
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s_eff - W_s_eff[a])))
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s][a]
+            q[s][a] += lr * delta
+
+            # WM update: reward installs/boosts a crisp one-hot memory; no-reward decays towards uniform slightly via recency at next access
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot  # store the correct mapping strongly
+
+            # Book-keeping
+            last_seen[s] = t
+            prev_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM with entropy-gated arbitration and set-size scaling, plus time-since-last-visit decay of WM.
+
+    Mechanisms
+    - RL: delta rule with softmax.
+    - WM: stores rewarded action; WM decays across time since last visit to a state.
+    - Arbitration: WM weight is a squashed function of RL uncertainty (entropy of softmax over Q)
+      and is further down-weighted by set size nS^(-gamma).
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within block).
+    model_parameters : tuple/list of 6 floats
+        lr : RL learning rate in [0,1].
+        wm_base : Baseline WM weight in (0,1); transformed via logit internally.
+        wm_slope : Sensitivity of WM weight to RL entropy (can be positive or negative).
+        gamma : Load exponent >= 0; effective WM weight scales as nS^(-gamma).
+        softmax_beta : RL inverse temperature (rescaled internally by *10).
+        decay_lambda : WM retention parameter in [0,1]; WM decays as lambda^dt with time since last seen.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_base, wm_slope, gamma, softmax_beta, decay_lambda = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+
+    # helper: sigmoid
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        last_seen = -1 * np.ones(nS, dtype=int)
+
+        # Precompute load scaling
+        load_scale = (nS ** (-max(0.0, gamma)))
+
+        # Stabilize base logit
+        wm_base_c = np.clip(wm_base, 1e-5, 1 - 1e-5)
+        base_logit = np.log(wm_base_c / (1.0 - wm_base_c))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # RL softmax probabilities for entropy
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            exp_logits = np.exp(logits)
+            p_rl_vec = exp_logits / np.sum(exp_logits)
+            p_rl = p_rl_vec[a]
+
+            # Entropy of RL policy (0..log(nA)); use it to gate WM
+            entropy = -np.sum(p_rl_vec * np.log(np.clip(p_rl_vec, 1e-12, 1.0)))
+            # Map entropy to WM weight via logistic with slope
+            wm_weight_unc = sigmoid(base_logit + wm_slope * entropy)
+            wm_weight_eff = np.clip(wm_weight_unc * load_scale, 0.0, 1.0)
+
+            # WM decay by time-since-last-visit
+            if last_seen[s] >= 0:
+                dt = t - last_seen[s]
+                rec = (decay_lambda ** dt)
+                W_s_eff = rec * w[s, :] + (1.0 - rec) * w_0[s, :]
+            else:
+                W_s_eff = w[s, :]
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s_eff - W_s_eff[a])))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: reward installs one-hot; non-reward lets the trace stay (will decay on next access)
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot
+
+            last_seen[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM with interference-limited WM availability and load-dependent lapse.
+
+    Mechanisms
+    - RL: delta rule with softmax.
+    - WM: stores rewarded actions; traces suffer global interference (toward uniform).
+    - Arbitration: base WM weight is multiplicatively reduced by a factor rho^M,
+      where M = number of distinct states currently held with confident WM traces.
+    - Lapse: final choice includes an epsilon-greedy lapse that increases with set size.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within block).
+    model_parameters : tuple/list of 6 floats
+        lr : RL learning rate in [0,1].
+        wm_weight : Baseline WM mixture weight in [0,1].
+        softmax_beta : RL inverse temperature (rescaled internally by *10).
+        rho_interference : Interference parameter in (0,1); WM availability scales as rho^M and also controls decay.
+        eps_base : Baseline lapse rate in [0,1).
+        eps_slope : Increase in lapse per extra item beyond 3 (can be >=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, rho_interference, eps_base, eps_slope = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track which states are confidently stored (max prob near 1.0)
+        stored_mask = np.zeros(nS, dtype=bool)
+
+        # Lapse rate increases with load
+        eps = np.clip(eps_base + eps_slope * max(0, nS - 3), 0.0, 0.5)  # cap to keep probabilities sane
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Compute number of stored states M (based on confident WM traces)
+            M = int(np.sum(stored_mask))
+            wm_weight_eff = np.clip(wm_weight * (rho_interference ** M), 0.0, 1.0)
+
+            # WM policy (using current trace)
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+
+            # Apply lapse (epsilon-greedy)
+            p_total = (1.0 - eps) * p_mix + eps * (1.0 / nA)
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update with global interference toward uniform
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Interference-controlled consolidation: move toward one-hot but subject to interference
+                w[s, :] = rho_interference * w[s, :] + (1.0 - rho_interference) * onehot
+            else:
+                # Non-reward: interference drifts WM toward uniform
+                w[s, :] = rho_interference * w[s, :] + (1.0 - rho_interference) * w_0[s, :]
+
+            # Update stored mask based on confidence
+            stored_mask[s] = (np.max(w[s, :]) > 0.9)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

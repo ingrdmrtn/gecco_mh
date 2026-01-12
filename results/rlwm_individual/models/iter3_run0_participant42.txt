@@ -1,0 +1,328 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy- and capacity-gated WM, and WM decay.
+
+    Mechanism:
+    - RL: standard delta rule with softmax choice.
+    - WM: fast encoding toward chosen action with decay to uniform.
+    - Arbitration inside WM policy: WM policy itself is diluted toward uniform based on
+      (a) set-size capacity gating (sigmoid over set size), and
+      (b) trial-wise RL uncertainty (entropy of RL policy).
+      The effective WM policy is: p_wm_eff = g_eff * softmax(W_s) + (1 - g_eff) * uniform,
+      where g_eff = g_cap * g_uncert.
+
+    Parameters (in order):
+    - lr: RL learning rate in [0,1], also used as WM encoding gain.
+    - wm_weight: Mixture weight of WM in the final policy (0..1). This line is fixed by the template.
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_decay: Trial-wise WM decay to uniform [0,1]; higher means faster forgetting.
+    - sig_center: Center of capacity sigmoid (where WM influence is half-max as set size increases).
+    - sig_slope: Slope of capacity sigmoid; positive values reduce WM influence faster with set size.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_decay, sig_center, sig_slope = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+
+    # Clips to maintain sensible ranges
+    lr = np.clip(lr, 0.0, 1.0)
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    wm_decay = np.clip(wm_decay, 0.0, 1.0)
+    sig_slope = float(sig_slope)
+    sig_center = float(sig_center)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            # Compute RL policy over all actions for entropy
+            Q_shift = softmax_beta * (Q_s - np.max(Q_s))
+            expQ = np.exp(Q_shift)
+            p_rl_vec = expQ / np.sum(expQ)
+            p_rl = p_rl_vec[a]  # probability of chosen action
+
+            # Working memory policy: compute softmax_wm (deterministic) and then gate it
+            W_s = w[s, :]
+            W_shift = softmax_beta_wm * (W_s - np.max(W_s))
+            expW = np.exp(W_shift)
+            p_wm_soft = expW[a] / np.sum(expW)
+
+            # Capacity gating via sigmoid over set size (more states => smaller g_cap)
+            g_cap = 1.0 / (1.0 + np.exp(sig_slope * (nS - sig_center)))
+            g_cap = np.clip(g_cap, 0.0, 1.0)
+
+            # RL uncertainty gating via entropy (higher entropy => rely more on WM)
+            # Normalize entropy by log(nA) to be in [0,1]
+            entropy_rl = -np.sum(p_rl_vec * (np.log(p_rl_vec + 1e-12)))
+            g_uncert = entropy_rl / np.log(nA)
+            g_uncert = np.clip(g_uncert, 0.0, 1.0)
+
+            g_eff = g_cap * g_uncert
+            uniform_p = 1.0 / nA
+            p_wm = g_eff * p_wm_soft + (1.0 - g_eff) * uniform_p
+
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform across all states
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+            # WM encoding on the current state toward the chosen action (one-shot-like)
+            w[s, :] = (1.0 - lr) * w[s, :]
+            w[s, a] += lr
+            # Normalize and clip for numerical stability
+            w[s, :] = np.clip(w[s, :], 1e-9, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with action perseveration and power-law WM capacity scaling.
+
+    Mechanism:
+    - RL: delta rule with softmax; incorporates a perseveration bias that adds to the
+      value of the previously chosen action in the same state (choice stickiness).
+    - WM: fast encoding with learn rate eta_wm; no explicit decay, but capacity-limited:
+      WM policy is diluted toward uniform by a power-law of set size.
+      p_wm_eff = g_cap * softmax(W_s) + (1 - g_cap) * uniform, with g_cap = nS^(-pow_exp).
+
+    Parameters (in order):
+    - lr: RL learning rate in [0,1].
+    - wm_weight: Mixture weight of WM in the final policy (0..1). This line is fixed by the template.
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - pers_beta: Strength of perseveration bias added to the previous action's logit for this state.
+    - pow_exp: Exponent controlling power-law scaling of WM capacity with set size (>=0). Larger => weaker WM at large nS.
+    - eta_wm: WM encoding rate toward chosen action [0,1].
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, pers_beta, pow_exp, eta_wm = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+
+    lr = np.clip(lr, 0.0, 1.0)
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    eta_wm = np.clip(eta_wm, 0.0, 1.0)
+    pow_exp = max(0.0, float(pow_exp))
+    pers_beta = float(pers_beta)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # not used for decay here but kept for template consistency
+
+        # Track previous chosen action per state for perseveration
+        last_action = -np.ones(nS, dtype=int)
+
+        # Power-law capacity factor for WM dilution
+        g_cap = (nS ** (-pow_exp)) if nS > 0 else 1.0
+        g_cap = np.clip(g_cap, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL with perseveration bias on logits
+            Q_s = q[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += pers_beta / max(1.0, softmax_beta)  # scale so tempers with beta
+
+            Q_shift = softmax_beta * (Q_s - np.max(Q_s))
+            expQ = np.exp(Q_shift)
+            p_rl_vec = expQ / np.sum(expQ)
+            p_rl = p_rl_vec[a]
+
+            # WM policy with capacity dilution
+            W_s = w[s, :]
+            W_shift = softmax_beta_wm * (W_s - np.max(W_s))
+            expW = np.exp(W_shift)
+            p_wm_soft = expW[a] / np.sum(expW)
+            uniform_p = 1.0 / nA
+            p_wm = g_cap * p_wm_soft + (1.0 - g_cap) * uniform_p
+
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: encode toward the chosen action (no decay)
+            w[s, :] = (1.0 - eta_wm) * w[s, :]
+            w[s, a] += eta_wm
+            w[s, :] = np.clip(w[s, :], 1e-9, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+            # Update perseveration memory
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with forgetting and exploration bonus + WM success gating and overwrite.
+
+    Mechanism:
+    - RL:
+      - Delta rule with decay (forgetting) toward uniform each trial.
+      - Directed exploration bonus added to RL logits via a novelty term 1/sqrt(N_sa+1).
+      - Softmax choice; a small lapse is applied to RL probabilities before mixing.
+    - WM:
+      - Overwrite rule: if rewarded, store a near-one-hot for the chosen action in that state.
+        If not rewarded, mildly suppress that action.
+      - Success gating: the WM policy is diluted toward uniform based on a confidence signal,
+        which equals the last observed reward for the stored action in this state (1 or 0),
+        further scaled by set size: conf_eff = conf / (1 + (nS-1)).
+        p_wm_eff = conf_eff * softmax(W_s) + (1 - conf_eff) * uniform.
+
+    Parameters (in order):
+    - lr: RL learning rate in [0,1].
+    - wm_weight: Mixture weight of WM in the final policy (0..1). This line is fixed by the template.
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - phi_forget: RL forgetting rate in [0,1]; higher means faster decay toward uniform each trial.
+    - beta_explore: Weight on exploration bonus (UCB-like) added to RL logits.
+    - lapse: Lapse probability mixed into RL policy (applied to RL side before mixture).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, phi_forget, beta_explore, lapse = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+
+    lr = np.clip(lr, 0.0, 1.0)
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    phi_forget = np.clip(phi_forget, 0.0, 1.0)
+    beta_explore = float(beta_explore)
+    lapse = np.clip(lapse, 0.0, 0.5)  # keep reasonable
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track counts for UCB-like exploration
+        counts = np.zeros((nS, nA), dtype=float)
+        # Track WM confidence per state (last reward for stored action)
+        wm_conf = np.zeros(nS, dtype=float)  # in [0,1], updated after feedback
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL logits with exploration bonus
+            Q_s = q[s, :].copy()
+            bonus = beta_explore / np.sqrt(counts[s, :] + 1.0)
+            logits_rl = Q_s + bonus
+
+            # Softmax for RL
+            L_shift = softmax_beta * (logits_rl - np.max(logits_rl))
+            expL = np.exp(L_shift)
+            p_rl_vec = expL / np.sum(expL)
+            p_rl = p_rl_vec[a]
+            # Apply lapse to RL side before mixture
+            p_rl = (1.0 - lapse) * p_rl + lapse * (1.0 / nA)
+
+            # WM policy: confidence- and set-size-gated
+            W_s = w[s, :]
+            W_shift = softmax_beta_wm * (W_s - np.max(W_s))
+            expW = np.exp(W_shift)
+            p_wm_soft = expW[a] / np.sum(expW)
+            uniform_p = 1.0 / nA
+            # confidence scaled by set size (more items -> more dilution)
+            conf_eff = wm_conf[s] / (1.0 + max(0, nS - 1))
+            conf_eff = np.clip(conf_eff, 0.0, 1.0)
+            p_wm = conf_eff * p_wm_soft + (1.0 - conf_eff) * uniform_p
+
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform baseline
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+            # Global decay each trial
+            q = (1.0 - phi_forget) * q + phi_forget * (1.0 / nA)
+            # Keep Q_s bounded
+            q = np.clip(q, -10.0, 10.0)
+
+            # Update counts for exploration
+            counts[s, a] += 1.0
+
+            # WM update: overwrite if rewarded; suppress if not
+            if r > 0.5:
+                # Overwrite toward one-hot on chosen action
+                w[s, :] = 1e-6
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+                wm_conf[s] = 1.0
+            else:
+                # Mild suppression of the chosen action weight
+                w[s, a] *= 0.5
+                w[s, :] = np.clip(w[s, :], 1e-9, 1.0)
+                w[s, :] /= np.sum(w[s, :])
+                wm_conf[s] = 0.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

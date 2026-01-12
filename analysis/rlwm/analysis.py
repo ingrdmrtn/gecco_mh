@@ -1,9 +1,9 @@
 import os, sys, re, glob, numpy as np, pandas as pd, matplotlib.pyplot as plt
 
-group_bics = pd.read_csv('group_bics.csv')[:10]
-individual_age_bics = pd.read_csv('individual_age_bics.csv')[:10]
-baseline_bics = pd.read_csv('baseline_bics.csv')[:10]
-individual_bics = pd.read_csv('individual_bics.csv')[:10]
+group_bics = pd.read_csv('group_bics.csv')
+individual_age_bics = pd.read_csv('individual_age_bics.csv')
+baseline_bics = pd.read_csv('baseline_bics.csv')
+individual_bics = pd.read_csv('individual_bics.csv')
 
 
 
@@ -21,6 +21,6 @@ axis.errorbar(np.arange(4),
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['baseline','group\ngecco','individual' , 'individual\n+ age'])
 axis.set_ylabel('bic')
-axis.set_ylim([200,300])
+axis.set_ylim([240, 320])
 
 figure.savefig('bics_comparison.png')

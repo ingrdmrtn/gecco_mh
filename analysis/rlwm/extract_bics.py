@@ -20,7 +20,7 @@ results_dir = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit
 young_participants = list(df[df.age < 45].participant.unique()[:15])
 old_participants = list(df[df.age > 45].participant.unique()[:15])
 all_participants = young_participants + old_participants
-all_participants = all_participants[:10]
+# all_participants = all_participants[:18]
 
 gecco_bics = []
 baseline_bics = []

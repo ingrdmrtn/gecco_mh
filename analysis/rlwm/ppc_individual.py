@@ -44,7 +44,7 @@ param_dir = project_root / "results/rlwm_individual/parameters/"
 young_participants = list(df[df.age < 45].participant.unique()[:15])
 old_participants = list(df[df.age > 45].participant.unique()[:15])
 all_participants = young_participants + old_participants
-all_participants = all_participants[:10]
+all_participants = all_participants[:16]
 
 def learning_curves(p_df):
 
@@ -59,7 +59,7 @@ def learning_curves(p_df):
 
     for b in blocks:
 
-        print(f'participant:{p}; block:{b}')
+        # print(f'participant:{p}; block:{b}')
 
         ns = np.array(p_df[p_df.blocks == b].set_sizes)[0]
         stimulus, rewards = np.array(p_df[p_df.blocks == b].stimulus), np.array(p_df[p_df.blocks == b].rewards)
@@ -77,8 +77,11 @@ def learning_curves(p_df):
         else:
             ns6_learning_curve.append(learning_curve)
 
+
+
     participant_ns_3.append(np.nanmean(np.array(ns3_learning_curve),axis=0))
     participant_ns_6.append(np.nanmean(np.array(ns6_learning_curve),axis=0))
+
 
 
     ns3_mean = np.mean(participant_ns_3,axis=0)
@@ -102,11 +105,11 @@ for p in all_participants:
     df_participant = df[df.participant==p].reset_index()
     df_participant = df_participant[df_participant.rewards>=0].reset_index()
     df_participant = df_participant.drop(columns='level_0')
-    df_participant = df_participant[df_participant.blocks < 5].reset_index()
+    # df_participant = df_participant[df_participant.blocks < 5].reset_index()
 
 
     ns3_mean_real, ns3_sem_real, ns6_mean_real, ns6_sem_real = learning_curves(df_participant)
-    if p >= 36:
+    if p > 36:
         p_correct_ns3_old_real.append(ns3_mean_real)
         p_correct_ns6_old_real.append(ns6_mean_real)
 
@@ -118,7 +121,6 @@ for p in all_participants:
     best_parameters = pd.read_csv(f'{param_dir}/best_params_run0_participant{p}.csv')
 
 
-    # stimulus, blocks, set_sizes, correct_answer, age, parameters
     stimulus, blocks , set_sizes, correct_answer, age = (np.array(df_participant.stimulus),
                                                           np.array(df_participant.blocks),
                                                           np.array(df_participant.set_sizes),
@@ -141,26 +143,42 @@ for p in all_participants:
     simulation_pars = [best_parameters[n][0] for n in best_parameters.columns]
     #simulation_pars.append(stai)
 
-    simulated_actions, simulated_rewards  = model_func(stimulus, blocks, set_sizes, correct_answer, simulation_pars)
-    # else:
+    ns3_mean_sim_iter, ns3_sem_sim_iter, ns6_mean_sim_iter, ns6_sem_sim_iter = [],[],[],[]
+
+    for s in range(10):
+
+        simulated_actions, simulated_rewards  = model_func(stimulus, blocks, set_sizes, correct_answer, simulation_pars)
+        # else:
 
 
-    ppc_df = pd.DataFrame({'actions':simulated_actions,
-                  'rewards':simulated_rewards,
-                  'stimulus':stimulus,
-                  'correct_answer':simulated_rewards,
-                  'blocks': blocks,
-                  'set_sizes':set_sizes})
-    ns3_mean, ns3_sem, ns6_mean, ns6_sem = learning_curves(ppc_df)
+        ppc_df = pd.DataFrame({'actions':simulated_actions,
+                      'rewards':simulated_rewards,
+                      'stimulus':stimulus,
+                      'correct_answer':simulated_rewards,
+                      'blocks': blocks,
+                      'set_sizes':set_sizes})
+
+        # if p == 47:
+        #     print('stop')
+        #
+        ns3_mean, ns3_sem, ns6_mean, ns6_sem = learning_curves(ppc_df)
+
+        ns3_mean_sim_iter.append(ns3_mean)
+        ns3_sem_sim_iter.append(ns3_sem)
+        ns6_mean_sim_iter.append(ns6_mean)
+        ns6_sem_sim_iter.append(ns6_sem)
+
+
+
 
 
     if p >= 36:
-        p_correct_ns3_old.append(ns3_mean)
-        p_correct_ns6_old.append(ns6_mean)
+        p_correct_ns3_old.append(np.mean(ns3_mean_sim_iter,axis=0))
+        p_correct_ns6_old.append(np.mean(ns6_mean_sim_iter,axis=0))
 
     else:
-        p_correct_ns3_young.append(ns3_mean)
-        p_correct_ns6_young.append(ns6_mean)
+        p_correct_ns3_young.append(np.mean(ns3_mean_sim_iter,axis=0))
+        p_correct_ns6_young.append(np.mean(ns6_mean_sim_iter,axis=0))
 
 
 
@@ -189,15 +207,15 @@ axis[0].set_xlabel('stimulus iterations')
 axis[0].set_ylabel('p(correct)')
 axis[0].set_title('young')
 axis[0].set_ylim([0,1])
-
+#
 # axis[1].set_xticks(np.arange(9))
 # axis[1].set_xlabel('stimulus iterations')
 # axis[1].set_ylabel('p(correct)')
 # axis[1].set_title('old')
 # axis[1].set_ylim([0,1])
-#
+# #
 
-figure.savefig('ppcs_individual.png')
+figure.savefig('ppcs_individual_1.png')
 
 print('stop')
 
@@ -207,6 +225,8 @@ n3_old = pd.DataFrame(p_correct_ns3_old)
 n3_old.to_csv('ns3_old_individual_age.csv')
 n6_old = pd.DataFrame(p_correct_ns6_old)
 n6_old.to_csv('ns6_old_individual_age.csv')
+
+
 n3_young = pd.DataFrame(p_correct_ns3_young)
 n3_young.to_csv('ns3_young_individual_age.csv')
 n6_young = pd.DataFrame(p_correct_ns6_young)

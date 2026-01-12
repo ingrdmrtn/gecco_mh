@@ -1,0 +1,334 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and set-size-dependent WM interference.
+
+    Policy:
+    - RL: standard softmax over Q-values.
+    - WM: softmax over WM weights, but WM precision degrades with larger set sizes via an interference parameter.
+    - Arbitration: the effective WM mixture weight is larger when WM is more certain (lower entropy) than RL.
+      Specifically, eff_wm_weight = wm_weight * sigmoid((H_rl - H_wm)/arbit_tau), so when WM is sharper than RL
+      (H_wm < H_rl), WM influence increases.
+
+    WM update:
+    - Rewarded trials increase the selected action weight and normalize the row.
+    - Non-rewarded trials still update but more weakly.
+    - Global interference (leak toward uniform) is set-size dependent through wm_interference.
+
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 5
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Base mixture weight on WM (0-1), modulated by arbitration.
+        softmax_beta : float
+            RL inverse temperature (internally scaled by 10).
+        wm_interference : float
+            Strength of set-size-dependent WM interference/leak (>=0). Higher means more degradation at larger set sizes.
+        arbit_tau : float
+            Temperature of arbitration based on entropy difference; smaller values make arbitration more decisive.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, wm_interference, arbit_tau = model_parameters
+    softmax_beta *= 10.0  # per template
+    softmax_beta_wm = 50.0  # base, will be downscaled by interference
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size-dependent effective WM precision via interference
+        wm_interf_scale = 1.0 + wm_interference * max(0, nS - 3)
+        wm_beta_eff = softmax_beta_wm / wm_interf_scale
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL likelihood of chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM likelihood of chosen action
+            p_wm = 1.0 / np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+
+            # Entropy-based arbitration: compare entropies of current policies
+            # Build action probabilities for entropy computation
+            rl_probs = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            rl_probs = rl_probs / np.sum(rl_probs)
+            wm_probs = np.exp(wm_beta_eff * (W_s - np.max(W_s)))
+            wm_probs = wm_probs / np.sum(wm_probs)
+
+            H_rl = -np.sum(rl_probs * np.log(np.clip(rl_probs, eps, 1.0)))
+            H_wm = -np.sum(wm_probs * np.log(np.clip(wm_probs, eps, 1.0)))
+
+            # eff_wm_weight increases when WM is more certain than RL
+            diff = (H_rl - H_wm) / max(arbit_tau, eps)
+            eff_wm_weight = wm_weight / (1.0 + np.exp(-diff))  # sigmoid
+
+            p_total = eff_wm_weight * p_wm + (1.0 - eff_wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM global interference/leak toward uniform increases with set size
+            leak = min(1.0, 0.05 * wm_interf_scale)
+            w = (1.0 - leak) * w + leak * w_0
+
+            # WM local update: stronger after rewards, weaker otherwise
+            alpha_pos = 0.8
+            alpha_neg = 0.2
+            alpha = alpha_pos if r > 0.0 else alpha_neg
+            # Shrink row then add mass to chosen action, then renormalize
+            w[s, :] = (1.0 - alpha) * w[s, :]
+            w[s, a] += alpha
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with surprise-gated WM encoding and set-size-specific WM precision.
+
+    Policy:
+    - RL: softmax over Q-values.
+    - WM: softmax over WM weights with precision that depends on set size (distinct parameters for small and large sets).
+    - Mixture: fixed base wm_weight.
+    - Surprise-gated WM encoding: WM is updated strongly when |prediction error| exceeds a gate threshold,
+      otherwise updated weakly. This approximates selective WM storage under high surprise.
+
+    WM update:
+    - Strong update on high-surprise trials; weak otherwise.
+    - Mild global stabilization toward uniform to avoid degeneracy.
+
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 6
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Mixture weight on WM (0-1), not state-dependent.
+        softmax_beta : float
+            RL inverse temperature (internally scaled by 10).
+        gate_surprise : float
+            Surprise threshold on |PE| for strong WM encoding (0-1).
+        wm_beta_small : float
+            WM inverse temperature for small set size blocks (e.g., nS=3); higher means sharper WM policy.
+        wm_beta_large : float
+            WM inverse temperature for large set size blocks (e.g., nS=6); typically smaller than wm_beta_small.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, gate_surprise, wm_beta_small, wm_beta_large = model_parameters
+    softmax_beta *= 10.0  # per template
+    softmax_beta_wm = 50.0  # base, will be modulated by wm_beta_small/large
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Choose WM precision by set size
+        wm_beta_scale = wm_beta_small if nS <= 3 else wm_beta_large
+        wm_beta_eff = max(0.0, wm_beta_scale)  # use supplied scale directly
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL and WM likelihoods
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # Small global stabilization to avoid numerical pathology
+            stabilize = 0.02
+            w = (1.0 - stabilize) * w + stabilize * w_0
+
+            # Surprise-gated WM update
+            if abs(delta) >= gate_surprise:
+                alpha_strong = 0.9
+                w[s, :] = (1.0 - alpha_strong) * w[s, :]
+                w[s, a] += alpha_strong
+            else:
+                alpha_weak = 0.2
+                w[s, :] = (1.0 - alpha_weak) * w[s, :]
+                w[s, a] += alpha_weak
+
+            # Normalize WM row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + WM with cross-state interference.
+
+    Policy:
+    - RL: softmax over Q-values, but Q is updated via an eligibility trace that propagates prediction errors
+      to recently visited state-action pairs (temporal credit assignment within a block).
+    - WM: softmax over WM weights with adjustable temperature, and subject to cross-state interference
+      (updates to one state slightly leak to others).
+    - Mixture: fixed wm_weight mixture of WM and RL policies.
+
+    WM update:
+    - Rewarded trials strongly reinforce the selected action in WM; non-rewarded trials moderately.
+    - Cross-state interference: a small fraction of the selected action update leaks uniformly to other states,
+      scaled by an interference rate and set size.
+
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 6
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Mixture weight on WM (0-1).
+        softmax_beta : float
+            RL inverse temperature (internally scaled by 10).
+        trace_lambda : float
+            Eligibility trace decay (0-1). Higher means longer memory for RL credit assignment.
+        interference_rate : float
+            Degree of WM cross-state interference (>=0). Higher values spread WM updates across states.
+        wm_temp : float
+            WM inverse temperature scaling (>=0) controlling WM selectivity.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, trace_lambda, interference_rate, wm_temp = model_parameters
+    softmax_beta *= 10.0  # per template
+    softmax_beta_wm = 50.0  # base; we'll scale by wm_temp/set size
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility trace over state-action pairs
+        e = np.zeros((nS, nA))
+
+        # Set-size-adjusted WM precision
+        wm_beta_eff = wm_temp * (softmax_beta_wm / max(1, nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL and WM action likelihoods
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL with eligibility traces
+            delta = r - Q_s[a]
+            # decay traces
+            e *= trace_lambda
+            # set trace for current state-action to 1
+            e[s, a] = 1.0
+            # update all Q by eligibility
+            q += lr * delta * e
+
+            # WM cross-state interference update
+            # First, a local update at state s
+            alpha_pos = 0.85
+            alpha_neg = 0.25
+            alpha = alpha_pos if r > 0.0 else alpha_neg
+            w[s, :] = (1.0 - alpha) * w[s, :]
+            w[s, a] += alpha
+            # Then, leak a small fraction of this update to other states, on the chosen action dimension
+            leak_frac = min(1.0, interference_rate / max(1, nS))
+            if leak_frac > 0 and nS > 1:
+                for s2 in range(nS):
+                    if s2 == s:
+                        continue
+                    # Move row s2 a bit toward uniform, then add small mass to chosen action column
+                    w[s2, :] = (1.0 - 0.05 * leak_frac) * w[s2, :] + (0.05 * leak_frac) * w_0[s2, :]
+                    w[s2, a] = (1.0 - leak_frac) * w[s2, a] + leak_frac * (1.0 / nA)
+
+            # Normalize all rows to remain valid distributions
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            w = np.divide(w, np.clip(row_sums, eps, None))
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

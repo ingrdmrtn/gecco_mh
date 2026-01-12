@@ -1,0 +1,312 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited, slot-based WM with probabilistic encoding and lapses.
+
+    Mechanism:
+    - RL learns Q-values per state via a standard delta rule.
+    - WM stores deterministic state-action associations, but only if the state is encoded.
+      Encoding is capacity-limited: probability of encoding scales with C/nS and eta_enc.
+    - WM policy is near-deterministic when the state is encoded; otherwise, it is uniform.
+    - A lapse parameter epsilon injects state-independent noise into the WM policy.
+
+    Parameters (in order):
+    - lr: RL learning rate for Q-values (0..1).
+    - wm_weight: Mixture weight scaling the contribution of WM policy (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - C: WM capacity in number of items (0..6); influences encoding probability via C/nS.
+    - eta_enc: Additional multiplicative encoding gain (>=0), p_enc = min(1, eta_enc * C/nS).
+    - epsilon: Lapse probability for WM (0..1), mixing WM with uniform.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, C, eta_enc, epsilon = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    epsilon = np.clip(epsilon, 0.0, 1.0)
+    C = max(0.0, C)
+    eta_enc = max(0.0, eta_enc)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track whether a state's association is currently held in WM
+        encoded = np.zeros(nS, dtype=bool)
+        # Track which action is held if encoded
+        wm_action = -1 * np.ones(nS, dtype=int)
+
+        # Encoding probability based on capacity and set size
+        base_p_enc = min(1.0, (C / max(1.0, nS)) * eta_enc)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            # WM policy: if encoded, near-deterministic on stored action; else uniform
+            if encoded[s] and wm_action[s] >= 0:
+                W_s = np.copy(w_0[s, :])
+                # Make the stored action dominant in WM
+                W_s *= 1e-6
+                W_s[wm_action[s]] = 1.0 - (nA - 1) * 1e-6
+            else:
+                W_s = np.copy(w_0[s, :])
+
+            # Compute RL and WM choice probabilities for the observed action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm_det = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            # Lapse within WM: mix with uniform
+            p_wm = (1.0 - epsilon) * p_wm_det + epsilon * (1.0 / nA)
+
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: consider encoding upon rewarded feedback
+            if r > 0.0:
+                # With probability base_p_enc, encode this state-action pair in WM
+                if np.random.rand() < base_p_enc:
+                    encoded[s] = True
+                    wm_action[s] = a
+                    # Make WM distribution one-hot for the encoded state
+                    w[s, :] = 1e-6
+                    w[s, a] = 1.0 - (nA - 1) * 1e-6
+                else:
+                    # Not encoded: keep uniform WM for this state
+                    encoded[s] = False
+                    wm_action[s] = -1
+                    w[s, :] = w_0[s, :]
+
+            # If negative feedback arrives, do not encode; keep current WM state
+            # (existing encoding remains until overwritten by a later reward)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning + WM with load-based gating and valence-dependent WM plasticity.
+
+    Mechanism:
+    - RL uses separate learning rates for positive and negative RPEs (lr_pos, lr_neg).
+    - WM policy is combined with RL via a load-dependent weight:
+        wm_weight_eff = wm_weight / (1 + (nS / s0)^gamma)
+      so WM influence drops as set size increases.
+    - WM updates are valence-dependent:
+        - On reward (r=1): W_s moves toward a one-hot on the chosen action with step lr_pos.
+        - On no reward (r=0): W_s is pushed away from the chosen action with step lr_neg,
+          redistributing probability to the other actions.
+
+    Parameters (in order):
+    - lr_pos: RL learning rate for positive prediction errors (0..1).
+    - lr_neg: RL learning rate for negative prediction errors (0..1).
+    - wm_weight: Baseline WM weight scale (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - s0: Set-size scale for WM gating (>0).
+    - gamma: Exponent controlling how sharply WM weight declines with set size (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, wm_weight, softmax_beta, s0, gamma = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    s0 = max(1e-6, s0)
+    gamma = max(0.0, gamma)
+    lr_pos = np.clip(lr_pos, 0.0, 1.0)
+    lr_neg = np.clip(lr_neg, 0.0, 1.0)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-based WM weight for this block
+        wm_weight_eff = wm_weight / (1.0 + (max(1.0, nS) / s0) ** gamma)
+        wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = p_wm * wm_weight_eff + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            delta = r - Q_s[a]
+            if delta >= 0.0:
+                q[s, a] += lr_pos * delta
+            else:
+                q[s, a] += lr_neg * delta
+
+            # WM update: valence-dependent
+            if r > 0.0:
+                # Move WM distribution toward one-hot on chosen action (step lr_pos)
+                w[s, :] = (1.0 - lr_pos) * w[s, :]
+                w[s, a] += lr_pos
+            else:
+                # Push probability away from chosen action and redistribute to others (step lr_neg)
+                take = lr_neg * w[s, a]
+                w[s, a] -= take
+                redistribute = take / (nA - 1)
+                for ao in range(nA):
+                    if ao != a:
+                        w[s, ao] += redistribute
+
+            # Normalize and clip to avoid numerical issues
+            w[s, :] = np.clip(w[s, :], 1e-9, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM arbitration via RL uncertainty, with WM decay and load-dependent interference.
+
+    Mechanism:
+    - RL: standard delta-rule learning for Q-values.
+    - Arbitration: WM weight increases when RL is uncertain (high entropy policy).
+      wm_weight_eff = wm_weight * sigmoid(alpha * H_norm), where H_norm is entropy normalized by log(nA).
+    - WM dynamics:
+        - Decay toward uniform each trial with rate lam, amplified by set size via xi:
+          lam_eff = 1 - (1 - lam) * exp(-xi * max(0, nS - 3)).
+        - On reward, WM moves toward a one-hot on the chosen action with learning rate
+          wm_learn = 1 - exp(-alpha), tying plasticity to the arbitration sensitivity.
+
+    Parameters (in order):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Base scale for WM contribution (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - alpha: Sensitivity of arbitration to RL uncertainty; also sets WM learning rate (>0).
+    - lam: Baseline WM decay rate toward uniform per trial (0..1).
+    - xi: Load-dependent amplification of WM decay with set size (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, alpha, lam, xi = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    alpha = max(1e-6, alpha)
+    lam = np.clip(lam, 0.0, 1.0)
+    xi = max(0.0, xi)
+
+    wm_learn = 1.0 - np.exp(-alpha)  # in (0,1)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Effective decay increases with load
+        lam_eff = 1.0 - (1.0 - lam) * np.exp(-xi * max(0, nS - 3))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy and entropy (uncertainty)
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            exp_logits = np.exp(logits)
+            p_vec = exp_logits / np.sum(exp_logits)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Entropy normalized by log(nA)
+            H = -np.sum(p_vec * np.log(np.clip(p_vec, 1e-12, 1.0)))
+            H_norm = H / np.log(nA)
+
+            # Arbitration weight increases with RL uncertainty
+            wm_gate = 1.0 / (1.0 + np.exp(-alpha * (H_norm - 0.5)))  # centered around medium uncertainty
+            wm_weight_eff = np.clip(wm_weight * wm_gate, 0.0, 1.0)
+
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = p_wm * wm_weight_eff + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform (load-amplified)
+            w[s, :] = (1.0 - lam_eff) * w[s, :] + lam_eff * w_0[s, :]
+
+            # WM learning on reward: move toward one-hot on chosen action
+            if r > 0.0:
+                w[s, :] = (1.0 - wm_learn) * w[s, :]
+                w[s, a] += wm_learn
+
+            # Normalize and clip
+            w[s, :] = np.clip(w[s, :], 1e-9, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

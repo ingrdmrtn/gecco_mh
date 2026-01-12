@@ -1,0 +1,367 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL (asymmetric learning) + WM (interference-limited store) with load-sensitive WM precision.
+
+    Mechanisms
+    - RL: delta-rule with separate positive/negative learning rates and softmax choice.
+    - WM: stores a one-hot trace of the most likely correct action per state when rewarded.
+          WM suffers global interference: storing an action for one state slightly corrupts the
+          same action in other states. WM precision (softmax beta) drops with set size.
+    - Arbitration: fixed WM weight (per block), combined mixture of RL and WM policies.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within a block).
+    model_parameters : tuple/list of 6 floats
+        lr_pos : RL learning rate for positive prediction errors in [0,1].
+        lr_neg : RL learning rate for negative prediction errors in [0,1].
+        softmax_beta : Base inverse temperature for RL (rescaled internally by *10).
+        wm_weight0 : Mixture weight for WM in [0,1] (blockwise constant).
+        wm_softmax_gain : Nonnegative factor; WM precision scales as 1/(1 + wm_softmax_gain*(nS-1)).
+        interference_phi : Nonnegative interference strength; when a WM item is stored, it reduces
+                           the same action’s WM value in other states by a small amount.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, wm_weight0, wm_softmax_gain, interference_phi = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Load-sensitive WM precision
+        beta_wm_eff = softmax_beta_wm / (1.0 + max(0.0, wm_softmax_gain) * max(0, nS - 1))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight0 * p_wm + (1.0 - wm_weight0) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - q[s][a]
+            lr = lr_pos if pe >= 0 else lr_neg
+            q[s][a] += lr * pe
+
+            # WM update:
+            # - If rewarded, store a strong one-hot for the chosen action in state s.
+            # - Apply global interference to the same action in other states.
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot
+
+                # Interference: reduce the trace for action 'a' in other states slightly,
+                # then renormalize each affected state's WM distribution.
+                if interference_phi > 0:
+                    for s2 in range(nS):
+                        if s2 == s:
+                            continue
+                        w[s2, a] = max(0.0, w[s2, a] - interference_phi / max(1, nS - 1))
+                        # Renormalize to a valid distribution
+                        row_sum = np.sum(w[s2, :])
+                        if row_sum <= 1e-12:
+                            w[s2, :] = w_0[s2, :]
+                        else:
+                            w[s2, :] /= row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with value decay + volatility-gated WM arbitration.
+
+    Mechanisms
+    - RL: delta rule with softmax; values decay slightly toward uniform each trial.
+    - WM: win-stay-like trace updated on rewards; trace also updated (but less strongly) on nonrewards.
+    - Arbitration: WM weight is dynamically increased when recent PE volatility is high (RL deemed unreliable).
+      Volatility is an exponentially weighted absolute deviation of PE from its running mean.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within a block).
+    model_parameters : tuple/list of 6 floats
+        lr : RL learning rate in [0,1].
+        softmax_beta : Base inverse temperature for RL (rescaled internally by *10).
+        wm_weight0 : Baseline WM mixture weight; passed through sigmoid for [0,1].
+        q_decay : Value decay toward uniform per trial in [0,1].
+        pe_volatility_tau : EWMA rate for PE mean in [0,1]; larger -> faster volatility tracking.
+        volatility_beta : Gain mapping volatility to WM weight (positive increases WM with volatility).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight0, q_decay, pe_volatility_tau, volatility_beta = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Volatility trackers per block
+        pe_mean = 0.0  # running mean of PE
+        initialized = False
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Apply RL decay toward uniform across all states before computing policy
+            if q_decay > 0:
+                q = (1.0 - q_decay) * q + q_decay * (1.0 / nA)
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (deterministic when a clear winner exists)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute PE, update volatility estimate
+            pe = r - q[s][a]
+            if not initialized:
+                pe_mean = pe
+                initialized = True
+            else:
+                pe_mean = (1.0 - pe_volatility_tau) * pe_mean + pe_volatility_tau * pe
+            volatility = abs(pe - pe_mean)
+
+            # Dynamic arbitration: more WM when volatility is high
+            wm_weight_t = sigmoid(wm_weight0 + volatility_beta * volatility)
+
+            # Mixture
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s][a] += lr * pe
+
+            # WM update:
+            # - Reward: move toward one-hot on chosen action (win-stay).
+            # - No reward: move slightly away from chosen action toward uniform (lose-dilute).
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Volatility-dependent update strength (stronger when surprising outcome)
+                gamma = np.clip(0.5 + 0.5 * volatility, 0.0, 1.0)
+                w[s, :] = (1.0 - gamma) * w[s, :] + gamma * onehot
+            else:
+                gamma = np.clip(0.25 + 0.25 * volatility, 0.0, 1.0)
+                target = (1.0 / nA) * np.ones(nA)
+                target[a] = target[a] * 0.5  # dilute the losing action a bit more
+                w[s, :] = (1.0 - gamma) * w[s, :] + gamma * target
+
+            # Renormalize WM row to avoid numerical drift
+            row_sum = np.sum(w[s, :])
+            if row_sum <= 1e-12:
+                w[s, :] = w_0[s, :]
+            else:
+                w[s, :] /= row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Bayesian-like count WM with load-dependent forgetting and reliability-based gating.
+
+    Mechanisms
+    - RL: standard delta rule with softmax.
+    - WM: per-state action counts (Dirichlet-like). Rewards increment chosen action; nonrewards
+          mildly penalize chosen action and redistribute mass to alternatives. Counts forget over time,
+          with forgetting increased under larger set sizes.
+    - Arbitration: WM weight increases when WM is reliable, operationalized as the advantage of the
+      best action probability in WM over uniform.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (constant within a block).
+    model_parameters : tuple/list of 6 floats
+        lr : RL learning rate in [0,1].
+        softmax_beta : Base inverse temperature for RL (rescaled internally by *10).
+        wm_weight0 : Baseline arbitration bias (logit space).
+        wm_forget_rate : Baseline WM forgetting rate per visit in [0,1].
+        wm_reliability_gain : Gain mapping WM reliability to WM weight (logit space).
+        setsize_forget_gain : Multiplier for forgetting with load; effective forgetting is
+                              wm_forget_rate * (1 + setsize_forget_gain * (nS - 1)).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight0, wm_forget_rate, wm_reliability_gain, setsize_forget_gain = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # WM counts start as symmetric pseudo-counts (1.0)
+        counts = np.ones((nS, nA))
+        w = counts / np.sum(counts, axis=1, keepdims=True)  # probabilities derived from counts
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Effective forgetting under load
+        forget_eff = wm_forget_rate * (1.0 + max(0.0, setsize_forget_gain) * max(0, nS - 1))
+        forget_eff = np.clip(forget_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Before computing policy, apply forgetting to WM counts for the visited state
+            if forget_eff > 0:
+                counts[s, :] = (1.0 - forget_eff) * counts[s, :] + forget_eff * 1.0  # shrink toward prior 1.0
+
+            Q_s = q[s, :]
+            # Recompute WM probabilities from counts
+            total_c = np.sum(counts[s, :])
+            if total_c <= 1e-12:
+                W_s = w_0[s, :]
+            else:
+                W_s = counts[s, :] / total_c
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # WM reliability: advantage over uniform
+            reliability = np.max(W_s) - (1.0 / nA)
+            wm_weight_t = sigmoid(wm_weight0 + wm_reliability_gain * reliability)
+
+            # Mixture
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s][a]
+            q[s][a] += lr * pe
+
+            # WM counts update
+            if r > 0.5:
+                counts[s, a] += 1.0
+            else:
+                # Penalize chosen action slightly and redistribute to alternatives
+                dec = 0.5
+                counts[s, a] = max(0.0, counts[s, a] - dec)
+                inc = dec / (nA - 1)
+                for aa in range(nA):
+                    if aa != a:
+                        counts[s, aa] += inc
+
+            # Keep counts nonnegative and refresh W_s in w
+            counts[s, :] = np.maximum(counts[s, :], 0.0)
+            total_c = np.sum(counts[s, :])
+            if total_c <= 1e-12:
+                w[s, :] = w_0[s, :]
+            else:
+                w[s, :] = counts[s, :] / total_c
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

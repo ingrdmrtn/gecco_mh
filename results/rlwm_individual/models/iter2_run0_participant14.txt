@@ -1,0 +1,278 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with global WM decay, reward-gated WM writing, and action perseveration.
+
+    Idea:
+    - Decisions are a mixture of RL and WM policies. WM is a fast, high-precision store that decays
+      globally with cognitive load. RL learns incrementally from reward prediction errors.
+    - WM weight is baseline-controlled and amplified when WM is confident; WM decays faster under
+      higher set size.
+    - A perseveration bias encourages repeating the last action taken in the current state.
+
+    Parameters (model_parameters):
+    - lr: scalar in [0,1], RL learning rate.
+    - wm_weight_base: scalar in [0,1], baseline weight of WM in the policy mixture.
+    - softmax_beta: scalar >=0, RL inverse temperature (internally scaled by 10).
+    - wm_decay_base: scalar >=0, base global WM decay rate per trial; effective decay grows with set size.
+    - wm_write_strength: scalar in [0,1], strength of WM writing on rewarded trials (one-shot boost toward one-hot).
+    - perseveration: scalar, added as a bias to the last action taken in a state.
+
+    Returns:
+    - Negative log-likelihood of the observed actions under the model.
+    """
+    lr, wm_weight_base, softmax_beta, wm_decay_base, wm_write_strength, perseveration = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Set-size dependent global WM decay rate per trial
+        wm_decay = 1.0 - np.exp(-wm_decay_base * max(1.0, nS) / 3.0)
+        wm_decay = np.clip(wm_decay, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Global WM decay each trial (load-sensitive)
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+
+            # RL policy with perseveration bias for the last action in this state
+            Q_bias = Q_s.copy()
+            if last_action[s] >= 0:
+                Q_bias[last_action[s]] += perseveration
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_bias - Q_bias[a])))
+
+            # WM policy (deterministic softmax on WM weights)
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+
+            # WM confidence (1 - normalized entropy)
+            Wc = W_s - np.max(W_s)
+            expW = np.exp(softmax_beta_wm * Wc)
+            pvec_wm = expW / np.sum(expW)
+            entropy_wm = -np.sum(pvec_wm * np.log(pvec_wm + 1e-12))
+            conf_wm = 1.0 - entropy_wm / np.log(nA)
+
+            # Effective WM weight: baseline scaled by confidence; naturally reduced by global decay dynamics
+            wm_weight_eff = np.clip(wm_weight_base * (0.5 + 0.5 * conf_wm), 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            log_p += np.log(p_total + 1e-12)
+      
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: reward-gated one-shot writing with strength
+            if r > 0:
+                # Move row toward uniform then set chosen action high (competing traces partially cleared)
+                w[s, :] = (1.0 - wm_write_strength) * w[s, :] + wm_write_strength * w_0[s, :]
+                w[s, a] = 1.0
+                w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+            # Update last action for perseveration
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with adaptive RL temperature (reward-rate driven) and set-size power-law WM capacity.
+
+    Idea:
+    - Policy is a mixture of RL and WM.
+    - RL inverse temperature adapts to running reward rate: higher recent rewards -> more exploitation.
+    - WM influence scales as a power-law of set size with capacity C: weight ~ (C / nS)^alpha, capped at 1.
+    - WM is written one-shot on reward; otherwise it decays mildly toward uniform.
+
+    Parameters (model_parameters):
+    - lr: scalar in [0,1], RL learning rate.
+    - wm_weight_base: scalar in [0,1], baseline WM weight before capacity scaling.
+    - softmax_beta: scalar >=0, base RL inverse temperature (internally scaled by 10).
+    - beta_gain: scalar, scales how much recent reward rate modulates RL inverse temperature.
+    - C: positive scalar, WM capacity parameter (number-like; effective when compared to set size).
+    - alpha_wm: scalar >=0, exponent controlling how sharply WM weight declines with set size.
+
+    Returns:
+    - Negative log-likelihood of the observed actions under the model.
+    """
+    lr, wm_weight_base, softmax_beta, beta_gain, C, alpha_wm = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size capacity scaling for WM mixture weight
+        cap_ratio = np.clip(C / max(1.0, nS), 0.0, 1.0)
+        cap_scale = cap_ratio ** max(0.0, alpha_wm)
+        wm_weight_cap = np.clip(wm_weight_base * cap_scale, 0.0, 1.0)
+
+        # Running reward-rate to adapt RL temperature
+        rr = 0.5  # initialize neutral running reward rate
+        rr_alpha = 0.2  # fixed EMA for reward rate within a block
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+
+            # RL temperature adapts to recent reward rate
+            beta_eff = softmax_beta * (1.0 + beta_gain * (rr - 0.5))
+            beta_eff = max(0.0, beta_eff)
+
+            p_rl = 1 / np.sum(np.exp(beta_eff*(Q_s - Q_s[a])))
+
+            # WM policy (deterministic softmax on WM weights)
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+
+            wm_weight_eff = wm_weight_cap
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            log_p += np.log(p_total + 1e-12)
+      
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: one-shot on reward; mild decay otherwise
+            if r > 0:
+                w[s, :] = 0.2 * w[s, :] + 0.8 * w_0[s, :]
+                w[s, a] = 1.0
+            else:
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+            w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+            # Update running reward rate
+            rr = (1 - rr_alpha) * rr + rr_alpha * r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with probabilistic WM retrieval (capacity-limited) and RL forgetting.
+
+    Idea:
+    - WM contributes via a retrieval process that can fail under load. Retrieval failure probability
+      increases with set size relative to a capacity K via a logistic with slope 'interference'.
+    - RL includes passive forgetting toward uniform (resource depletion under load), controlled by rl_decay.
+    - WM is written one-shot on reward and otherwise drifts to uniform.
+
+    Parameters (model_parameters):
+    - lr: scalar in [0,1], RL learning rate.
+    - wm_weight_base: scalar in [0,1], baseline WM weight in the mixture when retrieval succeeds.
+    - softmax_beta: scalar >=0, RL inverse temperature (internally scaled by 10).
+    - K_capacity: positive scalar, WM capacity parameter compared to set size.
+    - interference: scalar >=0, slope of the logistic linking overload (nS - K_capacity) to retrieval failure.
+    - rl_decay: scalar in [0,1], per-trial RL forgetting toward uniform.
+
+    Returns:
+    - Negative log-likelihood of the observed actions under the model.
+    """
+    lr, wm_weight_base, softmax_beta, K_capacity, interference, rl_decay = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    rl_decay = np.clip(rl_decay, 0.0, 1.0)
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Retrieval failure probability as logistic of overload
+        overload = nS - K_capacity
+        p_fail = 1.0 / (1.0 + np.exp(-interference * overload))
+        p_fail = np.clip(p_fail, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL passive forgetting toward uniform each trial
+            q = (1.0 - rl_decay) * q + rl_decay * (1.0 / nA) * np.ones_like(q)
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+
+            # RL policy
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s - Q_s[a])))
+
+            # WM policy with retrieval failure: mixture of WM softmax and random
+            p_wm_soft = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+            p_wm = (1.0 - p_fail) * p_wm_soft + p_fail * (1.0 / nA)
+
+            wm_weight_eff = wm_weight_base
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            log_p += np.log(p_total + 1e-12)
+      
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: one-shot write on reward; otherwise drift toward uniform
+            if r > 0:
+                w[s, :] = 0.2 * w[s, :] + 0.8 * w_0[s, :]
+                w[s, a] = 1.0
+            else:
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+            w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

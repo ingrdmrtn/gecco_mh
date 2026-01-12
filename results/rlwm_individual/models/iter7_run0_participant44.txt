@@ -1,0 +1,320 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited WM (capacity factor) with load-sensitive recall.
+    
+    Idea
+    - RL learns Q-values per state-action via a simple delta rule.
+    - WM stores the currently believed correct action per state with strong precision.
+    - WM contribution is limited by a capacity parameter relative to set size and a load-sensitive
+      recall gating (sigmoid over set size).
+    - WM passively decays toward uniform and is updated toward the chosen action when rewarded.
+    
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 6
+      lr            : RL learning rate (0..1).
+      softmax_beta  : RL inverse temperature; internally scaled by 10.
+      wm_base       : Base WM recall logit intercept (can be negative or positive).
+      wm_capacity   : Effective WM capacity in number of pairs (>=0); mixed into policy as capacity/nS (capped to 1).
+      wm_decay      : WM decay/update rate (0..1). Higher = faster decay and stronger write on rewards.
+      recall_slope  : Load-sensitivity slope for WM recall; positive values favor small set sizes.
+    
+    Returns
+    -------
+    neg_log_likelihood : float
+      Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, wm_base, wm_capacity, wm_decay, recall_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states  = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q   = (1.0 / nA) * np.ones((nS, nA))
+        w   = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Capacity factor: how much WM can contribute given set size
+        capacity_factor = min(1.0, max(0.0, float(wm_capacity) / float(nS)))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL softmax policy
+            logits_rl = softmax_beta * q[s, :]
+            max_rl = np.max(logits_rl)
+            exp_rl = np.exp(logits_rl - max_rl)
+            p_rl_vec = exp_rl / np.sum(exp_rl)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # WM softmax policy
+            logits_wm = softmax_beta_wm * w[s, :]
+            max_wm = np.max(logits_wm)
+            exp_wm = np.exp(logits_wm - max_wm)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Load-sensitive WM recall gate (sigmoid over set size effect)
+            # Recall increases as set size gets smaller.
+            load_term = 1.0 - (float(nS) / 6.0)  # 0 at nS=6, 0.5 at nS=3
+            recall_logit = wm_base + recall_slope * load_term
+            recall_prob = 1.0 / (1.0 + np.exp(-recall_logit))
+
+            wm_mix = np.clip(capacity_factor * recall_prob, 0.0, 1.0)
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # WM update on reward: move toward one-hot chosen action
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Uncertainty-gated WM with load penalty.
+    
+    Idea
+    - RL learns Q-values; we also track state-wise uncertainty as a moving average of |PE|.
+    - WM contribution grows when RL is uncertain (large |PE| on that state) but is penalized by set size.
+    - WM decays toward uniform and updates toward chosen action upon reward.
+    
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 6
+      lr              : RL learning rate (0..1).
+      softmax_beta    : RL inverse temperature; internally scaled by 10.
+      base_mix        : Base WM mix (0..1) controlling average reliance on WM before gating.
+      gate_scale      : Scales how strongly uncertainty boosts WM mix (>=0).
+      pe_sensitivity  : Learning rate for uncertainty trace (0..1) over |PE|.
+      wm_decay        : WM decay/update rate (0..1).
+    
+    Returns
+    -------
+    neg_log_likelihood : float
+      Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, base_mix, gate_scale, pe_sensitivity, wm_decay = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    # constrain base_mix to (0,1) via sigmoid transform on the fly in case input is unconstrained
+    base_mix = 1.0 / (1.0 + np.exp(-base_mix))
+    gate_scale = max(0.0, gate_scale)
+
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states  = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q   = (1.0 / nA) * np.ones((nS, nA))
+        w   = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # State-wise uncertainty (0..1), initialized mid-level
+        uncert = 0.5 * np.ones(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            logits_rl = softmax_beta * q[s, :]
+            max_rl = np.max(logits_rl)
+            exp_rl = np.exp(logits_rl - max_rl)
+            p_rl_vec = exp_rl / np.sum(exp_rl)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # WM policy
+            logits_wm = softmax_beta_wm * w[s, :]
+            max_wm = np.max(logits_wm)
+            exp_wm = np.exp(logits_wm - max_wm)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Compute PE and update uncertainty trace
+            delta = r - q[s, a]
+            uncert[s] = (1.0 - pe_sensitivity) * uncert[s] + pe_sensitivity * abs(delta)
+
+            # Load penalty: larger set sizes reduce WM reliance
+            load_penalty = np.log(1.0 + float(nS))  # increases with nS
+
+            # WM mixture gated by uncertainty and penalized by load
+            # Convert base_mix to logit and add gating
+            base_logit = np.log(base_mix + 1e-12) - np.log(1.0 - base_mix + 1e-12)
+            gate = base_logit + gate_scale * (uncert[s] - 0.5) - load_penalty
+            wm_mix = 1.0 / (1.0 + np.exp(-gate))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # WM update on rewards
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with load-sensitive inverse temperature + WM with misbinding (state confusion).
+    
+    Idea
+    - RL beta decreases with set size (more load -> noisier RL choice).
+    - WM can misbind items across states, mixing the target state's WM row with the
+      average of other states' WM rows; misbinding grows with set size.
+    - WM reliance scales down with set size (resource dilution).
+    - WM decays toward uniform and learns from rewards; the update slightly spills to other rows,
+      consistent with feature confusions under load.
+    
+    Parameters
+    ----------
+    model_parameters : tuple/list of length 6
+      lr               : RL learning rate (0..1).
+      softmax_beta     : Baseline RL inverse temperature; internally scaled by 10 before load adjustment.
+      wm_strength      : Base WM mixing weight at set size 3 (0..1), diluted by set size.
+      confusion_rate   : Base WM misbinding rate (0..1) that scales with set size.
+      wm_decay         : WM decay/update rate (0..1).
+      size_beta_slope  : How strongly RL beta decreases with set size (>=0).
+    
+    Returns
+    -------
+    neg_log_likelihood : float
+      Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, wm_strength, confusion_rate, wm_decay, size_beta_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_strength = np.clip(wm_strength, 0.0, 1.0)
+    confusion_rate = np.clip(confusion_rate, 0.0, 1.0)
+    size_beta_slope = max(0.0, size_beta_slope)
+
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states  = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL beta decreases with set size
+        # Reference at nS=3; additional load (nS-3) reduces beta exponentially
+        beta_eff = softmax_beta * np.exp(-size_beta_slope * max(0.0, float(nS - 3)))
+
+        q   = (1.0 / nA) * np.ones((nS, nA))
+        w   = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM dilution with set size
+        wm_mix_base = wm_strength * (3.0 / float(nS))
+        wm_mix_base = np.clip(wm_mix_base, 0.0, 1.0)
+
+        # Misbinding grows with set size (normalized to [0,1])
+        if nS > 1:
+            conf_eff = confusion_rate * (float(nS - 1) / float(6 - 1))
+        else:
+            conf_eff = 0.0
+        conf_eff = np.clip(conf_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with load-adjusted beta
+            logits_rl = beta_eff * q[s, :]
+            max_rl = np.max(logits_rl)
+            exp_rl = np.exp(logits_rl - max_rl)
+            p_rl_vec = exp_rl / np.sum(exp_rl)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # WM misbinding: mix row s with average of other rows
+            w_row = w[s, :].copy()
+            if nS > 1:
+                others_idx = [i for i in range(nS) if i != s]
+                avg_others = np.mean(w[others_idx, :], axis=0)
+                w_row = (1.0 - conf_eff) * w_row + conf_eff * avg_others
+
+            logits_wm = softmax_beta_wm * w_row
+            max_wm = np.max(logits_wm)
+            exp_wm = np.exp(logits_wm - max_wm)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            p_total = wm_mix_base * p_wm + (1.0 - wm_mix_base) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # WM update with spillover (misbinding) on reward
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Update target row
+                w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * one_hot
+                # Spillover to others scaled by conf_eff
+                if nS > 1 and conf_eff > 0.0:
+                    spill = wm_decay * conf_eff
+                    others_idx = [i for i in range(nS) if i != s]
+                    for j in others_idx:
+                        w[j, :] = (1.0 - spill) * w[j, :] + spill * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

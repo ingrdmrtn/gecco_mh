@@ -1,0 +1,298 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Surprise-gated RL+WM with load-dependent arbitration and load-driven WM decay.
+
+    Idea:
+    - Model-free RL with a single learning rate and softmax policy.
+    - A fast, one-shot Working Memory (WM) store that is updated more when surprise is high.
+    - Arbitration weight for WM increases with surprise but decreases with set size (load).
+    - WM globally decays toward uniform per trial; decay increases with load using the same
+      load_scale parameter.
+
+    Parameters (model_parameters):
+    - lr: [0,1] RL learning rate.
+    - softmax_beta: >=0 RL inverse temperature (internally scaled by 10).
+    - wm_base: base log-odds bias in favor of WM arbitration (higher -> more WM).
+    - surprise_gain: >=0 scales how much reward prediction error (surprise) gates WM.
+    - load_scale: >=0 scales how strongly larger set sizes reduce WM contributions and increase decay.
+    - wm_learn: [0,1] strength of WM encoding on each trial when updated.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, wm_base, surprise_gain, load_scale, wm_learn = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))   # RL values
+        w = (1 / nA) * np.ones((nS, nA))   # WM policy-like weights
+        w_0 = (1 / nA) * np.ones((nS, nA)) # Uniform baseline
+
+        # Load-dependent WM decay (toward uniform): more decay as set size increases
+        load_term = max(0.0, (nS - 3))
+        wm_decay = np.clip(load_scale * (load_term / max(1.0, nS)), 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Global WM decay toward uniform each trial
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL softmax probability of chosen action (efficient evaluation)
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM softmax (high precision)
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Surprise (unsigned prediction error) gates WM arbitration; higher load reduces WM
+            surprise = abs(r - Q_s[a])
+            # logistic gating for WM weight
+            wm_logit = wm_base + surprise_gain * surprise - load_scale * load_term
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + 1e-12)
+
+            # RL update
+            delta = r - q[s][a]
+            q[s][a] += lr * delta
+
+            # WM update: write toward a one-hot target on rewarded trials; weaker write otherwise
+            if r > 0:
+                target = w_0[s, :].copy()
+                target[a] = 1.0
+                target = target / np.sum(target)
+                # Encoding strength modulated by surprise-gated arbitration
+                eta = wm_learn * wm_weight
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * target
+            else:
+                # On non-rewarded trials, lightly relax toward uniform (uses wm_learn as small diffusion)
+                eta = 0.25 * wm_learn * (1.0 + wm_weight)  # a bit more diffusion when WM is relied upon
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + WM with load-suppressed arbitration and simple decay.
+
+    Idea:
+    - RL uses an eligibility trace so recent choices receive larger credit assignments.
+      Even in a one-step task, traces capture inertia of value changes across visits.
+    - WM is a rapidly updated policy map with its own decay toward uniform.
+    - Arbitration weight for WM decreases with set size via a logistic transform of a base bias.
+    - WM encoding strength is controlled independently.
+
+    Parameters (model_parameters):
+    - lr: [0,1] RL learning rate scaling the prediction error applied via eligibility traces.
+    - softmax_beta: >=0 RL inverse temperature (internally scaled by 10).
+    - lam: [0,1] eligibility trace decay per trial (higher -> longer credit assignment).
+    - wm_bias_base: real, base log-odds bias for WM in the mixture (higher -> more WM).
+    - load_suppress: >=0, how strongly larger set sizes reduce WM arbitration weight.
+    - wm_learn: [0,1], WM encoding strength per update.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, lam, wm_bias_base, load_suppress, wm_learn = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))   # RL values
+        w = (1 / nA) * np.ones((nS, nA))   # WM policy-like weights
+        w_0 = (1 / nA) * np.ones((nS, nA)) # Uniform baseline
+
+        # Eligibility traces over state-action pairs
+        e = np.zeros((nS, nA))
+
+        # Load-dependent arbitration bias
+        load_term = max(0.0, (nS - 3))
+
+        # WM decay toward uniform per trial; increase with load
+        wm_decay = np.clip(load_suppress * (load_term / max(1.0, nS)), 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Decay WM and traces each trial
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+            e *= lam
+            # Set chosen eligibility to 1 for the visited state-action
+            e[s, a] = 1.0
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Load-suppressed WM arbitration: logistic transform
+            wm_logit = wm_bias_base - load_suppress * load_term
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + 1e-12)
+
+            # RL update via eligibility traces
+            delta = r - q[s][a]
+            q += lr * delta * e
+
+            # WM update
+            if r > 0:
+                target = w_0[s, :].copy()
+                target[a] = 1.0
+                target = target / np.sum(target)
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * target
+            else:
+                # Slight diffusion toward uniform on errors
+                w[s, :] = (1.0 - 0.25 * wm_learn) * w[s, :] + (0.25 * wm_learn) * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with stickiness + WM precision limited by load (binding noise).
+
+    Idea:
+    - RL with a single learning rate and a within-state perseveration (stickiness) bias
+      toward the previously chosen action in that state.
+    - WM is a near-deterministic associative map whose precision is reduced by load
+      (binding noise). WM precision controls both its softmax sharpness and its weight
+      in the arbitration mixture.
+    - WM also decays toward uniform as binding noise increases.
+
+    Parameters (model_parameters):
+    - lr: [0,1] RL learning rate.
+    - softmax_beta: >=0 RL inverse temperature (internally scaled by 10).
+    - wm_precision_base: >=0 baseline precision of WM at set size 3.
+    - bind_noise_load: >=0 additional load-dependent noise reducing WM precision per step of set size.
+    - stickiness: real, added bias to the last action chosen in the same state.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, wm_precision_base, bind_noise_load, stickiness = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # base WM precision (will be scaled)
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last action per state for stickiness
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Compute WM precision and derived quantities as a function of load
+        load_term = max(0.0, (nS - 3))
+        wm_precision = max(0.0, wm_precision_base - bind_noise_load * load_term)
+        # Map precision to arbitration weight in [0,1]
+        wm_weight = wm_precision / (1.0 + wm_precision) if wm_precision > 0 else 0.0
+        # Effective WM inverse temperature scales with precision
+        wm_beta_eff = softmax_beta_wm * max(0.0, wm_precision)
+
+        # WM decay toward uniform scaled by binding noise and load
+        wm_decay = np.clip(bind_noise_load * (load_term / max(1.0, nS)), 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Per-trial WM decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # Add stickiness bias within state to both RL and WM channels
+            if last_action[s] >= 0:
+                bias_vec = np.zeros(3)
+                bias_vec[last_action[s]] = stickiness
+                Q_s = Q_s + bias_vec
+                W_s = W_s + bias_vec
+
+            # RL and WM policies
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            # If precision is zero, WM becomes uniform; handle by effective beta
+            if wm_beta_eff > 0:
+                p_wm = 1 / np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+            else:
+                p_wm = 1.0 / 3.0
+
+            # Arbitration weight from WM precision
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + 1e-12)
+
+            # RL update
+            delta = r - q[s][a]
+            q[s][a] += lr * delta
+
+            # WM update: reward strengthens one-hot association; errors diffuse
+            if r > 0:
+                target = w_0[s, :].copy()
+                target[a] = 1.0
+                target = target / np.sum(target)
+                # Encoding strength scales with precision as well
+                eta = min(1.0, 0.5 + 0.5 * wm_weight)  # between 0.5 and 1.0
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * target
+            else:
+                # On errors, gentle drift toward uniform; stronger when precision is low
+                eta = 0.3 * (1.0 - wm_weight)
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * w_0[s, :]
+
+            # Update stickiness memory
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

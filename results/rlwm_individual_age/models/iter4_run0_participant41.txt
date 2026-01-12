@@ -1,0 +1,403 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + state-specific Win-Stay/Lose-Shift with state-confusion and age/load-dependent omission gate.
+
+    Mechanism
+    - Model-free RL (Q-learning) produces a softmax policy over actions.
+    - A state-specific WSLS controller prefers repeating the last action after reward, and avoiding it after no reward.
+    - With some probability, the WSLS controller confuses the current state with the immediately previous state's trace
+      (state confusion), more likely for older adults and at larger set sizes.
+    - Final choice policy is a mixture of RL and (possibly confused) WSLS.
+    - An omission gate assigns some probability to an omission action (-2), increasing with age and set size.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index at each trial (0..nS-1 within a block).
+    actions : array-like of int
+        Chosen action each trial; valid actions are {0,1,2}; -2 denotes omission.
+    rewards : array-like of float/int
+        Feedback each trial (1 or 0). Negative values denote invalid feedback (e.g., after omission).
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size for the current block (3 or 6).
+    age : array-like of float/int
+        Participant age; older group (>=45) increases omission and state confusion.
+    model_parameters : list/tuple of length 4
+        [alpha, beta, ws_weight, state_confuse]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL softmax (>0).
+        - ws_weight: mixture weight of WSLS controller (0..1).
+        - state_confuse: baseline probability of referencing previous state's WSLS trace (0..1).
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, ws_weight, state_confuse = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_ll = 0.0
+
+    # Helper: omission base as function of age and load
+    def omission_base(nS):
+        # Base omission grows with age and load
+        base = 0.02 + 0.03 * older + 0.02 * max(0, (nS - 3) / 3.0)
+        return max(0.0, min(0.25, base))  # cap modestly
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # Initialize RL values and WSLS memory
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_reward = np.zeros(nS)  # last reward experienced in that state
+
+        # Keep track of most recent visited state for confusion
+        prev_state = None
+
+        # Effective weights and confusion probability modulated by age/load
+        ws_w_eff = max(0.0, min(1.0, ws_weight * (1.15 if nS == 3 else 0.85) * (0.9 if older else 1.0)))
+        confuse_eff = max(0.0, min(1.0, state_confuse * (1.4 if older else 1.0) * (1.3 if nS == 6 else 1.0)))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL softmax
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            rl_logits = beta * Qs
+            rl_probs = np.exp(rl_logits - np.max(rl_logits))
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            # WSLS policy for the relevant state (may be confused)
+            s_for_wsls = s
+            if prev_state is not None:
+                # Confuse the state used by WSLS with probability confuse_eff
+                if np.random.RandomState(s + t + b).rand() < confuse_eff:
+                    s_for_wsls = prev_state
+
+            wsls_probs = np.ones(nA) / nA
+            la = last_action[s_for_wsls]
+            lrwd = last_reward[s_for_wsls]
+            if la >= 0:
+                if lrwd > 0.5:
+                    # Win: prefer repeating last action
+                    pref = 0.80
+                    rest = (1.0 - pref) / (nA - 1)
+                    wsls_probs = np.ones(nA) * rest
+                    wsls_probs[la] = pref
+                else:
+                    # Lose: avoid last action
+                    avoid = 0.10
+                    rest = (1.0 - avoid) / (nA - 1)
+                    wsls_probs = np.ones(nA) * rest
+                    wsls_probs[la] = avoid
+            wsls_probs = wsls_probs / np.sum(wsls_probs)
+
+            # Mixture policy
+            mix_probs = ws_w_eff * wsls_probs + (1.0 - ws_w_eff) * rl_probs
+            mix_probs = np.maximum(mix_probs, eps)
+            mix_probs = mix_probs / np.sum(mix_probs)
+
+            # Omission probability
+            p_omit = omission_base(nS)
+
+            # Likelihood of observed choice
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * mix_probs[a]
+            else:
+                p_choice = eps
+
+            neg_ll -= np.log(max(p_choice, eps))
+
+            # Learning updates only for non-omission with valid reward
+            if a >= 0 and r >= 0:
+                # RL update
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+                # Track WSLS memory on the true current state (not the possibly confused one)
+                last_action[s] = a
+                last_reward[s] = r
+
+            prev_state = s
+
+    return neg_ll
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Entropy-based arbitration between RL and capacity-limited WM, with age/load-modulated omission.
+
+    Mechanism
+    - RL: Q-learning with softmax.
+    - WM: one-shot encoding of rewarded stimulus-action associations with decay to uniform.
+    - Arbitration: the controller compares policy entropies; weight shifts toward the less entropic (more certain) source.
+      A temperature parameter controls arbitration sensitivity.
+    - Age and set size reduce effective WM capacity and arbitration weight toward WM.
+    - Omission action (-2) probability increases with age, load, and when both controllers are uncertain.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index each trial (0..nS-1 per block).
+    actions : array-like of int
+        Chosen action each trial; {0,1,2}, -2 denotes omission.
+    rewards : array-like of float/int
+        Feedback each trial (1 or 0). Negative denotes invalid feedback (e.g., omission).
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size for the current block (3 or 6).
+    age : array-like of float/int
+        Participant age; older group (>=45) reduces WM capacity and arbitration toward WM.
+    model_parameters : list/tuple of length 4
+        [alpha, beta, wm_cap, tau]
+        - alpha: RL learning rate (0..1).
+        - beta: RL inverse temperature (>0).
+        - wm_cap: baseline WM encoding strength (0..1).
+        - tau: arbitration temperature (>0); lower values make arbitration more sensitive to entropy differences.
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, wm_cap, tau = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    lnA = np.log(nA)
+    eps = 1e-12
+    neg_ll = 0.0
+
+    def omission_base(nS, H_rl, H_wm):
+        # Base omission by age and load
+        base = 0.02 + 0.03 * older + 0.02 * max(0, (nS - 3) / 3.0)
+        # Increase omissions when both controllers are uncertain
+        uncert = (H_rl / lnA) * (H_wm / lnA)
+        p_om = base + 0.10 * uncert
+        return max(0.0, min(0.4, p_om))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM store initialized uniform; represents probability over actions per state
+        W = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM capacity reduced by age and load
+        wm_eff = wm_cap / (1.0 + 0.5 * older + 0.5 * max(0, (nS - 3) / 3.0))
+        wm_eff = max(0.0, min(1.0, wm_eff))
+
+        # Arbitration penalty toward WM for older adults
+        wm_age_gate = (1.0 - 0.3 * older)
+
+        # WM decay per visit grows with load and age
+        wm_decay = 0.05 * (1.0 + 0.5 * older) * (1.0 + max(0, (nS - 3) / 3.0))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            rl_logits = beta * Qs
+            rl_probs = np.exp(rl_logits - np.max(rl_logits))
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            # WM policy (sharp readout of W)
+            Ws = W[s].copy()
+            Ws = np.maximum(Ws, eps)
+            Ws = Ws / np.sum(Ws)
+            beta_wm = 6.0
+            wm_logits = beta_wm * (Ws - np.max(Ws))
+            wm_probs = np.exp(wm_logits - np.max(wm_logits))
+            wm_probs = wm_probs / np.sum(wm_probs)
+
+            # Entropies
+            H_rl = -np.sum(rl_probs * np.log(np.maximum(rl_probs, eps)))
+            H_wm = -np.sum(wm_probs * np.log(np.maximum(wm_probs, eps)))
+
+            # Arbitration: weight WM higher when it is more certain (lower entropy)
+            # Use a sigmoid over the entropy difference scaled by tau
+            diff = (H_rl - H_wm) / max(tau, 1e-6)
+            w_wm = 1.0 / (1.0 + np.exp(-diff))
+            # Apply effective capacity and age gate
+            w_wm = w_wm * wm_eff * wm_age_gate
+            w_wm = max(0.0, min(1.0, w_wm))
+
+            mix_probs = w_wm * wm_probs + (1.0 - w_wm) * rl_probs
+            mix_probs = np.maximum(mix_probs, eps)
+            mix_probs = mix_probs / np.sum(mix_probs)
+
+            # Omission probability
+            p_omit = omission_base(nS, H_rl, H_wm)
+
+            # Likelihood
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * mix_probs[a]
+            else:
+                p_choice = eps
+
+            neg_ll -= np.log(max(p_choice, eps))
+
+            # Learning and WM updates for valid non-omission trials
+            if a >= 0 and r >= 0:
+                # RL update
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+
+                # WM update: move toward one-hot on rewarded action; otherwise decay toward uniform
+                if r > 0.5:
+                    # Encode with strength wm_eff
+                    target = np.zeros(nA)
+                    target[a] = 1.0
+                    W[s] = (1.0 - wm_eff) * W[s] + wm_eff * target
+                else:
+                    # Partial decay on unrewarded
+                    W[s] = (1.0 - 0.5 * wm_decay) * W[s] + (0.5 * wm_decay) * (np.ones(nA) / nA)
+
+                # Global decay each visit
+                W[s] = (1.0 - wm_decay) * W[s] + wm_decay * (np.ones(nA) / nA)
+                W[s] = np.maximum(W[s], eps)
+                W[s] = W[s] / np.sum(W[s])
+
+    return neg_ll
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model-free RL with directed novelty exploration and center-action bias, modulated by age and load.
+
+    Mechanism
+    - RL: Q-learning with softmax choice.
+    - Directed exploration: add an action-specific novelty bonus inversely proportional to visit count.
+    - Action bias: additive bias toward the middle action (action 1), stronger in older adults and under high load.
+    - Omission gate: probability of omission (-2) increases with age/load but is reduced when recent reward rate is high.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index each trial (0..nS-1 per block).
+    actions : array-like of int
+        Chosen action each trial; {0,1,2} or -2 for omission.
+    rewards : array-like of float/int
+        Feedback each trial (1 or 0). Negative denotes invalid feedback (e.g., omission).
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size for the current block (3 or 6).
+    age : array-like of float/int
+        Participant age; older group (>=45) exhibits stronger center bias and higher omission.
+    model_parameters : list/tuple of length 4
+        [alpha, beta, eta_nov, gamma_center]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature (>0).
+        - eta_nov: weight of novelty bonus (>0).
+        - gamma_center: additive bias toward the center action in logits (can be >=0).
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, eta_nov, gamma_center = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_ll = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        visits = np.zeros((nS, nA))  # visit counts per state-action
+
+        # Moving average of reward to modulate omissions
+        rew_avg = 0.5
+        avg_decay = 0.2
+
+        # Center bias increases with age and load
+        center_bias = gamma_center * (1.0 + 0.3 * older) * (1.2 if nS == 6 else 1.0)
+
+        # Base omission by age and load
+        omit_base = 0.03 + 0.03 * older + 0.03 * max(0, (nS - 3) / 3.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Novelty bonus
+            bonus = eta_nov / np.sqrt(visits[s] + 1.0)
+
+            # Biased logits
+            logits = beta * (Q[s] + bonus)
+            # Add center-action bias to action 1
+            bias_vec = np.zeros(nA)
+            bias_vec[1] = center_bias
+            logits = logits + bias_vec
+
+            # Softmax
+            logits = logits - np.max(logits)
+            probs = np.exp(logits)
+            probs = probs / np.sum(probs)
+
+            # Omission probability reduces when recent rewards are high
+            p_omit = omit_base * (1.2 - 0.8 * rew_avg)
+            p_omit = max(0.0, min(0.35, p_omit))
+
+            # Likelihood
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * probs[a]
+            else:
+                p_choice = eps
+
+            neg_ll -= np.log(max(p_choice, eps))
+
+            # Update reward average (only if valid reward)
+            if r >= 0:
+                rew_avg = (1.0 - avg_decay) * rew_avg + avg_decay * r
+
+            # Update Q and visits for executed non-omission actions
+            if a >= 0 and r >= 0:
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+                visits[s, a] += 1.0
+
+            # Small passive decay of visit counts to avoid frozen bonuses
+            visits[s] = np.maximum(0.0, visits[s] * (1.0 - 0.01))
+
+    return neg_ll

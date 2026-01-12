@@ -1,0 +1,282 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid incremental RL + episodic cache with age- and load-dependent gating, plus lapse.
+
+    Idea:
+    - A standard model-free Q-learning system (incremental RL).
+    - A fast episodic cache that stores "last success" for a state-action and decays over time.
+      This cache is more effective in low load (smaller set size) and is weakened for older adults.
+    - Final policy is a softmax over a linear combination of Q and episodic cache signal.
+    - A small lapse probability mixes in uniform random choice.
+    
+    Parameters (model_parameters):
+    - alpha: RL learning rate in [0,1]
+    - beta: Inverse temperature (>0), scaled internally (x10)
+    - epi_weight_base: Baseline weight of episodic cache contribution [0,1]
+    - epi_decay: Per-trial decay of episodic traces in (0,1]
+    - age_gate: Additional multiplicative down-weight of episodic cache for older adults in [0,1]
+    - lapse: Lapse probability in [0,0.5]
+    
+    Inputs:
+    - states: np.array of state indices per trial
+    - actions: np.array of chosen action indices per trial (0..2; other values treated as lapses)
+    - rewards: np.array of rewards per trial (any real; converted to {0,1})
+    - blocks: np.array of block indices per trial
+    - set_sizes: np.array of set size per trial (3 or 6)
+    - age: np.array with a single value of participant age
+    - model_parameters: tuple/list of six parameters described above
+    
+    Returns:
+    - Negative log-likelihood of the observed action sequence under the model.
+    """
+    alpha, beta, epi_weight_base, epi_decay, age_gate, lapse = model_parameters
+    # Parameter hygiene
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    epi_weight_base = min(max(epi_weight_base, 0.0), 1.0)
+    epi_decay = min(max(epi_decay, 1e-6), 1.0)
+    age_gate = min(max(age_gate, 0.0), 1.0)
+    lapse = min(max(lapse, 0.0), 0.5)
+    
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+        
+        nS = int(block_set_sizes[0])
+        # Initialize RL values and episodic cache
+        Q = np.zeros((nS, nA))
+        E = np.zeros((nS, nA))  # episodic success traces
+        
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            ss = float(block_set_sizes[t])
+            
+            # Age- and load-dependent episodic weight
+            # Stronger weight in low set size; reduced if older
+            epi_w = epi_weight_base * (3.0 / max(1.0, ss)) * (1.0 - age_gate * older)
+            epi_w = min(max(epi_w, 0.0), 1.0)
+            
+            # Combine signals into a single logit vector: beta * (Q + epi_w * E)
+            logits = beta * (Q[s, :] + epi_w * E[s, :])
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+            if 0 <= a < nA and Z > 0:
+                p_choice = exps[a] / max(Z, eps)
+                p = (1.0 - lapse) * p_choice + lapse * (1.0 / nA)
+            else:
+                # Invalid action indices get only lapse/uniform mass
+                p = max(eps, lapse * (1.0 / nA))
+            total_loglik += np.log(max(p, eps))
+            
+            # Learning updates (only if valid action)
+            if 0 <= a < nA:
+                # RL update
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+                
+                # Episodic cache decay at the state, then update on rewards
+                E[s, :] *= epi_decay
+                if r > 0.5:
+                    # Store strong success trace for chosen action; weakly suppress competitors
+                    E[s, a] = 1.0
+                    for a_ in range(nA):
+                        if a_ != a:
+                            E[s, a_] = max(0.0, E[s, a_] - (1.0 - epi_decay) * 0.5)
+                else:
+                    # On failure, decay further the chosen action trace
+                    E[s, a] *= epi_decay
+
+    return -total_loglik
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Actor-Critic with entropy-regularized policy, load- and age-adaptive exploration, plus lapse.
+
+    Idea:
+    - Critic learns state values; actor learns state-action preferences via policy gradient with TD error.
+    - Policy = softmax(beta * preferences), but we apply explicit entropy regularization by mixing with uniform.
+      The entropy mixing increases with set size and more for older adults (added exploration under load/aging).
+    - Small lapse probability accounts for accidental/random responses.
+
+    Parameters (model_parameters):
+    - alpha_actor: Actor learning rate [0,1]
+    - alpha_critic: Critic learning rate [0,1]
+    - beta: Inverse temperature for the actor's softmax (>0), internally scaled (x10)
+    - entropy_base: Baseline entropy mixing weight in [0,1]
+    - age_entropy_boost: Additional entropy mixing applied if older (>0)
+    - lapse: Lapse probability in [0,0.5]
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays as specified
+    - model_parameters: tuple/list with six entries described above
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    alpha_actor, alpha_critic, beta, entropy_base, age_entropy_boost, lapse = model_parameters
+    alpha_actor = min(max(alpha_actor, 0.0), 1.0)
+    alpha_critic = min(max(alpha_critic, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    entropy_base = min(max(entropy_base, 0.0), 1.0)
+    age_entropy_boost = max(0.0, age_entropy_boost)
+    lapse = min(max(lapse, 0.0), 0.5)
+
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nS = int(block_set_sizes[0])
+        # Preferences (actor) and state values (critic)
+        H = np.zeros((nS, nA))
+        V = np.zeros(nS)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            ss = float(block_set_sizes[t])
+
+            # Softmax over preferences
+            logits = beta * H[s, :]
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+            pi = exps / max(Z, eps) if Z > 0 else np.ones(nA) / nA
+
+            # Entropy mixing weight increases with load and more for older adults
+            entropy_w = entropy_base * (ss / 3.0)
+            if older == 1:
+                entropy_w = min(1.0, entropy_w + age_entropy_boost)
+            entropy_w = min(max(entropy_w, 0.0), 1.0)
+
+            pi_reg = (1.0 - entropy_w) * pi + entropy_w * (np.ones(nA) / nA)
+
+            if 0 <= a < nA:
+                p_choice = pi_reg[a]
+                p = (1.0 - lapse) * p_choice + lapse * (1.0 / nA)
+            else:
+                p = max(eps, lapse * (1.0 / nA))
+            total_loglik += np.log(max(p, eps))
+
+            # TD error using critic
+            if 0 <= a < nA:
+                td = r - V[s]
+                V[s] += alpha_critic * td
+                # Policy gradient (advantage = td)
+                # Update only the taken action preference positively, others negatively by baseline
+                for a_ in range(nA):
+                    grad = (1.0 if a_ == a else 0.0) - pi[a_]
+                    H[s, a_] += alpha_actor * td * grad
+
+    return -total_loglik
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with uncertainty-driven exploration bonus and load- & age-dependent forgetting.
+
+    Idea:
+    - Standard Q-learning with per-visit uncertainty bonuses added to action values at decision time.
+    - Bonuses are larger for less-visited actions; scale with set size and more for older adults.
+    - Forgetting (decay toward 0) occurs on each visit to a state, stronger under higher load and in older adults.
+    - No lapse parameter here; stochasticity arises from softmax and uncertainty bonus.
+
+    Parameters (model_parameters):
+    - alpha: Learning rate [0,1]
+    - beta: Inverse temperature (>0), internally scaled (x10)
+    - kappa: Base weight of exploration bonus (>0)
+    - phi: Controls how fast uncertainty decays with visits (>0)
+    - forget_rate: Base forgetting rate per state visit in [0,1]
+    - age_mod: Scales both bonus and forgetting when older (>0)
+    
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays as specified
+    - model_parameters: tuple/list with six entries described above
+    
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    alpha, beta, kappa, phi, forget_rate, age_mod = model_parameters
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = max(1e-6, beta) * 10.0
+    kappa = max(0.0, kappa)
+    phi = max(1e-6, phi)
+    forget_rate = min(max(forget_rate, 0.0), 1.0)
+    age_mod = max(0.0, age_mod)
+
+    older = 1 if age[0] > 45 else 0
+    nA = 3
+    eps = 1e-12
+    total_loglik = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nS = int(block_set_sizes[0])
+        Q = np.zeros((nS, nA))
+        N = np.zeros((nS, nA))  # visit counts per state-action
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = 1.0 if block_rewards[t] > 0 else 0.0
+            ss = float(block_set_sizes[t])
+
+            # Effective parameters as a function of load and age
+            bonus_scale = kappa * (ss / 3.0) * (1.0 + age_mod * older)
+            f_eff = forget_rate * (ss / 6.0) * (1.0 + age_mod * older)
+            f_eff = min(max(f_eff, 0.0), 1.0)
+
+            # Compute uncertainty bonuses for this state
+            U = np.zeros(nA)
+            for a_ in range(nA):
+                # Uncertainty ~ 1 / (1 + visits)^phi
+                U[a_] = 1.0 / ((1.0 + N[s, a_]) ** phi)
+            bonus = bonus_scale * U
+
+            # Softmax over Q + bonus
+            logits = beta * (Q[s, :] + bonus)
+            m = np.max(logits)
+            exps = np.exp(logits - m)
+            Z = np.sum(exps)
+
+            if 0 <= a < nA and Z > 0:
+                p = exps[a] / max(Z, eps)
+            else:
+                p = 1.0 / nA  # treat invalid as uniform
+            total_loglik += np.log(max(p, eps))
+
+            # On visiting the state, apply forgetting to that state's Q-values
+            Q[s, :] *= (1.0 - f_eff)
+
+            # Update counts and Q if valid action
+            if 0 <= a < nA:
+                N[s, a] += 1.0
+                pe = r - Q[s, a]
+                Q[s, a] += alpha * pe
+
+    return -total_loglik

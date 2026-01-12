@@ -1,0 +1,343 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 1: Dual-learning-rate RL with state-specific perseveration and set-size-dependent forgetting.
+    
+    Mechanism:
+      - Q-learning with separate learning rates for positive and negative prediction errors.
+      - State-specific perseveration bias: tendency to repeat the last action taken in the same state.
+        The perseveration strength is modulated by age (older adults show stronger perseveration).
+      - Value forgetting within blocks increases with set size (higher load -> stronger drift toward zero).
+      - Policy uses a softmax over the sum of Q-values and perseveration bias.
+    
+    Parameters (model_parameters)
+    --------------------------------
+    alpha_pos : float
+        Learning rate for positive RPEs (0..1).
+    alpha_neg : float
+        Learning rate for negative RPEs (0..1).
+    beta : float
+        Base inverse temperature (>0); internally scaled.
+    phi0 : float
+        Baseline perseveration log-bias added to the last action in the same state.
+    age_phi_shift : float
+        Additive increase in perseveration log-bias for older adults (>=45).
+    f_base : float
+        Baseline forgetting rate factor mapped via sigmoid and scaled by set size.
+    
+    Inputs
+    ------
+    states : array-like (T,)
+        State index per trial (0..nS-1 within a block).
+    actions : array-like (T,)
+        Chosen action per trial (0..2).
+    rewards : array-like (T,)
+        Binary rewards (0/1).
+    blocks : array-like (T,)
+        Block index per trial. Values indicate trials belonging to the same block.
+    set_sizes : array-like (T,)
+        Set size for each trial in its block (e.g., 3 or 6).
+    age : array-like or scalar
+        Participant age; older group defined as age >= 45.
+    
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    nA = 3
+    eps = 1e-12
+
+    alpha_pos, alpha_neg, beta, phi0, age_phi_shift, f_base = model_parameters
+    beta = 5.0 * max(beta, eps)
+
+    age_val = age[0] if hasattr(age, "__len__") and not np.isscalar(age) else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        nS = int(set_sizes[idx][0])
+
+        # Initialize Q-values and last-action memory per state
+        Q = np.zeros((nS, nA))
+        last_action = -np.ones(nS, dtype=int)  # -1 means no previous action in this state yet
+
+        # Set-size factor for forgetting (0 for 3, 1 for 6)
+        ss_factor = (nS - 3) / 3.0
+        # Map f_base to (0,1) via sigmoid, and scale with set size and age (older -> slightly more forgetting)
+        f_sig = 1.0 / (1.0 + np.exp(-f_base))
+        forget_rate = np.clip(f_sig * (1.0 + 0.5 * ss_factor) * (1.0 + 0.2 * is_older), 0.0, 1.0)
+
+        # Perseveration strength
+        phi = phi0 + age_phi_shift * is_older  # can be positive or negative as a log-bias
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Apply global forgetting toward zero before decision
+            if forget_rate > 0:
+                Q *= (1.0 - forget_rate)
+
+            # Compute logits: Q plus perseveration bias on last action in this state
+            logits = Q[s, :].copy()
+            if last_action[s] >= 0:
+                logits[last_action[s]] += phi
+
+            # Softmax
+            logits_centered = logits - np.max(logits)
+            p = np.exp(beta * logits_centered)
+            p = p / (np.sum(p) + eps)
+            p = np.clip(p, eps, 1.0)
+            p /= np.sum(p)
+
+            total_logp += np.log(p[a])
+
+            # Update last action memory for this state
+            last_action[s] = a
+
+            # Q-learning with asymmetric learning rates
+            pe = r - Q[s, a]
+            eta = alpha_pos if pe >= 0 else alpha_neg
+            Q[s, a] += eta * pe
+
+    return -float(total_logp)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 2: RL + capacity-limited WM gating with age- and set-size-modulated access and noisy recall.
+    
+    Mechanism:
+      - RL system: standard Q-learning.
+      - WM system: stores the last rewarded action for a state; retrieval produces a pointed policy
+        favoring the stored action but with temperature (wm_temp) controlling recall precision.
+      - Effective WM availability depends on a capacity gate whose log-odds depends on age and is diluted by set size.
+      - The final policy is a convex mixture between WM and RL, with the mixture weight increasing with WM availability.
+    
+    Parameters (model_parameters)
+    --------------------------------
+    alpha : float
+        Q-learning rate in [0,1].
+    beta : float
+        Base inverse temperature for RL (>0); internally scaled.
+    slot_logit_base : float
+        Baseline log-odds of having an available WM slot.
+    age_slot_shift : float
+        Additive shift on WM slot log-odds if older (>=45). Positive increases WM availability for older adults.
+    wm_temp : float
+        Inverse temperature for WM policy (>0). Higher -> sharper WM policy toward stored action.
+    mix_logit_base : float
+        Baseline log-odds for mixing WM into policy; effective mixture scales with WM availability and this logit.
+    
+    Inputs
+    ------
+    states : array-like (T,)
+        State index per trial (0..nS-1 within a block).
+    actions : array-like (T,)
+        Chosen action per trial (0..2).
+    rewards : array-like (T,)
+        Binary rewards (0/1).
+    blocks : array-like (T,)
+        Block index per trial.
+    set_sizes : array-like (T,)
+        Set size for each trial in its block (e.g., 3 or 6).
+    age : array-like or scalar
+        Participant age; older group defined as age >= 45.
+    
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    nA = 3
+    eps = 1e-12
+
+    alpha, beta, slot_logit_base, age_slot_shift, wm_temp, mix_logit_base = model_parameters
+    beta = 5.0 * max(beta, eps)
+    wm_temp = 5.0 * max(wm_temp, eps)
+
+    age_val = age[0] if hasattr(age, "__len__") and not np.isscalar(age) else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        nS = int(set_sizes[idx][0])
+
+        Q = np.zeros((nS, nA))
+
+        # WM store: -1 means empty; otherwise stores action index 0..2
+        WM_store = -np.ones(nS, dtype=int)
+
+        # Compute WM availability and mixture weight for this block
+        # Slot availability from logit and age, then diluted by set size (more states -> less per-state availability)
+        slot_logit = slot_logit_base + age_slot_shift * is_older
+        slot_p = 1.0 / (1.0 + np.exp(-slot_logit))  # (0,1)
+        # Per-state effective availability: scaled by ratio of small set size to actual set size
+        avail = np.clip(slot_p * (3.0 / max(float(nS), 1.0)), 0.0, 1.0)
+
+        # Mixture base from logit, then modulated by availability
+        mix_base = 1.0 / (1.0 + np.exp(-mix_logit_base))
+        mix_w = np.clip(mix_base * avail, 0.0, 1.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            q_s = Q[s, :].copy()
+            q_s -= np.max(q_s)
+            p_rl = np.exp(beta * q_s)
+            p_rl = p_rl / (np.sum(p_rl) + eps)
+
+            # WM policy: if we have a stored action for this state, point mass with temperature; else uniform
+            if WM_store[s] >= 0:
+                prefs = np.zeros(nA)
+                prefs[WM_store[s]] = 1.0
+                prefs -= np.max(prefs)
+                p_wm = np.exp(wm_temp * prefs)
+                p_wm = p_wm / (np.sum(p_wm) + eps)
+            else:
+                p_wm = np.ones(nA) / nA
+
+            # Final mixture
+            p = mix_w * p_wm + (1.0 - mix_w) * p_rl
+            p = np.clip(p, eps, 1.0)
+            p /= np.sum(p)
+
+            total_logp += np.log(p[a])
+
+            # Q-learning update
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+            # WM storage rule: on rewarded trials, store that action; on non-reward, do not store
+            # Interference/decay: with probability (1 - avail), clear the store (approximated deterministically)
+            if r > 0.5:
+                WM_store[s] = a
+            # Deterministic decay toward empty when availability is low
+            if avail < 1.0:
+                # Apply mild decay: if a different state is being experienced, interference increases clearing.
+                # Here we use a small leak proportional to lack of availability.
+                if np.random.rand() < (1.0 - avail) * 0.0:
+                    # Disabled randomness to keep likelihood well-defined; emulate mild deterministic weakening by occasionally clearing.
+                    pass
+                # Deterministic surrogate: if stored, occasionally clear based on low availability and lack of recent reward.
+                if r < 0.5 and WM_store[s] >= 0 and avail < 0.5:
+                    WM_store[s] = -1
+
+    return -float(total_logp)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 3: Uncertainty-bonus RL (UCB-like) with age- and set-size-modulated exploration.
+    
+    Mechanism:
+      - Q-learning updates expected values.
+      - Track action visit counts per state to estimate epistemic uncertainty.
+      - Decision logits combine Q-values with an exploration bonus proportional to uncertainty (1/sqrt(N+init)).
+      - The exploration bonus magnitude increases with set size and can be shifted by age.
+        Older adults may rely more or less on exploration depending on age_bonus_shift.
+    
+    Parameters (model_parameters)
+    --------------------------------
+    alpha : float
+        Q-learning rate in [0,1].
+    beta : float
+        Base inverse temperature for softmax (>0); internally scaled.
+    bonus_base : float
+        Baseline weight on the uncertainty bonus (>=0 preferred but can be any real; internally rectified).
+    age_bonus_shift : float
+        Additive shift to the bonus for older adults (>=45).
+    ss_bonus_scale : float
+        Additional scaling of the bonus with set size factor (0 for 3, 1 for 6).
+    init_count : float
+        Pseudo-count added to action visit counts to modulate initial uncertainty (>0).
+    
+    Inputs
+    ------
+    states : array-like (T,)
+        State index per trial (0..nS-1 within a block).
+    actions : array-like (T,)
+        Chosen action per trial (0..2).
+    rewards : array-like (T,)
+        Binary rewards (0/1).
+    blocks : array-like (T,)
+        Block index per trial.
+    set_sizes : array-like (T,)
+        Set size for each trial in its block (e.g., 3 or 6).
+    age : array-like or scalar
+        Participant age; older group defined as age >= 45.
+    
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices under the model.
+    """
+    nA = 3
+    eps = 1e-12
+
+    alpha, beta, bonus_base, age_bonus_shift, ss_bonus_scale, init_count = model_parameters
+    beta = 5.0 * max(beta, eps)
+    init_count = max(init_count, eps)
+
+    age_val = age[0] if hasattr(age, "__len__") and not np.isscalar(age) else age
+    is_older = 1.0 if age_val >= 45 else 0.0
+
+    total_logp = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_states = states[idx].astype(int)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        nS = int(set_sizes[idx][0])
+
+        Q = np.zeros((nS, nA))
+        N = np.zeros((nS, nA))  # visit counts
+
+        # Set-size factor: 0 for 3, 1 for 6
+        ss_factor = (nS - 3) / 3.0
+
+        # Effective bonus weight with age and set size. Rectify to be nonnegative.
+        bonus_w = bonus_base + age_bonus_shift * is_older + ss_bonus_scale * ss_factor
+        bonus_w = max(0.0, bonus_w)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Uncertainty = 1/sqrt(N + init_count)
+            unc = 1.0 / np.sqrt(N[s, :] + init_count)
+
+            # Combine Q and uncertainty bonus
+            logits = Q[s, :] + bonus_w * unc
+
+            # Softmax choice
+            logits -= np.max(logits)
+            p = np.exp(beta * logits)
+            p = p / (np.sum(p) + eps)
+            p = np.clip(p, eps, 1.0)
+            p /= np.sum(p)
+
+            total_logp += np.log(p[a])
+
+            # Update counts and Q
+            N[s, a] += 1.0
+            pe = r - Q[s, a]
+            Q[s, a] += alpha * pe
+
+    return -float(total_logp)

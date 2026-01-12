@@ -18,6 +18,7 @@ The function should be called simulate_model.
 It should take the following inputs: {cfg.data.simulation_columns}, parameters.
 It should return the following: {cfg.data.simulation_return}.
 Make sure your simulation code follows the logic of the best fitting model. 
+Do not define any new functions within the code you write.
 
     """
 

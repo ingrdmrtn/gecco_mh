@@ -17,7 +17,7 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 def main():
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "rlwm_individual_age.yaml")
+    cfg = load_config(project_root / "config" / "rlwm_individual.yaml")
     data_cfg = cfg.data
     fit_type = cfg.evaluation.fit_type
     max_independent_runs  = cfg.loop.max_independent_runs
@@ -30,8 +30,7 @@ def main():
     young_participants = list(df_w_participant[df_w_participant.age<45].participant.unique()[:15])
     old_participants = list(df_w_participant[df_w_participant.age>45].participant.unique()[:15])
     all_participants  = young_participants + old_participants
-
-
+    all_participants = all_participants [16:]
     if fit_type == "individual":
 
 
@@ -42,7 +41,7 @@ def main():
 
             # best_hybrid_bic =
             df_participant = df[df.participant == participant].reset_index()
-
+            df_participant = df_participant[df_participant.rewards >= 0].reset_index()
             if cfg.loop.early_stopping == "True":
                 baseline_bics = load_data(data_cfg.path)
                 baseline_bic = baseline_bics[baseline_bics.participant == participant].reset_index().baseline_bic[0]

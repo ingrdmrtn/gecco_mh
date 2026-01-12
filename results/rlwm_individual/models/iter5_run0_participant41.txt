@@ -1,394 +1,304 @@
-def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
     """
-    Hybrid RL + set-size-specific working memory (WM) slots with age-modulated mixture and lapses.
+    Capacity-limited gated working memory with decay and lapses, mixed with RL.
 
     Idea:
-    - RL: incremental Q-learning over state-action values with softmax choice.
-    - WM: fast, capacity-weighted cache per state that stores the most recently rewarded action.
-      When a state-action is rewarded, WM for that state becomes peaked on that action; otherwise it decays.
-    - Mixture: action policy is a mixture of WM and RL, with the WM weight depending on set size (3 vs 6),
-      participant age, and the corresponding capacity parameter.
-    - Lapses: a portion of trials are treated as lapses leading to either omission or random action.
+    - RL: standard delta-rule Q-learning.
+    - WM: stores rewarded action as a one-hot distribution for a state; its strength m[s] decays.
+           Storage is capacity-limited; total WM strength across states is constrained by K.
+    - Arbitration: WM contribution scales with the current memory strength for the queried state and
+      a base gate parameter; also reduced by lapse. WM availability also effectively scales down when
+      set size exceeds capacity (via normalization of m to sum<=K).
+    - Lapse: with probability 'lapse', respond uniformly random.
 
-    Parameters
-    ----------
-    states : array-like (int)
-        State index per trial within block (0..nS-1).
-    actions : array-like (int)
-        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
-    rewards : array-like (float/int)
-        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission/timeout).
-    blocks : array-like (int)
-        Block index per trial.
-    set_sizes : array-like (int)
-        Set size (3 or 6) per trial. Within a block it's constant.
-    age : array-like (float/int)
-        Participant age; older group (>=45) reduces effective WM and increases lapse effect.
-    model_parameters : list/tuple of length 5
-        [alpha, beta, wm3, wm6, lapse]
-        - alpha: RL learning rate (0-1).
-        - beta: inverse temperature for RL softmax (>0).
-        - wm3: baseline WM weight in set size 3 blocks (0-1 scale).
-        - wm6: baseline WM weight in set size 6 blocks (0-1 scale).
-        - lapse: lapse probability (0-1); half to omissions, half to random responding.
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_gate_base: baseline WM policy weight (0..1).
+    - wm_decay: per-trial decay of memory strength m and stored WM distribution (0..1).
+    - wm_capacity: capacity K (>=0) controlling the total WM strength across states.
+    - lapse: lapse probability (0..1), mixed with uniform choice.
 
-    Returns
-    -------
-    neg_log_lik : float
-        Negative log-likelihood of the observed choices.
+    Returns:
+    - Negative log-likelihood of observed actions.
     """
-    alpha, beta, wm3, wm6, lapse = model_parameters
-    age_val = age[0]
-    older = 1 if age_val >= 45 else 0
-
-    nA = 3
+    lr, softmax_beta, wm_gate_base, wm_decay, wm_capacity, lapse = model_parameters
+    softmax_beta *= 10.0  # higher upper bound as specified
+    softmax_beta_wm = 50.0  # very deterministic WM when stored
     eps = 1e-12
-    neg_log_lik = 0.0
 
-    # Age effects: older -> lower WM trust, higher effective lapse
-    age_wm_mult = 0.7 if older else 1.0
-    age_lapse_mult = 1.2 if older else 1.0
-
+    blocks_log_p = 0.0
     for b in np.unique(blocks):
-        mask = (blocks == b)
-        block_states = states[mask]
-        block_actions = actions[mask]
-        block_rewards = rewards[mask]
-        nS = int(set_sizes[mask][0])
 
-        # RL values
-        Q = (1.0 / nA) * np.ones((nS, nA))
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
 
-        # WM representation: probability vectors per state over actions
-        WM = (1.0 / nA) * np.ones((nS, nA))
-        # A confidence variable for each state's WM (0..1), increased on reward, decays otherwise
-        WM_conf = np.zeros(nS)
+        nA = 3
+        nS = int(block_set_sizes[0])
 
-        # Set-size-specific baseline WM weight
-        wm_base = wm3 if nS <= 3 else wm6
-        wm_weight = max(0.0, min(1.0, wm_base * age_wm_mult))
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # State-specific WM strength in [0,1], subject to capacity normalization
+        m = np.zeros(nS)
 
-        # WM decay is stronger under higher set size and with age
-        wm_decay = 0.05 * (1.0 + 0.5 * older) * (1.0 + (nS - 3) / 3.0)
-
-        # Lapse per block, scaled by age
-        lapse_eff = max(0.0, min(1.0, lapse * age_lapse_mult))
-
+        log_p = 0.0
         for t in range(len(block_states)):
-            s = int(block_states[t])
+
             a = int(block_actions[t])
+            s = int(block_states[t])
             r = float(block_rewards[t])
 
-            # RL policy
-            Qs = Q[s].copy()
-            Qs -= np.max(Qs)
-            rl_logits = beta * Qs
-            rl_probs = np.exp(rl_logits - np.max(rl_logits))
-            rl_probs = rl_probs / np.sum(rl_probs)
+            # RL policy probability of chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
 
-            # WM policy from stored distribution sharpened by confidence
-            WM_s = WM[s].copy()
-            WM_s = np.maximum(WM_s, eps)
-            WM_s /= np.sum(WM_s)
-            # Internal sharpness scales with confidence
-            beta_wm = 4.0 * (0.1 + 0.9 * WM_conf[s])  # 0.4..4.0
-            wm_logits = beta_wm * (WM_s - np.max(WM_s))
-            wm_probs = np.exp(wm_logits - np.max(wm_logits))
-            wm_probs = wm_probs / np.sum(wm_probs)
+            # Capacity-constrained WM strength normalization
+            total_m = np.sum(m)
+            if total_m > wm_capacity and wm_capacity >= 0.0:
+                scale = wm_capacity / total_m if total_m > 0 else 1.0
+                m = m * scale
+
+            # WM policy with near-deterministic softmax over W_s
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Effective WM policy weight depends on memory strength for this state
+            wm_avail = np.clip(wm_gate_base * m[s], 0.0, 1.0)
+
+            # Mixture with lapse to uniform
+            p_mix = wm_avail * p_wm + (1.0 - wm_avail) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM updates
+            # Decay memory strength and WM distributions slightly toward uniform
+            m = (1.0 - wm_decay) * m
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # Gate WM on rewarded outcomes for this state
+            if r > 0.5:
+                # Increase memory strength for this state (bounded by 1, later capacity-normalized)
+                m[s] = np.clip(m[s] + (1.0 - m[s]) * 0.5, 0.0, 1.0)  # saturating increase
+                # Store rewarded action as one-hot distribution
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with set-size–sensitive inverse temperature and WM with swap interference.
+
+    Idea:
+    - RL: delta-rule Q-learning. The effective inverse temperature decreases with set size,
+      capturing noisier policy under higher cognitive load.
+    - WM: updated by a delta rule toward one-hot on rewards and toward uniform on non-rewards.
+      WM suffers swap-like interference: with set-size–dependent probability, the effective WM
+      policy is mixed with the average of other states' WM distributions.
+    - Arbitration: fixed WM weight scaled by set size (weaker when nS is large).
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: base RL inverse temperature; internally scaled by 10 and made set-size sensitive.
+    - wm_weight_base: baseline WM weight in the policy mixture (0..1).
+    - swap_rate: base swap/interference rate (>=0); grows with set size beyond 3.
+    - beta_size_slope: slope controlling how much RL beta decreases with set size (>=0).
+    - wm_learn: WM learning rate toward targets (0..1).
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, wm_weight_base, swap_rate, beta_size_slope, wm_learn = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size scaling
+        size_term = max(0.0, (float(nS) - 3.0) / 3.0)  # 0 for 3, 1 for 6
+        beta_eff = softmax_beta / (1.0 + beta_size_slope * size_term)
+        wm_weight = np.clip(wm_weight_base * (3.0 / max(3.0, float(nS))), 0.0, 1.0)
+        swap_eff = np.clip(swap_rate * size_term, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with set-size–adjusted beta
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # WM with swap interference: mix with average of other states
+            if nS > 1:
+                mean_other = (np.sum(w, axis=0) - w[s, :]) / max(1, nS - 1)
+            else:
+                mean_other = w[s, :].copy()
+            W_eff = (1.0 - swap_eff) * w[s, :] + swap_eff * mean_other
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_eff - W_eff[a])))
 
             # Mixture
-            mix_probs = wm_weight * wm_probs + (1.0 - wm_weight) * rl_probs
-            mix_probs = np.maximum(mix_probs, eps)
-            mix_probs /= np.sum(mix_probs)
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
 
-            # Lapse model: split between omissions and random actions
-            p_omit = lapse_eff * 0.5
-            p_rand = lapse_eff * 0.5
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
 
-            if a == -2:
-                p_choice = p_omit
-            elif 0 <= a < nA:
-                p_choice = (1.0 - lapse_eff) * mix_probs[a] + p_rand * (1.0 / nA)
+            # WM update rule: toward one-hot when rewarded, toward uniform when not
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
             else:
-                p_choice = eps
+                target = w_0[s, :]
+            w[s, :] = w[s, :] + wm_learn * (target - w[s, :])
+            # ensure normalization
+            w[s, :] = np.maximum(w[s, :], 0.0)
+            w[s, :] /= np.sum(w[s, :]) if np.sum(w[s, :]) > 0 else 1.0
 
-            neg_log_lik -= np.log(max(p_choice, eps))
+        blocks_log_p += log_p
 
-            # Learning (only if non-negative reward and a real action)
-            if (a >= 0) and (r >= 0):
-                # RL update
-                pe = r - Q[s, a]
-                Q[s, a] += alpha * pe
-
-                # WM update: rewarded responses increase confidence and concentrate mass
-                if r > 0.5:
-                    WM_conf[s] = min(1.0, (1.0 - wm_decay) * WM_conf[s] + (1.0 - WM_conf[s]) * 0.8)
-                    # Move distribution toward a on reward
-                    gain = 0.6
-                    WM[s, a] = WM[s, a] + gain * (1.0 - WM[s, a])
-                    for aa in range(nA):
-                        if aa != a:
-                            WM[s, aa] = (1.0 - gain) * WM[s, aa]
-                else:
-                    # No-reward: reduce confidence and flatten slightly
-                    WM_conf[s] = max(0.0, (1.0 - wm_decay) * WM_conf[s])
-                    flatten = 0.2
-                    WM[s] = (1.0 - flatten) * WM[s] + flatten * (np.ones(nA) / nA)
-
-                # Global WM decay toward uniform each trial
-                WM[s] = (1.0 - wm_decay) * WM[s] + wm_decay * (np.ones(nA) / nA)
-                WM[s] = np.maximum(WM[s], eps)
-                WM[s] /= np.sum(WM[s])
-
-    return neg_log_lik
+    return -blocks_log_p
 
 
-def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
     """
-    RL with load-dependent interference across states and value forgetting, age-sensitive.
+    Entropy-based arbitration with WM hypothesis store, set-size–dependent WM decay,
+    and RL stickiness bias.
 
     Idea:
-    - Standard Q-learning drives action values per state.
-    - Interference: learning in one state causes spillover toward the global action mean in other states.
-      This interference is stronger for larger set sizes and for older adults.
-    - Forgetting: values decay toward a neutral prior each trial; older adults forget more.
-    - Softmax choice with lapses and omission channel.
+    - RL: delta-rule Q-learning; action preferences include a stickiness term favoring the
+      last action taken in the same state.
+    - WM: hypothesis-like store of last rewarded action per state (one-hot). When not rewarded,
+      WM decays toward uniform; decay increases with set size.
+    - Arbitration: WM weight increases when WM is confident (low entropy) and RL is uncertain
+      (high entropy). Weight is passed through a sigmoid controlled by a base term and an
+      entropy-contrast gain.
 
-    Parameters
-    ----------
-    states : array-like (int)
-        State index per trial within block (0..nS-1).
-    actions : array-like (int)
-        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
-    rewards : array-like (float/int)
-        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission/timeout).
-    blocks : array-like (int)
-        Block index per trial.
-    set_sizes : array-like (int)
-        Set size (3 or 6) per trial. Within a block it's constant.
-    age : array-like (float/int)
-        Participant age; older group (>=45) increases interference and forgetting.
-    model_parameters : list/tuple of length 5
-        [alpha, beta, gamma_interf, decay, lapse]
-        - alpha: RL learning rate (0-1).
-        - beta: inverse temperature for RL softmax (>0).
-        - gamma_interf: baseline interference gain (>=0).
-        - decay: baseline value decay toward prior per trial (0-1).
-        - lapse: lapse probability (0-1); split between omission and random action.
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_base: base term inside the sigmoid for WM reliance.
+    - ent_weight: gain multiplying (H_rl - H_wm) inside the sigmoid; larger favors WM when
+      RL is more uncertain than WM (>=0).
+    - decay_size_slope: slope controlling how WM decay increases with set size (>=0).
+    - kappa: RL stickiness bias added to the previous action's logit within the state (>=0).
 
-    Returns
-    -------
-    neg_log_lik : float
-        Negative log-likelihood of the observed choices.
+    Returns:
+    - Negative log-likelihood of observed actions.
     """
-    alpha, beta, gamma_interf, decay, lapse = model_parameters
-    age_val = age[0]
-    older = 1 if age_val >= 45 else 0
-
-    nA = 3
+    lr, softmax_beta, wm_base, ent_weight, decay_size_slope, kappa = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
     eps = 1e-12
-    neg_log_lik = 0.0
 
-    # Age multipliers
-    age_interf_mult = 1.3 if older else 1.0
-    age_decay_mult = 1.25 if older else 1.0
-    age_lapse_mult = 1.1 if older else 1.0
+    def softmax_vec(x):
+        x = x - np.max(x)
+        ex = np.exp(x)
+        return ex / np.sum(ex)
 
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0.0
     for b in np.unique(blocks):
-        mask = (blocks == b)
-        block_states = states[mask]
-        block_actions = actions[mask]
-        block_rewards = rewards[mask]
-        nS = int(set_sizes[mask][0])
 
-        # Initialize Q-values
-        Q = (1.0 / nA) * np.ones((nS, nA))
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
 
-        # Effective parameters per block
-        load_factor = 1.0 + 0.5 * ((nS - 3) / 3.0)  # 1 for 3-set, 1.5 for 6-set
-        gamma_eff = max(0.0, gamma_interf * age_interf_mult * load_factor)
-        decay_eff = max(0.0, min(1.0, decay * age_decay_mult * load_factor))
-        lapse_eff = max(0.0, min(1.0, lapse * age_lapse_mult))
+        nA = 3
+        nS = int(block_set_sizes[0])
 
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # Track previous action per state for stickiness
+        prev_action = -1 * np.ones(nS, dtype=int)
+
+        # Set-size dependent WM decay
+        lam = np.clip(decay_size_slope * (float(nS) / 3.0), 0.0, 1.0)
+
+        log_p = 0.0
         for t in range(len(block_states)):
-            s = int(block_states[t])
+
             a = int(block_actions[t])
+            s = int(block_states[t])
             r = float(block_rewards[t])
 
-            # Choice policy
-            Qs = Q[s].copy()
-            Qs -= np.max(Qs)
-            logits = beta * Qs
-            probs = np.exp(logits - np.max(logits))
-            probs = probs / np.sum(probs)
+            # RL policy with stickiness in logits
+            Qb = q[s, :].copy()
+            if prev_action[s] >= 0:
+                Qb[prev_action[s]] += kappa
+            # Convert to probability of chosen action using softmax definition
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Qb - Qb[a])))
 
-            p_omit = lapse_eff * 0.5
-            p_rand = lapse_eff * 0.5
+            # WM policy over actions
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
 
-            if a == -2:
-                p_choice = p_omit
-            elif 0 <= a < nA:
-                p_choice = (1.0 - lapse_eff) * probs[a] + p_rand * (1.0 / nA)
-            else:
-                p_choice = eps
+            # Compute full distributions to estimate entropies
+            pi_rl = softmax_vec(softmax_beta * Qb)
+            pi_wm = softmax_vec(softmax_beta_wm * W_s)
+            H_rl = -np.sum(pi_rl * np.log(np.clip(pi_rl, eps, 1.0)))
+            H_wm = -np.sum(pi_wm * np.log(np.clip(pi_wm, eps, 1.0)))
 
-            neg_log_lik -= np.log(max(p_choice, eps))
+            # Entropy-based arbitration via sigmoid
+            wm_weight = sigmoid(wm_base + ent_weight * (H_rl - H_wm))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
 
-            # Learning if valid feedback/action
-            if (a >= 0) and (r >= 0):
-                # Standard RL update on visited state-action
-                pe = r - Q[s, a]
-                Q[s, a] += alpha * pe
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
 
-                # Value forgetting toward neutral (1/nA)
-                Q[s] = (1.0 - decay_eff) * Q[s] + decay_eff * (np.ones(nA) / nA)
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
 
-                # Interference: other states drift toward block-wide action means
-                # Compute current global mean over states for each action
-                global_mean = np.mean(Q, axis=0)
-                for s_other in range(nS):
-                    if s_other == s:
-                        continue
-                    Q[s_other] = (1.0 - gamma_eff) * Q[s_other] + gamma_eff * global_mean
+            # WM update: reward => store one-hot; otherwise decay toward uniform
+            if r > 0.5:
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+            # Global decay toward uniform, stronger in larger set sizes
+            w = (1.0 - lam) * w + lam * w_0
 
-                # Ensure numeric stability
-                # (No need to renormalize Q; it's a value function. Keep bounded to avoid overflow)
-                Q = np.clip(Q, -10.0, 10.0)
+            # Update stickiness state-wise
+            prev_action[s] = a
 
-    return neg_log_lik
+        blocks_log_p += log_p
 
-
-def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
-    """
-    Noisy Win-Stay / Lose-Shift with age- and load-dependent stay/shift propensities plus a softmax fallback.
-
-    Idea:
-    - Primary controller: WS/LS within each state:
-        * After a reward in a state, repeat the last action with high probability (stay propensity).
-        * After no reward in a state, choose any other action (shift propensity distributes mass over non-last actions).
-    - Secondary controller: a weak RL softmax baseline that accumulates evidence across trials.
-    - Mixture: WSLS-derived distribution is combined with the RL baseline; older adults and larger sets reduce shift,
-      slightly increase reliance on RL baseline, and increase omissions.
-
-    Parameters
-    ----------
-    states : array-like (int)
-        State index per trial within block (0..nS-1).
-    actions : array-like (int)
-        Chosen action per trial. Valid actions {0,1,2}; -2 denotes omission.
-    rewards : array-like (float/int)
-        Feedback per trial. 0 or 1; negative denotes invalid (e.g., omission/timeout).
-    blocks : array-like (int)
-        Block index per trial.
-    set_sizes : array-like (int)
-        Set size (3 or 6) per trial. Within a block it's constant.
-    age : array-like (float/int)
-        Participant age; older group (>=45) shifts toward staying and lapses more.
-    model_parameters : list/tuple of length 5
-        [beta, stay_gain, shift_gain, mix_rl, lapse]
-        - beta: inverse temperature for the RL fallback (>0).
-        - stay_gain: baseline strength to stay after reward (>=0).
-        - shift_gain: baseline strength to shift after no-reward (>=0).
-        - mix_rl: baseline mixture weight of RL fallback in final policy (0-1).
-        - lapse: lapse probability (0-1); split between omission and random action.
-
-    Returns
-    -------
-    neg_log_lik : float
-        Negative log-likelihood of the observed choices.
-    """
-    beta, stay_gain, shift_gain, mix_rl, lapse = model_parameters
-    age_val = age[0]
-    older = 1 if age_val >= 45 else 0
-
-    nA = 3
-    eps = 1e-12
-    neg_log_lik = 0.0
-
-    # Age and load effects on WS/LS and mixing
-    age_stay_mult = 1.15 if older else 1.0      # older: more likely to stay after reward
-    age_shift_mult = 0.85 if older else 1.0     # older: less likely to shift after loss
-    age_mix_mult = 1.1 if older else 1.0        # older: rely a bit more on RL fallback
-    age_lapse_mult = 1.15 if older else 1.0
-
-    for b in np.unique(blocks):
-        mask = (blocks == b)
-        block_states = states[mask]
-        block_actions = actions[mask]
-        block_rewards = rewards[mask]
-        nS = int(set_sizes[mask][0])
-
-        # RL fallback values
-        Q = (1.0 / nA) * np.ones((nS, nA))
-
-        # Track last action and last outcome per state
-        last_a = -1 * np.ones(nS, dtype=int)
-        last_r = np.zeros(nS)
-
-        # Load modulation
-        load_stay_mult = 1.0 if nS <= 3 else 0.9
-        load_shift_mult = 1.0 if nS <= 3 else 0.8
-        load_mix_mult = 1.0 if nS <= 3 else 1.15
-
-        stay_eff = max(0.0, stay_gain * age_stay_mult * load_stay_mult)
-        shift_eff = max(0.0, shift_gain * age_shift_mult * load_shift_mult)
-        mix_rl_eff = max(0.0, min(1.0, mix_rl * age_mix_mult * load_mix_mult))
-        lapse_eff = max(0.0, min(1.0, lapse * age_lapse_mult))
-
-        for t in range(len(block_states)):
-            s = int(block_states[t])
-            a = int(block_actions[t])
-            r = float(block_rewards[t])
-
-            # WS/LS distribution
-            wsls_probs = np.ones(nA) / nA
-            if last_a[s] >= 0:
-                if last_r[s] > 0.5:
-                    # Win: stay with probability from logistic(stay_eff)
-                    p_stay = 1.0 / (1.0 + np.exp(-stay_eff))
-                    wsls_probs = np.ones(nA) * ((1.0 - p_stay) / (nA - 1))
-                    wsls_probs[last_a[s]] = p_stay
-                else:
-                    # Loss: shift away from last action with probability from logistic(shift_eff)
-                    p_shift = 1.0 / (1.0 + np.exp(-shift_eff))
-                    wsls_probs = np.ones(nA) * (p_shift / (nA - 1))
-                    wsls_probs[last_a[s]] = 1.0 - p_shift
-
-            # RL fallback distribution
-            Qs = Q[s].copy()
-            Qs -= np.max(Qs)
-            rl_logits = beta * Qs
-            rl_probs = np.exp(rl_logits - np.max(rl_logits))
-            rl_probs = rl_probs / np.sum(rl_probs)
-
-            # Mixture
-            mix_probs = (1.0 - mix_rl_eff) * wsls_probs + mix_rl_eff * rl_probs
-            mix_probs = np.maximum(mix_probs, eps)
-            mix_probs /= np.sum(mix_probs)
-
-            # Lapse with omission channel
-            p_omit = lapse_eff * 0.5
-            p_rand = lapse_eff * 0.5
-
-            if a == -2:
-                p_choice = p_omit
-            elif 0 <= a < nA:
-                p_choice = (1.0 - lapse_eff) * mix_probs[a] + p_rand * (1.0 / nA)
-            else:
-                p_choice = eps
-
-            neg_log_lik -= np.log(max(p_choice, eps))
-
-            # Updates
-            if (a >= 0) and (r >= 0):
-                # Simple RL fallback update with a conservative learning rate derived from mix_rl
-                # The more we rely on RL in policy, the more we allow it to learn here
-                alpha_rl = 0.2 + 0.6 * mix_rl_eff  # in [0.2,0.8]
-                pe = r - Q[s, a]
-                Q[s, a] += alpha_rl * pe
-
-                # Track last state outcome for WS/LS rule
-                last_a[s] = a
-                last_r[s] = r
-
-    return neg_log_lik
+    return -blocks_log_p

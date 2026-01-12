@@ -1,0 +1,375 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid RL + Bayesian (Dirichlet-Beta) inference over state-action correctness with age- and
+    uncertainty-driven omissions.
+
+    Idea:
+    - RL: Q-learning over state-action values with softmax.
+    - Bayesian: for each state-action, maintain a Beta posterior over p(reward=1 | s,a).
+      Start from a symmetric prior; update (success = r, failure = 1-r when r in {0,1}).
+      Use posterior mean as "Bayesian value" and a state-wise confidence measure.
+    - Mixture: policy is a convex combination of RL softmax and Bayesian softmax.
+      Mixture weight depends on set size (via confidence) and age (older use less Bayesian WM-like inference).
+    - Omissions: probability of omission grows with decision uncertainty (entropy of the mixed policy),
+      scaled by a parameter and age.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid 0..2; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial. Typically 0 or 1. Negative values denote invalid feedback (e.g., omission).
+    blocks : array-like of int
+        Block index per trial. Set size is constant within a block.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6).
+    age : array-like of float/int
+        Participant age. Older group (>=45) downweights Bayesian component and increases omissions.
+    model_parameters : list/tuple of length 5
+        [alpha, beta, prior_conc, mix_bias, omit_gain]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL and Bayesian softmax (>0).
+        - prior_conc: symmetric prior concentration for Beta(a0,b0) on p(reward|s,a) (>=2).
+        - mix_bias: baseline mixture weight toward Bayesian component (0..1).
+        - omit_gain: scales omission probability as a function of uncertainty (>=0).
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, prior_conc, mix_bias, omit_gain = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Age effects:
+    # - Older adults reduce reliance on Bayesian inference (working-memory-like) and
+    #   increase omission weighting from uncertainty.
+    mix_age_mult = 0.7 if older else 1.0
+    omit_age_mult = 1.3 if older else 1.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # RL Q-values
+        Q = (1.0 / nA) * np.ones((nS, nA))
+
+        # Bayesian counts for Beta posterior per (s,a): a_succ, b_fail
+        a0 = max(1.0, prior_conc / 2.0)
+        b0 = max(1.0, prior_conc / 2.0)
+        A_succ = a0 * np.ones((nS, nA))
+        B_fail = b0 * np.ones((nS, nA))
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            rl_probs = np.exp(beta * Qs)
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            # Bayesian policy: use posterior mean as value proxy
+            post_mean = A_succ[s] / (A_succ[s] + B_fail[s])
+            pm = post_mean.copy()
+            pm -= np.max(pm)
+            bayes_probs = np.exp(beta * pm)
+            bayes_probs = bayes_probs / np.sum(bayes_probs)
+
+            # Confidence for state s: concentration of best action
+            conc_s = np.sum(A_succ[s] + B_fail[s])
+            best = np.argmax(post_mean)
+            best_conc = (A_succ[s, best] + B_fail[s, best])
+            conf_s = best_conc / (conc_s + eps)  # in (0,1)
+
+            # Mixture weight: baseline mix_bias, reduced by set size and age
+            load_mult = 1.0 / (1.0 + (nS - 3) / 3.0)  # 1.0 for 3, ~0.5 for 6
+            wm_weight = np.clip(mix_bias * mix_age_mult * (0.5 + 0.5 * conf_s) * load_mult, 0.0, 1.0)
+
+            mix_probs = wm_weight * bayes_probs + (1.0 - wm_weight) * rl_probs
+            mix_probs = np.maximum(mix_probs, eps)
+            mix_probs /= np.sum(mix_probs)
+
+            # Uncertainty-driven omissions: use entropy of mixed policy
+            ent = -np.sum(mix_probs * np.log(np.maximum(mix_probs, eps))) / np.log(nA)  # normalized to [0,1]
+            p_omit = np.clip(omit_gain * omit_age_mult * ent, 0.0, 0.5)  # cap to keep feasible mass
+
+            # Likelihood of observed action (including omissions)
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * mix_probs[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning updates only when an action was made and reward is valid (0/1)
+            if (a >= 0) and (r >= 0.0):
+                # RL update
+                Q[s, a] += alpha * (r - Q[s, a])
+
+                # Bayesian update
+                A_succ[s, a] += r
+                B_fail[s, a] += (1.0 - r)
+
+    return neg_log_lik
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with aversive trace and age-modulated avoidance and omission gating.
+
+    Idea:
+    - RL: standard Q-learning for rewards.
+    - Aversive trace: track recent non-reward/negative outcomes per (s,a) in a separate trace A.
+      Policy uses softmax over effective value V = Q - phi * A. A decays over time.
+    - Age: older adults weigh avoidance more strongly and forget aversive traces more slowly.
+    - Omissions: when the best available effective value is below a threshold determined by the
+      recent count of negative outcomes in the state, the model increases omission probability.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid 0..2; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial (1, 0, or negative for invalid).
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6).
+    age : array-like of float/int
+        Participant age; older group (>=45) increases avoidance impact and omission tendency.
+    model_parameters : list/tuple of length 5
+        [alpha, beta, phi, decay, neg_thr]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature (>0).
+        - phi: scaling of aversive trace in decision value (>=0).
+        - decay: decay rate of aversive trace A per trial (0..1), higher = faster forgetting.
+        - neg_thr: threshold parameter controlling omission gating from recent negatives (>=0).
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of observed choices.
+    """
+    alpha, beta, phi, decay, neg_thr = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # Age effects on avoidance and forgetting
+    phi_eff_mult = 1.3 if older else 1.0       # stronger avoidance if older
+    decay_eff_mult = 0.8 if older else 1.0     # slower decay if older
+    omit_mult = 1.2 if older else 1.0          # more omissions if older
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        Q = (1.0 / nA) * np.ones((nS, nA))   # RL values
+        A = np.zeros((nS, nA))               # aversive trace
+        neg_counts_state = np.zeros(nS)      # recent negatives per state (for omission gating)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # Effective decision values
+            V = Q[s] - (phi * phi_eff_mult) * A[s]
+            V = V - np.max(V)
+            probs = np.exp(beta * V)
+            probs = probs / np.sum(probs)
+
+            # Omission gating based on recent negatives in this state
+            # Map neg_counts_state[s] relative to neg_thr into an omission probability
+            x = neg_counts_state[s] - neg_thr
+            # Squash to (0, 0.5) to keep room for actions
+            p_omit = np.clip(omit_mult * (1.0 / (1.0 + np.exp(-x)) - 0.5), 0.0, 0.5)
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * probs[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning and traces
+            # Decay aversive traces every trial for current state
+            A[s] = (1.0 - decay * decay_eff_mult) * A[s]
+
+            # If a valid action was chosen
+            if a >= 0:
+                if r >= 0.0:
+                    # RL update
+                    Q[s, a] += alpha * (r - Q[s, a])
+                    # Aversive update: increase when non-reward, decrease slightly when rewarded
+                    if r < 0.5:
+                        A[s, a] += 1.0
+                        neg_counts_state[s] += 1.0
+                    else:
+                        A[s, a] = max(0.0, A[s, a] - 0.5)
+                        neg_counts_state[s] = max(0.0, neg_counts_state[s] - 0.5)
+                else:
+                    # Invalid feedback (e.g., omission feedback), treat as negative signal to aversive trace
+                    A[s, a] += 0.5
+                    neg_counts_state[s] += 0.5
+
+    return neg_log_lik
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + probabilistic WM gating with set-size and age modulation; omissions from low confidence.
+
+    Idea:
+    - RL: Q-learning baseline.
+    - WM: per state, when a rewarded action is observed, the state can enter WM with prob p_gate,
+      storing a peaked distribution over that action; WM decays back to uniform otherwise.
+    - Gating probability p_gate depends on set size (lower for 6 than 3) and age (lower if older).
+    - Policy: mixture of WM and RL. Omission probability increases when the maximum mixed choice
+      probability (confidence) is low.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial within block (0..nS-1).
+    actions : array-like of int
+        Chosen action per trial. Valid 0..2; -2 denotes omission/timeout.
+    rewards : array-like of float/int
+        Feedback per trial (0/1; negative means invalid).
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6).
+    age : array-like of float/int
+        Participant age. Older group (>=45) reduces WM gating and increases omissions.
+    model_parameters : list/tuple of length 5
+        [alpha, beta, p_base, load_slope, age_decline]
+        - alpha: RL learning rate (0..1).
+        - beta: inverse temperature for RL (>0).
+        - p_base: baseline WM gating probability for set size 3 in younger (0..1).
+        - load_slope: additional reduction in p_gate per +3 items (>=0).
+        - age_decline: additional reduction in p_gate if older, and increased omission from low confidence (>=0).
+
+    Returns
+    -------
+    neg_log_lik : float
+        Negative log-likelihood of the observed choices.
+    """
+    alpha, beta, p_base, load_slope, age_decline = model_parameters
+    age_val = age[0]
+    older = 1 if age_val >= 45 else 0
+
+    nA = 3
+    eps = 1e-12
+    neg_log_lik = 0.0
+
+    # WM retrieval sharpness: higher for younger; scaled down if older via age_decline
+    beta_wm = 6.0 * (1.0 / (1.0 + age_decline * older))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_states = states[mask]
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        nS = int(set_sizes[mask][0])
+
+        # RL values
+        Q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM store: distribution per state; start uniform
+        WM = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute gating probability given set size and age
+        load_factor = max(0.0, 1.0 - load_slope * max(0, (nS - 3)) / 3.0)  # reduce when going from 3 to 6
+        p_gate = np.clip(p_base * load_factor * (1.0 - age_decline * older), 0.0, 1.0)
+
+        # WM decay toward uniform each trial
+        wm_decay = 0.05 * (1.0 + 0.5 * older) * (1.0 + (nS - 3) / 3.0)
+
+        for t in range(len(block_states)):
+            s = int(block_states[t])
+            a = int(block_actions[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = Q[s].copy()
+            Qs -= np.max(Qs)
+            rl_probs = np.exp(beta * Qs)
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            # WM policy from stored distribution sharpened by beta_wm
+            WM_s = np.maximum(WM[s].copy(), eps)
+            WM_s /= np.sum(WM_s)
+            wlog = beta_wm * (WM_s - np.max(WM_s))
+            wm_probs = np.exp(wlog)
+            wm_probs = wm_probs / np.sum(wm_probs)
+
+            # Mixture weight equals current WM concentration (how peaked it is)
+            conc = np.max(WM_s)  # 1/3..1
+            wm_weight = np.clip((conc - 1.0 / nA) / (1.0 - 1.0 / nA), 0.0, 1.0)
+
+            mix_probs = wm_weight * wm_probs + (1.0 - wm_weight) * rl_probs
+            mix_probs = np.maximum(mix_probs, eps)
+            mix_probs /= np.sum(mix_probs)
+
+            # Omission probability from low confidence (1 - max prob), scaled by age_decline
+            conf = np.max(mix_probs)
+            p_omit = np.clip((1.0 - conf) * (0.8 * (1.0 + 0.5 * age_decline * older)), 0.0, 0.5)
+
+            if a == -2:
+                p_choice = p_omit
+            elif 0 <= a < nA:
+                p_choice = (1.0 - p_omit) * mix_probs[a]
+            else:
+                p_choice = eps
+
+            neg_log_lik -= np.log(max(p_choice, eps))
+
+            # Learning and WM maintenance
+            if (a >= 0) and (r >= 0.0):
+                # RL update
+                Q[s, a] += alpha * (r - Q[s, a])
+
+                # WM update: if rewarded, gate into WM with probability p_gate
+                if r > 0.5:
+                    # stochastically gate: approximate expectation by blending with p_gate
+                    gain = p_gate
+                    WM[s, a] = WM[s, a] + gain * (1.0 - WM[s, a])
+                    for aa in range(nA):
+                        if aa != a:
+                            WM[s, aa] = (1.0 - gain) * WM[s, aa]
+                else:
+                    # Non-reward: drift toward uniform (forget)
+                    WM[s] = (1.0 - 0.2) * WM[s] + 0.2 * (np.ones(nA) / nA)
+
+                # Global decay toward uniform to model forgetting/interference
+                WM[s] = (1.0 - wm_decay) * WM[s] + wm_decay * (np.ones(nA) / nA)
+                WM[s] = np.maximum(WM[s], eps)
+                WM[s] /= np.sum(WM[s])
+
+    return neg_log_lik

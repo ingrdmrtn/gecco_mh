@@ -14,7 +14,6 @@ project_root = Path(__file__).resolve().parents[2]
 cfg = load_config(project_root / "config" / "rlwm.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
-# participants = df.participant.unique()
 
 metric_name = cfg.evaluation.metric.upper()
 metric_map = {"AIC": _aic, "BIC": _bic}
@@ -106,16 +105,23 @@ parameter_bounds = list(spec.bounds.values())
 eval_metrics = []
 parameter_estimates = []
 
+
 for p in all_participants:
     df_participant = df[df.participant==p].reset_index()
+    df_participant = df_participant[df_participant.blocks < 5].reset_index()
+    df_participant = df_participant[df_participant.rewards >= 0]
     print(p)
 
 
     input_cols = list(data_cfg.input_columns)
     inputs = [df_participant[c].to_numpy() for c in input_cols]
 
+
+
     min_ll = np.inf
     best_parameter_values = []
+
+    #states, actions, rewards, blocks, parameters
     for _ in range(n_starts):
         x0 = [np.random.uniform(lo, hi) for lo, hi in parameter_bounds]
         res = minimize(
@@ -142,8 +148,7 @@ for p in all_participants:
         p_correct_ns3_young_real.append(ns3_mean_real)
         p_correct_ns6_young_real.append(ns6_mean_real)
 
-
-    # stimulus, blocks, set_sizes, correct_answer, age, parameters
+    df_participant = df[df.participant == p].reset_index()
     stimulus, blocks , set_sizes, correct_answer, age = (np.array(df_participant.stimulus),
                                                           np.array(df_participant.blocks),
                                                           np.array(df_participant.set_sizes),
@@ -159,11 +164,9 @@ for p in all_participants:
 
     parameter_names  = extract_parameter_names(participant_simulation_model)
 
-    # if stai in  parameter_names:
     simulation_pars = best_parameter_values
-    #simulation_pars.append(stai)
+
     simulated_actions, simulated_rewards  = model_func_sim(stimulus, blocks, set_sizes, correct_answer, simulation_pars)
-    # else:
 
 
     ppc_df = pd.DataFrame({'actions':simulated_actions,

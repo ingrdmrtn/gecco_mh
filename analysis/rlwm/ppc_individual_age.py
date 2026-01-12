@@ -20,8 +20,8 @@ metric_name = cfg.evaluation.metric.upper()
 metric_map = {"AIC": _aic, "BIC": _bic}
 metric_func = metric_map.get(metric_name, _bic)
 
-best_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/models/'
-best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/simulation/'
+best_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}_age/models/'
+best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}_age/simulation/'
 simulation_columns  = cfg.data.simulation_columns
 
 p_correct_ns3_young = []
@@ -39,12 +39,12 @@ p_correct_ns6_old_real = []
 
 
 
-param_dir = project_root / "results/rlwm_individual/parameters/"
+param_dir = project_root / "results/rlwm_individual_age/parameters/"
 
 young_participants = list(df[df.age < 45].participant.unique()[:15])
 old_participants = list(df[df.age > 45].participant.unique()[:15])
 all_participants = young_participants + old_participants
-
+all_participants=all_participants[:24]
 
 def learning_curves(p_df):
 
@@ -100,6 +100,10 @@ for p in all_participants:
 
     print(p)
     df_participant = df[df.participant==p].reset_index()
+    df_participant = df_participant[df_participant.rewards>=0].reset_index()
+    df_participant = df_participant.drop(columns='level_0')
+    df_participant = df_participant[df_participant.blocks < 5].reset_index()
+
 
     ns3_mean_real, ns3_sem_real, ns6_mean_real, ns6_sem_real = learning_curves(df_participant)
     if p >= 36:
@@ -109,10 +113,6 @@ for p in all_participants:
     else:
         p_correct_ns3_young_real.append(ns3_mean_real)
         p_correct_ns6_young_real.append(ns6_mean_real)
-
-
-
-
 
 
     best_parameters = pd.read_csv(f'{param_dir}/best_params_run0_participant{p}.csv')
@@ -127,6 +127,9 @@ for p in all_participants:
     age = age[0]
     participant_simulation_model = open(f'{best_simulated_models}simulation_model_participant{p}.txt', 'r')
     participant_simulation_model = participant_simulation_model.read()
+    # if p == 12:
+    #     print('stop')
+
     participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
 
     exec(participant_simulation_model, globals())
@@ -137,6 +140,7 @@ for p in all_participants:
     # if stai in  parameter_names:
     simulation_pars = [best_parameters[n][0] for n in best_parameters.columns]
     #simulation_pars.append(stai)
+
     simulated_actions, simulated_rewards  = model_func(stimulus, blocks, set_sizes, correct_answer, age, simulation_pars)
     # else:
 
@@ -193,7 +197,7 @@ axis[1].set_title('old')
 axis[1].set_ylim([0,1])
 
 
-figure.savefig('ppcs_individual.png')
+figure.savefig('ppcs_individual_age.png')
 
 print('stop')
 

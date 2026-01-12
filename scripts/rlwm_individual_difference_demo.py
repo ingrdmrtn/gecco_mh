@@ -30,7 +30,7 @@ def main():
     young_participants = list(df_w_participant[df_w_participant.age<45].participant.unique()[:15])
     old_participants = list(df_w_participant[df_w_participant.age>45].participant.unique()[:15])
     all_participants  = young_participants + old_participants
-    all_participants = all_participants [17:]
+    all_participants = all_participants [16:]
     if fit_type == "individual":
 
 

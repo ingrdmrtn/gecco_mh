@@ -198,7 +198,7 @@ def load_gecco_bics(bics_dir: str, participants: List[int]) -> dict:
     """Load best GECCO model BICs for each participant."""
     gecco_bics = {}
     for pid in participants:
-        pattern = os.path.join(bics_dir, f'*_participant{pid}.json')
+        pattern = os.path.join(bics_dir, f'iter*_participant{pid}.json')
         files = glob.glob(pattern)
         if files:
             best_bic = float('inf')
@@ -424,7 +424,7 @@ def main():
     bics_dir = os.path.join(base_dir, 'results', 'two_step_psychiatry_individual_stai_class_individual', 'bics')
     output_dir = os.path.join(base_dir, 'results', 'two_step_psychiatry_individual_stai_class_individual')
     
-    participants = list(range(18, 45))  # Participants 18-44
+    participants = list(range(14, 45))  # Participants 14-44
     
     # Load data
     print("Loading data...")
@@ -459,7 +459,8 @@ def main():
     print(f"Exceedance probability (GECCO): {result.exceedance_probability[1]:.4f}")
     print(f"Protected exceedance probability (GECCO): {result.protected_exceedance_probability[1]:.4f}")
     print(f"Bayesian Omnibus Risk: {result.bor:.4f}")
-    
+    print(f'Mean BIC GECCO: {np.mean(list(gecco_bics.values()))} ± {np.std(list(gecco_bics.values()))/np.sqrt(len(gecco_bics))}')
+    print(f'Mean BIC Baseline: {np.mean(list(baseline_bics.values()))} ± {np.std(list(baseline_bics.values()))/np.sqrt(len(baseline_bics))}')
     print("\nInterpretation:")
     if result.exceedance_probability[1] > 0.95:
         print("  → Decisive evidence that GECCO models outperform baseline")

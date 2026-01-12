@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]
-cfg = load_config(project_root / "config" / "two_step_psychiatry.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_function_gemini-3-pro.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -21,15 +21,14 @@ metric_name = cfg.evaluation.metric.upper()
 metric_map = {"AIC": _aic, "BIC": _bic}
 metric_func = metric_map.get(metric_name, _bic)
 
-best_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/models/'
-best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}/simulation/'
+best_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}{'_stai' if cfg.task.name == "two_step_task" else ""}/models/'
+best_simulated_models = f'{project_root}/results/{cfg.task.name + '_' + cfg.evaluation.fit_type}{'_stai' if cfg.task.name == "two_step_task" else ""}/simulation/'
 simulation_columns  = cfg.data.simulation_columns
-
+param_dir = project_root / f"results/{cfg.task.name + '_' + cfg.evaluation.fit_type}{'_stai' if cfg.task.name == "two_step_task" else ""}/parameters/"
 p_stay = {'prob_stay_common_rewarded':[],
           'prob_stay_rare_rewarded':[],
           'prob_stay_common_not_rewarded':[],
           'prob_stay_rare_not_rewarded':[]}
-param_dir = project_root / "results/two_step_task_individual/parameters/"
 
 
 
@@ -77,11 +76,20 @@ for p in participants[14:]:
     print(p)
     df_participant = df[df.participant==p].reset_index()
 
-    best_parameters = pd.read_csv(f'{param_dir}/best_params_run0_participant{p}.csv')
+    try:
+        print(param_dir)
+        best_parameters = pd.read_csv(f'{param_dir}/best_params_run0_participant{p}.csv')
+    except:
+        print(f'No parameters for participant {p}')
+        continue
     reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
                                                                   np.array(df_participant.reward_p_s0_1),
                                                                   np.array(df_participant.reward_p_s1_0),
                                                                   np.array(df_participant.reward_p_s1_1))
+    drift1, drift2, drift3, drift4 = (np.array(df_participant.reward_p_s0_0),
+                                                                  np.array(df_participant.reward_p_s0_1),
+                                                                  np.array(df_participant.reward_p_s1_0),
+                                                                  np.array(df_participant.reward_p_s1_1))                                                      
     stai = df_participant['stai'][0]
     n_trials = df_participant.shape[0]
     participant_simulation_model = open(f'{best_simulated_models}simulation_model_participant{p}.txt', 'r')
@@ -94,14 +102,23 @@ for p in participants[14:]:
     parameter_names  = extract_parameter_names(participant_simulation_model)
 
     # if stai in  parameter_names:
-    simulation_pars = [best_parameters[n][0] for n in best_parameters.columns]
+    parameters = [best_parameters[n][0] for n in best_parameters.columns]
     #simulation_pars.append(stai)
-    stage1_choice, state2, stage2_choice, reward = model_func(
+    if 'gemini' in cfg.task.name:
+        print(simulation_columns)
+        stage1_choice, state2, stage2_choice, reward = model_func(
+            *[globals()[name] for name in simulation_columns]
+        )
+    else:
+        if p==12:
+            continue
+        parameters.append(stai)
+        stage1_choice, state2, stage2_choice, reward = model_func(
         n_trials,
-        simulation_pars,
-        *[globals()[name] for name in simulation_columns]
-    )
-    # else:
+        parameters,
+            *[globals()[name] for name in simulation_columns]
+        )
+    # else
 
 
     (prob_stay_common_rewarded,
@@ -117,7 +134,7 @@ for p in participants[14:]:
 
 
 ppcs = pd.DataFrame(p_stay)
-ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_individual_stai.csv')
+ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_{cfg.task.name + '_' + cfg.evaluation.fit_type + "_stai"}.csv')
 
 
 
@@ -130,7 +147,7 @@ axis.set_title('GeCCo Individual with STAI (function) - Two Step Task')
 axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_individual_stai.png')
+figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_{cfg.task.name + '_' + cfg.evaluation.fit_type + "_stai"}.png')
 
 print('stop')
 

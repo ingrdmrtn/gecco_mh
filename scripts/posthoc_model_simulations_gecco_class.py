@@ -13,18 +13,18 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 def main():
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class.yaml")
+    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_function_gemini-3-pro.yaml")
     task_name = cfg.task.name
-    results_dir = project_root / "results" / "two_step_psychiatry_individual_stai_class_individual" / "models"
+    results_dir = project_root / "results" / "two_step_psychiatry_individual_stai_function_gemini-3-pro_individual"
     data_cfg = cfg.data
     fit_type = cfg.evaluation.fit_type
     df = load_data(data_cfg.path, data_cfg.input_columns)
 
-    for participant in df.participant.unique()[18:]:
+    for participant in df.participant.unique()[14:]:
 
         df_participant = df[df.participant == participant].reset_index()
         # load best mode best_model_0_participant{participant}.txtl for participant
-        best_model_file = results_dir / f"best_model_0_participant{participant}.txt"
+        best_model_file = results_dir / "models" / f"best_model_0_participant{participant}.txt"
         with open(best_model_file, "r") as f:
             global_best_model = f.read()
         

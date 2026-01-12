@@ -1,6 +1,6 @@
 
 import os, sys, re, glob, numpy as np, pandas as pd
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from pathlib import Path
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant, parse_split
@@ -11,11 +11,12 @@ from gecco.utils import *
 import matplotlib.pyplot as plt
 
 
-project_root = Path(__file__).resolve().parents[1]
-cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata_stai.yaml")
+# project_root = Path(__file__).resolve().parents[1]
+project_root = Path('/home/aj9225/gecco-1')
+cfg = load_config(project_root / "config" / "two_step_psychiatry_group.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
-participants = parse_split(cfg.data.splits.eval, df.participant.unique().tolist())
+participants = parse_split(cfg.data.splits.test, df.participant.unique().tolist()) #df.participant.unique()
 num_runs = cfg.loop.max_independent_runs
 metric_name = cfg.evaluation.metric.upper()
 metric_map = {"AIC": _aic, "BIC": _bic}
@@ -30,7 +31,7 @@ p_stay = {'prob_stay_common_rewarded':[],
           'prob_stay_rare_rewarded':[],
           'prob_stay_common_not_rewarded':[],
           'prob_stay_rare_not_rewarded':[]}
-param_dir = project_root / "results/two_step_task_group_metadata_stai/parameters/"
+param_dir = project_root / f"results/{cfg.task.name}/parameters/"
 
 
 
@@ -78,14 +79,14 @@ for r in range(num_runs):
         print(p)
         df_participant = df[df.participant==p].reset_index()
 
-        best_parameters = pd.read_csv(f'{param_dir}/best_params_run{r}.csv').iloc[idx]
+        best_parameters = pd.read_csv(f'{param_dir}/best_params_on_test_run{r}.csv').iloc[idx]
         reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
                                                                     np.array(df_participant.reward_p_s0_1),
                                                                     np.array(df_participant.reward_p_s1_0),
                                                                     np.array(df_participant.reward_p_s1_1))
         stai = df_participant['stai'][0]
         n_trials = df_participant.shape[0]
-        participant_simulation_model = open(f'{best_simulated_models}simulation_model.txt', 'r')
+        participant_simulation_model = open(f'{best_simulated_models}simulation_model_run{r}.txt', 'r')
         participant_simulation_model = participant_simulation_model.read()
         participant_simulation_model = extract_full_function(participant_simulation_model,'simulate_model')
 
@@ -95,14 +96,22 @@ for r in range(num_runs):
         parameter_names  = extract_parameter_names(participant_simulation_model)
         # make sure stai is passed to the model function depending on how stai_score is taken in by the function
         simulation_pars = [best_parameters[n] for n in best_parameters.keys()]
-        stage1_choice, state2, stage2_choice, reward = model_func(
-            n_trials,
-            simulation_pars,
-            *[globals()[name] for name in simulation_columns],
-            stai_score = stai, ## was hand coded
-        )
-        
-
+        if cfg.metadata.flag:
+            stage1_choice, state2, stage2_choice, reward = model_func(
+                n_trials,
+                simulation_pars,
+                *[globals()[name] for name in simulation_columns],
+                stai_score = stai, ## was hand coded
+            )
+        else:
+            drift1, drift2, drift3, drift4 = (np.array(df_participant.reward_p_s0_0),
+                                                                    np.array(df_participant.reward_p_s0_1),
+                                                                    np.array(df_participant.reward_p_s1_0),
+                                                                    np.array(df_participant.reward_p_s1_1))
+            parameters = [best_parameters[n] for n in best_parameters.keys()]
+            stage1_choice, state2, stage2_choice, reward = model_func(
+                *[globals()[name] for name in simulation_columns],
+            )
 
         (prob_stay_common_rewarded,
         prob_stay_rare_rewarded,
@@ -117,7 +126,7 @@ for r in range(num_runs):
 
 
     ppcs = pd.DataFrame(p_stay)
-    ppcs.to_csv('ppcs_group_metadata.csv')
+    ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_group{"_metadata" if cfg.metadata.flag else ""}.csv')
 
 
 
@@ -126,9 +135,10 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title(f'GeCCo Group {"w/ STAI as metadata" if cfg.metadata.flag else ""} (Function) - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig('ppcs_group_metadata.png')
+figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_group{"_metadata" if cfg.metadata.flag else ""}.png')
 
 print('stop')

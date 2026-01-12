@@ -5,11 +5,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from pathlib import Path
 from gecco.prompt_builder.simulation_prompt import simulation_prompt
 from config.schema import load_config
+from gecco.offline_evaluation.fit_generated_models import run_fit
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.load_llms.model_loader import load_llm
 from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
+import pandas as pd
+import json
 
 def main():
     # --- Load configuration & data ---
@@ -21,7 +24,7 @@ def main():
 
     df = load_data(data_cfg.path, data_cfg.input_columns)
     splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-    df_prompt, df_eval = splits["prompt"], splits["eval"]
+    df_prompt, df_eval, df_test, = splits["prompt"], splits["eval"], splits["test"]
 
     if cfg.loop.early_stopping == "True":
         df_baselines = load_data(data_cfg.path)
@@ -58,36 +61,78 @@ def main():
 
     for r in range(max_independent_runs):
         best_model, best_bic, best_params = search.run_n_shots(r, baseline_bic=baseline_bic)
-
-        if best_bic < global_best_bic:
-            global_best_bic = best_bic
-            global_best_model = best_model
-            global_best_params = best_params
-
+        best_iter = search.best_iter
         # --- Print results for a run ---
         print("\n[🏁 GeCCo] Run complete.")
         print(f"Best model parameters: {', '.join(best_params)}")
         print(f"Best mean BIC: {best_bic:.2f}")
-        print(f"Best params: {', '.join(global_best_params)}")
+        print(f"Best params: {', '.join(best_params)}")
+
         if cfg.llm.do_simulation == "True":
             from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
             simulation_prompt_text = simulation_prompt(
-                global_best_model,
+                best_model,
                 cfg.llm.simulation_template,
             )
             simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
             simulation_dir = search.results_dir / "simulation"
             simulation_dir.mkdir(parents=True, exist_ok=True)
-            simulation_file = simulation_dir / f"simulation_model.txt"
+            simulation_file = simulation_dir / f"simulation_model_run{r}.txt"
             with open(simulation_file, "w") as f:
                 f.write(simulation_text)
+   
+        results_dir = search.results_dir
+        best_model_file = results_dir / "models" / f"best_model_run{r}.txt"
+        with open(best_model_file, "r") as f:
+            best_model = f.read()
+            
+        # fit the best model to test data: (1) report BIC, (2) save best params, (3) save simulation
+        print("\n Fitting best model to test data...")
+        try:
+            # extract function name from model code
+            func_name = f"cognitive_model{best_iter}" 
+            fit_res = run_fit(df_test, best_model, cfg=cfg, expected_func_name=func_name)
+            mean_metric = float(fit_res["metric_value"])
+            metric_name = fit_res["metric_name"]
+            params = fit_res["param_names"]
+
+            print(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
+            
+            # save best model bic
+            best_bic_file = (
+                results_dir / "bics" / f"best_bic_on_test_run{r}.json"
+            )
+            # save best bics to json across participants
+            # fit_res['eval_metrics'] is a list of bics for each participant: [437.4235310062762, 557.8133717150291, 478.1469470482797, 470.78509749717364, 328.51242771038415, 219.52379669611818, 377.2421201048371, 351.9631188780421, 337.3545037733362, 366.12602047624944, 450.09353867481525, 126.98829795881838, 253.5581869957461, 406.95593007888044, 380.5687939943248, 264.2553031674379, 514.3963045824119, 384.2459136412227, 336.4981903599349, 396.85986980687835, 372.5575441074137, 329.24768724723754, 457.22504147884547, 456.06518231837924, 382.5115132329936, 325.06967212781683, 446.54528039644237, 278.15614188014604, 334.1230336957856, 532.6872059457748, 434.50828260351295]
+            with open(best_bic_file, "w") as f:
+                json.dump({"mean_"+metric_name: mean_metric, "individual_"+metric_name: fit_res['eval_metrics']}, f)    
+
+            # save best model params
+            param_df = pd.DataFrame(
+                fit_res["parameter_values"],
+                columns=params
+            )
+            param_dir = results_dir / "parameters"
+            param_dir.mkdir(parents=True, exist_ok=True)
+            param_file = (
+                param_dir / f"best_params_on_test_run{r}.csv"
+            )
+            param_df.to_csv(param_file, index=False)
+
+        except Exception as e:
+            print(f"[⚠️ GeCCo] Error fitting {func_name}: {e}")
+
+        if best_bic < global_best_bic:
+            global_best_bic = best_bic
+            global_best_model = best_model
+            global_best_params = best_params
+            global_best_iter = best_iter
+
 
     # --- Print final results ---
     print("\n[🏁 GeCCo] Search complete.")
-    print(f"Best model parameters: {', '.join(best_params)}")
-    print(f"Best mean BIC: {best_bic:.2f}")
-
+    print(f"Best mean BIC: {global_best_bic:.2f}")
 
 # -------------------------------------------------------------------------
 # Entrypoint

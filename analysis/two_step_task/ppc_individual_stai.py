@@ -1,5 +1,5 @@
 import os, sys, re, glob, numpy as np, pandas as pd
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from pathlib import Path
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant
@@ -10,8 +10,9 @@ from gecco.utils import *
 import matplotlib.pyplot as plt
 
 
-project_root = Path(__file__).resolve().parents[1]
-cfg = load_config(project_root / "config" / "two_step_psychiatry_baseline_individual.yaml")
+# project_root = Path(__file__).resolve().parents[1]
+project_root = Path(__file__).resolve().parents[2]
+cfg = load_config(project_root / "config" / "two_step_psychiatry.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -71,7 +72,7 @@ def compute_stay_probabilities(choice_1, state, reward):
 
 
 
-for p in participants:
+for p in participants[14:]:
 
     print(p)
     df_participant = df[df.participant==p].reset_index()
@@ -116,7 +117,7 @@ for p in participants:
 
 
 ppcs = pd.DataFrame(p_stay)
-ppcs.to_csv('ppcs_individual.csv')
+ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_individual_stai.csv')
 
 
 
@@ -125,10 +126,11 @@ axis.bar(np.arange(4),[np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_common_not_rewarded'])),
                        np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-
+axis.set_title('GeCCo Individual with STAI (function) - Two Step Task')
+axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig('ppcs_individual.png')
+figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_individual_stai.png')
 
 print('stop')
 

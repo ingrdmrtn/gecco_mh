@@ -88,13 +88,31 @@ class GeCCoModelSearch:
                 f"(reasoning={reasoning_effort})"
             )
 
+            config_args = {
+                "temperature": self.cfg.llm.temperature,
+                "system_instruction": self.cfg.llm.system_prompt,
+            }
+
+            if reasoning_effort:
+                assert reasoning_effort in ["low", "high"], \
+                    f"Invalid reasoning_effort: {reasoning_effort}. Choose from 'low', 'high'."
+                if self.cfg.llm.base_model.lower().startswith("gemini-3"):
+                    #note: flash models allow minimal and medium thinking levels but only low and high are exposed to be compatible with pro and flash
+                    config_args["thinking_config"] = types.ThinkingConfig(
+                        thinking_level=reasoning_effort
+                    )
+                elif self.cfg.llm.base_model.lower().startswith("gemini-2"):
+                    #note: for Gemini 2, we set thinking_budget to approximate low/high levels (max thinking tokens for 2.5 pro is 32768; 2.5 flash is 24576)
+                    # max set to 24576 to make it compatible with both 2.5 pro and flash
+                    config_args["thinking_config"] = types.ThinkingConfig(
+                        thinking_budget= 4096 if reasoning_effort == 'low' else 24576
+                        )
+
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                       temperature=self.cfg.llm.temperature,
-                       system_instruction=self.cfg.llm.system_prompt,
-                       thinking_config=types.ThinkingConfig(thinking_level=reasoning_effort),
+                    **config_args
                 )
             )
             decoded = resp.text.strip()

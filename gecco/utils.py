@@ -87,10 +87,10 @@ def extract_full_function(text: str, func_name: str) -> str:
         def cognitive_model1(...):
             ...
     """
-    # Prefer fenced code block first
-    match = re.search(r"```(?:python)?(.*?)```", text, re.S)
-    if match:
-        text = match.group(1).strip()
+    # extract all revelant blcoks
+    blocks = re.findall(r"```(?:python)?(.*?)```", text, re.S)
+    if blocks:
+        text = "\n\n".join(block.strip() for block in blocks if block.strip())
 
     # Match the specific function by name (greedy until next def or end)
     pattern = rf"(def\s+{func_name}\s*\([^)]*\)\s*:[\s\S]+?)(?=\n\s*def|\Z)"

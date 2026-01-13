@@ -8,7 +8,7 @@ from scipy.optimize import minimize
 from gecco.offline_evaluation.evaluation_functions import aic as _aic, bic as _bic
 from gecco.utils import *
 import matplotlib.pyplot as plt
-
+rng = np.random.default_rng()
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]

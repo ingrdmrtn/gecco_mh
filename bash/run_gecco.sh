@@ -15,4 +15,4 @@ module purge
 module load anaconda3/2025.12 
 module load proxy/default
 conda activate gecco
-python scripts/two_step_individual_stai_class.py
+python scripts/posthoc_model_simulations_gecco_class.py

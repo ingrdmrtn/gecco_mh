@@ -14,7 +14,7 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 def main():
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_function_gemini-3-pro.yaml")
+    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_ocd_function_gemini-3-pro.yaml")
     data_cfg = cfg.data
     fit_type = cfg.evaluation.fit_type
     max_independent_runs  = cfg.loop.max_independent_runs
@@ -81,7 +81,6 @@ def main():
             print(f"Best params: {', '.join(global_best_params)}")
 
             if cfg.llm.do_simulation == "True":
-                from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
                 simulation_prompt_text = simulation_prompt(
                     global_best_model,
@@ -150,7 +149,6 @@ def main():
             print(f"Best params: {', '.join(global_best_params)}")
 
         if cfg.llm.do_simulation == "True":
-            from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
             simulation_prompt_text = simulation_prompt(
                 global_best_model,

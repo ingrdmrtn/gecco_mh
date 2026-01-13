@@ -9,7 +9,7 @@ df = pd.read_csv('self_report_study1.csv')
 # Low: 0-20
 # Medium: 21-40
 # High: 41-60
-low_group = df[(df['oci_total'] >= 0) & (df['oci_total'] <= 20)]
+low_group = df[(df['oci_total'] > 0) & (df['oci_total'] <= 20)]
 medium_group = df[(df['oci_total'] > 20) & (df['oci_total'] <= 40)]
 high_group = df[(df['oci_total'] > 40) & (df['oci_total'] <= 60)]
 

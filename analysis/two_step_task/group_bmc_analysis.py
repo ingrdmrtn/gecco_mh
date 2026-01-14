@@ -197,7 +197,10 @@ def load_baseline_bics(data_path: str, participants: List[int]) -> dict:
 def load_gecco_bics(bics_dir: str, participants: List[int]) -> dict:
     """Load best GECCO model BICs for each participant."""
     gecco_bics = {}
-    for pid in participants:
+    for idx, pid in enumerate(participants):
+        ## if you want plug in best bics directly
+        # bics = [407.93073607039423, 558.1486246570571, 473.35230379814095, 462.8890419919733, 306.0607714913982, 225.60935154996739, 390.83602078476395, 364.287526315459, 305.42694661840176, 407.47321750089316, 490.3438439696416, 189.38688955636044, 240.03628882635164, 341.10382179045155, 395.49676864099183, 264.0658778772686, 495.6025468361587, 395.6375151193356, 337.65639784102973, 382.3917675248307, 372.41997516089623, 380.8885832003291, 450.3910162711118, 413.4644631000158, 378.40803666809813, 307.7907494370812, 409.7152809680055, 280.1907363756094, 254.8524137429026, 550.7165567441883, 417.32460251025975]
+        # gecco_bics[pid] = bics[idx]
         pattern = os.path.join(bics_dir, f'iter*_participant{pid}.json')
         files = glob.glob(pattern)
         if files:
@@ -348,6 +351,7 @@ def create_visualization(baseline_bics: dict, gecco_bics: dict,
     
     baseline_list = [baseline_bics[pid] for pid in participants]
     gecco_list = [gecco_bics.get(pid, np.nan) for pid in participants]
+    #gecco_list  = plug in values
     stai_list = [stai_scores[pid] for pid in participants]
     bic_diff = [gecco_list[i] - baseline_list[i] for i in range(len(participants))]
     

@@ -14,7 +14,7 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 def main():
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_ocd_function_gemini-3-pro.yaml")
+    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_function_gemini-3-pro.yaml")
     data_cfg = cfg.data
     fit_type = cfg.evaluation.fit_type
     max_independent_runs  = cfg.loop.max_independent_runs

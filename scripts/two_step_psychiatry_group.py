@@ -13,11 +13,14 @@ from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
 import pandas as pd
 import json
-
+import argparse
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='', help='*REQUIRED* config.yaml')
+    args = parser.parse_args()
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_group.yaml")
+    cfg = load_config(project_root / "config" / args.config)
     data_cfg = cfg.data
     metadata = cfg.metadata.flag
     max_independent_runs  = cfg.loop.max_independent_runs

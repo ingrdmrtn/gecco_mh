@@ -10,11 +10,14 @@ from gecco.prepare_data.data2text import get_data2text_function
 from gecco.load_llms.model_loader import load_llm
 from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
-
+import argparse
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='', help='*REQUIRED* config.yaml')
+    args = parser.parse_args()
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_function_gemini-3-pro.yaml")
+    cfg = load_config(project_root / "config" / args.config)
     data_cfg = cfg.data
     fit_type = cfg.evaluation.fit_type
     max_independent_runs  = cfg.loop.max_independent_runs

@@ -1,6 +1,9 @@
 import shutil
 import os
 import pandas as pd
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize, differential_evolution
 
 # 1. Load the dataset
 df = pd.read_csv('self_report_study1.csv')
@@ -351,14 +354,14 @@ def append_scores():
           'stai_total', 'sds_total', 'oci_total']].head())
 
 
-# Run the function to append scores
+# Run the function to append oci scores
 append_scores()
 
 
 # Configuration
 # ---------------------------------------------------------
 input_file = 'combined_data_with_scores.csv'
-output_file = 'two_step_gillan_2016_ocibalanced.csv'
+output_file = 'preprocessed_data.csv'
 # ---------------------------------------------------------
 
 
@@ -408,7 +411,8 @@ def process_data():
         'stage_2_state': 'state',
         'stai_total': 'stai',
         'sds_total': 'sds',
-        'oci_total': 'oci'
+        'oci_total': 'oci',
+        'trial_num': 'trial'
     }
 
     df.rename(columns=rename_map, inplace=True)
@@ -433,5 +437,141 @@ def process_data():
     print("="*40)
     print(df.head())
 
-
+# Run the processing function
 process_data()
+
+
+# Configuration
+# ---------------------------------------------------------
+input_file = 'preprocessed_data.csv'
+output_file = 'two_step_gillan_2016_ocibalanced.csv'
+# ---------------------------------------------------------
+
+
+def hybrid_model(action_1, state, action_2, reward, model_parameters):
+    """
+    Hybrid Model-Based and Model-Free Learning with Perseveration and Eligibility Traces.
+
+    Parameters:
+    - learning_rate: Learning rate for stage 1 MF updates
+    - learning_rate_2: Learning rate for stage 2 MF updates
+    - beta: Inverse temperature for stage 1 choices
+    - beta_2: Inverse temperature for stage 2 choices
+    - w: Weight on model-based vs. model-free values (stage 1)
+    - lambd: Eligibility trace weight
+    - perseveration: Tendency to repeat previous stage 1 action
+    """
+
+    # Unpack parameters
+    learning_rate, learning_rate_2, beta, beta_2, w, lambd, perseveration = model_parameters
+    n_trials = len(action_1)
+
+    # Transition model: spaceship -> planet
+    transition_matrix = np.array([[0.7, 0.3], [0.3, 0.7]])
+
+    # Perseveration indicator: 1 if action was repeated at stage 1
+    prev_action_indicator = np.zeros(2)
+
+    # Store choice probabilities
+    p_choice_1 = np.zeros(n_trials)
+    p_choice_2 = np.zeros(n_trials)
+
+    # Initialize Q-values
+    q_stage1_mf = np.zeros(2)          # Model-free Q-values for spaceship choices
+    q_stage2_mf = np.zeros((2, 2))     # Model-free Q-values for state × action
+
+    for trial in range(n_trials):
+        # ----- Stage 1 -----
+        max_q_stage2 = np.max(q_stage2_mf, axis=1)  # max Q for each planet
+        q_stage1_mb = transition_matrix @ max_q_stage2  # model-based Q-values
+
+        q_stage1_combined = w * q_stage1_mb + (1 - w) * q_stage1_mf
+        q_stage1_with_pers = q_stage1_combined + perseveration * prev_action_indicator
+
+        exp_q1 = np.exp(beta * q_stage1_with_pers)
+        probs_1 = exp_q1 / np.sum(exp_q1)
+        p_choice_1[trial] = probs_1[action_1[trial]]
+
+        # ----- Stage 2 -----
+        state_idx = state[trial]
+        exp_q2 = np.exp(beta_2 * q_stage2_mf[state_idx])
+        probs_2 = exp_q2 / np.sum(exp_q2)
+        p_choice_2[trial] = probs_2[action_2[trial]]
+
+        # ----- Learning -----
+
+        # TD error for stage 1 (bootstrapped from stage 2)
+        delta_stage1 = q_stage2_mf[state_idx, action_2[trial]] - q_stage1_mf[action_1[trial]]
+        q_stage1_mf[action_1[trial]] += learning_rate * delta_stage1
+
+        # TD error for stage 2
+        delta_stage2 = reward[trial] - q_stage2_mf[state_idx, action_2[trial]]
+        q_stage2_mf[state_idx, action_2[trial]] += learning_rate_2 * delta_stage2
+
+        # Eligibility trace for stage 1
+        q_stage1_mf[action_1[trial]] += lambd * learning_rate * delta_stage2
+
+        # ----- Perseveration update -----
+        prev_action_indicator.fill(0)
+        prev_action_indicator[action_1[trial]] = 1
+
+    eps = 1e-10
+    log_loss = -(np.sum(np.log(p_choice_1 + eps)) + np.sum(np.log(p_choice_2 + eps)))
+
+    return log_loss
+
+def fit_hybrid_model(choice1, choice2_state, choice2, reward, trials, df_participant):
+
+    nreps = 10
+    llh_min_hybrid = np.inf
+    model_parameter_bounds_hybrid = [[0, 1], [0, 1], [0.1, 10], [0.1, 10], [0, 1], [0, 1], [0, 1]]
+
+    for rep in range(nreps):
+        initial_guess_hybrid = [np.random.uniform(model_parameter_bounds_hybrid[i][0], model_parameter_bounds_hybrid[i][1])
+                                for i in
+                                range(len(model_parameter_bounds_hybrid))]
+        res_hybrid = minimize(
+            lambda params: hybrid_model(choice1, choice2_state, choice2, reward, params),
+            # Pass params, not initial_guess
+            initial_guess_hybrid,
+            method='L-BFGS-B',
+            bounds=model_parameter_bounds_hybrid)
+        if res_hybrid.fun < llh_min_hybrid:
+            llh_min_hybrid = res_hybrid.fun
+            best_params_hybrid_current = res_hybrid.x
+
+    bic_hybrid = (2 * llh_min_hybrid) + (len(model_parameter_bounds_hybrid) * np.log(len(trials)))
+
+    if np.isinf(bic_hybrid) or np.isnan(bic_hybrid):
+        bic_hybrid = -4 * np.log(0.5) * len(choice1)
+
+    return bic_hybrid, best_params_hybrid_current
+
+def add_baseline_to_ocibalanced(input_file, output_file):
+    # load data
+    df = pd.read_csv(input_file)
+    results = []
+    print("\n" + "="*40)
+    print("Starting to fit participants for baseline model...")
+    print("="*40 + "\n")
+    for participant_id, df_participant in df.groupby('participant'):
+        print(f"Fitting participant {participant_id}")
+        choice1 = df_participant['choice_1'].to_numpy()
+        choice2_state = df_participant['state'].to_numpy()
+        choice2 = df_participant['choice_2'].to_numpy()
+        reward = df_participant['reward'].to_numpy()
+        trials = df_participant['trial'].to_numpy()
+        bic_hybrid, best_params_hybrid_current = fit_hybrid_model(choice1, choice2_state, choice2, reward, trials, df_participant)
+        # add the results bics to the original data as a column called baseline
+        df.loc[df['participant'] == participant_id, 'baseline'] = bic_hybrid
+
+    df.to_csv(output_file, index=False)
+
+    print("\n" + "="*40)
+    print("All participants fitted and baseline BICs added.")
+    print(f"Saved updated data to: {output_file}")
+    print("="*40)
+
+
+# Run the function to add baseline BICs
+add_baseline_to_ocibalanced(input_file, output_file)

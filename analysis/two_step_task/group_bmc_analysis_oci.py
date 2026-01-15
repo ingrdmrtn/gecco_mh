@@ -452,11 +452,11 @@ def main():
     # Configuration
     base_dir = os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))))
-    data_path = os.path.join(base_dir, 'data', 'two_step_gillan_2016.csv')
+    data_path = os.path.join(base_dir, 'data', 'two_step_gillan_2016_ocibalanced.csv')
     bics_dir = os.path.join(
-        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_gemini-3-pro_individual', 'bics')
+        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_ocibalanced_individual', 'bics')
     output_dir = os.path.join(
-        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_gemini-3-pro_individual')
+        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_ocibalanced_individual')
 
     participants = list(range(14, 45))  # Participants 14-44
 

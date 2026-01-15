@@ -23,7 +23,7 @@ rng = np.random.default_rng()
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]
 cfg = load_config(project_root / "config" /
-                  "two_step_psychiatry_individual_ocd_function_gemini-3-pro.yaml")
+                  "two_step_psychiatry_individual_function_gemini-3-pro_ocd.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -91,16 +91,16 @@ for p in participants[14:]:
     except:
         print(f'No parameters for participant {p}')
         continue
-    reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
-                                                                  np.array(
-                                                                      df_participant.reward_p_s0_1),
-                                                                  np.array(
-                                                                      df_participant.reward_p_s1_0),
-                                                                  np.array(df_participant.reward_p_s1_1))
-    drift1, drift2, drift3, drift4 = (np.array(df_participant.reward_p_s0_0),
-                                      np.array(df_participant.reward_p_s0_1),
-                                      np.array(df_participant.reward_p_s1_0),
-                                      np.array(df_participant.reward_p_s1_1))
+        # reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
+        #                                                             np.array(
+        #                                                                 df_participant.reward_p_s0_1),
+        #                                                             np.array(
+        #                                                                 df_participant.reward_p_s1_0),
+        #                                                             np.array(df_participant.reward_p_s1_1))
+    drift1, drift2, drift3, drift4 = (np.array(df_participant.drift_1),
+                                      np.array(df_participant.drift_2),
+                                      np.array(df_participant.drift_3),
+                                      np.array(df_participant.drift_4))
     oci = df_participant['oci'][0]
     n_trials = df_participant.shape[0]
     participant_simulation_model = open(
@@ -117,7 +117,7 @@ for p in participants[14:]:
     # if oci in  parameter_names:
     parameters = [best_parameters[n][0] for n in best_parameters.columns]
     # simulation_pars.append(oci)
-    if 'gemini' in cfg.task.name:
+    if 'gemini' in cfg.task.name or 'ocibalanced' in cfg.task.name:
         # print(simulation_columns)
         try:
             stage1_choice, state2, stage2_choice, reward = model_func(
@@ -160,7 +160,7 @@ axis.bar(np.arange(4), [np.mean(np.mean(p_stay['prob_stay_common_rewarded'])),
                         np.mean(
                             np.mean(p_stay['prob_stay_common_not_rewarded'])),
                         np.mean(np.mean(p_stay['prob_stay_rare_not_rewarded']))])
-axis.set_title('GeCCo Individual with oci (function) - Two Step Task')
+axis.set_title(f'GeCCo Individual {"w/" if cfg.individual_difference.individual_feature=='oci' else "w/o"} oci (function) - Two Step Task')
 axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r', 'rare/r', 'common/nr', 'rare/nr'])

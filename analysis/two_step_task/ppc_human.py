@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_stai_class_gemini-2.5-pro.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_individual_function_gemini-3-pro_ocd.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -66,10 +66,10 @@ for idx, p in enumerate(participants[14:]):
     df_participant = df[df.participant==p].reset_index()
 
     
-    reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
-                                                                np.array(df_participant.reward_p_s0_1),
-                                                                np.array(df_participant.reward_p_s1_0),
-                                                                np.array(df_participant.reward_p_s1_1))
+    reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.drift_1),
+                                                                np.array(df_participant.drift_2),
+                                                                np.array(df_participant.drift_3),
+                                                                np.array(df_participant.drift_4))
     stai = df_participant['stai'][0]
     n_trials = df_participant.shape[0]
     stage1_choice = np.array(df_participant['choice_1'])

@@ -9,11 +9,11 @@ from scipy.optimize import minimize
 from gecco.offline_evaluation.evaluation_functions import aic as _aic, bic as _bic
 from gecco.utils import *
 import matplotlib.pyplot as plt
-
+rng = np.random.default_rng()
 
 project_root = Path(__file__).resolve().parents[2]
 # project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_group_metadata_ocd.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_group_ocd.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = parse_split(cfg.data.splits.test, df.participant.unique().tolist()) #df.participant.unique()
@@ -80,10 +80,10 @@ for r in range(num_runs):
         df_participant = df[df.participant==p].reset_index()
 
         best_parameters = pd.read_csv(f'{param_dir}/best_params_on_test_run{r}.csv').iloc[idx]
-        reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
-                                                                    np.array(df_participant.reward_p_s0_1),
-                                                                    np.array(df_participant.reward_p_s1_0),
-                                                                    np.array(df_participant.reward_p_s1_1))
+        # reward_p_s0_0, reward_p_s0_1, reward_p_s1_0, reward_p_s1_1 = (np.array(df_participant.reward_p_s0_0),
+        #                                                             np.array(df_participant.reward_p_s0_1),
+        #                                                             np.array(df_participant.reward_p_s1_0),
+        #                                                             np.array(df_participant.reward_p_s1_1))
         oci = df_participant['oci'][0]
         n_trials = df_participant.shape[0]
         participant_simulation_model = open(f'{best_simulated_models}simulation_model_run{r}.txt', 'r')
@@ -96,10 +96,10 @@ for r in range(num_runs):
         parameter_names  = extract_parameter_names(participant_simulation_model)
         # make sure oci is passed to the model function depending on how oci_score is taken in by the function
         simulation_pars = [best_parameters[n] for n in best_parameters.keys()]
-        drift1, drift2, drift3, drift4 = (np.array(df_participant.reward_p_s0_0),
-                                                                    np.array(df_participant.reward_p_s0_1),
-                                                                    np.array(df_participant.reward_p_s1_0),
-                                                                    np.array(df_participant.reward_p_s1_1))
+        drift1, drift2, drift3, drift4 = (np.array(df_participant.drift_1),
+                                                                    np.array(df_participant.drift_2),
+                                                                    np.array(df_participant.drift_3),
+                                                                    np.array(df_participant.drift_4))
         parameters = [best_parameters[n] for n in best_parameters.keys()]
         stage1_choice, state2, stage2_choice, reward = model_func(
             *[globals()[name] for name in simulation_columns],

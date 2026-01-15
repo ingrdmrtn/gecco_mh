@@ -562,8 +562,8 @@ def add_baseline_to_ocibalanced(input_file, output_file):
         reward = df_participant['reward'].to_numpy()
         trials = df_participant['trial'].to_numpy()
         bic_hybrid, best_params_hybrid_current = fit_hybrid_model(choice1, choice2_state, choice2, reward, trials, df_participant)
-        # add the results bics to the original data as a column called baseline
-        df.loc[df['participant'] == participant_id, 'baseline'] = bic_hybrid
+        # add the results bics to the original data as a column called baseline_bic
+        df.loc[df['participant'] == participant_id, 'baseline_bic'] = bic_hybrid
 
     df.to_csv(output_file, index=False)
 

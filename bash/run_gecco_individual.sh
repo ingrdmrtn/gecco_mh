@@ -15,4 +15,5 @@ module purge
 module load anaconda3/2025.12 
 module load proxy/default
 conda activate gecco
-python scripts/two_step_individual_function.py
+python scripts/two_step_individual_function.py --config two_step_psychiatry_individual_ocd_function_gemini-3-pro_ocd.yaml
+python scripts/two_step_individual_function.py --config two_step_psychiatry_individual_function_gemini-3-pro_ocd.yaml

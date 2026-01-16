@@ -96,7 +96,9 @@ def get_data2text_function(name):
                     sub = sub.head(max_trials or len(sub))
                     for _, row in sub.iterrows():
                         vals = dict(row)
-                        try:
+                        if 'trial' in vals.keys():
+                            vals['trial'] = str(int(vals['trial'])+1)
+                        try:   
                             trial_lines.append(template.format(**vals))
                         except KeyError:
                             continue

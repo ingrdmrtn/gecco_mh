@@ -52,6 +52,7 @@ rng = np.random.default_rng()
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]
+run = 0
 cfg = load_config(project_root / "config" /
                   "two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml")
 compare_config = load_config(project_root / "analysis" /
@@ -78,12 +79,19 @@ best_params_list = {'participant': [], 'fitted_parameters': [],
                     'shared': [], 'model_type': [], 'baseline_params': [],
                     'baseline_bic': [], 'best_model_bic': []}
 baseline_params = ['learning_rate', 'learning_rate_2', 'beta', 'beta_2', 'w', 'lambd', 'perseveration']
-for p in participants[14:39]:
+for p in participants[14:]:
 
-    print(p)
+    if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
+        existing_df = pd.read_csv(
+            f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
+        if p in existing_df['participant'].values:
+            print(f'Participant {p} already processed. Skipping.')
+            continue
+
+    print(f'Processing participant {p}')
     df_participant = df[df.participant == p].reset_index()
     # load best model
-    model_path = f'{best_models}best_model_0_participant{p}.txt'
+    model_path = f'{best_models}best_model_{run}_participant{p}.txt'
     with open(model_path, 'r') as f:
         best_model = f.read()
     psychiatry = False
@@ -118,14 +126,14 @@ for p in participants[14:39]:
     try:
         # print(param_dir)
         best_model_parameters = pd.read_csv(
-            f'{param_dir}/best_params_run0_participant{p}.csv')
+            f'{param_dir}/best_params_run{run}_participant{p}.csv')
         fitted_parameters = [best_model_parameters[n][0] for n in best_model_parameters.columns]
     except:  # noqa: E722
         print(f'No parameters for participant {p}')
         continue
     
     # load bics 
-    bic_path = f'{bics}best_bic_0_participant{p}.json'
+    bic_path = f'{bics}best_bic_{run}_participant{p}.json'
     # load json from bic_path
     bic = json.load(open(bic_path, 'r'))
     # get baseline model bic
@@ -153,9 +161,15 @@ for p in participants[14:39]:
     best_params_list['baseline_bic'].append(baseline_bic)
     best_params_list['best_model_bic'].append(best_model_bic)
 
-# check if dataframe ecists append to existing else create new
-best_params_df = pd.DataFrame(best_params_list)
-best_params_df.to_csv(
-    f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/comparison/gecco_baseline_comparison.csv', index=False)
-print(
-        f'Saved comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/comparison/gecco_baseline_comparison.csv')
+    # check if dataframe ecists append to existing else create new
+    if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
+        existing_df = pd.read_csv(
+            f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
+        new_df = pd.DataFrame(best_params_list)
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        combined_df.to_csv(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv', index=False)
+        print(f'Appended comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
+    else:
+        best_params_df = pd.DataFrame(best_params_list)
+        best_params_df.to_csv(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv', index=False)
+        print(f'Saved comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')

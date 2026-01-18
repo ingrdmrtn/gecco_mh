@@ -56,7 +56,7 @@ run = 0
 cfg = load_config(project_root / "config" /
                   "two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml")
 compare_config = load_config(project_root / "analysis" /
-                             "two_step_task" / "compare_gecco_baseline.yaml")
+                             "two_step_task" / "compare_gecco_baseline_twostep_individual_ocd.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -94,9 +94,8 @@ for p in participants[14:]:
     model_path = f'{best_models}best_model_{run}_participant{p}.txt'
     with open(model_path, 'r') as f:
         best_model = f.read()
-    psychiatry = False
-    vals = {'base_code': compare_config.compare.hybrid_model, 'model_code': best_model,
-            'psychiatry': "- OCD: obsesstive compulsive disorder score (0-1) modulates behavior" if psychiatry else ""}
+    vals = {'base_code': compare_config.compare.base_model, 'model_code': best_model,
+            'psychiatry': "- OCD: obsesstive compulsive disorder score (0-1) modulates behavior" if compare_config.compare.psychiatry else ""}
     prompt = compare_config.compare.comparison_prompt.format(**vals)
     model, tokenizer = load_llm(cfg.llm.provider, cfg.llm.base_model)
     search = GeCCoModelSearch(model, tokenizer, cfg, df_participant, None)

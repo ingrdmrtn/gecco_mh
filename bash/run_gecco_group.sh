@@ -6,7 +6,7 @@
 #SBATCH --output=logs/%x-%j.out
 ## SBATCH --gres=gpu:1
 #SBATCH --mem=40G
-#SBATCH -t 04:00:00
+#SBATCH -t 12:00:00
 #SBATCH -c 32
 #SBATCH --mail-user=akshay.jagadish@princeton.edu
 
@@ -15,5 +15,7 @@ module purge
 module load anaconda3/2025.12 
 module load proxy/default
 conda activate gecco
-python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd.yaml
-python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd.yaml
+python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd_maxsetting.yaml
+python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml
+# python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd.yaml
+# python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd.yaml

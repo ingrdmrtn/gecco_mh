@@ -23,6 +23,11 @@ from typing import List, Optional
 from scipy import integrate
 from scipy.stats import rv_continuous, dirichlet, multivariate_normal as mvn, pearsonr
 from scipy.special import digamma as psi, gammainc, gammaln, softmax, expit
+import argparse
+from pathlib import Path
+import sys, re
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from config.schema import load_config
 
 epsilon = np.finfo(float).eps
 
@@ -449,14 +454,20 @@ def create_visualization(baseline_bics: dict, gecco_bics: dict,
 
 def main():
     """Run the complete Group BMC analysis."""
+    args = argparse.ArgumentParser()
+    args.add_argument('--config', type=str, required=True, help='Configuration YAML file for the experiment.')
+    args = args.parse_args()
+
     # Configuration
+    project_root = Path(__file__).resolve().parents[2]
+    cfg = load_config(project_root / "config" / args.config)
     base_dir = os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))))
     data_path = os.path.join(base_dir, 'data', 'two_step_gillan_2016_ocibalanced.csv')
     bics_dir = os.path.join(
-        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_ocibalanced_individual', 'bics')
+        base_dir, 'results', f'{cfg.task.name}_individual', 'bics')
     output_dir = os.path.join(
-        base_dir, 'results', 'two_step_psychiatry_individual_oci_function_ocibalanced_individual')
+        base_dir, 'results', f'{cfg.task.name}_individual')
 
     participants = list(range(14, 45))  # Participants 14-44
 
@@ -478,7 +489,7 @@ def main():
     print_bmc_results(result, participants)
 
     # Create visualization
-    output_path = os.path.join(output_dir, 'group_bmc_results_oci.png')
+    output_path = os.path.join(output_dir, f'group_bmc_results_{cfg.task.name}_individual.png')
     create_visualization(baseline_bics, gecco_bics, oci_scores, result,
                          participants, output_path)
 

@@ -21,11 +21,3 @@ python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_o
 python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml
 # python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd.yaml
 # python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd.yaml
-
-# ppc generation
-python analysis/two_step_task/ppc_group_oci.py --config two_step_psychiatry_group_ocd_maxsetting.yaml
-python analysis/two_step_task/ppc_group_oci.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml
-
-# group bmc analysis
-python analysis/two_step_task/group_bmc_analysis_oci.py --config two_step_psychiatry_group_ocd_maxsetting.yaml
-python analysis/two_step_task/group_bmc_analysis_oci.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml

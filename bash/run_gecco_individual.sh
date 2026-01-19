@@ -21,11 +21,3 @@ python scripts/two_step_individual_function.py --config two_step_psychiatry_indi
 # python scripts/two_step_individual_function.py --config two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml
 # python scripts/two_step_individual_function.py --config two_step_psychiatry_individual_ocd_function_gemini-3-pro_ocd.yaml
 # python scripts/two_step_individual_function.py --config two_step_psychiatry_individual_function_gemini-3-pro_ocd.yaml
-
-# ppc generation
-python analysis/two_step_task/ppc_individual_oci.py --config two_step_psychiatry_individual_ocd_function_gemini-3-pro_ocd_maxsetting.yaml
-python analysis/two_step_task/ppc_individual_oci.py --config two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml
-
-# group bmc analysis
-python analysis/two_step_task/group_bmc_analysis_oci.py --config two_step_psychiatry_individual_ocd_function_gemini-3-pro_ocd_maxsetting.yaml
-python analysis/two_step_task/group_bmc_analysis_oci.py --config two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml

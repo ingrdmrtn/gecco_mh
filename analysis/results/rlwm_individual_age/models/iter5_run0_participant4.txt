@@ -1,0 +1,315 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Surprise-gated WM mixture (surprise depends on unsigned PE history) with set-size and age effects.
+
+    Idea:
+    - RL: tabular Q-learning.
+    - WM: fast store of most recently rewarded action per state; used via a near-deterministic softmax.
+    - Gating: the WM mixture weight increases with state-specific surprise (|last PE|), but decreases with set size and age.
+      This captures that WM is engaged more when outcomes are surprising, yet cognitive load (larger set) and age reduce WM reliance.
+
+    Parameters (5):
+    - lr: learning rate for RL Q-updates (0..1).
+    - wm_weight_base: baseline WM mixture weight (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - surprise_gain: sensitivity of WM gating to unsigned PE (>=0).
+    - age_surprise_bias: extra additive surprise drive for older group (>=0); ignored in young, applied in old.
+
+    Age and set-size effects:
+    - WM mixture weight is down-weighted by set size: divide by (1 + 0.5*(nS-3)) and also by (1 + 0.5*age_group).
+    - Surprise contribution to WM gating adds age_surprise_bias only for the older group.
+    - RL softmax temperature is constant across set sizes here (all set-size effects are in WM).
+
+    Inputs:
+    - states, actions, rewards: arrays of equal length for trials.
+    - blocks: block index per trial (states do not overlap across blocks).
+    - set_sizes: set size of the current block on each trial (3 or 6).
+    - age: array-like with a single repeated value; coded to age_group 0 (<=45) or 1 (>45).
+    - model_parameters: list [lr, wm_weight_base, softmax_beta, surprise_gain, age_surprise_bias].
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, surprise_gain, age_surprise_bias = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0  # deterministic WM policy
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM stores
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last unsigned PE per state to drive WM gating
+        last_abs_pe = np.zeros(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL choice probability
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            # WM choice probability
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            # Surprise-gated WM weight with set-size and age down-weighting
+            # Base load penalty increases from set size 3 to 6
+            load_penalty = 1.0 + 0.5 * max(0, nS - 3)
+            age_penalty = 1.0 + 0.5 * age_group
+            surprise_term = last_abs_pe[s] + (age_surprise_bias * age_group)
+            wm_gate = 1.0 / (1.0 + np.exp(-surprise_gain * (surprise_term)))  # 0..1
+            wm_weight_eff = wm_weight_base * wm_gate / (load_penalty * age_penalty)
+            wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update:
+            # - small passive decay toward uniform
+            # - on reward, replace with one-hot of chosen action (episodic capture)
+            decay = 0.05
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+
+            # track last unsigned PE for next trial gating
+            last_abs_pe[s] = abs(pe)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with set/age-adjusted temperature + WM with cross-state crosstalk interference.
+
+    Idea:
+    - RL: tabular Q-learning; softmax inverse temperature decreases with set size and with age.
+    - WM: stores rewarded actions per state, but updates 'leak' to other states (crosstalk), modeling interference under load.
+           WM choice is near-deterministic when clean; crosstalk blurs the WM distribution across states.
+    - Mixture: fixed WM mixture weight (parameter) combined with RL policy.
+
+    Parameters (5):
+    - lr: RL learning rate (0..1).
+    - beta_base: base inverse temperature for RL (scaled by 10 internally).
+    - wm_weight: mixture weight for WM (0..1).
+    - crosstalk: proportion of WM update that spreads to other states (0..1); larger at larger set sizes effectively hurts WM.
+    - age_beta_drop: magnitude by which age reduces RL inverse temperature (>=0).
+
+    Age and set-size effects:
+    - RL beta_eff = 10*beta_base / (1 + 0.25*(nS-3) + age_beta_drop*age_group).
+    - WM crosstalk distributes a fraction of rewarded one-hot to other states uniformly, making WM less precise as nS grows
+      because the same crosstalk mass is split among more states.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_weight, crosstalk, age_beta_drop = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Effective RL beta accounting for set size and age
+        softmax_beta = (10.0 * beta_base) / (1.0 + 0.25 * max(0, nS - 3) + age_beta_drop * age_group)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # small passive decay of WM towards baseline
+        wm_decay = 0.03
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            # WM policy
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            # Mixture
+            wm_weight_eff = np.clip(wm_weight, 0.0, 1.0)
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update with crosstalk interference
+            # Passive leak toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            if r > 0.5:
+                # Construct a one-hot on action a at state s
+                one_hot = np.zeros((nS, nA))
+                one_hot[s, a] = 1.0
+
+                # Distribute a fraction 'crosstalk' of this update to other states uniformly
+                if nS > 1 and crosstalk > 0.0:
+                    other_states = [i for i in range(nS) if i != s]
+                    leak_per_state = crosstalk / len(other_states)
+                    for os in other_states:
+                        one_hot[os, a] += leak_per_state  # leak along the same action into other states
+
+                # Normalize per state and overwrite WM to reflect the episodic capture + interference
+                for ss in range(nS):
+                    vec = one_hot[ss, :]
+                    if np.sum(vec) > 0:
+                        w[ss, :] = vec / np.sum(vec)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM elimination-by-aspects (rule-out) with set-size/age scaling of precision.
+
+    Idea:
+    - RL: tabular Q-learning with a fixed learning rate; softmax inverse temperature is reduced by set size and age.
+    - WM: maintains per-state candidate probabilities over actions. On errors, it prunes the chosen action;
+           on rewards, it concentrates on the chosen action. This mimics hypothesis testing in WM.
+    - Mixture: fixed WM weight combined with RL policy.
+
+    Parameters (5):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: base RL inverse temperature (scaled by 10 internally, then reduced by set size and age).
+    - wm_weight: WM mixture weight (0..1).
+    - prune_rate: fraction removed from the chosen action on negative feedback (0..1).
+    - age_setsize_penalty: scales how much set size and age reduce RL temperature and WM reliability (>=0).
+
+    Age and set-size effects:
+    - RL beta_eff = 10*softmax_beta / (1 + age_setsize_penalty*(age_group + 0.5*(nS-3))).
+    - WM beta is high, but the same penalty reduces the effective WM weight: wm_weight_eff = wm_weight / (1 + age_setsize_penalty*(age_group + 0.5*(nS-3))).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight, prune_rate, age_setsize_penalty = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Effective precision scales
+        penalty = 1.0 + age_setsize_penalty * (age_group + 0.5 * max(0, nS - 3))
+        beta_eff = (10.0 * softmax_beta) / penalty
+        beta_wm = 50.0  # high precision for WM readout
+        wm_weight_eff = np.clip(wm_weight / penalty, 0.0, 1.0)
+
+        # Initialize value stores
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM candidate distribution per state
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Small leak back to uniform to avoid dead-ends
+        wm_leak = 0.02
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            # WM policy from candidate distribution
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM elimination-by-aspects update
+            # Leak toward uniform each trial
+            w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+            if r > 0.5:
+                # Confirm chosen action: concentrate mass on the chosen action
+                keep = max(1e-8, 1.0 - prune_rate)  # reuse prune_rate as a smoothing factor
+                w[s, :] = (1.0 - keep) * w[s, :]  # shrink all
+                w[s, a] += keep  # add mass to chosen
+            else:
+                # Prune the chosen action
+                cut = np.clip(prune_rate, 0.0, 1.0) * w[s, a]
+                w[s, a] -= cut
+                redistribute = cut / (nA - 1)
+                for aa in range(nA):
+                    if aa != a:
+                        w[s, aa] += redistribute
+
+            # Normalize to be safe
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

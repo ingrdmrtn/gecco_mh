@@ -1,0 +1,320 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Capacity-limited WM with strength and decay; arbitration scales with load.
+
+    Rationale:
+    - RL uses a standard delta-rule and softmax policy.
+    - WM stores stimulus-action associations when rewarded, with a memory strength that depends on
+      available capacity (slots vs set size) and decays over time.
+    - Arbitration weight decreases under higher load because fewer items can be allocated per state.
+    - WM policy is a probabilistic row for the current state, mixed with a lapse to uniform.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight0: Base WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - wm_slots: Number of WM slots (>=0), constrains effective WM strength as min(1, wm_slots/nS)
+    - wm_decay: Per-trial decay rate of WM strength (0..1)
+    - wm_lapse: Lapse probability within WM controller mixing toward uniform (0..1)
+
+    Returns: negative log-likelihood of observed choices under the model
+    """
+    lr, wm_weight0, softmax_beta, wm_slots, wm_decay, wm_lapse = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # unused in this model's WM policy; WM uses explicit distribution
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM row is a probability distribution over actions
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM memory strength per state (0..1), decays each trial
+        m = np.zeros(nS)
+
+        # Capacity-based scaling for arbitration and encoding gain
+        cap_ratio = min(1.0, float(max(0.0, wm_slots)) / float(nS if nS > 0 else 1))
+        wm_weight_block = max(0.0, min(1.0, wm_weight0 * cap_ratio))
+        encode_gain = cap_ratio  # higher when more slots per item
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: mix remembered row with uniform according to memory strength and lapse
+            uniform = np.ones(nA) / nA
+            P_wm_row = (1.0 - wm_lapse) * (m[s] * w[s, :] + (1.0 - m[s]) * uniform) + wm_lapse * uniform
+            P_wm_row = np.maximum(P_wm_row, eps)
+            P_wm_row = P_wm_row / np.sum(P_wm_row)
+            p_wm = P_wm_row[a]
+
+            # Arbitration and likelihood
+            p_total = wm_weight_block * p_wm + (1.0 - wm_weight_block) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM updates: decay strength for all states; encode on rewarded trials
+            m = (1.0 - wm_decay) * m  # global decay each trial
+
+            if r > 0.5:
+                # Encode mapping for this state; increase strength toward 1 with encode_gain
+                m[s] = m[s] + (1.0 - m[s]) * encode_gain
+                # Sharpen row toward chosen action proportional to current strength
+                # Construct a peaked distribution favoring the chosen action
+                peaked = np.ones(nA) * ((1.0 - m[s]) / (nA - 1))
+                peaked[a] = m[s]
+                w[s, :] = peaked
+            else:
+                # On errors, weaken the chosen action in WM row slightly and renormalize
+                # The weakening is modest and proportional to current strength
+                if m[s] > 0:
+                    loss = 0.25 * m[s]  # small redistribution on error
+                    delta_down = min(loss, w[s, a])
+                    w[s, a] -= delta_down
+                    redistribute = delta_down / (nA - 1)
+                    for aa in range(nA):
+                        if aa != a:
+                            w[s, aa] += redistribute
+                    # No change to m[s] here beyond global decay
+
+            # Ensure proper normalization
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Inhibitory WM for avoiding recently punished actions; load-dependent logistic arbitration.
+
+    Rationale:
+    - RL is standard delta-rule with softmax.
+    - WM acts as an avoidance controller: after a non-reward, it suppresses the chosen action for that state,
+      and slowly relaxes back toward uniform otherwise.
+    - Arbitration weight is reduced in larger set sizes via a logistic function of load (nS).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Base WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - aversive_wm: Magnitude of WM suppression after errors (0..1)
+    - wm_persist: Persistence of WM avoidance traces (0..1); higher = slower decay to uniform
+    - load_kappa: Steepness of logistic load effect on WM contribution (>=0)
+
+    Returns: negative log-likelihood of observed choices under the model
+    """
+    lr, wm_weight, softmax_beta, aversive_wm, wm_persist, load_kappa = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM values act like approach preferences; we'll penalize actions after errors
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-dependent arbitration scaling: more load => less WM
+        # For nS=3 -> logistic ~ higher; for nS=6 -> lower
+        load_center = 3.0  # anchor at low load
+        wm_load_scale = 1.0 / (1.0 + np.exp(max(0.0, load_kappa) * (float(nS) - load_center)))
+        wm_weight_block = max(0.0, min(1.0, wm_weight * wm_load_scale))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy via softmax on w row
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture and likelihood
+            p_total = wm_weight_block * p_wm + (1.0 - wm_weight_block) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM updates:
+            if r < 0.5:
+                # Suppress chosen action, redistribute mass to others
+                drop = max(0.0, min(1.0, aversive_wm))
+                delta = min(drop, w[s, a])
+                w[s, a] -= delta
+                inc = delta / (nA - 1)
+                for aa in range(nA):
+                    if aa != a:
+                        w[s, aa] += inc
+            else:
+                # After reward, slight relaxation toward uniform to avoid over-suppressing
+                pass
+
+            # Persistence/relaxation toward uniform each trial (for the current state row)
+            relax = 1.0 - max(0.0, min(1.0, wm_persist))
+            if relax > 0.0:
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+            # Normalize row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Recency-precision WM with time-based reliability and noise floor.
+
+    Rationale:
+    - RL uses a delta-rule and softmax.
+    - WM stores the last rewarded action for each state and drifts toward uniform with time.
+    - Arbitration weight is proportional to a precision signal derived from how recently the state
+      received reward; more recent reward -> higher precision. Precision is transformed by a gain,
+      and bounded below by a noise floor.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Base WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - recency_tau: Time constant controlling decline of WM precision with trial age (>0)
+    - precision_gain: Gain on the precision signal for arbitration (>=0)
+    - noise_floor: Minimal arbitration contribution from WM and minimal WM row sharpening (0..1)
+
+    Returns: negative log-likelihood of observed choices under the model
+    """
+    lr, wm_weight, softmax_beta, recency_tau, precision_gain, noise_floor = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+    recency_tau = max(recency_tau, eps)
+    noise_floor = max(0.0, min(1.0, noise_floor))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last rewarded time for each state; initialize to None/inf
+        last_reward_time = np.full(nS, np.inf)
+        t_global = 0  # time within block
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy via softmax over w row
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Precision from recency of last reward for this state
+            age = t_global - last_reward_time[s]
+            if not np.isfinite(age) or age < 0:
+                age = np.inf
+            # Convert age to precision in [0,1): more recent => closer to 1
+            base_prec = 1.0 / (1.0 + (age / recency_tau))
+            # Gain and floor
+            prec = 1.0 / (1.0 + np.exp(-precision_gain * (base_prec - 0.5)))  # squash
+            prec = max(prec, noise_floor)
+            # Additional load effect: scale precision by (3/nS) to reflect lower reliability in larger sets
+            load_scale = 3.0 / float(nS)
+            wm_weight_t = max(0.0, min(1.0, wm_weight * prec * load_scale))
+
+            # Likelihood
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update:
+            if r > 0.5:
+                # Store a sharp row pointing to the rewarded action, mixed slightly with uniform (noise floor)
+                sharp = np.ones(nA) * (noise_floor / (nA - 1))
+                sharp[a] = 1.0 - noise_floor
+                w[s, :] = sharp
+                last_reward_time[s] = t_global
+            else:
+                # On non-reward, gently drift the row toward uniform
+                drift = 0.2  # modest drift rate per visit
+                w[s, :] = (1.0 - drift) * w[s, :] + drift * w_0[s, :]
+
+            # Normalize WM row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+            # Advance time
+            t_global += 1
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,332 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL+WM mixture with RPE-gated WM availability, age- and load-dependent WM noise, and choice stickiness.
+
+    Idea
+    - RL: standard Q-learning.
+    - WM: fast one-shot encoding of rewarded action per state; decays toward uniform with noise
+      that increases with set size and with age.
+    - Gating: the effective WM weight for a state is scaled by a learned availability variable that is
+      increased by large absolute RPEs (surprise-driven gating), stored per state and used next time
+      the state reappears.
+    - Stickiness: bias toward repeating the previous action, applied to both RL and WM policies.
+    - Age and set size:
+        - Older adults: lower effective RL beta, higher WM noise.
+        - Larger set size: higher WM noise.
+
+    Parameters
+    ----------
+    model_parameters : [lr, beta_base, wm_base, gate_slope, stickiness, wm_noise_base]
+        - lr: RL learning rate (0..1).
+        - beta_base: base inverse temperature for RL (scaled internally).
+        - wm_base: base WM weight (0..1).
+        - gate_slope: sensitivity of WM gating to |RPE| (>=0).
+        - stickiness: choice perseveration strength (>=0).
+        - wm_noise_base: base WM noise scaling with set size (>=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_base, gate_slope, stickiness, wm_noise_base = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_base = beta_base * 10.0 * (1.0 - 0.30 * age_group)
+    softmax_beta_wm_nominal = 50.0
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    prev_action_global = None  # for stickiness when state has not been seen before in block
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        wm_avail = np.ones(nS) * wm_base  # state-wise availability weight, updated by RPE gating
+        prev_action_state = -np.ones(nS, dtype=int)  # last action per state in this block
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            nS_t = int(block_set_sizes[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # Load- and age-dependent WM noise -> increases temperature (reduces determinism)
+            load_factor = max(0.0, (nS_t - 3) / 3.0)
+            wm_noise = wm_noise_base * (1.0 + 0.6 * age_group) * load_factor
+            softmax_beta_wm = softmax_beta_wm_nominal / (1.0 + wm_noise)
+
+            # Effective RL beta (slightly reduced in older adults)
+            softmax_beta = softmax_beta_base
+
+            # Choice stickiness bias: favor repeating previous action (state-specific if available)
+            prev_a = prev_action_state[s] if prev_action_state[s] >= 0 else (prev_action_global if prev_action_global is not None else -1)
+            bias = np.zeros(nA)
+            if prev_a >= 0:
+                bias[prev_a] = stickiness
+
+            # RL policy with bias
+            denom_rl = np.sum(np.exp(softmax_beta * ((Q_s + bias) - (Q_s[a] + bias[a]))))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy with bias
+            denom_wm = np.sum(np.exp(softmax_beta_wm * ((W_s + bias) - (W_s[a] + bias[a]))))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Interference factor on WM base weight due to load and age
+            interference = 1.0 / (1.0 + load_factor * (1.0 + 0.5 * age_group))
+            wm_weight_eff = np.clip(wm_base * interference * np.clip(wm_avail[s], 0.0, 1.0), 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM decay toward uniform (noise) then update if rewarded
+            decay = wm_noise  # larger noise => faster decay
+            w = (1.0 - decay) * w + decay * w_0
+            if r >= 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = target
+
+            # RPE-gated WM availability for this state (used next time this state appears)
+            wm_avail[s] = 1.0 / (1.0 + np.exp(-gate_slope * np.abs(pe)))
+
+            # Update stickiness memory
+            prev_action_state[s] = a
+            prev_action_global = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM with probabilistic encoding, load/age-dependent decay.
+
+    Idea
+    - RL: standard Q-learning with softmax.
+    - WM: can encode up to K items; when set size > K, the probability that the current state is in
+      WM is p_encode = K / set_size. WM content decays over time (toward uniform) at a rate that
+      increases with set size and with age.
+    - Mixture: action probability is p = p_encode * p_wm + (1 - p_encode) * p_rl (using effective
+      p_encode scaled by age- and load-dependent decay).
+    - Age and set size:
+        - Older adults: reduced effective capacity K and stronger decay.
+        - Larger set size: lower p_encode and stronger decay.
+
+    Parameters
+    ----------
+    model_parameters : [lr, beta_rl, K_base, beta_wm, wm_decay, age_K_drop]
+        - lr: RL learning rate (0..1).
+        - beta_rl: base inverse temperature for RL (scaled internally).
+        - K_base: baseline WM capacity (>=1).
+        - beta_wm: inverse temperature for WM policy (high => deterministic).
+        - wm_decay: base WM decay rate per trial (0..1).
+        - age_K_drop: capacity reduction applied if older (>=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, K_base, beta_wm, wm_decay, age_K_drop = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = beta_wm
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective capacity
+        K_eff = max(1.0, K_base - age_K_drop * age_group)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            nS_t = int(block_set_sizes[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Probabilistic encoding weight based on capacity and set size
+            p_encode = min(1.0, K_eff / float(nS_t))
+
+            # Age- and load-dependent decay reduces effective WM availability
+            load_factor = max(0.0, (nS_t - 3) / 3.0)
+            decay_eff = np.clip(wm_decay * (1.0 + 0.5 * age_group) * (1.0 + load_factor), 0.0, 1.0)
+            wm_weight_eff = np.clip(p_encode * (1.0 - 0.5 * decay_eff), 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM decay toward uniform, then encode deterministically weighted by p_encode if rewarded
+            w = (1.0 - decay_eff) * w + decay_eff * w_0
+            if r >= 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Partial overwrite proportional to p_encode (reflects chance the item is in WM)
+                w[s, :] = (1.0 - p_encode) * w[s, :] + p_encode * target
+            else:
+                # No explicit update on errors (could be extended to anti-Hebbian)
+                pass
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-weighted RL+WM mixture with age- and load-dependent reliability, negative-PE down-weighting, and lapse.
+
+    Idea
+    - RL: Q-learning with asymmetric learning (negative PEs use a scaled learning rate).
+    - WM: leaky count-based store (Dirichlet-like) of rewarded actions per state; transformed to
+      probabilities and passed through a high-beta softmax.
+    - Mixture: weighted by WM reliability that decreases with load and age; includes a lapse that
+      increases with load and age.
+    - Age and set size:
+        - Older and larger sets: lower WM reliability, higher lapse, and lower RL beta for larger sets.
+
+    Parameters
+    ----------
+    model_parameters : [lr, beta0, wm_rel0, neg_mult, lapse0, set_beta_drop]
+        - lr: base RL learning rate for positive PEs (0..1).
+        - beta0: base inverse temperature for RL (scaled internally).
+        - wm_rel0: base WM reliability weight (0..1).
+        - neg_mult: multiplier for negative PE learning rate (0..1).
+        - lapse0: base lapse probability (0..1).
+        - set_beta_drop: reduction of RL beta per unit load ((set_size-3)/3) (>=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, beta0, wm_rel0, neg_mult, lapse0, set_beta_drop = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_base = beta0 * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM as leaky counts; initialize with uniform prior (1)
+        counts = np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            nS_t = int(block_set_sizes[t])
+
+            Q_s = q[s, :]
+
+            # RL beta reduced by load and mildly by age via WM competition
+            load = max(0.0, (nS_t - 3) / 3.0)
+            beta_rl = softmax_beta_base / (1.0 + set_beta_drop * load) * (1.0 - 0.15 * age_group)
+
+            # RL policy
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy: normalize counts to probabilities then softmax
+            wm_prob = counts[s, :] / max(np.sum(counts[s, :]), eps)
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (wm_prob - wm_prob[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # WM reliability weight reduced by load and age
+            wm_rel = wm_rel0 / (1.0 + load * (1.0 + 0.7 * age_group))
+            wm_rel = np.clip(wm_rel, 0.0, 1.0)
+
+            # Lapse increases with load and age
+            lapse = np.clip(lapse0 * (1.0 + 0.5 * age_group) * (1.0 + 0.5 * load), 0.0, 0.25)
+
+            p_mix = wm_rel * p_wm + (1.0 - wm_rel) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / 3.0)
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric negative learning
+            pe = r - q[s, a]
+            lr_eff = lr if pe >= 0 else lr * np.clip(neg_mult * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            q[s, a] += lr_eff * pe
+
+            # WM leaky counts update:
+            # decay toward prior (1) with rate tied to (1 - wm_rel), then increment on reward
+            decay = 0.5 * (1.0 - wm_rel)  # more decay when WM less reliable (load/age)
+            counts[s, :] = (1.0 - decay) * counts[s, :] + decay * 1.0
+            if r >= 0.5:
+                counts[s, a] += 1.0
+            else:
+                # slight suppression of chosen action on errors to reflect avoidance
+                counts[s, a] = max(1.0, counts[s, a] - 0.2)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

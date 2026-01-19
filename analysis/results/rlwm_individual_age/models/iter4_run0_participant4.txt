@@ -1,0 +1,349 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Bayesian-like WM counts with age- and set-size-dependent precision
+
+    Idea:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: for each state, maintain Dirichlet-like counts over actions (w holds counts).
+      The WM policy is a softmax over the normalized counts (categorical means), with its
+      effective precision scaling with the total evidence (sum of counts). Larger set sizes
+      and older age reduce WM precision by lowering effective counts.
+    - Mixture: convex combination of RL and WM policies with a fixed weight.
+
+    Age and set size:
+    - The WM precision is reduced as set size increases (more interference) and further reduced
+      for older age. Implemented by scaling the WM softmax inverse temperature by an
+      effective alpha_sum = sum(counts) / (1 + wm_setsize_alpha_drop*(nS-1)) / (1 + age_alpha_drop*age_group).
+      Thus larger set sizes and older age yield less deterministic WM.
+
+    Parameters (list; total 6):
+    - lr: RL learning rate (0..1).
+    - wm_weight: mixture weight for WM (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_alpha_base: prior pseudo-count added to each action at block start (>=0).
+    - wm_setsize_alpha_drop: how much larger set sizes reduce WM effective precision (>=0).
+    - age_alpha_drop: additional precision drop for older age (>=0).
+
+    Inputs:
+    - states: array of state indices per trial (0..nS-1 for each block).
+    - actions: array of chosen actions per trial (0..2).
+    - rewards: array of rewards per trial (0 or 1).
+    - blocks: array of block indices per trial.
+    - set_sizes: array of set size for the current block per trial (3 or 6).
+    - age: array with a single repeated value for participant age.
+    - model_parameters: list of parameters specified above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_alpha_base, wm_setsize_alpha_drop, age_alpha_drop = model_parameters
+    softmax_beta *= 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0  # base scale; will be modulated by evidence
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL values
+        q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM "counts" initialized with Dirichlet-like prior
+        w = wm_alpha_base * np.ones((nS, nA))
+        w_0 = wm_alpha_base * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: normalize counts to probabilities, precision scales with total counts
+            counts_s = w[s, :]
+            prob_s = counts_s / max(np.sum(counts_s), 1e-12)
+
+            # effective precision damped by set size and age
+            alpha_sum = np.sum(counts_s)
+            precision_scale = alpha_sum / (1.0 + wm_setsize_alpha_drop * max(0, nS - 1))
+            precision_scale = precision_scale / (1.0 + age_alpha_drop * age_group)
+            beta_wm_eff = softmax_beta_wm * max(precision_scale, 1e-6)
+
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (prob_s - prob_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: reward strengthens chosen action's count; no-reward weakly increases others
+            if r >= 0.5:
+                w[s, a] += 1.0
+            else:
+                # distribute a small error-driven mass to non-chosen actions (implicit exclusion learning)
+                small = 0.2
+                for aa in range(nA):
+                    if aa != a:
+                        w[s, aa] += small / (nA - 1)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with decaying Q and entropy-based arbitration to WM
+
+    Idea:
+    - RL: tabular Q-learning with softmax choice and value decay (q_decay) toward uniform,
+      capturing forgetting under load.
+    - WM: fast cache of action probabilities per state (w) that is refreshed on rewards and
+      otherwise drifts toward uniform. The WM policy is a sharp softmax over w.
+    - Arbitration: the mixture weight is dynamic and depends on the relative entropy
+      (uncertainty) of WM vs RL for the current state. If WM is more certain (lower entropy),
+      weight more on WM; otherwise rely on RL. Sensitivity to entropy is increased by set size
+      and reduced by age sensitivity drop.
+
+    Age and set size:
+    - Entropy sensitivity is scaled by (1 + entropy_gain*(nS-1)) and then reduced for older age
+      by dividing by (1 + age_entropy_drop*age_group).
+    - Q decay models set-size-related forgetting implicitly because arbitration shifts away
+      from RL when WM is confident.
+
+    Parameters (list; total 6):
+    - lr: RL learning rate (0..1).
+    - wm_weight: baseline WM mixture weight (0..1), used as midpoint in arbitration.
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - q_decay: per-trial decay of Q toward uniform (0..1).
+    - entropy_gain: scales the arbitration's sensitivity to WM-RL entropy difference (>=0).
+    - age_entropy_drop: reduces entropy sensitivity in older age (>=0).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: as specified.
+    - model_parameters: list of parameters specified above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, q_decay, entropy_gain, age_entropy_drop = model_parameters
+    softmax_beta *= 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective entropy gain considering set size and age
+        ent_gain_eff = entropy_gain * (1.0 + max(0, nS - 1))
+        ent_gain_eff = ent_gain_eff / (1.0 + age_entropy_drop * age_group)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy-based arbitration
+            # Compute entropies of current policies (RL softmax probs and WM probs)
+            # Derive full action distributions to compute entropy
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_probs = np.exp(rl_logits)
+            rl_probs = rl_probs / np.sum(rl_probs)
+
+            wm_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / np.sum(wm_probs)
+
+            def entropy(p):
+                p_safe = np.clip(p, 1e-12, 1.0)
+                return -np.sum(p_safe * np.log(p_safe))
+
+            H_rl = entropy(rl_probs)
+            H_wm = entropy(wm_probs)
+
+            # Map entropy difference to a gating weight via a logistic around wm_weight
+            # If WM is more certain (H_wm < H_rl), weight increases toward 1
+            x = ent_gain_eff * (H_rl - H_wm)
+            wm_gate = 1.0 / (1.0 + np.exp(-x))
+            wm_weight_eff = wm_weight * (1.0 - 0.5) + 0.5 * wm_gate  # center around 0.5 and blend with baseline
+            # Keep within [0,1]
+            wm_weight_eff = min(max(wm_weight_eff, 0.0), 1.0)
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL value decay toward uniform plus TD update
+            q[s, :] = (1.0 - q_decay) * q[s, :] + q_decay * (1.0 / nA)
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: reward refreshes to near-delta on chosen action; otherwise slow drift to uniform
+            drift = 0.05
+            w[s, :] = (1.0 - drift) * w[s, :] + drift * w_0[s, :]
+            if r >= 0.5:
+                w[s, :] = 0.01 * w[s, :]  # small residual
+                w[s, a] = 1.0  # refresh
+
+            # Renormalize WM row to a probability simplex
+            w[s, :] = np.clip(w[s, :], 1e-8, None)
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with cross-state interference (leak) that grows with set size and age
+
+    Idea:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: per-state action probabilities that are sharply expressed in policy, but they are
+      subject to cross-state interference: the current state's WM pattern leaks into other
+      states' WM with strength wm_leak_eff. Reward refreshes the current state's WM to a
+      one-hot on the chosen action. Drift to uniform maintains some forgetting.
+    - Mixture: fixed convex combination of WM and RL, with wm_weight possibly reduced at larger set sizes.
+
+    Age and set size:
+    - Interference leak increases with set size and is amplified by age via age_leak_gain.
+    - The WM mixture weight is also reduced slightly as set size increases.
+
+    Parameters (list; total 5):
+    - lr: RL learning rate (0..1).
+    - wm_weight: baseline WM mixture weight (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_leak: base cross-state leak (>=0).
+    - age_leak_gain: multiplicative increase in leak for older age (>=0).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: as specified.
+    - model_parameters: list of parameters specified above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_leak, age_leak_gain = model_parameters
+    softmax_beta *= 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective leak and WM weight adjustment by set size and age
+        wm_leak_eff = wm_leak * (1.0 + max(0, nS - 1)) * (1.0 + age_leak_gain * age_group)
+        wm_leak_eff = min(max(wm_leak_eff, 0.0), 1.0)
+        wm_weight_eff_block = wm_weight / (1.0 + 0.25 * max(0, nS - 1))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM drift and reward refresh at current state
+            drift = 0.05
+            w[s, :] = (1.0 - drift) * w[s, :] + drift * w_0[s, :]
+            if r >= 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.0 * w[s, :] + one_hot
+
+            # Cross-state interference: leak current state's WM into other states
+            if nS > 1:
+                leak_share = wm_leak_eff / max(1, nS - 1)
+                for s2 in range(nS):
+                    if s2 == s:
+                        continue
+                    w[s2, :] = (1.0 - wm_leak_eff) * w[s2, :] + leak_share * w[s, :]
+
+            # Renormalize rows to valid distributions
+            for s2 in range(nS):
+                w[s2, :] = np.clip(w[s2, :], 1e-8, None)
+                w[s2, :] = w[s2, :] / np.sum(w[s2, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,319 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited slots WM (mixture). WM reliance drops with larger set size and (for older age),
+    and memory traces decay toward uniform.
+
+    Mechanism:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: a per-state action distribution w[s,:] that encodes the last rewarded action (slot-like).
+      When rewarded, the correct action is written strongly; otherwise, the chosen action is suppressed.
+      WM decays toward uniform each trial.
+    - Arbitration: mixture between WM policy and RL policy with a block-level WM weight that reflects
+      the effective capacity (decreasing with set size and for older adults).
+
+    Parameters (list of length 6):
+    - lr: RL learning rate (0..1).
+    - beta_rl: RL inverse-temperature; internally scaled by 10 for a wide range.
+    - wm_slot_base: baseline WM mixture weight (0..1) before set-size and age penalties.
+    - wm_forget_rate: WM decay rate toward uniform (0..1) applied every trial.
+                      Also sets the write strength as (1 - wm_forget_rate) on rewarded trials.
+    - age_slot_penalty: additional down-weighting of WM for older adults (>=0).
+    - setsize_slot_penalty: WM down-weighting per increase beyond set size 3 (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, wm_slot_base, wm_forget_rate, age_slot_penalty, setsize_slot_penalty = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM mixture weight from capacity limits
+        # Use a logit transform to keep stability and interpret penalties additively
+        eps = 1e-6
+        base_logit = np.log(np.clip(wm_slot_base, eps, 1 - eps)) - np.log(1 - np.clip(wm_slot_base, eps, 1 - eps))
+        penalty = setsize_slot_penalty * max(0, nS - 3) + age_slot_penalty * age_group
+        wm_weight_block = 1.0 / (1.0 + np.exp(-(base_logit - penalty)))
+        wm_weight_block = np.clip(wm_weight_block, 0.0, 1.0)
+
+        encode_strength = 1.0 - np.clip(wm_forget_rate, 0.0, 1.0)
+        decay_rate = np.clip(wm_forget_rate, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy probability of the chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy probability of the chosen action (deterministic toward stored action)
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * W_s
+            wm_logits -= np.max(wm_logits)
+            wm_exp = np.exp(wm_logits)
+            wm_pol = wm_exp / np.sum(wm_exp)
+            p_wm = float(wm_pol[a])
+
+            # Mixture
+            p_total = wm_weight_block * p_wm + (1.0 - wm_weight_block) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - encode_strength) * w[s, :] + encode_strength * target
+            else:
+                # Suppress the chosen (likely wrong) action a bit
+                w[s, a] = (1.0 - 0.5 * encode_strength) * w[s, a]
+
+            # Global decay toward uniform (interference/forgetting)
+            w = (1.0 - decay_rate) * w + decay_rate * w_0
+
+            # Normalize rows
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            row_sums = np.clip(row_sums, 1e-12, None)
+            w = w / row_sums
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + surprise-gated WM (mixture). WM encoding is driven by RL prediction error magnitude
+    and is less likely under higher set size and for older age.
+
+    Mechanism:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: per-state policy w[s,:], updated when a gate opens. The gate is a sigmoid of the
+      unsigned prediction error |delta|, minus penalties for set size and age.
+    - Arbitration: WM vs RL mixture where the WM weight on each trial equals the current gate value.
+      Thus, when surprise is high, WM dominates; otherwise, RL dominates.
+    - WM decays slightly each trial toward uniform; stronger gates write more strongly.
+
+    Parameters (list of length 6):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_gate_base: baseline gate bias; higher means more frequent WM gating.
+    - wm_pe_gain: sensitivity of the gate to |prediction error|.
+    - ss_gate_penalty: penalty per increase in set size beyond 3 that closes the gate (>=0).
+    - age_gate_penalty: penalty applied for older adults that closes the gate (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_gate_base, wm_pe_gain, ss_gate_penalty, age_gate_penalty = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Compute current TD error (based on pre-update Q)
+            delta = r - Q_s[a]
+
+            # Surprise-gated WM weight on this trial
+            penalty = ss_gate_penalty * max(0, nS - 3) + age_gate_penalty * age_group
+            gate_input = wm_gate_base + wm_pe_gain * np.abs(delta) - penalty
+            wm_weight = 1.0 / (1.0 + np.exp(-gate_input))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # WM policy
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * W_s
+            wm_logits -= np.max(wm_logits)
+            wm_exp = np.exp(wm_logits)
+            wm_pol = wm_exp / np.sum(wm_exp)
+            p_wm = float(wm_pol[a])
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * delta
+
+            # WM update: write strength increases with gate opening; otherwise light decay
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_weight) * w[s, :] + wm_weight * target
+            else:
+                # If no reward, small suppression of chosen action proportional to the gate (surprise)
+                w[s, a] = (1.0 - 0.5 * wm_weight) * w[s, a]
+
+            # Global mild decay toward uniform to reflect interference
+            decay = 0.05 + 0.05 * max(0, nS - 3) + 0.05 * age_group
+            decay = np.clip(decay, 0.0, 0.5)
+            w = (1.0 - decay) * w + decay * w_0
+
+            # Normalize rows
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            row_sums = np.clip(row_sums, 1e-12, None)
+            w = w / row_sums
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + interference-driven WM (mixture). WM precision and reliance degrade with interference that
+    increases with set size and with age.
+
+    Mechanism:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: per-state distribution w[s,:] that stores the rewarded action. Each trial, WM suffers
+      interference-driven decay toward uniform. On reward, it writes toward the correct action.
+    - Arbitration: mixture of WM and RL policies with a WM weight that scales down with the same
+      interference rate that degrades WM.
+
+    Parameters (list of length 6):
+    - lr: RL learning rate (0..1).
+    - beta_rl: RL inverse temperature (scaled by 10 internally).
+    - wm_weight_base: base WM mixture weight (0..1) before interference scaling.
+    - wm_interference_base: base logit controlling interference rate (can be negative or positive).
+                            Higher means more interference/decay.
+    - ss_interf_gain: how much interference increases per step beyond set size 3 (>=0).
+    - age_interf_gain: additional interference for older adults (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, wm_weight_base, wm_interference_base, ss_interf_gain, age_interf_gain = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+
+    eps = 1e-6
+    base_w_logit = np.log(np.clip(wm_weight_base, eps, 1 - eps)) - np.log(1 - np.clip(wm_weight_base, eps, 1 - eps))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Interference rate for this block (converted by sigmoid)
+        interf_input = wm_interference_base + ss_interf_gain * max(0, nS - 3) + age_interf_gain * age_group
+        interference_rate = 1.0 / (1.0 + np.exp(-interf_input))
+        interference_rate = np.clip(interference_rate, 0.0, 1.0)
+
+        # WM mixture weight reduced by interference
+        wm_weight_block = 1.0 / (1.0 + np.exp(-(base_w_logit + np.log(np.clip(1.0 - interference_rate, eps, 1.0)))))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * W_s
+            wm_logits -= np.max(wm_logits)
+            wm_exp = np.exp(wm_logits)
+            wm_pol = wm_exp / np.sum(wm_exp)
+            p_wm = float(wm_pol[a])
+
+            # Mixture
+            p_total = wm_weight_block * p_wm + (1.0 - wm_weight_block) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward writes toward the chosen action; non-reward slight suppression
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                write_strength = 1.0 - interference_rate
+                w[s, :] = (1.0 - write_strength) * w[s, :] + write_strength * target
+            else:
+                w[s, a] = (1.0 - 0.5 * (1.0 - interference_rate)) * w[s, a]
+
+            # Interference-driven decay toward uniform
+            w = (1.0 - interference_rate) * w + interference_rate * w_0
+
+            # Normalize rows
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            row_sums = np.clip(row_sums, 1e-12, None)
+            w = w / row_sums
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

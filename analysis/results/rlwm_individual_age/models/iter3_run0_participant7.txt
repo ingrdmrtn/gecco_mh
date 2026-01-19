@@ -1,0 +1,306 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with precision-weighted mixture and binding noise in WM.
+
+    Idea:
+    - RL and WM produce policies; their mixture weight is proportional to their relative precision.
+    - WM precision decreases with set size via binding noise; older age further reduces WM precision.
+    - RL uses a standard delta rule.
+    - WM is updated toward a one-hot distribution on rewarded action, and toward uniform when unrewarded.
+
+    Parameters (list):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature (scaled by 10 internally)
+    - wm_weight_base: base mixing weight scaling factor for WM (>=0)
+    - bind_noise: WM binding noise scale; larger -> lower WM precision; increases with set size (>=0)
+    - alpha_wm: WM learning rate toward target (0..1)
+    - age_temp_shift: additional WM noise for older adults (>=0)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, beta_base, wm_weight_base, bind_noise, alpha_wm, age_temp_shift = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm_nominal = 50.0  # nominal WM precision (deterministic limit)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM value tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # baseline prior (uniform)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy with load- and age-dependent precision (binding noise)
+            # Effective WM inverse temperature: higher noise with larger set size and age
+            noise_eff = bind_noise * (float(nS) / 3.0) + (age_temp_shift if age_group == 1 else 0.0)
+            beta_wm_eff = softmax_beta_wm_nominal / (1.0 + noise_eff)
+            Lc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(beta_wm_eff * Lc))
+            p_wm = np.exp(beta_wm_eff * Lc[a]) / max(1e-12, denom_wm)
+
+            # Precision-weighted mixture
+            prec_rl = softmax_beta
+            prec_wm = beta_wm_eff
+            wm_weight = wm_weight_base * (prec_wm / (prec_wm + prec_rl))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr * rpe
+
+            # WM update: attract to one-hot when rewarded; otherwise revert toward prior
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+            else:
+                target = w_0[s, :]  # uniform prior on failure
+            w[s, :] += alpha_wm * (target - W_s)
+            # Keep WM distribution normalized and bounded
+            w[s, :] = np.clip(w[s, :], 1e-8, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning and decay + WM one-shot cache gated by recent-reward trace.
+
+    Idea:
+    - RL: asymmetric learning rates for positive/negative RPE and value decay (forgetting).
+    - WM: one-shot cache that stores the most recently rewarded action per state.
+    - Arbitration: mixture weight depends on a recency-weighted reward trace; higher recent reward -> favor WM.
+    - Load penalty on the gate reduces WM usage in larger set sizes; age reduces WM usage and increases decay.
+
+    Parameters (list):
+    - lr_pos: RL learning rate for positive RPE (0..1)
+    - lr_neg: RL learning rate for negative RPE (0..1)
+    - beta_base: base RL inverse temperature (scaled by 10 internally)
+    - kappa_forget: RL forgetting rate per trial toward uniform (0..1)
+    - eta_trace: decay of the recent reward trace (0..1), also scales its influence
+    - wm_mix_base: base bias for WM usage (can be negative..positive)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr_pos, lr_neg, beta_base, kappa_forget, eta_trace, wm_mix_base = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM cache distribution per state
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Recent reward trace (block-level)
+        rtrace = 0.0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL decay toward uniform each trial (older adults forget more)
+            decay_eff = kappa_forget * (1.15 if age_group == 1 else 1.0)
+            q[s, :] = (1.0 - decay_eff) * q[s, :] + decay_eff * (1.0 / nA)
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy (deterministic softmax on cache)
+            Lc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(softmax_beta_wm * Lc))
+            p_wm = np.exp(softmax_beta_wm * Lc[a]) / max(1e-12, denom_wm)
+
+            # Update rtrace (recency-weighted reward)
+            rtrace = (1.0 - eta_trace) * rtrace + eta_trace * r
+
+            # Gate: favor WM when recent rewards are high; penalize larger set size and older age
+            load_pen = np.log(float(nS) / 3.0)  # 0 for nS=3, >0 for nS=6
+            age_pen = 0.25 if age_group == 1 else 0.0
+            z = wm_mix_base + rtrace - load_pen - age_pen
+            gate = 1.0 / (1.0 + np.exp(-z))
+            gate = np.clip(gate, 0.0, 1.0)
+
+            p_total = gate * p_wm + (1.0 - gate) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            rpe = r - Q_s[a]
+            lr_eff = lr_pos if rpe >= 0.0 else lr_neg
+            q[s, a] += lr_eff * rpe
+
+            # WM update: one-shot cache on reward; slight reversion to uniform on no reward
+            if r > 0.5:
+                w[s, :] = (1e-8) * np.ones(nA)
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+            else:
+                w[s, :] = (1.0 - eta_trace) * W_s + eta_trace * w_0[s, :]
+                w[s, :] = np.clip(w[s, :], 1e-8, None)
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with state-interference in WM and RL value leak.
+
+    Idea:
+    - RL: standard delta rule plus global leak (forgetting) toward uniform each trial.
+    - WM: update spreads not only to the current state but also interferes with other states.
+      Interference grows with set size and age.
+    - Arbitration: mixture weight is a sigmoid of a WM gain parameter reduced by interference.
+
+    Parameters (list):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature (scaled by 10 internally)
+    - alpha_wm: WM learning rate (0..1)
+    - xi_interf: base WM interference strength across states (>=0)
+    - leak_rl: RL leak/forgetting rate toward uniform (0..1)
+    - wm_gain: base gain for WM usage in arbitration (can be negative..positive)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, beta_base, alpha_wm, xi_interf, leak_rl, wm_gain = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective interference increases with load and age
+        interf_scale = (float(nS) / 3.0) * (1.0 + 0.5 * age_group)
+        xi_eff = xi_interf * interf_scale
+
+        # Arbitration uses WM gain reduced by interference
+        gate_bias = wm_gain - xi_eff  # larger interference -> less WM reliance
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL leak toward uniform (applied per trial on visited state)
+            q[s, :] = (1.0 - leak_rl) * q[s, :] + leak_rl * (1.0 / nA)
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy
+            Lc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(softmax_beta_wm * Lc))
+            p_wm = np.exp(softmax_beta_wm * Lc[a]) / max(1e-12, denom_wm)
+
+            # Mixture gate via sigmoid of reduced WM gain
+            gate = 1.0 / (1.0 + np.exp(-gate_bias))
+            gate = np.clip(gate, 0.0, 1.0)
+
+            p_total = gate * p_wm + (1.0 - gate) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr * rpe
+
+            # WM update at current state
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+            else:
+                target = w_0[s, :]
+
+            delta_s = target - W_s
+            w[s, :] += alpha_wm * delta_s
+
+            # Interference: spread a fraction of the update to other states
+            if nS > 1:
+                spread = (xi_eff / max(1, nS - 1)) * alpha_wm
+                for s2 in range(nS):
+                    if s2 == s:
+                        continue
+                    W_s2 = w[s2, :].copy()
+                    w[s2, :] += spread * (target - W_s2)
+
+            # Normalize rows to be valid distributions
+            w = np.clip(w, 1e-8, None)
+            w /= np.sum(w, axis=1, keepdims=True)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

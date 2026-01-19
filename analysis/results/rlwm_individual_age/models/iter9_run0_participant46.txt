@@ -1,0 +1,321 @@
+Here are three standalone cognitive models that explain choices in an RL–WM task while incorporating age group and set-size effects. Each function returns the negative log-likelihood of the observed choices.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + interference-based WM with age- and load-dependent arbitration.
+
+    Mechanism:
+    - RL: tabular Q-learning with a single learning rate.
+    - WM: one-shot mapping updated on rewarded trials; its contents decay as a function of
+      interference (number of distinct states encountered since the last visit to a given state).
+    - Arbitration: fixed base WM weight scaled down by age group and set size.
+      WM policy is a softmax of the WM map; RL policy is softmax of Q.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally.
+    - wm_mix0: base WM mixture weight (0..1).
+    - interference_gain: strength of interference-based decay (>=0); higher -> stronger decay when more novel states intervened.
+    - age_load_scaler: scales the penalty from age and set size on WM reliance (>=0).
+
+    Age and load effects:
+    - WM weight = wm_mix0 / (1 + age_load_scaler * age_group + age_load_scaler * max(0, nS-3)).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_mix0, interference_gain, age_load_scaler = model_parameters
+    softmax_beta *= 10.0
+    wm_temp = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL values and WM maps
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track interference: number of distinct states encountered so far and last count per state
+        seen = np.zeros(nS, dtype=bool)
+        n_unique = 0
+        last_unique_count = np.zeros(nS, dtype=float)
+
+        # Precompute arbitration weight
+        denom = 1.0 + age_load_scaler * float(age_group) + age_load_scaler * max(0.0, float(nS - 3))
+        wm_weight_global = wm_mix0 / max(denom, 1e-8)
+        wm_weight_global = min(max(wm_weight_global, 0.0), 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Update distinct state counter when a new state appears
+            if not seen[s]:
+                seen[s] = True
+                n_unique += 1
+
+            # Apply interference-based decay to WM for this state since last time it was accessed
+            delta_unique = max(0.0, n_unique - last_unique_count[s])
+            decay = np.exp(-interference_gain * delta_unique)
+            w[s, :] = w_0[s, :] + (w[s, :] - w_0[s, :]) * decay
+
+            # Policies
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(wm_temp * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight_global * p_wm + (1.0 - wm_weight_global) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: reward-locked storage (one-shot), otherwise leave decayed contents
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update last unique marker for this state
+            last_unique_count[s] = n_unique
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Asymmetric RL mixed with a Win-Stay/Lose-Shift (WSLS) heuristic; arbitration depends on age and load.
+
+    Mechanism:
+    - RL: tabular Q-learning with separate learning rates for positive vs negative prediction errors.
+    - Heuristic (treated as WM policy): WSLS at the state level.
+        - If previous choice in the state was rewarded: repeat it (stay).
+        - If it was not rewarded: switch uniformly among other actions (shift).
+        - If no history in the state: uniform.
+      Implemented as a softmax over a one-hot (stay) or anti-one-hot (shift) template.
+    - Arbitration: logistic gating into [0,1] using a base bias reduced by age and set size.
+
+    Parameters (model_parameters):
+    - lr_pos: learning rate for positive PEs (0..1).
+    - lr_neg: learning rate for negative PEs (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally.
+    - wsls_bias0: base arbitration bias for the WSLS heuristic (real-valued, mapped through sigmoid).
+    - age_wsls_bias: additional negative impact of being older on WSLS reliance (>=0 typical).
+    - load_wsls_penalty: penalty per extra item above 3 on WSLS reliance (>=0).
+
+    Age and load effects:
+    - wsls_weight = sigmoid(wsls_bias0 - age_wsls_bias * age_group - load_wsls_penalty * max(0, nS-3)).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, wsls_bias0, age_wsls_bias, load_wsls_penalty = model_parameters
+    softmax_beta *= 10.0
+    wm_temp = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # Dummy WM arrays to comply with template; we'll construct WSLS distribution on the fly
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_reward = np.zeros(nS, dtype=float)
+
+        # Arbitration weight
+        wsls_weight = sigmoid(wsls_bias0 - age_wsls_bias * float(age_group) - load_wsls_penalty * max(0.0, float(nS - 3)))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WSLS policy as a softmax over a template
+            logits = np.zeros(nA)
+            if last_action[s] == -1:
+                # No history -> uniform
+                logits[:] = 0.0
+            else:
+                if last_reward[s] > 0.0:
+                    # Win-Stay: prefer last action
+                    logits[last_action[s]] = 1.0
+                    logits[np.arange(nA) != last_action[s]] = 0.0
+                else:
+                    # Lose-Shift: prefer other actions uniformly
+                    logits[last_action[s]] = 0.0
+                    logits[np.arange(nA) != last_action[s]] = 1.0
+
+            # Softmax probability of chosen action under WSLS template
+            denom_wm = np.sum(np.exp(wm_temp * (logits - logits[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture
+            p_total = wsls_weight * p_wm + (1.0 - wsls_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - q[s, a]
+            lr_eff = lr_pos if pe >= 0.0 else lr_neg
+            q[s, a] += lr_eff * pe
+
+            # Update WSLS memory
+            last_action[s] = a
+            last_reward[s] = r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited slot WM with age-specific capacity and load-scaled arbitration.
+
+    Mechanism:
+    - RL: tabular Q-learning with single learning rate.
+    - WM: discrete slots that store state->action associations only for rewarded states.
+      Capacity differs by age:
+        - Young capacity = round(slots_young)
+        - Old capacity   = round(slots_old)
+      If capacity is full when a new mapping is to be stored, evict the least recently rewarded state (LRU).
+      WM policy is deterministic over stored mappings; otherwise uniform.
+    - Arbitration: base WM weight scaled by coverage (min(1, K/nS)) so larger sets reduce effective WM use.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally.
+    - wm_weight_base: base mixture weight for WM (0..1).
+    - slots_young: WM capacity (number of states) for younger adults (>=0).
+    - slots_old: WM capacity (number of states) for older adults (>=0).
+
+    Age and load effects:
+    - WM capacity depends on age group (slots_young vs slots_old).
+    - Effective WM weight = wm_weight_base * coverage, where coverage = min(1, K / nS).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, slots_young, slots_old = model_parameters
+    softmax_beta *= 10.0
+    wm_temp = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    capacity = int(np.round(slots_young if age_group == 0 else slots_old))
+    capacity = max(0, capacity)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # will hold one-hot if stored in WM, uniform otherwise
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM bookkeeping: slot membership and recency for LRU eviction
+        in_slot = np.zeros(nS, dtype=bool)
+        last_reward_time = -1 * np.ones(nS, dtype=int)
+        t_global = 0
+
+        # Effective WM weight scales with coverage
+        coverage = 0.0 if nS == 0 else min(1.0, (capacity / float(nS)) if nS > 0 else 0.0)
+        wm_weight_eff = wm_weight_base * coverage
+        wm_weight_eff = min(max(wm_weight_eff, 0.0), 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy: deterministic if stored mapping exists; else uniform
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(wm_temp * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: store mapping only after reward
+            if r > 0.0:
+                # Ensure s has a slot; allocate or update recency
+                if not in_slot[s]:
+                    if capacity > 0:
+                        # If capacity is full, evict least recently rewarded state
+                        if np.sum(in_slot) >= capacity:
+                            # Among in-slot states, find the smallest last_reward_time (LRU)
+                            candidates = np.where(in_slot)[0]
+                            lru_state = candidates[np.argmin(last_reward_time[candidates])]
+                            in_slot[lru_state] = False
+                            w[lru_state, :] = w_0[lru_state, :]
+
+                        in_slot[s] = True
+                # Store deterministic mapping in WM
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+                last_reward_time[s] = t_global
+
+            t_global += 1
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

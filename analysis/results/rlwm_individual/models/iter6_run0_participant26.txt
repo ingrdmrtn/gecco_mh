@@ -1,0 +1,309 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with probabilistic encoding and interference-limited recall.
+    - Policy: convex mixture of RL softmax and WM softmax.
+    - Arbitration: WM weight equals estimated recall success for the current state,
+      which depends on encoding strength and set-size/interference costs.
+    - WM dynamics: reward-triggered encoding toward chosen action; non-reward triggers
+      drift toward uniform; encoding probability decreases with set size and cumulative
+      interference (unique states encountered).
+
+    Parameters (tuple):
+    - lr: RL learning rate for Q-values (0..1).
+    - beta_rl: inverse temperature for RL softmax; internally scaled x10.
+    - theta_enc: baseline WM encoding strength on rewarded trials (real-valued; passed through sigmoid-like limiter).
+    - k_interf: interference sensitivity (>=0); reduces recall as more unique states are seen.
+    - omega_recall: scales recall success into arbitration weight (0..1+).
+    - ss_penalty: set-size penalty on WM encoding/retrieval (>=0), applied per extra item beyond 3.
+
+    Set-size influence:
+    - Larger set sizes (nS=6 vs 3) reduce effective encoding strength and recall weight via ss_penalty.
+    """
+    lr, beta_rl, theta_enc, k_interf, omega_recall, ss_penalty = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track WM encoding strength per state and interference (unique states seen)
+        enc_strength = np.zeros(nS)  # [0,1] approximately
+        seen = np.zeros(nS, dtype=bool)
+        n_seen = 0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            if not seen[s]:
+                seen[s] = True
+                n_seen += 1
+            frac_unique = n_seen / float(nS)
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Effective encoding strength (squashed to 0..1) penalized by set size and interference
+            # Use logistic-like limiter via 1 - exp(-x_+) to keep in [0,1)
+            penal = ss_penalty * max(0, nS - 3) + k_interf * frac_unique
+            x = max(0.0, theta_enc - penal)
+            theta_eff = 1.0 - np.exp(-x)  # in [0,1)
+
+            # Estimated recall success for this state: current encoding strength penalized by interference
+            recall_success = enc_strength[s] * max(0.0, 1.0 - penal)
+            wm_weight_dyn = np.clip(omega_recall * recall_success, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight_dyn * p_wm + (1.0 - wm_weight_dyn) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM value updating with probabilistic encoding/decay:
+            if r > 0.0:
+                # Encode rewarded action toward one-hot with strength theta_eff
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - theta_eff) * w[s, :] + theta_eff * onehot
+                # Increase encoding strength for this state
+                enc_strength[s] = enc_strength[s] + theta_eff * (1.0 - enc_strength[s])
+            else:
+                # Without reward, drift toward uniform (forgetting)
+                w[s, :] = (1.0 - theta_eff) * w[s, :] + theta_eff * w_0[s, :]
+                # Penalize encoding strength by interference even when not rewarded
+                enc_strength[s] = enc_strength[s] * max(0.0, 1.0 - penal)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and asymmetric WM learning.
+    - Policy: convex mixture of RL softmax and WM softmax.
+    - Arbitration: WM weight decreases with WM uncertainty (entropy of WM distribution);
+      set size increases WM leak, reducing WM certainty in larger sets.
+    - WM dynamics: positive (rewarded) outcomes strongly stored; negative outcomes
+      cause milder drift toward uniform (asymmetry).
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - beta_rl: inverse temperature for RL softmax; internally scaled x10.
+    - wm_w_base: baseline WM mixture weight before uncertainty gating (0..1).
+    - wm_leak: base WM leak per visit (0..1); scaled up by set size factor (nS/3).
+    - wm_pos_boost: multiplicative boost of WM update on rewards (>=0).
+    - entropy_gain: strength of entropy-based reduction in WM weight (>=0).
+
+    Set-size influence:
+    - Effective WM leak = wm_leak * (nS/3). Larger set size increases leak, raising WM entropy
+      and shifting arbitration toward RL.
+    """
+    lr, beta_rl, wm_w_base, wm_leak, wm_pos_boost, entropy_gain = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Precompute effective leak given set size
+        eff_leak = np.clip(wm_leak * (nS / 3.0), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy of WM for current state (base e), bounded in [0, ln(3)]
+            P_wm = np.exp(softmax_beta_wm * (W_s - np.max(W_s)))
+            P_wm = P_wm / np.sum(P_wm)
+            eps = 1e-12
+            H_wm = -np.sum(P_wm * np.log(P_wm + eps))  # higher = more uncertain
+
+            # Uncertainty-based arbitration: reduce WM weight with entropy
+            wm_weight_dyn = wm_w_base * np.exp(-entropy_gain * H_wm)
+            wm_weight_dyn = np.clip(wm_weight_dyn, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight_dyn * p_wm + (1.0 - wm_weight_dyn) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: leak toward uniform, then asymmetric learning
+            # Leak on each visit (set-size scaled)
+            w[s, :] = (1.0 - eff_leak) * w[s, :] + eff_leak * w_0[s, :]
+
+            if r > 0.0:
+                # Rewarded: push strongly toward one-hot of chosen action
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                eta_pos = np.clip(wm_pos_boost * (1.0 - eff_leak), 0.0, 1.0)
+                w[s, :] = (1.0 - eta_pos) * w[s, :] + eta_pos * onehot
+            else:
+                # Non-rewarded: mild drift toward uniform beyond leak
+                eta_neg = 0.5 * eff_leak
+                w[s, :] = (1.0 - eta_neg) * w[s, :] + eta_neg * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Capacity-limited WM cache with recall failures.
+    - Policy: convex mixture of RL softmax and WM softmax.
+    - Arbitration: WM weight equals probability of successful recall for this state,
+      which depends on whether the state is in a WM cache (capacity 'cap') and on
+      a recall failure rate that increases with set size.
+    - WM dynamics: rewarded mappings are cached; if cache exceeds capacity, evict
+      the oldest entry; cached states hold one-hot mappings with mild decay.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - beta_rl: inverse temperature for RL softmax; internally scaled x10.
+    - cap: WM capacity (0..6, continuous allowed but effectively used as an integer bound).
+    - fail_rate: baseline probability of recall failure (0..1).
+    - ss_bias: additional recall failure per extra item beyond 3 (>=0).
+    - decay: WM decay toward uniform for cached states per visit (0..1).
+
+    Set-size influence:
+    - Effective recall failure = fail_rate + ss_bias*(nS-3), clipped to [0,1].
+      Larger sets increase recall failures, reducing WM weight and shifting toward RL.
+    """
+    lr, beta_rl, cap, fail_rate, ss_bias, decay = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Discrete cache to track which states are stored and in what order (FIFO)
+        cache = []
+        in_cache = np.zeros(nS, dtype=bool)
+        cap_int = int(np.clip(np.round(cap), 0, nS))
+
+        # Precompute failure rate with set size
+        fail_eff = np.clip(fail_rate + ss_bias * max(0, nS - 3), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration via recall probability
+            recall_prob = 0.0
+            if cap_int > 0 and in_cache[s]:
+                recall_prob = 1.0 - fail_eff
+            else:
+                recall_prob = 0.0
+            wm_weight_dyn = np.clip(recall_prob, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight_dyn * p_wm + (1.0 - wm_weight_dyn) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: decay cached state toward uniform on visit
+            if in_cache[s]:
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # Reward-driven caching and mapping update
+            if r > 0.0 and cap_int > 0:
+                # Update mapping to one-hot for the rewarded action
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * onehot  # strengthen mapping
+
+                # Refresh or insert into cache with FIFO eviction
+                if in_cache[s]:
+                    # Move s to the end (most recent)
+                    cache = [x for x in cache if x != s]
+                    cache.append(s)
+                else:
+                    cache.append(s)
+                    in_cache[s] = True
+                    if len(cache) > cap_int:
+                        evict = cache.pop(0)
+                        in_cache[evict] = False
+                        # Optional: reset evicted state's WM to uniform
+                        w[evict, :] = w_0[evict, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

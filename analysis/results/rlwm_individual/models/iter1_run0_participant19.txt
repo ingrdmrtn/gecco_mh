@@ -1,0 +1,262 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Hybrid RL + WM with entropy-gated arbitration and set-size-dependent lapses.
+
+    Idea:
+    - RL learns action values via a delta rule.
+    - WM encodes recent action-outcome association per state via a simple supervised update.
+    - Arbitration: WM weight is reduced when RL is more certain (lower entropy); when RL is uncertain (higher entropy), WM is relied upon more.
+    - Lapses: A set-size-dependent lapse mixes in a uniform policy more at larger set sizes, capturing increased load.
+
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - wm_weight_base: baseline logit for WM weight; passed through sigmoid to form a weight and then modulated by RL entropy
+    - softmax_beta: inverse temperature for RL policy (scaled by 10 internally)
+    - wm_lr: WM learning rate for updating W toward current outcome on the chosen action (0..1)
+    - epsilon_base: baseline logit for lapse rate; converted via sigmoid to lapse probability
+    - entropy_scale: scales the effect of RL entropy on WM weight (positive -> more WM when RL entropy is high)
+
+    Set-size impact:
+    - Lapse probability increases with set size via epsilon = sigmoid(epsilon_base + entropy_scale*(nS-3)/3).
+      This ties overall noisiness to cognitive load; the same entropy_scale scales both the WM gating by RL entropy and the set-size lapse effect
+      to keep parameter count within the limit.
+    """
+    lr, wm_weight_base, softmax_beta, wm_lr, epsilon_base, entropy_scale = model_parameters
+    softmax_beta *= 10  # RL inverse temperature scaling
+    softmax_beta_wm = 50  # deterministic WM readout
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size-dependent lapse rate (higher for larger nS)
+        lapse = 1.0 / (1.0 + np.exp(-(epsilon_base + (entropy_scale * (nS - 3) / 3.0))))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of the chosen action (efficient softmax computation)
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # RL uncertainty via entropy of its softmax distribution
+            pi_rl = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            pi_rl /= np.sum(pi_rl)
+            H_rl = -np.sum(pi_rl * np.log(np.maximum(pi_rl, 1e-12)))
+
+            # WM policy via softmax over W
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # WM weight increases when RL entropy is high
+            wm_weight = 1.0 / (1.0 + np.exp(-(wm_weight_base + entropy_scale * H_rl)))
+
+            # Mixture with lapse to uniform
+            p_mix = wm_weight * p_wm + (1 - wm_weight) * p_rl
+            p_total = (1 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: gentle decay to baseline, then supervised push of chosen action toward reward r
+            w = 0.99 * w + 0.01 * w_0  # light global stabilization
+            w[s, :] = (1 - wm_lr) * w[s, :]
+            w[s, a] += wm_lr * r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning + WM trace with set-size-dependent decay + perseveration bias.
+
+    Idea:
+    - RL uses separate learning rates for positive and negative prediction errors.
+    - WM stores a recency-weighted trace per state that decays faster when set size is larger.
+    - Action perseveration bias (tendency to repeat last action in a state) affects both RL and WM policies.
+
+    Parameters:
+    - alpha_pos: RL learning rate for positive prediction errors (0..1)
+    - alpha_neg: RL learning rate for negative prediction errors (0..1)
+    - wm_weight: constant WM/RL arbitration weight (0..1 after sigmoid transform inside)
+    - softmax_beta: inverse temperature for RL policy (scaled by 10 internally)
+    - setsize_sensitivity: controls how much WM trace decays with set size; higher -> faster decay for larger set size
+    - perseveration: bias added to the last action taken in this state (applied to both Q and W logits)
+
+    Set-size impact:
+    - WM decay per trial within a block: decay = sigmoid(setsize_sensitivity * (nS - 4.5)).
+      Larger nS yields larger decay, weakening WM.
+    """
+    alpha_pos, alpha_neg, wm_weight, softmax_beta, setsize_sensitivity, perseveration = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Per-state last action for perseveration
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # WM decay increases with set size
+        decay = 1.0 / (1.0 + np.exp(-setsize_sensitivity * (nS - 4.5)))
+
+        # Fixed arbitration weight transformed to (0,1)
+        wm_w = 1.0 / (1.0 + np.exp(-wm_weight))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # Apply perseveration bias to logits by shifting chosen-last action value
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += perseveration
+                W_s[last_action[s]] += perseveration
+
+            # RL policy
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_w * p_wm + (1 - wm_w) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning
+            pe = r - q[s, a]
+            alpha = alpha_pos if pe >= 0 else alpha_neg
+            q[s, a] += alpha * pe
+
+            # WM decay toward baseline depends on set size (stronger decay at larger nS)
+            w = (1 - decay) * w + decay * w_0
+
+            # WM update: store current outcome at chosen action (one-shot trace)
+            w[s, a] = r
+
+            # Update perseveration memory
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with recency-based arbitration and set-size-dependent recency penalty.
+
+    Idea:
+    - RL learns via delta rule.
+    - WM stores action-outcome associations and is updated with its own learning rate.
+    - Arbitration weight depends on how recently the current state was seen: WM is trusted less as the interval grows,
+      and this recency cost is amplified at larger set sizes.
+
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - wm_weight_base: baseline logit of WM weight; converted to (0,1) via sigmoid
+    - softmax_beta: inverse temperature for RL (scaled by 10 internally)
+    - recency_decay: per-trial discount applied to WM weight per time-since-last-visit (>=0)
+    - wm_lr: WM learning rate for the chosen action (0..1)
+    - setsize_recency_boost: additional penalty on WM weight for larger set sizes (>=0)
+
+    Set-size impact:
+    - Effective WM weight per trial: sigmoid(wm_weight_base - recency_decay * age_s - setsize_recency_boost * (nS - 3)),
+      where age_s is the number of trials since the state was last encountered. Larger set sizes reduce WM influence.
+    """
+    lr, wm_weight_base, softmax_beta, recency_decay, wm_lr, setsize_recency_boost = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last-seen trial index per state for recency computation
+        last_seen = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL choice prob
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute recency-based WM weight
+            age = 0 if last_seen[s] < 0 else (t - last_seen[s])
+            wm_logit = wm_weight_base - recency_decay * age - setsize_recency_boost * (nS - 3)
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM light decay to baseline and update chosen action
+            w = 0.98 * w + 0.02 * w_0
+            w[s, :] = (1 - wm_lr) * w[s, :]
+            w[s, a] += wm_lr * r
+
+            # Update last seen
+            last_seen[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

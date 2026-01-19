@@ -1,0 +1,325 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Hybrid RL + surprise-gated, fast WM traces with set-size-dependent encoding.
+    - RL: softmax choice with learning rate on Q-values.
+    - WM: fast table W updated toward a one-hot pattern for rewarded actions.
+      Encoding strength is gated by unsigned prediction error (surprise) and
+      a set-size-dependent probability (power-law drop-off with larger sets).
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index on each trial.
+    actions : array-like of int
+        Chosen action (0..2) on each trial.
+    rewards : array-like of int
+        Reward feedback (0/1) on each trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial.
+    model_parameters : sequence
+        lr : float in (0,1)
+            RL learning rate for Q-values.
+        wm_weight : float in [0,1]
+            Mixture weight on the WM policy (constant across trials).
+        softmax_beta : float >= 0
+            Inverse-temperature for RL softmax (scaled up internally).
+        wm_lr : float in (0,1)
+            WM learning rate controlling how strongly W moves toward the one-hot.
+        p0_enc : float in [0,1]
+            Base encoding probability at set size 3.
+        gamma_enc : float >= 0
+            Power exponent controlling decline of WM encoding with set size:
+            p_enc(set) = min(1, p0_enc * (3/set)^gamma_enc).
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_lr, p0_enc, gamma_enc = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic WM readout
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM table W; initialized uniform
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (softmax probability of chosen action)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax over W_s with high beta
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            w_mix = np.clip(wm_weight, 0.0, 1.0)
+            p_total = w_mix * p_wm + (1.0 - w_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: surprise-gated, set-size-dependent encoding when rewarded
+            # Encoding probability decays with set size (power-law)
+            set_t = float(block_set_sizes[t])
+            p_enc = min(1.0, max(0.0, p0_enc * (3.0 / set_t) ** max(0.0, gamma_enc)))
+            # Surprise gate by unsigned PE magnitude (bounded by 1 because r in {0,1}, Q in [0,1])
+            gate = abs(pe)
+            if r >= 0.5:
+                # Move W toward one-hot on the chosen action scaled by gate and p_enc
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                eta_w = wm_lr * gate * p_enc
+                w[s, :] = (1.0 - eta_w) * W_s + eta_w * one_hot
+            # No explicit decay on errors; W remains as previously stored
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Hybrid RL + retrieval WM with adaptive mixture based on set size and RL uncertainty.
+    - RL: softmax on Q-values with learning rate.
+    - WM: stores last rewarded action per state as a one-hot vector.
+      Choice from WM uses a tunable WM inverse-temperature.
+    - Mixture weight is dynamic: a logistic function of (i) a bias term,
+      (ii) set-size ease factor (larger for small sets), and (iii) RL uncertainty
+      measured by the entropy of the RL softmax distribution.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index on each trial.
+    actions : array-like of int
+        Chosen action (0..2) on each trial.
+    rewards : array-like of int
+        Reward feedback (0/1) on each trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial.
+    model_parameters : sequence
+        lr : float in (0,1)
+            RL learning rate for Q-values.
+        softmax_beta : float >= 0
+            Inverse-temperature for RL softmax (scaled up internally).
+        bias_wm : float (unbounded)
+            Bias term in the logistic that maps to WM weight.
+        b_set : float (unbounded)
+            Weight for set-size effect; larger when set is smaller via (3/set_size).
+        b_unc : float (unbounded)
+            Weight for uncertainty effect; higher entropy increases WM reliance if positive.
+        wm_beta_scale : float >= 0
+            Scales the WM inverse-temperature: beta_wm = 50 * wm_beta_scale.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, bias_wm, b_set, b_unc, wm_beta_scale = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0 * max(0.0, wm_beta_scale)
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM table; will become one-hot on rewarded actions
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track whether WM has a stored item per state
+        has_mem = np.zeros(nS, dtype=bool)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability for chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Full RL softmax for entropy (uncertainty)
+            q_shift = Q_s - np.max(Q_s)
+            exp_q = np.exp(softmax_beta * q_shift)
+            P_rl = exp_q / np.sum(exp_q)
+            entropy = -np.sum(P_rl * (np.log(P_rl + 1e-12)))  # in [0, ln(nA)]
+
+            # WM policy: if memory exists use softmax over W_s; else uniform baseline
+            if has_mem[s]:
+                p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            else:
+                p_wm = w_0[s, a]
+
+            # Adaptive mixture weight via logistic
+            set_factor = 3.0 / float(block_set_sizes[t])
+            lin = bias_wm + b_set * set_factor + b_unc * entropy
+            w_mix = 1.0 / (1.0 + np.exp(-lin))
+            p_total = w_mix * p_wm + (1.0 - w_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: store last rewarded action; clear if contradicted by error on same action
+            if r >= 0.5:
+                has_mem[s] = True
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0  # one-hot store
+            else:
+                # If we had the same action stored and it was wrong now, forget it
+                if has_mem[s] and np.argmax(W_s) == a:
+                    has_mem[s] = False
+                    w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Hybrid RL + resource-rational WM precision with consolidation.
+    - RL: standard softmax Q-learning.
+    - WM: fast table whose readout precision decreases with set size:
+      beta_wm_eff = 50 * beta0 / (set_size ** phi).
+      WM consolidates on rewards toward a one-hot vector; on non-rewards,
+      it relaxes toward uniform (forgetting).
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index on each trial.
+    actions : array-like of int
+        Chosen action (0..2) on each trial.
+    rewards : array-like of int
+        Reward feedback (0/1) on each trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size (3 or 6) on each trial.
+    model_parameters : sequence
+        lr : float in (0,1)
+            RL learning rate for Q-values.
+        wm_prior : float in [0,1]
+            Baseline mixture weight on WM policy (constant).
+        softmax_beta : float >= 0
+            Inverse-temperature for RL softmax (scaled up internally).
+        beta0 : float >= 0
+            Scale factor for WM inverse-temperature (precision resource).
+        phi : float >= 0
+            Exponent controlling how WM precision declines with set size.
+        persist : float in (0,1)
+            WM consolidation/forgetting rate:
+              W <- (1-persist)*W + persist*one_hot (if reward)
+              W <- (1-persist)*W + persist*uniform (if no reward)
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_prior, softmax_beta, beta0, phi, persist = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # base; we scale it per set size with beta0 and phi
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with set-size-controlled precision
+            set_t = float(block_set_sizes[t])
+            beta_wm_eff = softmax_beta_wm * max(0.0, beta0) / (set_t ** max(0.0, phi) + 1e-12)
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Mixture
+            w_mix = np.clip(wm_prior, 0.0, 1.0)
+            p_total = w_mix * p_wm + (1.0 - w_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM consolidation / forgetting update
+            if r >= 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - persist) * W_s + persist * one_hot
+            else:
+                w[s, :] = (1.0 - persist) * W_s + persist * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set-size dependence:
+- Model 1: WM encoding probability p_enc(set) = min(1, p0_enc*(3/set)^gamma_enc) explicitly declines for larger sets.
+- Model 2: The WM mixture weight increases with smaller sets via the term b_set*(3/set_size); uncertainty dependence via RL entropy.
+- Model 3: WM precision declines with set size through beta_wm_eff = 50*beta0/(set_size^phi), reducing WM influence when set size is larger.

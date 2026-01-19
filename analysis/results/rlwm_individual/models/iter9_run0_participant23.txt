@@ -1,0 +1,298 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with Pearce-Hall dynamic learning rate and capacity-limited WM encoding.
+
+    Idea:
+    - RL: Rescorla-Wagner with a dynamic Pearce-Hall learning rate based on recent surprise.
+      A running surprise trace modulates the instantaneous learning rate: alpha_t = lr0 + k_ph * surprise_t,
+      with surprise_t updated by an exponential decay toward |PE|.
+    - WM: One-shot encoding of the correct action on rewarded trials, but only with a probability that
+      reflects a limited-capacity WM. The probability that the current state is successfully stored is
+      p_mem = 1 - exp(-C_cap / nS). Larger set sizes reduce p_mem. WM produces a near-deterministic policy
+      over stored mappings.
+    - Mixture policy: p = wm_weight * p_wm + (1 - wm_weight) * p_rl.
+
+    Parameters (6 total):
+    - lr0: [0,1], baseline RL learning rate.
+    - k_ph: >=0, Pearce-Hall gain scaling how much current surprise inflates learning rate.
+    - ph_decay: [0,1], decay of the surprise trace toward the current |PE|.
+    - wm_weight: [0,1], mixture weight for WM policy.
+    - C_cap: >0, WM capacity parameter that controls storage probability p_mem = 1 - exp(-C_cap / nS).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+
+    Set size effects:
+    - WM storage probability directly depends on set size via p_mem = 1 - exp(-C_cap / nS);
+      larger nS reduces the chance of correctly storing the mapping, weakening WM guidance.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr0, k_ph, ph_decay, wm_weight, C_cap, softmax_beta = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # deterministic WM when stored
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # surprise trace per state for Pearce-Hall modulation
+        surpr = np.zeros(nS)
+
+        # probability of successfully encoding a mapping into WM for this block
+        p_mem = 1.0 - np.exp(-max(C_cap, 1e-8) / float(nS))
+        p_mem = np.clip(p_mem, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax over WM weights (near-deterministic if stored)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # Compute PE and update RL with Pearce-Hall dynamic learning rate
+            pe = r - Q_s[a]
+            surpr[s] = (1.0 - ph_decay) * surpr[s] + ph_decay * abs(pe)
+            alpha_t = np.clip(lr0 + k_ph * surpr[s], 0.0, 1.0)
+
+            q[s, a] += alpha_t * pe
+
+            # WM update: on reward, attempt to store the correct action with probability p_mem
+            if r > 0.0:
+                # Bernoulli-like probabilistic overwrite via convex combination toward one-hot
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - p_mem) * w[s, :] + p_mem * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-gated WM mixture and WM leak; set-size reduces WM influence.
+
+    Idea:
+    - RL: standard Rescorla-Wagner with softmax.
+    - WM: stores rewarded mappings as one-hot; between trials, stored mappings leak toward uniform.
+    - Mixture weight is state- and time-dependent: when RL is uncertain (high softmax entropy),
+      the model leans more on WM. Set size penalizes the WM mixture weight.
+      wm_mix = sigmoid(wm0 + k_ent * H_rl - ss_slope * (nS - 3)),
+      where H_rl is the softmax entropy from RL at the current state (in nats).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm0: real, base bias for WM mixture weight (logit space).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - k_ent: >=0, gain on RL entropy for increasing WM reliance under uncertainty.
+    - ss_slope: >=0, penalty on WM reliance as set size increases beyond 3.
+    - leak_w: [0,1], WM leak toward uniform each trial (larger -> faster forgetting).
+
+    Set size effects:
+    - Directly reduces WM mixture via the - ss_slope * (nS - 3) term in the WM logit.
+      Larger nS reduces WM contribution even under high uncertainty.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm0, softmax_beta, k_ent, ss_slope, leak_w = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # WM leak toward uniform prior each trial for the current state
+            w[s, :] = (1.0 - leak_w) * w[s, :] + leak_w * w_0[s, :]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy and entropy
+            denom = np.sum(np.exp(softmax_beta * (Q_s - np.max(Q_s))))
+            pi_rl = np.exp(softmax_beta * (Q_s - np.max(Q_s))) / max(denom, 1e-12)
+            p_rl = pi_rl[a]
+
+            # entropy of RL policy (nats)
+            H_rl = -np.sum(pi_rl * (np.log(pi_rl + 1e-12)))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy-gated WM mixture with set-size penalty
+            wm_logit = wm0 + k_ent * H_rl - ss_slope * max(nS - 3, 0)
+            wm_mix = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: reinforce correct mapping on reward
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with swap/misbinding in WM and exploration bonus in RL by novelty within-state.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax, augmented by a novelty bonus for under-explored actions in the current state:
+      Q_eff = Q + ucb / sqrt(visit_count + 1).
+    - WM: One-shot storage of rewarded mappings. However, due to interference, a fraction of WM-driven choices
+      are "misbound" to mappings of other states (swap errors). Swap probability increases with set size:
+      p_swap = sigmoid(swap_base + ss_gain * (nS - 3)).
+      The WM policy becomes (1 - p_swap)*softmax(W_s) + p_swap*softmax(mean_{s'≠s} W_{s'}).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], mixture weight for WM policy.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - ucb: >=0, strength of the exploration bonus for low-visit actions (within-state).
+    - swap_base: real, base logit for swap probability at set size 3.
+    - ss_gain: >=0, slope increasing swap probability with set size.
+
+    Set size effects:
+    - Increases misbinding probability via p_swap = sigmoid(swap_base + ss_gain*(nS-3)),
+      making WM less reliable in larger sets.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, ucb, swap_base, ss_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # visit counts per state-action for the UCB-like exploration bonus
+        visits = np.zeros((nS, nA))
+
+        # precompute swap probability for this block
+        swap_logit = swap_base + ss_gain * max(nS - 3, 0)
+        p_swap = 1.0 / (1.0 + np.exp(-swap_logit))
+        p_swap = np.clip(p_swap, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+
+            # Add exploration bonus (larger for low-visit actions)
+            bonus = ucb / np.sqrt(visits[s, :] + 1.0)
+            Q_eff = Q_s + bonus
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_eff - Q_eff[a])))
+
+            # WM policy with swap/misbinding
+            W_s = w[s, :]
+            # Softmax over current state's WM
+            denom_curr = np.sum(np.exp(softmax_beta_wm * (W_s - np.max(W_s))))
+            pi_wm_curr = np.exp(softmax_beta_wm * (W_s - np.max(W_s))) / max(denom_curr, 1e-12)
+
+            # Average WM over other states (if only one state seen, this reduces to uniform)
+            if nS > 1:
+                W_others = (np.sum(w, axis=0) - W_s) / max(nS - 1, 1)
+            else:
+                W_others = w[s, :]
+            denom_swap = np.sum(np.exp(softmax_beta_wm * (W_others - np.max(W_others))))
+            pi_wm_swap = np.exp(softmax_beta_wm * (W_others - np.max(W_others))) / max(denom_swap, 1e-12)
+
+            pi_wm = (1.0 - p_swap) * pi_wm_curr + p_swap * pi_wm_swap
+            p_wm = max(pi_wm[a], 1e-12)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update (based on true Q, not Q_eff)
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # Update visits after acting
+            visits[s, a] += 1.0
+
+            # WM update: on reward, store deterministic mapping
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

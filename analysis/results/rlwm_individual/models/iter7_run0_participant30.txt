@@ -1,0 +1,304 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Hebbian working-memory map with set-size-dependent decay.
+
+    Description:
+    - RL: single learning rate; softmax policy.
+    - WM: a probabilistic lookup table per state, w[s,:], that is pushed toward the rewarded action (Hebbian "one-shot" boost)
+      and decays toward uniform. Decay increases with set size (more interference in 6 vs 3).
+    - Action policy: mixture of RL softmax and WM softmax.
+
+    Parameters (all are used):
+    - model_parameters[0] = lr (float, 0..1): RL learning rate for Q-values.
+    - model_parameters[1] = wm_weight (float, 0..1): Base mixture weight on WM policy.
+    - model_parameters[2] = softmax_beta (float, >0): Inverse temperature for RL softmax; internally scaled by x10.
+    - model_parameters[3] = wm_store (float, 0..1): Strength of WM Hebbian update toward the chosen action on reward.
+    - model_parameters[4] = decay0 (float, 0..1): Baseline WM decay toward uniform each trial.
+    - model_parameters[5] = decay_slope (float, >=0): Additional WM decay per unit load; effective decay = decay0 + decay_slope*((nS-3)/3).
+      This directly implements set-size dependence (higher in set size 6).
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_store, decay0, decay_slope = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # WM stores a probability distribution per state; initialize uniform
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # set-size dependent decay (interference)
+        decay_eff = decay0 + decay_slope * (max(nS - 3, 0) / 3.0)
+        decay_eff = np.clip(decay_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL softmax prob of chosen action a
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM softmax prob of chosen action a (very sharp)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+            # WM Hebbian/store update
+            if r > 0:
+                # Push probability mass toward the chosen action
+                w[s, :] = (1.0 - wm_store) * w[s, :]
+                w[s, a] += wm_store
+            else:
+                # On errors, nudge away from the chosen action slightly
+                shrink = 0.5 * wm_store
+                take = min(shrink, max(w[s, a] - 1e-6, 0.0))
+                if take > 0:
+                    w[s, a] -= take
+                    distribute = take / (nA - 1)
+                    for aa in range(nA):
+                        if aa != a:
+                            w[s, aa] += distribute
+
+            # Renormalize and clip
+            w[s, :] = np.clip(w[s, :], 1e-8, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + entropy-gated WM with load-sensitive arbitration.
+
+    Description:
+    - RL: single learning rate; softmax policy.
+    - WM: probability table per state that moves toward one-hot of chosen action on reward and toward uniform on no-reward.
+    - Arbitration: mixture weight for WM is state- and time-dependent:
+        wm_eff = sigmoid(logit(wm_weight) - ss_load_bias*(nS-3) - entropy_temp * H(W_s)),
+      where H is the entropy of WM distribution for the current state.
+      Thus, larger set size and higher WM entropy reduce reliance on WM.
+    - Action policy: mixture of RL softmax and WM softmax using wm_eff.
+
+    Parameters (all are used):
+    - model_parameters[0] = lr (float, 0..1): RL learning rate.
+    - model_parameters[1] = wm_weight (float, 0..1): Base WM mixture weight (prior to gating).
+    - model_parameters[2] = softmax_beta (float, >0): Inverse temperature for RL softmax; internally scaled by x10.
+    - model_parameters[3] = entropy_temp (float, >=0): Strength of entropy-based down-weighting of WM.
+    - model_parameters[4] = ss_load_bias (float, >=0): Additive penalty on WM weight per unit set-size load (impacts 6>3).
+    - model_parameters[5] = wm_update_rate (float, 0..1): Speed of WM updates toward target distributions.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, entropy_temp, ss_load_bias, wm_update_rate = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    def logit(p):
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        return np.log(p) - np.log(1 - p)
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        base_logit = logit(wm_weight)
+        load_term = ss_load_bias * (max(nS - 3, 0) / 3.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy of WM for state s
+            W_clip = np.clip(W_s, 1e-12, 1.0)
+            H = -np.sum(W_clip * np.log(W_clip))
+
+            # Effective WM weight via sigmoid gating
+            gate = base_logit - load_term - entropy_temp * H
+            wm_eff = 1.0 / (1.0 + np.exp(-gate))
+
+            # Mixture
+            p_total = wm_eff * p_wm + (1.0 - wm_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update toward r-dependent target:
+            # if rewarded -> one-hot on a; if unrewarded -> uniform
+            target = w_0[s, :].copy()
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+
+            w[s, :] = (1.0 - wm_update_rate) * w[s, :] + wm_update_rate * target
+            w[s, :] = np.clip(w[s, :], 1e-8, 1.0)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + win-stay/lose-shift WM with load-dependent forgetting and aversion to last bad action.
+
+    Description:
+    - RL: single learning rate; softmax policy.
+    - WM: a compact memory per state that retains the last rewarded action (win-stay)
+      and avoids the last unrewarded action (lose-shift). Memory strength decays with set size.
+      WM policy logits are constructed from these memory traces and then passed through a sharp softmax.
+    - Action policy: mixture of RL softmax and WM softmax.
+
+    Parameters (all are used):
+    - model_parameters[0] = lr (float, 0..1): RL learning rate.
+    - model_parameters[1] = wm_weight (float, 0..1): Base mixture weight on WM policy.
+    - model_parameters[2] = softmax_beta (float, >0): Inverse temperature for RL softmax; internally scaled by x10.
+    - model_parameters[3] = wsls_stickiness (float, >=0): Strength of WM bias toward last rewarded action and away from last bad action.
+    - model_parameters[4] = forget_base (float, 0..1): Baseline WM forgetting per encounter (reduces memory strength).
+    - model_parameters[5] = ss_scale (float, >=0): Additional forgetting per unit load; effective forget = forget_base + ss_scale*((nS-3)/3).
+      This implements stronger forgetting under set size 6.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wsls_stickiness, forget_base, ss_scale = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # We still instantiate w/w_0 to match the template; w will be set from WM logits each trial for policy display.
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # WM traces
+        last_good = -1 * np.ones(nS, dtype=int)   # last rewarded action per state
+        last_bad = -1 * np.ones(nS, dtype=int)    # last unrewarded action per state
+        m_strength = np.zeros(nS)                 # memory strength in [0,1]
+
+        forget_eff = forget_base + ss_scale * (max(nS - 3, 0) / 3.0)
+        forget_eff = np.clip(forget_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # Build WM logits from traces
+            logits = np.zeros(nA)
+            if last_good[s] >= 0:
+                logits[last_good[s]] += wsls_stickiness * m_strength[s]
+            if last_bad[s] >= 0:
+                logits[last_bad[s]] -= wsls_stickiness * m_strength[s]
+
+            # Convert to a distribution W_s by softmax for the WM policy and to populate w[s,:]
+            # Use a sharp softmax_beta_wm downstream, but here we store normalized probs in w
+            # by applying a moderate softmax so that p_wm uses the intended high precision.
+            z = logits - np.max(logits)
+            expz = np.exp(z)
+            W_s = expz / np.sum(expz)
+            w[s, :] = W_s  # store for policy computation line below
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (sharp)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM forgetting
+            m_strength[s] *= (1.0 - forget_eff)
+            # WM update: win-stay / lose-shift traces
+            if r > 0:
+                last_good[s] = a
+                m_strength[s] = 1.0  # refresh on success
+            else:
+                last_bad[s] = a
+                # On failures, do not increase m_strength, only the "avoid" tag is updated
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

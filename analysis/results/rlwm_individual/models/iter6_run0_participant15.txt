@@ -1,0 +1,358 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with set-size-specific RL temperature and WM interference across states.
+
+    Mechanism
+    - RL: tabular Q-learning with softmax policy. The RL inverse temperature depends on set size (separate betas).
+    - WM: probability table over actions per state. Rewarded outcomes write a near-deterministic one-hot memory;
+      otherwise WM stays as-is. Additionally, each trial induces set-size-dependent interference that
+      diffuses WM for all non-visited states toward uniform (to capture increased cross-item interference in larger sets).
+    - Arbitration: convex mixture of WM and RL.
+    - Lapse: global uniform lapse on final policy.
+
+    Set-size dependence
+    - RL beta is explicitly different for set size 3 vs 6 (beta_small vs beta_large).
+    - WM precision degrades more in larger sets via an interference strength that scales with set size
+      (effective interference = wm_interference * nS/6).
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr : float
+            RL learning rate (0..1).
+        wm_weight : float
+            Mixture weight of WM vs RL (0..1).
+        beta_small : float
+            RL inverse temperature for set size 3 (scaled internally by 10).
+        beta_large : float
+            RL inverse temperature for set size 6 (scaled internally by 10).
+        wm_interference : float
+            Trial-by-trial WM interference toward uniform applied to all other states (0..1 typical).
+        epsilon : float
+            Lapse probability mixing uniform choice into the final policy (0..0.2 typical).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions.
+    """
+    lr, wm_weight, beta_small, beta_large, wm_interference, epsilon = model_parameters
+
+    # Template scalings
+    softmax_beta = 1.0  # unused directly; we will use set-size-specific betas below
+    softmax_beta *= 10  # keep template line, but we will compute our own per block
+    softmax_beta_wm = 50  # WM retrieval is sharp when stored
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL and WM tables
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Choose RL beta based on set size
+        beta_rl_block = (beta_small if nS == 3 else beta_large) * 10.0
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(beta_rl_block * (Q_s - Q_s[a])))
+
+            # WM policy probability of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration and lapse
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = (1.0 - epsilon) * p_total + epsilon * (1.0 / nA)
+
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update for visited state
+            if r > 0.5:
+                # write a sharp one-hot memory for the rewarded action
+                w[s, :] = tiny
+                w[s, a] = 1.0
+            else:
+                # no-reward: leave entry as-is (interference handled below)
+                pass
+
+            # Set-size-dependent WM interference on non-visited states
+            gamma = wm_interference * (nS / 6.0)
+            if gamma > 0:
+                for j in range(nS):
+                    if j == s:
+                        continue
+                    w[j, :] = (1.0 - gamma) * w[j, :] + gamma * w_0[j, :]
+                    # renormalize for numeric safety
+                    w[j, :] = np.maximum(w[j, :], tiny)
+                    w[j, :] /= np.sum(w[j, :])
+
+            # Ensure current row normalized too
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with surprise-gated arbitration and RL/WM forgetting.
+
+    Mechanism
+    - RL: tabular Q-learning with softmax policy plus per-visit forgetting of the whole state-row toward uniform.
+    - WM: categorical table per state. Rewarded outcomes write a one-hot distribution; otherwise WM decays toward uniform.
+    - Arbitration: WM weight is gated by unsigned prediction error (surprise). Larger surprise -> more WM reliance.
+      Additionally, WM weight is downscaled in larger sets (capacity pressure).
+    - Lapse: none (captured by surprise-gating and RL temperature).
+
+    Set-size dependence
+    - Effective WM weight is divided by (1 + (nS-3)) i.e., halved in set size 6 vs 3.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr : float
+            RL learning rate (0..1).
+        wm_weight_base : float
+            Baseline WM mixture weight before gating and set-size scaling (0..1).
+        softmax_beta : float
+            RL inverse temperature; internally multiplied by 10.
+        rl_forget : float
+            RL and WM forgetting rate toward uniform (0..1).
+        wm_gate_slope : float
+            Steepness of surprise gating; higher -> more sensitivity to unsigned RPE.
+        kappa_size : float
+            Additional set-size penalty factor on WM weight (>=0). Effective divisor is (1 + kappa_size*(nS-3)).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions.
+    """
+    lr, wm_weight_base, softmax_beta, rl_forget, wm_gate_slope, kappa_size = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # sharp WM retrieval
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size downweight of WM
+        wm_size_divisor = 1.0 + kappa_size * max(0, nS - 3)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of the chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy probability of the chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Surprise-gated WM arbitration
+            # Compute unsigned RPE using current Q before updating
+            unsigned_rpe = abs(r - Q_s[a])
+            # Sigmoid gating centered around 0.5 (chance-level reward)
+            gate = 1.0 / (1.0 + np.exp(-wm_gate_slope * (unsigned_rpe - 0.5)))
+            wm_weight_eff = (wm_weight_base * gate) / wm_size_divisor
+            wm_weight_eff = min(max(wm_weight_eff, 0.0), 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+            # RL forgetting toward uniform for the entire visited state's row
+            q[s, :] = (1.0 - rl_forget) * q[s, :] + rl_forget * (1.0 / nA)
+            # Renormalization is not needed for Q (not probabilities), but keep numeric bounds reasonable
+            # Clip Q to [0,1] as a bounded value function for a 0/1 reward task
+            q[s, :] = np.clip(q[s, :], 0.0, 1.0)
+
+            # WM update
+            if r > 0.5:
+                # successful encoding
+                w[s, :] = tiny
+                w[s, a] = 1.0
+            else:
+                # decay toward uniform when not rewarded
+                w[s, :] = (1.0 - rl_forget) * w[s, :] + rl_forget * w_0[s, :]
+
+            # Normalize WM row
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with novelty bonus and recency-dependent WM decay; RL exploration scales with set size.
+
+    Mechanism
+    - RL: tabular Q-learning with a directed exploration (novelty) bonus added to action values. The RL temperature
+      is reduced as set size increases (via beta_size_slope).
+    - WM: per-state probability table that decays with time-since-last-visit (recency-based decay). Rewarded outcomes
+      write a one-hot distribution.
+    - Arbitration: fixed mixture of WM and RL.
+
+    Set-size dependence
+    - RL inverse temperature is divided by (1 + beta_size_slope*(nS-3)), i.e., lower precision in larger sets.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr : float
+            RL learning rate (0..1).
+        wm_weight : float
+            Mixture weight of WM vs RL (0..1).
+        softmax_beta : float
+            Baseline RL inverse temperature; internally multiplied by 10 and then divided by a set-size factor.
+        eta_novelty : float
+            Directed exploration bonus; added to Q inversely with action visit count in the current state (>=0).
+        wm_recency : float
+            WM recency decay rate; larger means faster decay with time since last visit (>=0).
+        beta_size_slope : float
+            Scaling of RL temperature reduction with set size (>=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed actions.
+    """
+    lr, wm_weight, softmax_beta, eta_novelty, wm_recency, beta_size_slope = model_parameters
+
+    softmax_beta *= 10  # base RL precision
+    softmax_beta_wm = 50  # sharp WM retrieval when recently encoded
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Value tables and counts
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+        counts = np.zeros((nS, nA))  # action counts per state
+        last_seen = -np.ones(nS, dtype=int)  # last visit time index per state
+
+        # Set-size-scaled RL precision
+        beta_rl_block = softmax_beta / (1.0 + beta_size_slope * max(0, nS - 3))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Apply recency-based WM decay upon visiting state s
+            if last_seen[s] >= 0:
+                dt = t - last_seen[s]
+            else:
+                dt = 1
+            decay_amount = 1.0 - np.exp(-wm_recency * float(dt))
+            w[s, :] = (1.0 - decay_amount) * w[s, :] + decay_amount * w_0[s, :]
+            # Normalize
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # Directed exploration bonus inversely with sqrt(count)
+            bonus = eta_novelty / np.sqrt(1.0 + counts[s, :])
+            Q_aug = Q_s + bonus
+
+            # RL policy prob of chosen action with augmented values
+            p_rl = 1.0 / np.sum(np.exp(beta_rl_block * (Q_aug - Q_aug[a])))
+
+            # WM policy prob of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update (pure reward-based, without bonus)
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+            q[s, :] = np.clip(q[s, :], 0.0, 1.0)
+
+            # WM update based on feedback
+            if r > 0.5:
+                w[s, :] = tiny
+                w[s, a] = 1.0
+            # else: keep as after-decay memory
+
+            # Normalize WM row
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+            # Update counts and last seen
+            counts[s, a] += 1.0
+            last_seen[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

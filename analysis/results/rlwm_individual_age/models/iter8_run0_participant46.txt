@@ -1,0 +1,319 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces + surprise-gated WM mixture.
+
+    Mechanism:
+    - RL: tabular Q-learning augmented with eligibility traces (replacing, decaying across trials).
+      The decay of eligibility traces is reduced (stronger decay) for larger set sizes and for older adults.
+    - WM: fast mapping of rewarded pairs into WM with decay toward default. Mixture weight is gated by
+      unsigned surprise (|PE|), but attenuated by set size and age.
+    - Policy: mixture of RL and WM policies.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally (>0).
+    - wm_weight_base: baseline mixture weight for WM (0..1).
+    - surprise_gate: scales how strongly surprise (|PE|) boosts WM influence (>=0).
+    - trace_decay: eligibility trace decay parameter lambda (0..1), modulated by age and set size.
+
+    Age and load effects:
+    - Effective eligibility decay is reduced with larger set size and in older adults:
+      lambda_eff = trace_decay / (1 + age_group + (nS-3)/3).
+    - WM weight per trial is: wm_weight = wm_weight_base * (1 + surprise_gate*|PE|)
+      then divided by (1 + age_group + max(0, nS-3)) and clipped to [0,1].
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, surprise_gate, trace_decay = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    wm_temp = 50.0  # deterministic WM policy
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+
+        # Effective eligibility decay considering age and load
+        lambda_eff = trace_decay / (1.0 + float(age_group) + max(0.0, (nS - 3.0) / 3.0))
+        lambda_eff = np.clip(lambda_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy probability for chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy probability for chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(wm_temp * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Surprise-gated WM mixture, with age and load penalty
+            pe_imm = r - Q_s[a]
+            wm_weight = wm_weight_base * (1.0 + surprise_gate * abs(pe_imm))
+            wm_weight = wm_weight / (1.0 + float(age_group) + max(0.0, float(nS - 3)))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces (replacing trace for chosen SA)
+            e *= lambda_eff
+            e[s, :] = 0.0
+            e[s, a] = 1.0
+            q += lr * (r - q[s, a]) * e
+
+            # WM update: soft decay toward default, overwrite on reward
+            # Decay is stronger with age and load
+            decay_rate = 0.1 * (1.0 + float(age_group) + max(0.0, (nS - 3.0) / 3.0))
+            decay_rate = np.clip(decay_rate, 0.0, 1.0)
+            w = (1.0 - decay_rate) * w + decay_rate * w_0
+            if r > 0.0:
+                w_row = np.zeros(nA)
+                w_row[a] = 1.0
+                w[s, :] = w_row
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Arbitration by RL uncertainty + adjustable WM temperature.
+
+    Mechanism:
+    - RL: standard tabular Q-learning.
+    - WM: maintains a fast-mapped policy; temperature is a free parameter.
+    - Arbitration: WM weight increases when RL is uncertain (high entropy). WM weight is reduced
+      by age and load via a learned penalty.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally (>0).
+    - wm_weight_base: baseline WM mixture weight (0..1).
+    - wm_invtemp: WM inverse temperature (>0), applied directly to WM softmax.
+    - uncertainty_sensitivity: scales how strongly RL entropy boosts WM reliance (>=0).
+    - age_load_penalty: strength of age and set-size penalty on WM weight (>=0).
+
+    Age and load effects:
+    - WM weight is divided by (1 + age_load_penalty * (age_group + max(0, nS-3))).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, wm_invtemp, uncertainty_sensitivity, age_load_penalty = model_parameters
+    softmax_beta *= 10.0
+    wm_temp = max(1e-3, wm_invtemp)  # treat as inverse temperature directly
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy vector and chosen action prob
+            Q_s = q[s, :]
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_probs = np.exp(rl_logits)
+            rl_probs = rl_probs / max(np.sum(rl_probs), eps)
+            p_rl = max(rl_probs[a], eps)
+
+            # RL uncertainty via normalized entropy
+            H = -np.sum(rl_probs * np.log(np.clip(rl_probs, eps, 1.0)))
+            H_norm = H / np.log(nA)
+
+            # WM policy vector and chosen action prob
+            W_s = w[s, :]
+            wm_logits = wm_temp * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / max(np.sum(wm_probs), eps)
+            p_wm = max(wm_probs[a], eps)
+
+            # Uncertainty-based arbitration; sigmoid on normalized entropy
+            sig = 1.0 / (1.0 + np.exp(-uncertainty_sensitivity * (H_norm - 0.5)))
+            wm_weight = wm_weight_base * sig
+            wm_weight = wm_weight / (1.0 + age_load_penalty * (float(age_group) + max(0.0, float(nS - 3))))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: faster consolidation when rewarded
+            alpha_wm = 0.5 if r > 0.0 else 0.1
+            target = np.zeros(nA)
+            target[a] = 1.0
+            w[s, :] = (1.0 - alpha_wm) * w[s, :] + alpha_wm * target
+
+            # Mild global decay toward default to prevent runaway certainty
+            w = 0.98 * w + 0.02 * w_0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Capacity-limited WM cache + RL.
+
+    Mechanism:
+    - RL: standard Q-learning.
+    - WM: finite-capacity cache storing the last rewarded action for some states.
+      - Effective capacity decreases with age (older adults store fewer mappings).
+      - WM policy for cached states is near-deterministic; for uncached states it is noisy (near-uniform).
+      - When cache is full and a new rewarded state arrives, replacement happens with a probability.
+    - Mixture: higher WM weight when the queried state is cached; also reduced by load and age.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; scaled by 10 internally (>0).
+    - wm_weight_base: baseline WM mixture weight (0..1).
+    - capacity_base: baseline WM capacity in number of states (>=1).
+    - wm_noise: mixing with uniform noise for WM policy (0..1); higher means less precise WM.
+    - replace_prob: probability to replace a random cached state upon reward when cache is full (0..1).
+
+    Age and load effects:
+    - Effective capacity: cap_eff = max(1, min(nS, capacity_base - age_group)).
+    - WM weight is divided by (1 + age_group + max(0, nS - cap_eff)).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, capacity_base, wm_noise, replace_prob = model_parameters
+    softmax_beta *= 10.0
+    wm_temp = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    rng = np.random.RandomState(0)  # deterministic replacement index selection
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM cache bookkeeping
+        cap_eff = int(max(1, min(nS, capacity_base - age_group)))
+        cached = np.zeros(nS, dtype=bool)
+        stored_action = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # Build WM policy row based on cache
+            if cached[s] and stored_action[s] >= 0:
+                one_hot = np.zeros(nA)
+                one_hot[stored_action[s]] = 1.0
+                W_s = (1.0 - wm_noise) * one_hot + wm_noise * (1.0 / nA) * np.ones(nA)
+            else:
+                W_s = (1.0 / nA) * np.ones(nA)
+
+            denom_wm = np.sum(np.exp(wm_temp * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # WM mixture weight: more weight if this state is cached; penalized by age and load
+            base_state_weight = 1.0 if cached[s] else 0.2
+            wm_weight = wm_weight_base * base_state_weight
+            wm_weight = wm_weight / (1.0 + float(age_group) + max(0.0, float(nS - cap_eff)))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM cache update on reward
+            if r > 0.0:
+                if not cached[s]:
+                    num_cached = int(np.sum(cached))
+                    if num_cached < cap_eff:
+                        cached[s] = True
+                    else:
+                        # Replace a random cached state with probability replace_prob
+                        if rng.rand() < replace_prob:
+                            cached_indices = np.where(cached)[0]
+                            idx_to_replace = cached_indices[rng.randint(len(cached_indices))]
+                            cached[idx_to_replace] = False
+                            stored_action[idx_to_replace] = -1
+                            cached[s] = True
+                stored_action[s] = a
+
+            # Update WM matrix row from cache state for policy computation
+            if cached[s] and stored_action[s] >= 0:
+                one_hot = np.zeros(nA)
+                one_hot[stored_action[s]] = 1.0
+                w[s, :] = (1.0 - wm_noise) * one_hot + wm_noise * (1.0 / nA) * np.ones(nA)
+            else:
+                # keep at default for uncached
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,331 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with dynamic exploration, capacity-limited WM, interference, and choice stickiness.
+
+    Description:
+    - Policy mixes model-free RL and a decaying WM cache.
+    - RL inverse temperature is adjusted by local Q-entropy (more confident -> higher beta),
+      by set size (lower in size=6), and by age group (young > old).
+    - WM has decay and between-item interference that grows with set size.
+    - Arbitration weight for WM depends on baseline, set size, and age group.
+    - Includes choice stickiness at the state level.
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate (0..1)
+    - beta0: base RL inverse temperature before scaling (scaled internally by *10)
+    - wm_weight0: baseline WM mixture weight (0..1)
+    - wm_decay: WM decay rate toward uniform per trial (0..1)
+    - interference_gain: how much other states interfere with the active state's WM (0..1)
+    - stickiness: bias added toward previous action at a state (0..2 in Q units)
+
+    Age and set size usage:
+    - RL beta is scaled by: age_scale_beta (young 1.1, old 0.9) and size_scale_beta = sqrt(3/nS).
+    - WM weight scaled by age (young 1.2, old 0.8) and set size (3/nS).
+    - WM decay is increased with set size and slightly with age; interference rises with set size.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta0, wm_weight0, wm_decay, interference_gain, stickiness = model_parameters
+    softmax_beta = beta0 * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    age_scale_beta = 1.1 if age_group == 0 else 0.9
+    age_scale_wm = 1.2 if age_group == 0 else 0.8
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        size_scale_beta = np.sqrt(3.0 / float(nS))
+        wm_weight_base = np.clip(wm_weight0 * age_scale_wm * (3.0 / float(nS)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # Add choice stickiness (state-dependent)
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += stickiness
+                W_s[last_action[s]] += stickiness
+
+            # Entropy-adjusted RL temperature (more confident -> larger beta)
+            probs_temp = np.exp(Q_s - np.max(Q_s))
+            probs_temp = probs_temp / np.sum(probs_temp)
+            H = -np.sum(probs_temp * np.log(np.maximum(probs_temp, 1e-12)))
+            H_max = np.log(nA)
+            H_norm = H / H_max if H_max > 0 else 0.0
+            beta_eff = softmax_beta * age_scale_beta * size_scale_beta * (1.0 + (1.0 - H_norm))
+
+            # RL policy probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # WM policy probability of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture weight
+            wm_weight_eff = np.clip(wm_weight_base, 0.0, 1.0)
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += alpha * delta
+
+            # WM decay toward uniform
+            size_decay_scale = float(nS) / 3.0
+            age_decay_scale = 1.1 if age_group == 1 else 0.9
+            decay = np.clip(wm_decay * size_decay_scale * age_decay_scale, 0.0, 1.0)
+            w = (1.0 - decay) * w + decay * w_0
+
+            # WM interference: bleed from other states into current state's row
+            if nS > 1:
+                other_mean = np.mean(w[np.arange(nS) != s, :], axis=0) if nS > 1 else w_0[s, :]
+                inter_strength = np.clip(interference_gain * max(0.0, (nS - 3) / 3.0), 0.0, 1.0)
+                w[s, :] = (1.0 - inter_strength) * w[s, :] + inter_strength * other_mean
+
+            # WM store on reward, slight uncertainty on no-reward
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+            else:
+                w[s, :] = 0.8 * w[s, :] + 0.2 * w_0[s, :]
+
+            # Track last action
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Precision-weighted Bayesian RL with decaying WM and lapse.
+
+    Description:
+    - RL side is a Bayesian beta-binomial learner per state-action: maintains successes/failures.
+      The posterior mean serves as Q; effective beta is scaled by age and set size.
+    - WM is a decaying cache that stores the most recently rewarded action per state.
+    - Arbitration weight for WM scales with WM confidence, set size (down in size=6), and age (young > old).
+    - Includes a lapse parameter mixing in uniform random choice.
+
+    Parameters (model_parameters):
+    - prior_strength: symmetric prior count added to successes and failures (>0)
+    - beta_base: base inverse temperature for RL softmax (scaled internally by *10)
+    - wm_weight0: baseline WM mixture weight (0..1)
+    - wm_conf_decay: rate at which WM confidence decays toward uniform (0..1)
+    - age_beta_gain: multiplicative gain on beta for young vs old (young >1, old <1)
+    - lapse: lapse probability mixing in uniform choice (0..0.2 recommended)
+
+    Age and set size usage:
+    - RL beta scaled by age_beta (young=age_beta_gain, old=1/age_beta_gain) and by 3/nS.
+    - WM weight scaled by age (young 1.2, old 0.8), by set size (3/nS), and by WM confidence.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    prior_strength, beta_base, wm_weight0, wm_conf_decay, age_beta_gain, lapse = model_parameters
+    softmax_beta = beta_base * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    age_beta = age_beta_gain if age_group == 0 else (1.0 / max(age_beta_gain, 1e-6))
+    age_wm_scale = 1.2 if age_group == 0 else 0.8
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Bayesian counts
+        succ = np.zeros((nS, nA))
+        fail = np.zeros((nS, nA))
+
+        # Initialize WM tables
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        beta_eff_base = softmax_beta * age_beta * (3.0 / float(nS))
+        wm_weight_base = np.clip(wm_weight0 * age_wm_scale * (3.0 / float(nS)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Posterior mean as Q
+            alpha_post = prior_strength + succ[s, :]
+            beta_post = prior_strength + fail[s, :]
+            Q_s = alpha_post / np.maximum(alpha_post + beta_post, 1e-12)
+
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(beta_eff_base * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # WM confidence based arbitration
+            max_w = float(np.max(W_s))
+            conf = (max_w - 1.0 / nA) / (1.0 - 1.0 / nA)
+            conf = np.clip(conf, 0.0, 1.0)
+            wm_weight_eff = np.clip(wm_weight_base * conf, 0.0, 1.0)
+
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # Bayesian update of counts
+            if r > 0.5:
+                succ[s, a] += 1.0
+            else:
+                fail[s, a] += 1.0
+
+            # WM decay toward uniform
+            decay = np.clip(wm_conf_decay * (float(nS) / 3.0) * (1.1 if age_group == 1 else 0.9), 0.0, 1.0)
+            w = (1.0 - decay) * w + decay * w_0
+
+            # WM store on reward, mild uncertainty on no-reward
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+            else:
+                w[s, :] = 0.85 * w[s, :] + 0.15 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Surprise-gated arbitration: Q-learning with decay and WM fast Hebbian store.
+
+    Description:
+    - RL uses standard Q-learning with per-trial decay toward uniform (q_decay).
+    - WM is a fast Hebbian-like store updated on rewards; it decays and is renormalized.
+    - Arbitration weight for WM is gated down by surprise (|prediction error|),
+      scaled by age (young rely more on WM) and by set size (less WM in size=6).
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate (0..1)
+    - beta0: base RL inverse temperature (scaled internally by *10)
+    - wm_gate0: baseline WM mixture weight before gating (0..1)
+    - q_decay: per-trial decay of Q toward uniform (0..1)
+    - wm_fast_gain: strength of WM Hebbian update on reward (0..1)
+    - age_wm_boost: multiplicative WM boost for young vs old (young >1, old <1)
+
+    Age and set size usage:
+    - WM baseline weight multiplied by age_wm_boost for young, by 1/age_wm_boost for old, and by 3/nS.
+    - WM weight is further reduced by a sigmoid of surprise |delta| with fixed slope.
+    - Q and WM both decay more in larger set sizes; WM also decays slightly more for older adults.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha, beta0, wm_gate0, q_decay, wm_fast_gain, age_wm_boost = model_parameters
+    softmax_beta = beta0 * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    age_boost = age_wm_boost if age_group == 0 else (1.0 / max(age_wm_boost, 1e-6))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        size_scale = 3.0 / float(nS)
+        wm_weight_base = np.clip(wm_gate0 * age_boost * size_scale, 0.0, 1.0)
+
+        # Precompute per-trial decays
+        q_decay_eff = np.clip(q_decay * (float(nS) / 3.0), 0.0, 1.0)
+        wm_decay_eff = np.clip(q_decay * (float(nS) / 3.0) * (1.15 if age_group == 1 else 0.9), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Surprise-based gating of WM
+            delta = r - Q_s[a]
+            k = 5.0  # gating slope
+            gate_down = 1.0 / (1.0 + np.exp(-k * (1.0 - np.abs(delta))))  # large |delta| -> smaller (1-gate_down)
+            wm_weight_eff = np.clip(wm_weight_base * (1.0 - gate_down + 1e-6), 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with decay toward uniform
+            q = (1.0 - q_decay_eff) * q + q_decay_eff * (1.0 / nA)
+            q[s, a] += alpha * (r - q[s, a])
+
+            # WM decay toward uniform
+            w = (1.0 - wm_decay_eff) * w + wm_decay_eff * w_0
+
+            # WM Hebbian update on reward; renormalize row
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = np.maximum(0.0, w[s, :] + wm_fast_gain * one_hot)
+                row_sum = np.sum(w[s, :])
+                if row_sum > 0:
+                    w[s, :] = w[s, :] / row_sum
+                else:
+                    w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

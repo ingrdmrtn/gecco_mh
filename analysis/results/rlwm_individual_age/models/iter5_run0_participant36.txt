@@ -1,0 +1,331 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + confidence-gated WM with age- and load-dependent lapse and WM decay.
+
+    Summary:
+    - RL controller uses softmax with inverse temperature scaled by beta_base.
+    - WM controller stores one-hot responses on rewarded trials; otherwise decays toward uniform.
+    - The mixture weight is a dynamic gating function of WM confidence: higher WM certainty -> more WM control.
+    - A lapse process sends a fraction of choices to uniform random, increasing with set size and age.
+    - WM decay rate increases with set size and age.
+
+    Parameters (list of 6):
+    - lr: RL learning rate (0..1).
+    - beta_base: base inverse temperature for RL; internally scaled by 10.
+    - gate_bias: bias term in the WM gating logistic; higher -> more WM usage.
+    - conf_slope: sensitivity of the gate to WM confidence (max(W) - 1/3).
+    - lapse_base: base logit for lapse; age and set size additively increase lapse.
+    - tau_wm: base WM decay strength (0..1) toward uniform per encounter; amplified by load and age.
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays of equal length.
+    - age: 1D array with a single repeated value; age_group = 0 (<=45), 1 (>45).
+    - model_parameters: list of 6 parameters as defined above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, gate_bias, conf_slope, lapse_base, tau_wm = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 1 if age[0] > 45 else 0
+    softmax_beta_wm = 50.0  # near-deterministic WM readout
+
+    nA = 3
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Age- and load-dependent lapse and WM decay
+        lapse_logit = lapse_base + 0.6 * age_group + 0.3 * max(0, nS - 3)
+        epsilon = 1.0 / (1.0 + np.exp(-lapse_logit))
+        decay = np.clip(tau_wm * (1.0 + 0.5 * age_group) * (1.0 + 0.3 * max(0, nS - 3)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-300)
+
+            # WM policy (deterministic readout)
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-300)
+
+            # Confidence-gated WM mixing weight based on WM certainty
+            conf = float(np.max(W_s) - 1.0 / nA)  # 0..(1-1/nA)
+            gate = 1.0 / (1.0 + np.exp(-(gate_bias + conf_slope * conf)))
+            gate = np.clip(gate, 0.0, 1.0)
+
+            # Mixture with lapse
+            p_mix = gate * p_wm + (1.0 - gate) * p_rl
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: reward-locked write, otherwise decay toward uniform
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+            else:
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with within-state eligibility traces + WM chunking bonus and state-wise perseveration.
+
+    Summary:
+    - RL controller with replacing eligibility traces within the current state to propagate PE to recent actions.
+    - WM controller stores rewarded mappings; its determinism is boosted for small set sizes (chunking benefit).
+    - State-wise perseveration bias adds to chosen action's RL logit when repeating the action in the same state.
+    - Older adults have reduced effective temperature.
+
+    Parameters (list of 6):
+    - lr: RL learning rate (0..1).
+    - beta_base: base inverse temperature for RL; internally scaled by 10.
+    - lambda_trace: replacing eligibility trace parameter (0..1) within state.
+    - wm_chunk_bonus: increases WM determinism when set size is small; scales as (3/nS).
+    - pers_state: additive bias to repeat last action in the same state (per-state choice kernel).
+    - age_temp_penalty: scales down temperature by factor (1 + age_temp_penalty * age_group).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays of equal length.
+    - age: 1D array with a single repeated value; age_group = 0 (<=45), 1 (>45).
+    - model_parameters: list of 6 parameters as defined above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, lambda_trace, wm_chunk_bonus, pers_state, age_temp_penalty = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 1 if age[0] > 45 else 0
+    softmax_beta_wm_base = 50.0
+
+    nA = 3
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # Within-state eligibility traces
+        e = np.zeros((nS, nA))
+
+        # Effective temperatures
+        beta_eff = softmax_beta / (1.0 + age_temp_penalty * age_group)
+        wm_beta_eff = softmax_beta_wm_base * (1.0 + wm_chunk_bonus * (3.0 / max(3.0, nS)))
+
+        # Per-state last action memory for perseveration
+        last_action_per_state = -np.ones(nS, dtype=int)
+
+        # WM decay grows with load
+        decay = np.clip(0.1 * (1.0 + 0.4 * max(0, nS - 3)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy with state-wise perseveration
+            logits_rl = beta_eff * Q_s
+            if last_action_per_state[s] >= 0:
+                logits_rl[last_action_per_state[s]] += pers_state
+            denom_rl = np.sum(np.exp(logits_rl - logits_rl[a]))
+            p_rl = 1.0 / max(denom_rl, 1e-300)
+
+            # WM policy with chunking-induced determinism
+            denom_wm = np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-300)
+
+            # Fixed mixture weight based on load (more WM with smaller set size)
+            wm_weight = np.clip(1.0 - 0.15 * max(0, nS - 3), 0.0, 1.0)
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # PE
+            pe = r - Q_s[a]
+
+            # Eligibility trace update (within state, replacing trace)
+            e[s, :] *= lambda_trace
+            e[s, a] = 1.0
+
+            # RL update with trace
+            q[s, :] += lr * pe * e[s, :]
+
+            # WM update
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+            else:
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # Update perseveration memory
+            last_action_per_state[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Hybrid RL with capacity-limited slot WM, global choice kernel, and age/load-dependent retrieval and lapses.
+
+    Summary:
+    - RL controller as softmax over Q.
+    - WM stores up to K_slots state-action mappings per block (rewarded writes); deterministic readout for stored states.
+    - Retrieval from WM is noisy, degraded by age and by load relative to capacity.
+    - Global choice kernel bias favors repeating the last action (state-independent).
+    - Lapse increases with age and set size.
+
+    Parameters (list of 6):
+    - lr: RL learning rate (0..1).
+    - beta_base: base inverse temperature for RL; internally scaled by 10.
+    - K_slots: integer-like capacity of WM in number of states to store (clipped >=1).
+    - lapse0: base lapse rate (0..1) in probability space; age and load increase it.
+    - kernel_gain: additive bias to the last global action in RL logits.
+    - noise_wm: WM retrieval noise base (0..1); increases with age and load.
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays of equal length.
+    - age: 1D array with a single repeated value; age_group = 0 (<=45), 1 (>45).
+    - model_parameters: list of 6 parameters as defined above.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, K_slots, lapse0, kernel_gain, noise_wm = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 1 if age[0] > 45 else 0
+    softmax_beta_wm = 50.0
+
+    nA = 3
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Capacity-limited slots: track which states are stored (FIFO eviction)
+        K_eff = max(1, int(round(K_slots)))
+        stored_flags = np.zeros(nS, dtype=bool)
+        fifo_queue = []
+
+        # Age/load-dependent lapse and WM retrieval noise
+        epsilon = np.clip(lapse0 + 0.15 * age_group + 0.1 * max(0, nS - 3), 0.0, 0.5)
+        noise = np.clip(noise_wm * (1.0 + 0.5 * age_group) * (1.0 + max(0, nS - K_eff) / max(1.0, K_eff)), 0.0, 1.0)
+
+        last_global_action = -1
+        log_p = 0.0
+
+        # Light decay regardless of reward to reflect maintenance costs under load
+        decay = np.clip(0.05 * (1.0 + 0.5 * age_group + 0.5 * max(0, nS - K_eff) / max(1.0, K_eff)), 0.0, 1.0)
+
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL logits with global choice kernel
+            logits_rl = softmax_beta * Q_s
+            if last_global_action >= 0:
+                logits_rl[last_global_action] += kernel_gain
+            denom_rl = np.sum(np.exp(logits_rl - logits_rl[a]))
+            p_rl = 1.0 / max(denom_rl, 1e-300)
+
+            # WM policy and retrieval probability
+            if stored_flags[s]:
+                denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+                p_wm = 1.0 / max(denom_wm, 1e-300)
+                # Retrieval success decreases with noise
+                p_retrieve = np.clip(1.0 - noise, 0.0, 1.0)
+            else:
+                p_wm = 1.0 / nA
+                p_retrieve = 0.0
+
+            # Mixture with lapse
+            p_mix = p_retrieve * p_wm + (1.0 - p_retrieve) * p_rl
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM maintenance decay
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # WM write on reward with FIFO capacity management
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+                if not stored_flags[s]:
+                    if len(fifo_queue) >= K_eff:
+                        evict_state = fifo_queue.pop(0)
+                        stored_flags[evict_state] = False
+                        w[evict_state, :] = w_0[evict_state, :].copy()
+                    fifo_queue.append(s)
+                    stored_flags[s] = True
+
+            last_global_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

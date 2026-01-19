@@ -1,0 +1,326 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 1: RL + WM with recency-based WM decay and set-size/age-dependent WM mixture
+    - RL: delta rule with learning rate lr and softmax policy (beta scaled internally by 10).
+    - WM: fast, near-deterministic policy; memory decays with state-specific recency lag.
+    - Recency: each state's WM trace decays toward uniform as a function of time since last seen.
+      Decay is faster for larger set sizes and for older age groups.
+    - Mixture: fixed base WM weight downscaled by set size (3/nS) and applied each trial.
+      Additional WM noise blends WM values toward uniform before policy softmax.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight0: base WM mixture weight (0..1), downscaled by 3/nS
+    - softmax_beta: RL inverse temperature; internally multiplied by 10
+    - recency_tau: base time constant for WM recency decay (>0)
+    - age_recency_mult: multiplicative penalty for decay time constant if old (>=0)
+    - wm_noise: WM value noise (0..1) blending toward uniform before softmax
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, recency_tau, age_recency_mult, wm_noise = model_parameters
+    softmax_beta *= 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0  # near-deterministic WM
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Per-state recency (lag in trials since last seen)
+        lag = np.zeros(nS, dtype=float)
+
+        # Effective recency time constant: worsen for larger set sizes and older age
+        # Smaller tau -> faster decay
+        tau_base = recency_tau
+        if age_group == 1:
+            tau_base = recency_tau / (1.0 + age_recency_mult)
+        # Scale with set size: larger sets => faster decay
+        tau_eff = tau_base * (3.0 / max(1.0, nS))
+
+        # Mixture weight downscaled by set size
+        wm_mix_weight = np.clip(wm_weight0 * (3.0 / max(1.0, nS)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            # Global recency update: increment lags, then decay all WM rows accordingly
+            lag += 1.0
+            # Decay coefficient per state based on its lag
+            if tau_eff > 0:
+                d_all = 1.0 - np.exp(-lag / max(eps, tau_eff))
+            else:
+                d_all = np.ones_like(lag)
+            # Apply decay toward uniform
+            for s_idx in range(nS):
+                d = np.clip(d_all[s_idx], 0.0, 1.0)
+                w[s_idx, :] = (1.0 - d) * w[s_idx, :] + d * w_0[s_idx, :]
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # This state is now seen; reset its recency
+            lag[s] = 0.0
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of chosen action (analytic trick)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM noise blends values toward uniform before softmax
+            W_eff = (1.0 - wm_noise) * W_s + wm_noise * w_0[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_eff - W_eff[a])))
+
+            # Mixture policy
+            p_total = wm_mix_weight * p_wm + (1.0 - wm_mix_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward-supervised write-in
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Write strongly on rewards; decay on errors already handled by recency-global decay
+                w[s, :] = 0.5 * w[s, :] + 0.5 * one_hot  # fixed strong write; recency handles forgetting
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 2: RL with forgetting + WM arbitration via RL entropy, set-size penalty, and age bonus
+    - RL: delta rule with learning rate lr, softmax with beta_rl, and per-trial forgetting of the active state.
+    - WM: fast, near-deterministic policy using w; updated by reward-supervised learning and mild error decay.
+    - Arbitration: WM mixture weight is a sigmoid function of RL policy entropy (higher entropy => more WM),
+      attenuated by set size and modulated by age (young receive a positive WM bonus, old a negative).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature; internally multiplied by 10
+    - beta_wm: WM inverse temperature (unscaled)
+    - wm_gain_entropy: sensitivity of WM mixture to normalized RL entropy (>=0)
+    - forget_rate: RL forgetting rate for current state's Q toward uniform (0..1)
+    - age_wm_bonus: age effect on WM mixture; added if young, subtracted if old (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, beta_wm, wm_gain_entropy, forget_rate, age_wm_bonus = model_parameters
+    softmax_beta = beta_rl * 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = max(1e-3, float(beta_wm))
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size penalty on WM reliance: larger sets reduce WM contribution
+        ss_penalty = 3.0 / max(1.0, nS)
+
+        # Age WM bonus: young +bonus, old -bonus
+        age_bonus = age_wm_bonus if age_group == 0 else -age_wm_bonus
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # Compute full RL softmax to get entropy
+            z = Q_s - np.max(Q_s)
+            pi = np.exp(softmax_beta * z)
+            pi = pi / np.clip(np.sum(pi), eps, None)
+            # Chosen action probability under RL
+            p_rl = np.clip(pi[a], eps, 1.0)
+
+            # Normalized entropy in [0,1]
+            H = -np.sum(pi * np.log(np.clip(pi, eps, 1.0)))
+            H_norm = H / np.log(nA)
+
+            # WM policy probability of chosen action
+            W_s = w[s, :]
+            z_w = W_s - np.max(W_s)
+            pi_w = np.exp(softmax_beta_wm * z_w)
+            pi_w = pi_w / np.clip(np.sum(pi_w), eps, None)
+            p_wm = np.clip(pi_w[a], eps, 1.0)
+
+            # Entropy-driven WM mixture: sigmoid centered at 0.5 entropy
+            x = wm_gain_entropy * (H_norm - 0.5)
+            wm_mix = 1.0 / (1.0 + np.exp(-x))
+            # Apply set-size penalty and age bonus
+            wm_mix = np.clip(wm_mix * ss_penalty + age_bonus, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform for the active state
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            q[s, :] = (1.0 - forget_rate) * q[s, :] + (forget_rate) * (1.0 / nA)
+
+            # WM update: reward-supervised write-in with mild error decay
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+            else:
+                # mild decay toward uniform on errors
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Model 3: RL + WM with Bayesian-like precision arbitration
+    - RL: delta rule with lr and softmax policy (beta scaled by 10).
+      Tracks a running variance of RPEs per state; precision_rl = 1/(var + eps) + init_precision.
+    - WM: supervised memory updated by wm_learn; WM precision is proportional to its concentration
+      (distance from uniform). Larger set sizes reduce WM precision; age reduces (old) or increases (young) WM precision.
+    - Arbitration: mixture weight = precision_wm / (precision_wm + precision_rl).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature; internally multiplied by 10
+    - wm_learn: WM learning rate toward one-hot on rewards (0..1), also used as WM decay on errors
+    - init_precision: baseline precision added to both systems (>=0)
+    - age_precision_bias: age modulation on WM precision; added if young, subtracted if old (can be >=0)
+    - setsize_precision_decay: exponent controlling how set size reduces WM precision (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_learn, init_precision, age_precision_bias, setsize_precision_decay = model_parameters
+    softmax_beta *= 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track running variance of RPEs per state for RL precision
+        var_rpe = np.ones(nS) * 0.25  # initialize moderately uncertain
+        # Smoothing for variance update; slower updates for larger set sizes
+        v_alpha = 1.0 / (1.0 + setsize_precision_decay * max(1.0, nS - 1.0))
+
+        # Age effect on WM precision
+        wm_age_factor = age_precision_bias if age_group == 0 else -age_precision_bias
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL choice probability
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM choice probability
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute precisions
+            # RL precision from RPE variance
+            delta = r - Q_s[a]
+            var_rpe[s] = (1.0 - v_alpha) * var_rpe[s] + v_alpha * (delta ** 2)
+            precision_rl = init_precision + 1.0 / (var_rpe[s] + eps)
+
+            # WM precision from concentration of WM distribution (distance from uniform)
+            uniform = 1.0 / nA
+            concentration = np.max(W_s) - uniform  # in [0, 1 - 1/nA]
+            # Set-size penalty on WM precision
+            ss_factor = (3.0 / max(1.0, nS)) ** max(0.0, setsize_precision_decay)
+            # Age modulation (young +, old -)
+            wm_prec = init_precision + ss_factor * max(0.0, concentration) * (1.0 + wm_age_factor)
+
+            # Mixture by relative precision
+            denom = precision_rl + wm_prec
+            if denom <= eps:
+                wm_mix_weight = 0.5
+            else:
+                wm_mix_weight = np.clip(wm_prec / denom, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_mix_weight * p_wm + (1.0 - wm_mix_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - Q_s[a])
+
+            # WM update: reward-supervised write-in; decay toward uniform on errors
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * one_hot
+            else:
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

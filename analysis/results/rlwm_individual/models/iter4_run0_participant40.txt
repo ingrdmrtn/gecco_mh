@@ -1,0 +1,304 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with error-driven WM gating and anti-Hebb correction.
+
+    Mechanism
+    - RL: standard delta-rule learning with softmax choice.
+    - WM: vector of action weights per state that:
+        - strengthens toward the chosen action on reward (Hebbian),
+        - is actively pushed away from the chosen action on non-reward (anti-Hebbian),
+        - continuously leaks toward uniform.
+    - Arbitration: mixture of RL and WM policies; WM contribution shrinks with set size.
+
+    Parameters
+    ----------
+    model_parameters : list or array of length 6
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Baseline WM mixture weight (0-1), downscaled by 3/nS.
+        softmax_beta : float
+            RL inverse temperature; internally scaled by 10.
+        wm_hebb : float
+            WM Hebbian strengthening step on reward (0-1).
+        wm_anti : float
+            WM anti-Hebbian push-away step on non-reward (0-1).
+        wm_leak : float
+            WM leak per trial toward uniform (0-1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_hebb, wm_anti, wm_leak = model_parameters
+    softmax_beta *= 10 # beta has a higher upper bound
+    softmax_beta_wm = 50 # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b].astype(int)
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b].astype(int)
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: softmax over WM weights
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+
+            # Arbitration: WM weight scaled by set size
+            size_scale = 3.0 / float(nS)
+            eff_wm_weight = np.clip(wm_weight * size_scale, 0.0, 1.0)
+
+            p_total = p_wm*eff_wm_weight + (1-eff_wm_weight)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM updating: leak toward uniform + Hebb/anti-Hebb
+            # Leak
+            w[s,:] = (1 - wm_leak)*w[s,:] + wm_leak*w_0[s,:]
+            # Hebbian strengthen on reward; anti-Hebbian on error
+            if r > 0:
+                target = np.zeros(nA); target[a] = 1.0
+                w[s,:] = (1 - wm_hebb)*w[s,:] + wm_hebb*target
+            else:
+                # push mass away from chosen action toward others uniformly
+                anti = np.ones(nA)/nA
+                anti[a] = 0.0
+                anti = anti / anti.sum()
+                w[s,:] = (1 - wm_anti)*w[s,:] + wm_anti*anti
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with meta-learned inverse temperature + WM that encodes only after confirmation.
+
+    Mechanism
+    - RL: standard delta-rule learning; inverse temperature is adapted online via
+      meta-learning from signed prediction error (increase beta after rewards,
+      decrease after non-rewards), improving exploitation after success.
+    - RL win-stay bias: on trials following a rewarded choice in the same state,
+      add a bonus to that action's logit (distinct from generic stickiness).
+    - WM: only commits (strongly encodes) when receiving a reward that confirms
+      the same action was also rewarded last time this state appeared ("confirmation").
+      Otherwise WM softly decays to uniform.
+    - Arbitration: WM weight shrinks with set size.
+
+    Parameters
+    ----------
+    model_parameters : list or array of length 6
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Baseline WM mixture weight (0-1), downscaled by 3/nS.
+        softmax_beta : float
+            Initial RL inverse temperature; internally scaled by 10; adapted online.
+        meta_beta_lr : float
+            Step size for adapting beta based on signed prediction error (0-1).
+        win_stay_bias : float
+            Additive logit bias for previously rewarded action in same state (>=0).
+        wm_confirm_gain : float
+            Strength of WM consolidation on confirmation (0-1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, meta_beta_lr, win_stay_bias, wm_confirm_gain = model_parameters
+    softmax_beta *= 10 # base beta
+    softmax_beta_wm = 50 # very deterministic
+    blocks_log_p = 0
+    nA = 3
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last rewarded action per state for win-stay bias and confirmation
+        last_rew_action = -np.ones(nS, dtype=int)
+        last_rew_was_positive = np.zeros(nS, dtype=bool)
+
+        beta_t = softmax_beta
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:].copy()
+
+            # Win-stay bias: boost the previously rewarded action in this state
+            logits_Q = beta_t * (Q_s - np.max(Q_s))
+            if last_rew_was_positive[s] and last_rew_action[s] >= 0:
+                logits_Q[last_rew_action[s]] += win_stay_bias
+
+            exp_rl = np.exp(logits_Q - np.max(logits_Q))
+            pvec_rl = exp_rl / np.sum(exp_rl)
+            p_rl = pvec_rl[a]
+
+            W_s = w[s,:]
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+
+            size_scale = 3.0 / float(nS)
+            eff_wm_weight = np.clip(wm_weight * size_scale, 0.0, 1.0)
+
+            p_total = p_wm*eff_wm_weight + (1-eff_wm_weight)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            delta = r - q[s][a]
+            q[s][a] += lr*delta
+
+            # Meta-learning of beta: increase after positive PE, decrease after negative
+            beta_t = np.maximum(1e-6, beta_t + meta_beta_lr * (r - 0.5))  # bounded below
+
+            # WM decay to uniform each visit
+            w[s,:] = 0.9*w[s,:] + 0.1*w_0[s,:]
+
+            # WM confirmation rule: if current reward positive and last time this state
+            # was also rewarded with same action, consolidate strongly.
+            confirm = (r > 0) and last_rew_was_positive[s] and (last_rew_action[s] == a)
+            if confirm:
+                target = np.zeros(nA); target[a] = 1.0
+                w[s,:] = (1 - wm_confirm_gain)*w[s,:] + wm_confirm_gain*target
+
+            # Update last rewarded markers
+            if r > 0:
+                last_rew_action[s] = a
+                last_rew_was_positive[s] = True
+            else:
+                last_rew_was_positive[s] = False
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + probabilistic WM encoding with set-size-dependent gate.
+
+    Mechanism
+    - RL: standard delta-rule softmax learner.
+    - WM: updates use an expected encoding probability that depends on set size:
+        p_enc = sigmoid(wm_enc_base + wm_enc_size_coef * (3 - nS)).
+      This captures reduced WM encoding under higher load (nS=6 lowers p_enc).
+      When a reward occurs, WM shifts toward a one-hot for the chosen action with
+      strength proportional to p_enc; otherwise it weakly decays toward uniform.
+    - Arbitration: WM contribution combines the baseline weight and the current state's
+      WM confidence (max(W_s) - mean(W_s)), but capped to [0,1].
+
+    Parameters
+    ----------
+    model_parameters : list or array of length 6
+        lr : float
+            RL learning rate (0-1).
+        wm_weight : float
+            Baseline WM mixture weight (0-1).
+        softmax_beta : float
+            RL inverse temperature; internally scaled by 10.
+        wm_enc_base : float
+            Intercept for WM encoding gate before sigmoid.
+        wm_enc_size_coef : float
+            Slope for set-size modulation of encoding (positive -> more encoding for smaller sets).
+        wm_decay : float
+            Per-visit decay of WM toward uniform (0-1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_enc_base, wm_enc_size_coef, wm_decay = model_parameters
+    softmax_beta *= 10 # beta has a higher upper bound
+    softmax_beta_wm = 50 # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b].astype(int)
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b].astype(int)
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Compute expected encoding probability given set size
+        gate = wm_enc_base + wm_enc_size_coef * (3.0 - float(nS))
+        p_enc = 1.0 / (1.0 + np.exp(-gate))
+        p_enc = np.clip(p_enc, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: softmax over WM weights
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm*(W_s - W_s[a])))
+
+            # Arbitration: combine baseline WM weight with state confidence
+            conf = np.max(W_s) - np.mean(W_s)
+            eff_wm_weight = np.clip(wm_weight * (0.5 + conf), 0.0, 1.0)
+
+            p_total = p_wm*eff_wm_weight + (1-eff_wm_weight)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM updating: decay each visit
+            w[s,:] = (1 - wm_decay)*w[s,:] + wm_decay*w_0[s,:]
+            # Reward-triggered expected encoding weighted by p_enc
+            if r > 0:
+                target = np.zeros(nA); target[a] = 1.0
+                w[s,:] = (1 - p_enc)*w[s,:] + p_enc*target
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,309 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with capacity-limited, decaying WM and load-/age-scaled WM weighting.
+
+    Idea:
+    - RL learns Q-values with softmax choice.
+    - WM stores recent correct action per state, but:
+      • WM decays toward uniform at rate decay_wm each trial.
+      • WM has a capacity (cap_slots): when set size exceeds capacity, effective WM weight is reduced.
+      • Age modulates WM contribution (older -> lower WM influence).
+    - Policy is a mixture of WM and RL policies with a fixed WM inverse temperature.
+
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - beta_rl: base RL inverse temperature (scaled by 10 internally)
+    - wm_weight0: base WM mixture weight (0..1)
+    - decay_wm: WM decay rate toward uniform per trial (0..1)
+    - cap_slots: effective WM slot capacity (>=1)
+    - beta_wm: WM inverse temperature (>=0), controls determinism of WM policy
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, beta_rl, wm_weight0, decay_wm, cap_slots, beta_wm = model_parameters
+    softmax_beta = beta_rl * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    nll_total = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute effective WM weight given load and age
+        # If nS > capacity, scale weight down roughly by capacity/nS
+        load_scale = min(1.0, float(cap_slots) / max(1.0, float(nS)))
+        age_scale = 1.0 if age_group == 0 else 0.85
+        wm_weight_eff = np.clip(wm_weight0 * load_scale * age_scale, 0.0, 1.0)
+
+        log_p_block = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy (softmax)
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy (softmax over WM strengths)
+            Wc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(beta_wm * Wc))
+            p_wm = np.exp(beta_wm * Wc[a]) / max(1e-12, denom_wm)
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p_block += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr * rpe
+
+            # WM decay toward uniform baseline
+            w = (1.0 - decay_wm) * w + decay_wm * w_0
+
+            # WM write on rewarded trials: move s row toward one-hot on a
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Write strength proportional to load_scale (harder to strengthen under high load)
+                write_strength = 0.5 * load_scale  # bounded write, uses capacity effect
+                w[s, :] = (1.0 - write_strength) * w[s, :] + write_strength * target
+
+            # Renormalize WM row to a proper distribution
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+
+        nll_total += -log_p_block
+
+    return nll_total
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces + recency-based WM kernel, load-/age-modulated mixing.
+
+    Idea:
+    - RL uses eligibility traces that decay with lambda_elig across time.
+    - WM is a short-term recency kernel that accumulates value for recently rewarded actions per state,
+      decaying with the same lambda_elig. This captures fast recency/working-memory effects.
+    - WM mixing weight depends on recall probability scaled down by set size and age.
+    - Age additionally modulates RL temperature (older -> lower inverse temperature).
+
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - beta_rl: base RL inverse temperature (scaled by 10 internally)
+    - lambda_elig: eligibility/recency decay (0..1), used for both RL eligibility and WM recency decay
+    - beta_wm: WM inverse temperature (>=0), for the recency kernel policy
+    - wm_recall_prob: base probability of relying on WM (0..1), before load/age scaling
+    - age_temp_shift: shift applied to RL inverse temperature for older adults (can be negative or positive)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, beta_rl, lambda_elig, beta_wm, wm_recall_prob, age_temp_shift = model_parameters
+    age_group = 0 if age[0] <= 45 else 1
+
+    # RL inverse temperature with age effect
+    softmax_beta = beta_rl * 10.0 + (age_temp_shift if age_group == 1 else 0.0)
+    softmax_beta = max(0.0, softmax_beta)
+
+    nll_total = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # Eligibility traces over state-actions
+        e = np.zeros((nS, nA))
+
+        # WM recency kernel (higher when an action was recently rewarded)
+        w = np.zeros((nS, nA))  # starts at zero (no recency), will be normalized in policy
+        # Load and age scaling for WM mixing
+        load_scale = 3.0 / float(nS)  # 1.0 for nS=3, 0.5 for nS=6
+        age_scale = 1.0 if age_group == 0 else 0.8
+        wm_weight_eff = np.clip(wm_recall_prob * load_scale * age_scale, 0.0, 1.0)
+
+        log_p_block = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy from recency kernel w[s,:]
+            W_s = w[s, :].copy()
+            if np.allclose(W_s, 0.0):
+                # If no recency yet, WM is uniform
+                p_wm = 1.0 / nA
+            else:
+                Wc = W_s - np.max(W_s)
+                denom_wm = np.sum(np.exp(beta_wm * Wc))
+                p_wm = np.exp(beta_wm * Wc[a]) / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p_block += np.log(p_total)
+
+            # RL update with eligibility traces
+            # Decay all traces
+            e *= lambda_elig
+            # Set current trace to 1 for chosen (replacing traces)
+            e[s, a] = 1.0
+            rpe = r - Q_s[a]
+            q += lr * rpe * e  # broadcast over all state-actions with their traces
+
+            # WM recency kernel update:
+            # Decay recency everywhere
+            w *= lambda_elig
+            # If rewarded, boost recency for chosen action in this state
+            if r > 0.5:
+                w[s, a] += (1.0 - lambda_elig)
+
+        nll_total += -log_p_block
+
+    return nll_total
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with surprise-gated WM usage and lapse.
+
+    Idea:
+    - RL learns Q-values with softmax.
+    - WM stores a sharpened distribution for the last outcome per state and is updated proportionally to surprise (|RPE|).
+    - Arbitration (WM mixing weight) is driven by surprise: higher |RPE| increases WM reliance if it crosses a threshold.
+      Load reduces the gate; age shifts the gate bias (older -> higher threshold).
+    - A lapse parameter mixes in uniform random responding.
+
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature (scaled by 10 internally)
+    - beta_wm: WM inverse temperature (>=0)
+    - theta_surprise: threshold that |RPE|-based signal must exceed to engage WM (can be +/-)
+    - gate_bias_age: additive age bias to the gate input for older adults (>=0 increases threshold effectively)
+    - lapse: lapse probability mixing uniform choice (0..1)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, beta_rl, beta_wm, theta_surprise, gate_bias_age, lapse = model_parameters
+    softmax_beta = beta_rl * 10.0
+    lapse = np.clip(lapse, 0.0, 1.0)
+
+    age_group = 0 if age[0] <= 45 else 1
+    nll_total = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM distribution per state starts uniform
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load factor for gate (harder to engage WM under high load)
+        load_scale = 3.0 / float(nS)  # 1.0 for 3, 0.5 for 6
+
+        log_p_block = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(softmax_beta * Qc))
+            p_rl = np.exp(softmax_beta * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy
+            Wc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(beta_wm * Wc))
+            p_wm = np.exp(beta_wm * Wc[a]) / max(1e-12, denom_wm)
+
+            # Surprise-based gate: higher |RPE| favors WM
+            rpe = r - Q_s[a]
+            gate_input = (abs(rpe) - theta_surprise)
+            if age_group == 1:
+                gate_input -= gate_bias_age  # older: effectively higher threshold (less WM)
+            gate_input *= load_scale  # reduce gate under higher load
+            gate = 1.0 / (1.0 + np.exp(-gate_input))
+            gate = np.clip(gate, 0.0, 1.0)
+
+            # Mixture and lapse
+            p_mix = gate * p_wm + (1.0 - gate) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p_block += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * rpe
+
+            # WM update: surprise-modulated write
+            # Move row toward one-hot if rewarded; if not rewarded, softly suppress chosen action
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                write = np.clip(abs(rpe), 0.0, 1.0)  # surprise magnitude bounds write
+                w[s, :] = (1.0 - write) * W_s + write * target
+            else:
+                # No reward: reduce chosen action proportionally to surprise, renormalize
+                suppress = np.clip(abs(rpe), 0.0, 1.0)
+                W_s[a] = (1.0 - suppress) * W_s[a]
+                # slight redistribution to others
+                redistribute = suppress * (W_s[a] / max(1e-12, np.sum(W_s)))
+                for aa in range(nA):
+                    if aa != a:
+                        W_s[aa] += redistribute / (nA - 1)
+                w[s, :] = W_s
+
+            # Normalize WM row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        nll_total += -log_p_block
+
+    return nll_total

@@ -1,0 +1,322 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + recall-based WM with age/set-size dependent decay and recall noise.
+
+    Idea
+    - RL: standard Q-learning.
+    - WM: a cache that stores the last rewarded action for each state as a probability
+      vector, which decays toward uniform over time. The policy from WM is a mixture
+      of recalling the cached action (with probability) and defaulting to uniform when recall fails.
+    - Arbitration: the recall success probability serves as the WM mixing weight against RL.
+    - Age/set-size: both increase WM decay and reduce recall success.
+
+    Parameters
+    ----------
+    model_parameters : list-like of length 6
+        [lr_raw, beta_raw, wm_recall_raw, wm_decay_raw, age_noise_raw, setsize_noise_raw]
+        - lr_raw: RL learning rate (logistic-bounded to 0..1).
+        - beta_raw: RL inverse temperature scale (multiplied by 10).
+        - wm_recall_raw: base probability of successful WM recall (logistic 0..1).
+        - wm_decay_raw: base WM decay toward uniform per encounter of a state (logistic 0..1).
+        - age_noise_raw: increases WM noise for older group; reduces recall and increases decay.
+        - setsize_noise_raw: increases WM noise with larger set size (3 vs 6); reduces recall and increases decay.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_raw, beta_raw, wm_recall_raw, wm_decay_raw, age_noise_raw, setsize_noise_raw = model_parameters
+
+    # Parameter transforms
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    recall_base = 1.0 / (1.0 + np.exp(-wm_recall_raw))
+    decay_base = 1.0 / (1.0 + np.exp(-wm_decay_raw))
+    age_noise = 1.0 / (1.0 + np.exp(-age_noise_raw))
+    setsize_noise = 1.0 / (1.0 + np.exp(-setsize_noise_raw))
+
+    # Age group
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        level = (nS - 3) / 3.0  # 0 for 3, 1 for 6
+
+        # Effective recall prob reduced by age/set size noise
+        recall_eff = recall_base * (1.0 - age_noise * age_group) * (1.0 - setsize_noise * level)
+        recall_eff = max(0.0, min(1.0, recall_eff))
+
+        # Effective decay increased by age/set size noise
+        decay_eff = decay_base + 0.5 * (age_noise * age_group + setsize_noise * level)
+        decay_eff = max(0.0, min(1.0, decay_eff))
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy: probability of chosen action a under softmax(Q)
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy: with recall_eff use sharp softmax over W; otherwise uniform
+            p_wm_sharp = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = recall_eff * p_wm_sharp + (1.0 - recall_eff) * (1.0 / nA)
+
+            # Arbitration: recall probability gates WM vs RL
+            wm_weight_t = recall_eff
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: reward writes one-hot; always apply decay toward uniform
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot
+
+            # Decay (forgetting) toward uniform for the visited state
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM with slot-based arbitration and set-size dependent RL temperature.
+
+    Idea
+    - RL: Q-learning with inverse temperature reduced in larger set sizes (more noise).
+    - WM: high-precision cache updated on reward; mild relaxation otherwise.
+    - Arbitration: weight is proportional to capacity slots divided by set size (capped at 1),
+      modeling limited WM slots. Older group has fewer effective slots.
+
+    Parameters
+    ----------
+    model_parameters : list-like of length 6
+        [lr_raw, beta_base_raw, slots_raw, wm_precision_raw, age_slot_drop, setsize_temp_drop]
+        - lr_raw: RL learning rate (logistic 0..1).
+        - beta_base_raw: base RL inverse temperature (scaled by *10).
+        - slots_raw: base number of WM slots relative to set size (logistic mapped to 0..1, then scaled by nS).
+                     Implemented here as a capacity fraction that gates arbitration.
+        - wm_precision_raw: WM update precision on reward (logistic 0..1).
+        - age_slot_drop: multiplicative drop of capacity for older group (0..1 scale via logistic).
+        - setsize_temp_drop: reduces RL beta as set size increases (0..1 via logistic that scales the drop).
+                             Larger value -> larger beta reduction at set size 6.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_raw, beta_base_raw, slots_raw, wm_precision_raw, age_slot_drop, setsize_temp_drop = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta_base = max(1e-6, beta_base_raw * 10.0)
+    cap_frac = 1.0 / (1.0 + np.exp(-slots_raw))  # 0..1 fraction of items WM can cover
+    wm_prec = 1.0 / (1.0 + np.exp(-wm_precision_raw))
+    age_drop = 1.0 / (1.0 + np.exp(-age_slot_drop))  # 0..1
+    setsize_beta_drop = 1.0 / (1.0 + np.exp(-setsize_temp_drop))  # 0..1 fraction of beta reduction at nS=6
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+        level = (nS - 3) / 3.0  # 0 for 3, 1 for 6
+
+        # RL temperature reduced with set size
+        beta = max(1e-6, beta_base * (1.0 - setsize_beta_drop * level))
+
+        # Effective capacity fraction reduced with age
+        cap_eff = cap_frac * (1.0 - age_drop * age_group)
+        cap_eff = max(0.0, min(1.0, cap_eff))
+
+        # Arbitration weight based on slots coverage
+        wm_weight = min(1.0, cap_eff * (3.0 / nS))  # 3 actions per state; scale fraction to set-size coverage
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy likelihood of chosen action
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy via sharp softmax over WM distribution
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: reward sharpens toward one-hot, non-reward relaxes slightly
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_prec) * w[s, :] + wm_prec * onehot
+            else:
+                relax = 0.25 * (1.0 - wm_prec)
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with WM interference; entropy-gated arbitration. Age/set-size increase WM interference.
+
+    Idea
+    - RL: Q-learning with fixed beta.
+    - WM: when rewarded, update toward the chosen action; then apply interference that blurs
+      the WM distribution toward uniform (within-state confusion). Interference grows with
+      set size and in the older group.
+    - Arbitration: WM weight equals 1 - normalized entropy of WM state distribution
+      (certainty-based gating). Increased interference raises entropy and thus reduces WM weight.
+
+    Parameters
+    ----------
+    model_parameters : list-like of length 6
+        [lr_raw, beta_raw, wm_update_raw, wm_interf_raw, age_interf, setsize_interf]
+        - lr_raw: RL learning rate (logistic 0..1).
+        - beta_raw: RL inverse temperature (scaled by *10).
+        - wm_update_raw: WM learning rate toward one-hot on reward (logistic 0..1).
+        - wm_interf_raw: base WM interference (blurring toward uniform) per visit (logistic 0..1).
+        - age_interf: additive increase of interference for older group.
+        - setsize_interf: additive increase of interference with set size (0 for 3, +setsize_interf for 6).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_raw, beta_raw, wm_update_raw, wm_interf_raw, age_interf, setsize_interf = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    wm_eta = 1.0 / (1.0 + np.exp(-wm_update_raw))  # 0..1
+    interf_base = 1.0 / (1.0 + np.exp(-wm_interf_raw))  # 0..1
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+        level = (nS - 3) / 3.0  # 0 for 3, 1 for 6
+
+        # Effective interference
+        interf = interf_base + age_interf * age_group + setsize_interf * level
+        interf = max(0.0, min(1.0, interf))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy via sharp softmax of WM distribution
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy-based arbitration (certainty)
+            H = -np.sum(W_s * np.log(W_s + eps))
+            H_norm = H / np.log(nA)
+            wm_weight_t = max(0.0, min(1.0, 1.0 - H_norm))
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: reinforce on reward then apply interference blur toward uniform
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_eta) * w[s, :] + wm_eta * onehot
+            else:
+                # mild relaxation when no reward
+                relax = 0.25 * wm_eta
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+            # Apply interference blur (within-state confusion)
+            w[s, :] = (1.0 - interf) * w[s, :] + interf * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

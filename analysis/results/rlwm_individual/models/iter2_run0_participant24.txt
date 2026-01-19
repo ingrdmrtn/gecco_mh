@@ -1,0 +1,327 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-based arbitration and set-size bias.
+
+    Policy:
+    - RL system: softmax over Q-values with inverse temperature softmax_beta (scaled by 10).
+    - WM system: softmax over W with deterministic temperature (50).
+    - Arbitration: weight depends on (a) a base bias that decreases with set size and (b) WM certainty
+      (1 - normalized entropy of WM policy). p = w_eff * p_wm + (1 - w_eff) * p_rl.
+
+    WM mechanisms:
+    - Per-trial passive decay toward uniform with wm_decay.
+    - Reward-driven strengthening of the chosen action via wm_learn and proportional suppression of others.
+
+    Parameters:
+    - lr: RL learning rate for Q updates.
+    - wm_weight0: base arbitration bias at set size 3 (in logit units).
+    - softmax_beta: RL inverse temperature (rescaled by 10 in the code).
+    - wm_learn: WM learning rate when reward is received (potentiates chosen action).
+    - wm_decay: WM passive decay rate toward uniform on each trial.
+    - arbitration_slope: how much the arbitration bias decreases as set size increases from 3 to 6.
+
+    Set-size effect:
+    - Effective arbitration weight increases when set size is small via:
+      base = sigmoid(wm_weight0 + arbitration_slope * (3 - nS)/3).
+      Effective weight is base multiplied by WM certainty (1 - entropy/log(nA)), so larger nS
+      typically lowers WM precision and arbitration weight.
+    
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight0, softmax_beta, wm_learn, wm_decay, arbitration_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Base arbitration bias with set-size adjustment (in logit space -> sigmoid)
+        base_bias = wm_weight0 + arbitration_slope * (3.0 - float(nS)) / 3.0
+        base_weight = 1.0 / (1.0 + np.exp(-base_bias))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax over W
+            logits_wm = softmax_beta_wm * W_s
+            logits_wm -= np.max(logits_wm)
+            exp_wm = np.exp(logits_wm)
+            pvec_wm = exp_wm / np.sum(exp_wm)
+            p_wm = pvec_wm[a]
+
+            # WM certainty via entropy (normalized by log(nA))
+            entropy = -np.sum(pvec_wm * (np.log(pvec_wm + 1e-12)))
+            H_norm = entropy / np.log(nA)
+            wm_certainty = 1.0 - H_norm
+
+            # Effective arbitration weight
+            w_eff = np.clip(base_weight * wm_certainty, 0.0, 1.0)
+
+            p_total = w_eff * p_wm + (1.0 - w_eff) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            # WM reward-based potentiation with normalization
+            if r > 0.0:
+                # Increase chosen action, proportionally reduce others
+                inc = wm_learn * (1.0 - w[s, a])
+                w[s, a] += inc
+                others = [aa for aa in range(nA) if aa != a]
+                if len(others) > 0:
+                    red = inc / len(others)
+                    for aa in others:
+                        w[s, aa] = max(0.0, w[s, aa] - red)
+                # Normalize to sum 1
+                w[s, :] = np.clip(w[s, :], 0.0, None)
+                w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM win-stay/lose-shift with set-size-dependent WM decay.
+
+    Policy:
+    - RL system: softmax over Q-values with inverse temperature softmax_beta (scaled by 10).
+    - WM system: softmax over W with deterministic temperature (50).
+    - Arbitration: convex combination p = wm_weight * p_wm + (1 - wm_weight) * p_rl.
+
+    WM mechanisms (WSLS):
+    - Passive decay towards uniform with a decay rate that increases with set size.
+    - Win-stay: after reward, shift probability mass to the chosen action by ws_win.
+    - Lose-shift: after no reward, shift mass away from the chosen action by ws_lose.
+
+    Parameters:
+    - lr: RL learning rate for Q updates.
+    - wm_weight: arbitration weight for WM.
+    - softmax_beta: RL inverse temperature (rescaled by 10).
+    - ws_win: strength of win-stay update in WM (0..1).
+    - ws_lose: strength of lose-shift update in WM (0..1).
+    - tau_wm: WM time constant controlling decay; effective decay increases with set size as
+      d_eff = 1 - exp(-(nS/3)/tau_wm).
+
+    Set-size effect:
+    - Larger set sizes (nS=6) produce greater WM decay toward uniform via d_eff, weakening WM policy relative to RL.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, ws_win, ws_lose, tau_wm = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size dependent decay rate
+        d_eff = 1.0 - np.exp(-(float(nS) / 3.0) / max(1e-6, tau_wm))
+        d_eff = np.clip(d_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL softmax prob of chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM softmax prob of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - d_eff) * w[s, :] + d_eff * w_0[s, :]
+
+            # WSLS updates
+            if r > 0.0:
+                # Win-stay: move mass to chosen action
+                gain = ws_win * (1.0 - w[s, a])
+                w[s, a] += gain
+                others = [aa for aa in range(nA) if aa != a]
+                if len(others) > 0:
+                    loss = gain / len(others)
+                    for aa in others:
+                        w[s, aa] = max(0.0, w[s, aa] - loss)
+            else:
+                # Lose-shift: move mass from chosen action to others equally
+                loss = ws_lose * w[s, a]
+                w[s, a] = max(0.0, w[s, a] - loss)
+                others = [aa for aa in range(nA) if aa != a]
+                if len(others) > 0:
+                    gain = loss / len(others)
+                    for aa in others:
+                        w[s, aa] = min(1.0, w[s, aa] + gain)
+
+            # Normalize
+            w[s, :] = np.clip(w[s, :], 0.0, None)
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with set-size-dependent WM precision and Hebbian WM updates.
+
+    Policy:
+    - RL system: softmax over Q-values with inverse temperature softmax_beta (scaled by 10).
+    - WM system: softmax over W with precision (inverse temperature) that decreases with set size:
+        beta_wm_eff = max(1e-3, wm_beta3 * (3/nS) ** wm_beta_slope).
+    - Arbitration: convex combination using a base WM weight scaled by relative WM precision:
+        w_eff = sigmoid(wm_weight_base) * beta_wm_eff / (beta_wm_eff + softmax_beta).
+
+    WM mechanisms:
+    - Hebbian potentiation with reward: increases chosen association and redistributes from others.
+    - Anti-Hebbian with no reward: suppresses chosen association slightly and normalizes.
+
+    Parameters:
+    - lr: RL learning rate for Q updates.
+    - wm_weight_base: base arbitration bias (in logit units, converted via sigmoid).
+    - softmax_beta: RL inverse temperature (rescaled by 10).
+    - wm_beta3: WM precision parameter at set size 3.
+    - wm_beta_slope: exponent governing how WM precision scales with set size.
+    - hebb: Hebbian strength for WM updates (applied for both reward and no-reward cases).
+
+    Set-size effect:
+    - Larger set sizes reduce WM precision (lower beta_wm_eff), weakening WM's influence both in its
+      policy and in arbitration via w_eff.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, wm_beta3, wm_beta_slope, hebb = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # not used directly; WM precision is replaced by beta_wm_eff per set size
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM precision as a function of set size
+        beta_wm_eff = max(1e-3, float(wm_beta3) * (3.0 / float(nS)) ** float(wm_beta_slope))
+
+        # Arbitration scaling by relative precision
+        base_weight = 1.0 / (1.0 + np.exp(-wm_weight_base))
+        rel_prec = beta_wm_eff / (beta_wm_eff + softmax_beta)
+        w_eff_const = np.clip(base_weight * rel_prec, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy probability with set-size-dependent precision
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Arbitration
+            p_total = w_eff_const * p_wm + (1.0 - w_eff_const) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM Hebbian updates with normalization
+            if r > 0.0:
+                # Potentiate chosen, depress others proportionally
+                inc = hebb * (1.0 - w[s, a])
+                w[s, a] += inc
+                others = [aa for aa in range(nA) if aa != a]
+                if len(others) > 0:
+                    dec_each = inc / len(others)
+                    for aa in others:
+                        w[s, aa] = max(0.0, w[s, aa] - dec_each)
+            else:
+                # Anti-Hebbian: suppress chosen slightly and renormalize
+                dec = hebb * w[s, a]
+                w[s, a] = max(0.0, w[s, a] - dec)
+                others = [aa for aa in range(nA) if aa != a]
+                if len(others) > 0:
+                    inc_each = dec / len(others)
+                    for aa in others:
+                        w[s, aa] = min(1.0, w[s, aa] + inc_each)
+
+            # Normalize to preserve a valid distribution
+            w[s, :] = np.clip(w[s, :], 0.0, None)
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

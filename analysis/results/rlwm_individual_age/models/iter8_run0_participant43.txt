@@ -1,0 +1,382 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + confidence-gated WM mixture; WM refresh with age- and load-sensitive gating.
+
+    Mechanism
+    - Policy is a convex combination of RL softmax and WM softmax.
+    - RL uses standard TD update.
+    - WM stores a distribution over actions per state and is refreshed more strongly after rewarded trials.
+    - Arbitration: the WM weight is scaled by a confidence gate computed from the sharpness of the WM distribution
+      (max-minus-second-max). The gate must exceed a threshold; the effective threshold increases with age and load.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index at each trial, zero-based within each block.
+    actions : array-like of int
+        Chosen action at each trial (0..2).
+    rewards : array-like of int
+        Reward feedback (0/1).
+    blocks : array-like of int
+        Block index for each trial.
+    set_sizes : array-like of int
+        Set size (3 or 6) for the block of each trial.
+    age : array-like
+        Participant's age (repeated). Age group: 0=young (<=45), 1=old (>45).
+    model_parameters : list or array
+        [lr, wm_weight0, softmax_beta, conf_thresh, wm_refresh, age_conf_offset]
+        - lr: RL learning rate (0..1)
+        - wm_weight0: base mixture weight for WM (0..1)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - conf_thresh: confidence threshold for WM usage (higher = harder to use WM)
+        - wm_refresh: refresh strength of WM on each trial (0..1)
+        - age_conf_offset: additional threshold add-on for older adults (>=0)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight0, softmax_beta, conf_thresh, wm_refresh, age_conf_offset = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Base WM weight reduced under higher load
+        wm_w_block = np.clip(wm_weight0 * (1.0 if nS == 3 else 0.6), 0.0, 1.0)
+
+        # Age and load increase the WM confidence threshold
+        load_penalty = 0.0 if nS == 3 else 0.2
+        conf_threshold_eff = conf_thresh + age_conf_offset * age_group + load_penalty
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Q_center = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Q_center)
+            p_vec_rl /= np.sum(p_vec_rl)
+            p_rl = p_vec_rl[a]
+
+            # WM policy: softmax over WM weights
+            W_s = w[s, :].copy()
+            W_center = W_s - np.max(W_s)
+            p_vec_wm = np.exp(softmax_beta_wm * W_center)
+            p_vec_wm /= np.sum(p_vec_wm)
+            p_wm = p_vec_wm[a]
+
+            # Confidence gate from WM distribution sharpness (max - second max)
+            sorted_W = np.sort(W_s)
+            wm_sharpness = sorted_W[-1] - sorted_W[-2] if nA >= 2 else 0.0
+            # Smooth gate via sigmoid with fixed slope; threshold increases with age/load
+            gate = 1.0 / (1.0 + np.exp(-10.0 * (wm_sharpness - conf_threshold_eff)))
+
+            wm_w_eff = np.clip(wm_w_block * gate, 0.0, 1.0)
+
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: controlled refresh and decay
+            # Leak toward prior
+            w = (1.0 - (1.0 - wm_refresh)) * w + (1.0 - wm_refresh) * w_0  # simplifies to: w = wm_refresh*w + (1-wm_refresh)*w0
+
+            if r > 0.0:
+                # Rewarded: sharpen the chosen action by blending with a one-hot
+                one_hot = np.full(nA, 1e-6)
+                one_hot[a] = 1.0
+                one_hot /= np.sum(one_hot)
+                w[s, :] = wm_refresh * w[s, :] + (1.0 - wm_refresh) * one_hot
+            else:
+                # Unrewarded: slightly suppress the chosen action and renormalize
+                penalize = w[s, :].copy()
+                penalize[a] = max(penalize[a] * (1.0 - 0.5 * (1.0 - wm_refresh)), 1e-8)
+                penalize = np.maximum(penalize, 1e-12)
+                penalize /= np.sum(penalize)
+                w[s, :] = penalize
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with within-block meta-adaptation of learning rate and WM weight; meta-rates reduced by age and load.
+
+    Mechanism
+    - RL uses TD update; WM uses a one-shot encoding for rewarded outcomes with decay otherwise.
+    - Policy is a convex combination of RL softmax and WM softmax.
+    - Meta-learning: after each trial, adapt both RL learning rate and WM mixture weight.
+      * Learning rate lr moves toward the magnitude of the recent prediction error.
+      * WM mixture wm_w moves toward recent reward (higher reward encourages more WM reliance).
+    - Meta-learning rates are downscaled by set size (harder set) and further reduced in older adults.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of int
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like
+        Age group is derived: 0=young, 1=old.
+    model_parameters : list or array
+        [lr0, meta_lr, wm_weight0, meta_wm, softmax_beta, age_meta_boost]
+        - lr0: initial RL learning rate at block start (0..1)
+        - meta_lr: base meta-learning rate for adapting lr (0..1)
+        - wm_weight0: initial WM mixture weight at block start (0..1)
+        - meta_wm: base meta-learning rate for adapting wm_weight (0..1)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - age_meta_boost: factor that reduces meta-rates in older adults via 1/(1+age_meta_boost)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr0, meta_lr, wm_weight0, meta_wm, softmax_beta, age_meta_boost = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    # Age scaling for meta-updates: older -> slower adaptation
+    age_meta_scale = 1.0 / (1.0 + age_meta_boost * age_group)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Initialize adaptive parameters per block
+        lr = float(np.clip(lr0, 0.0, 1.0))
+        wm_w = float(np.clip(wm_weight0, 0.0, 1.0))
+
+        # Load scaling for meta-learning (harder load -> slower adaptation)
+        load_meta_scale = 1.0 if nS == 3 else 0.5
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Q_center = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Q_center)
+            p_vec_rl /= np.sum(p_vec_rl)
+            p_rl = p_vec_rl[a]
+
+            # WM policy
+            W_s = w[s, :].copy()
+            W_center = W_s - np.max(W_s)
+            p_vec_wm = np.exp(softmax_beta_wm * W_center)
+            p_vec_wm /= np.sum(p_vec_wm)
+            p_wm = p_vec_wm[a]
+
+            wm_w_eff = np.clip(wm_w, 0.0, 1.0)
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: decay toward uniform; reward installs a peaked distribution
+            w = 0.98 * w + 0.02 * w_0  # small continuous decay
+            if r > 0.0:
+                one_hot = np.full(nA, 1e-6)
+                one_hot[a] = 1.0
+                one_hot /= np.sum(one_hot)
+                w[s, :] = 0.5 * w[s, :] + 0.5 * one_hot
+
+            # Meta-adaptation of lr and wm_w
+            # Learning rate moves toward |PE|
+            meta_lr_eff = meta_lr * age_meta_scale * load_meta_scale
+            lr = np.clip(lr + meta_lr_eff * (abs(pe) - lr), 0.0, 1.0)
+
+            # WM mixture weight moves toward recent reward (reward -> rely more on WM next time)
+            meta_wm_eff = meta_wm * age_meta_scale * load_meta_scale
+            wm_w = np.clip(wm_w + meta_wm_eff * (r - wm_w), 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + win-stay/lose-shift working memory with age-by-load lapse.
+
+    Mechanism
+    - RL uses TD update and softmax policy.
+    - WM is a simple win-stay/lose-shift (WSLS) controller tracked per state:
+        * If last outcome in a state was rewarded, prefer repeating last action.
+        * If last outcome was a loss, prefer shifting away from last action.
+      The WM policy is converted to choice probabilities via a soft-argmax with parameter wsls_phi.
+    - Arbitration: convex combination of RL and WSLS policies.
+    - Additionally, there is a lapse process that grows with set size and is amplified in older adults.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of int
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like
+        Age group is derived: 0=young, 1=old.
+    model_parameters : list or array
+        [lr, wm_weight, softmax_beta, wsls_phi, lapse_base, age_load_interact]
+        - lr: RL learning rate (0..1)
+        - wm_weight: mixture weight for WSLS WM in the policy (0..1)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - wsls_phi: determinism of WSLS preference (higher -> more deterministic)
+        - lapse_base: baseline lapse rate (0..1)
+        - age_load_interact: multiplicative lapse increase for older adults with load
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, wsls_phi, lapse_base, age_load_interact = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0  # not used directly; placeholder to align with template
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))   # ancillary WM map for compatibility; updated to reflect WSLS memory
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Per-state last action and last outcome memory for WSLS
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_rew = -1 * np.ones(nS, dtype=int)  # -1 unknown, 0 loss, 1 win
+
+        # Effective WM weight reduced in larger set size
+        wm_w_block = np.clip(wm_weight * (1.0 if nS == 3 else 0.6), 0.0, 1.0)
+
+        # Lapse increases with load and with age
+        load_scale = 1.0 if nS == 3 else 1.5
+        lapse = np.clip(lapse_base * load_scale * (1.0 + age_group * age_load_interact), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Q_center = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Q_center)
+            p_vec_rl /= np.sum(p_vec_rl)
+
+            # WSLS WM policy
+            pref = np.zeros(nA)
+            if last_action[s] >= 0 and last_rew[s] >= 0:
+                la = int(last_action[s])
+                if last_rew[s] == 1:
+                    # Win: prefer staying
+                    pref[:] = 0.0
+                    pref[la] = 1.0
+                else:
+                    # Loss: prefer shifting away from last action
+                    pref[:] = 1.0
+                    pref[la] = 0.0
+            else:
+                # No memory yet: uniform
+                pref[:] = 1.0
+
+            # Convert WSLS preferences to probabilities with soft-argmax
+            pref_center = pref - np.max(pref)
+            p_vec_wm = np.exp(wsls_phi * pref_center)
+            p_vec_wm /= np.sum(p_vec_wm)
+
+            # Mixture before lapse
+            p_mix = wm_w_block * p_vec_wm + (1.0 - wm_w_block) * p_vec_rl
+            # Apply lapse to uniform
+            p_total_vec = (1.0 - lapse) * p_mix + lapse * (np.ones(nA) / nA)
+            p_total = p_total_vec[a]
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM "update": maintain WSLS memory and a shadow w map
+            last_action[s] = a
+            last_rew[s] = int(r)
+
+            # Update w to reflect WSLS memory for template consistency
+            w = 0.99 * w + 0.01 * w_0
+            if r > 0.0:
+                one_hot = np.full(nA, 1e-6)
+                one_hot[a] = 1.0
+                one_hot /= np.sum(one_hot)
+                w[s, :] = 0.5 * w[s, :] + 0.5 * one_hot
+            else:
+                # After a loss, flatten the chosen action slightly
+                row = w[s, :].copy()
+                row[a] = max(row[a] * 0.7, 1e-8)
+                row = np.maximum(row, 1e-12)
+                row /= np.sum(row)
+                w[s, :] = row
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)

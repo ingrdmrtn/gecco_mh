@@ -1,0 +1,286 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with binding errors (set-size and age dependent) and RL eligibility traces.
+
+    Mechanism
+    - RL: tabular Q-learning with eligibility trace lambda that generalizes updates within a block.
+    - WM: one-shot storage of rewarded action per state, but subject to binding errors that
+      increase with set size and are exacerbated by age. Binding errors mix the intended state's
+      WM with an average over other states, reducing WM precision in larger sets and for older adults.
+    - Policy: mixture of RL softmax and WM softmax. WM softmax uses a high inverse temperature.
+
+    Parameters (model_parameters; total 6)
+    0) lr: RL learning rate (0..1)
+    1) wm_weight_base: base mixture weight for WM contribution (0..1)
+    2) beta_base: base RL inverse temperature; internally scaled by 10
+    3) bind_error_base: base probability of a WM binding error at set size 3 (0..1)
+    4) age_bind_shift: additive shift to binding error for age_group=1 (older); 0 for younger
+    5) trace_lambda: eligibility trace parameter (0..1); higher spreads updates across actions
+
+    Age coding
+    - age_group = 0 for <=45 (younger), 1 for >45 (older)
+      Binding error increases by age_bind_shift for older group.
+
+    Set-size effects
+    - Binding error increases linearly with (set_size - 3): be = clip(bind_error_base + k*(nS-3) + age_shift, 0, 1)
+      where k = 0.15. This reduces the quality of WM retrieval in larger set sizes.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_base, beta_base, bind_error_base, age_bind_shift, trace_lambda = model_parameters
+    softmax_beta = beta_base * 10.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Binding error increases with set size and age
+        be = bind_error_base + 0.15 * max(0, nS - 3) + (age_bind_shift if age_group == 1 else 0.0)
+        be = min(max(be, 0.0), 1.0)
+
+        # Effective WM weight scales with reduced fidelity due to binding errors
+        wm_weight = wm_weight_base * (1.0 - be)
+        wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+        # Policies
+        beta_wm = 50.0  # near-deterministic WM choice, as in template
+
+        # Value stores
+        q = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM table
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+
+            # RL policy: chosen-action probability under softmax
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with binding error:
+            # mix the current state's WM vector with the average of other states
+            W_s_true = w[s, :]
+            if nS > 1:
+                other_idx = [i for i in range(nS) if i != s]
+                W_other_mean = np.mean(w[other_idx, :], axis=0)
+            else:
+                W_other_mean = (1.0 / nA) * np.ones(nA)
+            W_eff = (1.0 - be) * W_s_true + be * W_other_mean
+
+            p_wm = 1.0 / np.sum(np.exp(beta_wm * (W_eff - W_eff[a])))
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility trace on action in state s only (tabular per-state actions)
+            # increase trace for chosen (s,a); decay all traces
+            e *= trace_lambda
+            e[s, :] *= 0.0
+            e[s, a] = 1.0
+
+            delta = r - Q_s[a]
+            q += lr * delta * e
+
+            # WM updating: store one-shot on reward, otherwise slight diffusion to uniform
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                # mild diffusion toward uniform to reflect uncertainty after errors
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with age-dependent negative learning and WM confidence decaying with set size.
+
+    Mechanism
+    - RL: separate positive and negative learning rates, where the negative learning rate
+      is scaled by age (older adults show increased sensitivity to negative feedback if age_lr_asym > 0).
+    - WM: maintains last rewarded action per state; its confidence decays as set size increases.
+      WM policy uses a softmax with its own beta. The mixture weight is proportional to the
+      current WM confidence for the block's set size.
+    - Policy: mixture of RL and WM softmax.
+
+    Parameters (model_parameters; total 6)
+    0) lr_pos: RL learning rate for positive RPEs (0..1)
+    1) age_lr_asym: multiplier applied to lr_pos to get lr_neg in older group:
+       lr_neg = lr_pos * (1 + age_lr_asym * age_group)
+    2) beta_base: base RL inverse temperature (scaled by 10 internally)
+    3) wm_beta: WM inverse temperature (softmax precision for WM)
+    4) wm_init_conf: base WM confidence at set size 3 (0..1); also sets mixture scale
+    5) size_decay_gain: how much set size reduces WM confidence (>0)
+
+    Age coding
+    - age_group = 0 (younger) or 1 (older). Only lr_neg changes with age.
+
+    Set-size effects
+    - WM confidence d(nS) = wm_init_conf / (1 + size_decay_gain * (nS - 3))
+      used both to attenuate WM policy via mixture weight and to pre-trially shrink WM vectors.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, age_lr_asym, beta_base, wm_beta, wm_init_conf, size_decay_gain = model_parameters
+    softmax_beta = beta_base * 10.0
+    age_group = 0 if age[0] <= 45 else 1
+    lr_neg = lr_pos * (1.0 + age_lr_asym * age_group)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Set-size dependent WM confidence and mixture weight
+        decay_factor = 1.0 / (1.0 + size_decay_gain * max(0, nS - 3))
+        wm_conf = np.clip(wm_init_conf * decay_factor, 0.0, 1.0)
+        wm_weight = wm_conf
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Pre-trial WM weakening with set-size: shrink W_s toward uniform
+            w[s, :] = (1.0 - (1.0 - decay_factor) * 0.5) * w[s, :] + ((1.0 - decay_factor) * 0.5) * (1.0 / nA)
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with valence-specific learning rates
+            delta = r - Q_s[a]
+            alpha = lr_pos if delta >= 0.0 else lr_neg
+            q[s, a] += alpha * delta
+
+            # WM update: store one-shot if rewarded; else slight diffusion
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with surprise-triggered WM gating and age/set-size dependent threshold.
+
+    Mechanism
+    - RL: standard Q-learning with softmax choice.
+    - WM: stores the action only when a reward occurs AND the unsigned prediction error exceeds
+      a gating threshold (surprise). The threshold increases with set size (harder to gate WM under load)
+      and with age (for older group if age_thresh_shift > 0). Retrieval uses near-deterministic WM softmax.
+    - Policy: mixture of RL and WM with a base wm_weight.
+
+    Parameters (model_parameters; total 6)
+    0) lr: RL learning rate (0..1)
+    1) beta_base: RL inverse temperature base, scaled by 10 internally
+    2) wm_weight_base: base mixture weight for WM (0..1)
+    3) pe_threshold_base: base PE threshold for WM gating at set size 3 (>=0)
+    4) size_thresh_gain: increases threshold with set size: thr = base * (1 + size_thresh_gain*(nS-3))
+    5) age_thresh_shift: additive shift for older adults (age_group=1), 0 for younger
+
+    Age coding
+    - age_group = 0 (younger), 1 (older). Threshold is higher by age_thresh_shift for older.
+
+    Set-size effects
+    - Threshold grows with set size, making WM updates rarer in larger sets.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_weight_base, pe_threshold_base, size_thresh_gain, age_thresh_shift = model_parameters
+    softmax_beta = beta_base * 10.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        beta_wm = 50.0  # deterministic WM policy
+        wm_weight = wm_weight_base
+
+        # Surprise threshold adjusted by set size and age
+        thr = pe_threshold_base * (1.0 + size_thresh_gain * max(0, nS - 3)) + (age_thresh_shift if age_group == 1 else 0.0)
+        thr = max(0.0, thr)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # Surprise-triggered WM gating: store only if r>0 and |delta| >= thr
+            if (r > 0.0) and (abs(delta) >= thr):
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                # No update; optional mild decay toward uniform to prevent overcommitment without evidence
+                w[s, :] = 0.98 * w[s, :] + 0.02 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,339 @@
+Below are three standalone cognitive models tailored for the RL-WM task. Each adheres to the provided template: it mixes an RL softmax policy with a WM policy via wm_weight, and it updates both RL values and WM contents. All parameters are used, with up to 6 per model. Set-size effects are explicitly incorporated as noted in each docstring.
+
+Note: Assume numpy as np is already imported. Each function returns the negative log-likelihood of the observed choices.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with value forgetting + WM with capacity-dependent precision.
+
+    Mechanism
+    - RL: Q-learning with global forgetting toward uniform values (decay_rl), which can impair retention in longer blocks.
+    - WM: maintains a distribution over actions per state. When rewarded, it updates toward a one-hot on the chosen action
+      with precision that degrades with set size. Otherwise, it decays toward uniform. WM is queried via a near-deterministic
+      softmax. Arbitration uses fixed wm_weight.
+
+    Set-size dependence
+    - WM precision (how strongly WM moves to a one-hot when rewarded) decreases with set size:
+        precision = wm_precision_base / (1 + size_slope * (nS - 3))
+      Thus precision is highest for set size 3 and lower for set size 6.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr : float
+            RL learning rate (0..1).
+        wm_weight : float
+            Arbitration weight for WM (0..1).
+        softmax_beta : float
+            Inverse temperature for RL (scaled internally by 10).
+        decay_rl : float
+            RL forgetting rate toward uniform (0..1) applied each trial.
+        wm_precision_base : float
+            Baseline strength of WM update toward one-hot on rewarded trials (0..1).
+        size_slope : float
+            Slope controlling how WM precision decreases with larger set sizes (>=0).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, decay_rl, wm_precision_base, size_slope = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # WM precision declines with set size
+        precision = wm_precision_base / (1.0 + size_slope * max(0, nS - 3))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform each trial
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+            # Global forgetting (toward uniform baseline)
+            q = (1.0 - decay_rl) * q + decay_rl * (1.0 / nA)
+
+            # WM update:
+            # - Rewarded: move distribution toward one-hot on chosen action with size-dependent precision.
+            # - Unrewarded: decay toward uniform.
+            if r > 0.5:
+                target = tiny * np.ones(nA)
+                target[a] = 1.0
+                # Convex combination toward the target with strength = precision
+                w[s, :] = (1.0 - precision) * w[s, :] + precision * target
+            else:
+                # Decay WM toward uniform baseline
+                decay_wm = 0.2  # fixed small decay per trial
+                w[s, :] = (1.0 - decay_wm) * w[s, :] + decay_wm * w_0[s, :]
+
+            # Renormalize
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning (stronger update for negative PEs) + UCB exploration bonus + gated WM updating scaled by set size.
+
+    Mechanism
+    - RL: Q-learning with a single base learning rate (lr) and an asymmetry parameter (kappa_neg) that amplifies
+      the learning rate when prediction errors are negative (punishment-sensitive learning).
+    - Exploration: UCB-style bonus added to RL logits based on 1/sqrt(visit count), scaled by beta_bonus.
+    - WM: when rewarded, WM is updated toward the chosen action with a gating strength that scales down with set size;
+      when unrewarded, WM partially decays toward uniform.
+    - Arbitration: fixed wm_weight mixture.
+
+    Set-size dependence
+    - WM gating strength scales as wm_gate_strength / nS, making WM updates weaker in set size 6 than 3.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr : float
+            Base RL learning rate (0..1).
+        wm_weight : float
+            Arbitration weight for WM (0..1).
+        softmax_beta : float
+            Inverse temperature for RL (scaled internally by 10).
+        kappa_neg : float
+            Multiplier (> -1) that scales learning for negative PEs: lr_neg = lr * (1 + kappa_neg).
+        beta_bonus : float
+            Weight of UCB exploration bonus added to RL logits (>=0).
+        wm_gate_strength : float
+            Base WM update strength on rewarded trials before set-size scaling (0..1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, kappa_neg, beta_bonus, wm_gate_strength = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Visit counts for UCB bonus
+        n_sa = np.zeros((nS, nA))
+
+        # Set-size-scaled WM gate
+        gate = wm_gate_strength / max(1, nS)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with UCB exploration bonus
+            Q_s = q[s, :].copy()
+            bonus = beta_bonus / np.sqrt(n_sa[s, :] + 1.0)
+            Q_aug = Q_s + bonus
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_aug - Q_aug[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rate
+            delta = r - q[s, a]
+            lr_eff = lr if delta >= 0 else lr * (1.0 + kappa_neg)
+            lr_eff = np.clip(lr_eff, 0.0, 1.0)
+            q[s, a] += lr_eff * delta
+
+            # WM update:
+            # - On reward: move toward one-hot with strength 'gate'
+            # - On no reward: partial decay toward uniform
+            if r > 0.5:
+                target = tiny * np.ones(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - gate) * w[s, :] + gate * target
+            else:
+                decay_wm = 0.1
+                w[s, :] = (1.0 - decay_wm) * w[s, :] + decay_wm * w_0[s, :]
+
+            # Renormalize WM row
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+            # Update visit counts
+            n_sa[s, a] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with surprise-modulated learning + WM with set-size-dependent interference + lapse.
+
+    Mechanism
+    - RL: learning rate is dynamically modulated by unsigned prediction error magnitude
+      (surprise). lr_t = clip(lr_base + surprise_gain * |delta|, 0..1).
+    - WM: when rewarded, sets a peaked distribution on the chosen action, but suffers interference
+      proportional to set size that mixes the WM distribution with uniform after each update.
+    - Lapse: with probability 'lapse', the final choice is random (uniform), regardless of RL/WM.
+
+    Set-size dependence
+    - WM interference increases linearly with nS: eff_interf = clip(wm_interference * (nS / 3), 0..0.99).
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        lr_base : float
+            Base RL learning rate (0..1).
+        wm_weight : float
+            Arbitration weight for WM (0..1).
+        softmax_beta : float
+            Inverse temperature for RL (scaled internally by 10).
+        surprise_gain : float
+            Positive factor scaling learning rate with |delta| (>=0).
+        wm_interference : float
+            Base WM interference level mixed with uniform; effective interference scales with set size (0..1).
+        lapse : float
+            Lapse rate; probability of random choice, mixed at the final policy stage (0..1).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr_base, wm_weight, softmax_beta, surprise_gain, wm_interference, lapse = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    tiny = 1e-12
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size-scaled WM interference
+        eff_interf = np.clip(wm_interference * (nS / 3.0), 0.0, 0.99)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with interference applied to current WM row
+            W_s_clean = w[s, :]
+            W_s = (1.0 - eff_interf) * W_s_clean + eff_interf * w_0[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            # Lapse mixing with uniform
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = max(p_total, tiny)
+            log_p += np.log(p_total)
+
+            # RL update with surprise-modulated learning rate
+            delta = r - q[s, a]
+            lr_t = lr_base + surprise_gain * abs(delta)
+            lr_t = np.clip(lr_t, 0.0, 1.0)
+            q[s, a] += lr_t * delta
+
+            # WM update:
+            # - Rewarded: set a peaked distribution on chosen action
+            # - Unrewarded: decay slightly toward uniform
+            if r > 0.5:
+                w[s, :] = tiny * np.ones(nA)
+                w[s, a] = 1.0
+            else:
+                decay_wm = 0.1
+                w[s, :] = (1.0 - decay_wm) * w[s, :] + decay_wm * w_0[s, :]
+
+            # Apply interference to stored WM after update (to reflect ongoing load)
+            w[s, :] = (1.0 - eff_interf) * w[s, :] + eff_interf * w_0[s, :]
+
+            # Renormalize
+            w[s, :] = np.maximum(w[s, :], tiny)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on how set size may impact parameters in these models:
+- Model 1: WM precision explicitly decreases with set size (via size_slope), impairing WM in larger sets; RL forgetting is global and not set-size dependent here.
+- Model 2: WM gate strength is divided by nS, making WM learning weaker at larger set sizes; UCB bonus does not directly depend on set size but naturally encourages exploration of under-sampled pairs (which are more prevalent in larger sets).
+- Model 3: WM interference scales with nS, degrading WM fidelity more for larger sets; surprise-driven RL adapts its learning rate by trialwise surprise, independent of set size.

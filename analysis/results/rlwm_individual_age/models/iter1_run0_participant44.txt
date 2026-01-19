@@ -1,0 +1,283 @@
+Below are three standalone cognitive models that implement hybrid Reinforcement Learning + Working Memory (RL+WM) accounts tailored to the rlwm task. Each function:
+
+- Takes inputs: states, actions, rewards, blocks, set_sizes, age, model_parameters
+- Uses age group (0=younger, 1=older) meaningfully
+- Combines an RL softmax with a WM softmax via a mixture weight
+- Updates RL via delta-rule and WM via a capacity-limited, decaying memory
+- Returns the negative log-likelihood of the observed choices
+- Uses all provided parameters (≤ 6 per model)
+
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL+WM mixture with WM capacity/decay, size- and age-dependent WM weight.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - wm_weight_base: base WM mixture weight before adjustments (0..1)
+    - softmax_beta: inverse temperature for RL policy (>0); internally scaled
+    - wm_decay: how fast WM decays toward uniform on each trial (0..1)
+    - kappa_size: sensitivity of WM weight to set size; larger => stronger reduction at set size 6
+    - age_wm_bias: proportional reduction of WM weight for older adults (0..1)
+
+    Mechanism:
+    - RL: Q-learning with delta rule.
+    - WM: stimulus-action table that decays toward uniform each trial; on reward, encodes a one-hot preference for the rewarded action.
+    - Policy: p_total = wm_weight * p_wm + (1 - wm_weight) * p_rl
+      where wm_weight = clip(wm_weight_base * exp(-kappa_size*(nS-3)) * (1 - age_group * age_wm_bias), [0,1])
+    - Set size reduces WM influence exponentially; older age reduces WM influence multiplicatively.
+    """
+    lr, wm_weight_base, softmax_beta, wm_decay, kappa_size, age_wm_bias = model_parameters
+    softmax_beta *= 10.0  # match template scaling
+    softmax_beta_wm = 50.0  # near-deterministic WM policy
+
+    # Age group coding: 0=young, 1=old
+    age_group = 0 if age[0] <= 45 else 1
+
+    total_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM values
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy probability of chosen action
+            Qs = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy probability of chosen action
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # WM mixture weight depends on set size and age
+            size_penalty = np.exp(-kappa_size * (nS - 3.0))
+            age_penalty = (1.0 - age_group * age_wm_bias)
+            wm_weight = wm_weight_base * size_penalty * age_penalty
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Qs[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_uniform[s, :]
+
+            # WM encoding on rewarded trials: set a strong one-hot preference
+            if r > 0:
+                w[s, :] = w_uniform[s, :].copy()
+                w[s, a] = 1.0  # one-hot
+                # renormalize softly to keep numeric stability
+                w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning rates + perseveration, mixed with WM that stores last-correct mapping.
+    WM influence decreases with set size; age increases exploration and reduces WM reliance.
+
+    Parameters (model_parameters):
+    - alpha_pos: RL learning rate for positive prediction errors (0..1)
+    - alpha_neg: RL learning rate for negative prediction errors (0..1)
+    - softmax_beta_base: base inverse temperature for RL; internally scaled
+    - perseveration: choice stickiness (added to chosen action value in RL policy), can be +/-; older -> more stickiness effect
+    - wm_weight_base: base WM mixture weight (0..1)
+    - age_beta_shift: reduces inverse temperature for older adults (>=0)
+
+    Mechanism:
+    - RL: Q-learning with separate alphas for gains/losses; choice perseveration bias added to softmax via last choice.
+    - WM: on reward, store a one-hot association for the stimulus; decays minimally via normalization when overwritten.
+    - Policy: p_total = wm_weight * p_wm + (1 - wm_weight) * p_rl
+      with wm_weight = wm_weight_base / (1 + np.exp((nS - 3)))  [drops at size 6]
+      RL beta adjusted by age: beta = (softmax_beta_base*10) / (1 + age_group*age_beta_shift)
+      Perseveration applies only to RL policy and is stronger in older adults via the same division of beta.
+    """
+    alpha_pos, alpha_neg, softmax_beta_base, perseveration, wm_weight_base, age_beta_shift = model_parameters
+    beta_base = softmax_beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    # Reduce effective beta for older adults (more exploration)
+    beta = beta_base / (1.0 + age_group * max(age_beta_shift, 0.0))
+    softmax_beta_wm = 50.0
+
+    total_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        last_choice = None  # for perseveration
+
+        # WM mixture weight decreases with set size
+        wm_weight = wm_weight_base / (1.0 + np.exp(nS - 3.0))
+        wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy with perseveration (stickiness)
+            Qs = q[s, :].copy()
+            if last_choice is not None:
+                stick = np.zeros_like(Qs)
+                stick[last_choice] += perseveration
+                Qs = Qs + stick
+
+            denom_rl = np.sum(np.exp(beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric alphas
+            pe = r - q[s, a]
+            alpha = alpha_pos if pe >= 0 else alpha_neg
+            q[s, a] += alpha * pe
+
+            # WM update: encode rewarded mapping, otherwise leave as is
+            if r > 0:
+                w[s, :] = w_uniform[s, :].copy()
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+
+            # update last choice for perseveration
+            last_choice = a
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with value decay and WM gating by surprise; WM weight depends on set size and recent success.
+    Older age reduces RL learning and increases value decay (forgetting), also reduces WM weight sensitivity.
+
+    Parameters (model_parameters):
+    - lr_base: base RL learning rate (0..1)
+    - softmax_beta: inverse temperature for RL (>0); internally scaled
+    - rl_decay: decay of Q-values toward uniform each trial (0..1)
+    - wm_gate: scales WM engagement by surprise (|PE|); higher => more WM use when surprising rewards occur
+    - age_lr_scale: multiplicative factor reducing lr for older adults (0..1); effective lr = lr_base*(1 - age_group*age_lr_scale)
+    - kappa_size: reduces WM weight as set size increases
+
+    Mechanism:
+    - RL: Q-learning with learning rate reduced for older adults; Q-values decay toward uniform each trial by rl_decay (older -> relatively more forgetting because lr reduced).
+    - WM: decays toward uniform each trial; on reward, sets one-hot mapping.
+    - Surprise-driven WM mixture: wm_weight_t = base_size_weight * sigmoid(wm_gate * |PE_t|), where base_size_weight = exp(-kappa_size*(nS-3)).
+      Older adults have lower effective lr, thus smaller PEs on average and lower WM engagement.
+    - Policy: p_total = wm_weight_t * p_wm + (1 - wm_weight_t) * p_rl
+    """
+    lr_base, softmax_beta, rl_decay, wm_gate, age_lr_scale, kappa_size = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    lr = lr_base * (1.0 - age_group * max(age_lr_scale, 0.0))
+    lr = max(min(lr, 1.0), 0.0)
+
+    total_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        # Base WM weight from set size
+        base_size_weight = np.exp(-kappa_size * (nS - 3.0))
+        base_size_weight = min(max(base_size_weight, 0.0), 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy
+            Qs = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Surprise-driven WM mixture weight
+            pe = r - q[s, a]
+            wm_from_surprise = 1.0 / (1.0 + np.exp(-wm_gate * np.abs(pe)))
+            wm_weight = base_size_weight * wm_from_surprise
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with decay toward uniform
+            q[s, :] = (1.0 - rl_decay) * q[s, :] + rl_decay * w_uniform[s, :]
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM decay toward uniform and encoding on reward
+            w[s, :] = 0.9 * w[s, :] + 0.1 * w_uniform[s, :]  # mild decay each trial
+            if r > 0:
+                w[s, :] = w_uniform[s, :].copy()
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+Notes on age and set size impacts:
+- Model 1: WM weight is multiplicatively reduced by age (age_wm_bias) and by set size (kappa_size). Older adults and larger set sizes both reduce WM reliance.
+- Model 2: Older adults have lower inverse temperature (more exploration) via age_beta_shift, and the WM contribution is smaller for larger set sizes through a logistic down-weight. Perseveration affects RL choice tendencies.
+- Model 3: Older adults have reduced learning rate (age_lr_scale), which indirectly reduces surprise-driven WM engagement. Set size reduces the base WM weight via kappa_size. RL includes value decay (rl_decay), capturing age-related forgetting tendencies.

@@ -1,0 +1,291 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + gated WM encoding under load.
+
+    Policy:
+    - RL system: softmax over Q with inverse temperature softmax_beta (scaled by 10).
+    - WM system: softmax over W with high determinism (fixed 50).
+    - Arbitration: convex mixture with wm_weight.
+
+    RL mechanisms:
+    - Eligibility traces (replacing): an eligibility matrix e decays by lambda_trace each trial;
+      the chosen state-action gets eligibility 1; Q updates proportionally to e.
+      This captures multi-step credit assignment and faster consolidation.
+
+    WM mechanisms:
+    - Gated encoding: expected encoding strength is a sigmoid in set size:
+        p_store = sigmoid(g0 + g1 * (nS - 4.5))
+      Larger sets reduce encoding when g1 < 0.
+    - Reward-contingent overwrite toward the chosen action's one-hot:
+        W_s <- (1 - r*p_store) * W_s + r*p_store * one_hot(a)
+      Noisy outcomes (r = 0) produce no encoding.
+
+    Parameters:
+    - lr: Base RL learning rate (0..1).
+    - wm_weight: Arbitration weight on WM (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - lambda_trace: Eligibility trace decay (0..1), higher = longer memory trace.
+    - g0: WM gate baseline (real, mapped via sigmoid).
+    - g1: WM gate sensitivity to set size (real, mapped via sigmoid); negative values reduce encoding at nS=6.
+
+    Set-size effect:
+    - WM encoding probability p_store depends on set size via g1.
+    """
+    lr, wm_weight, softmax_beta, lambda_trace, g0, g1 = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+
+        # Gate as a function of set size (constant within block)
+        p_store = 1.0 / (1.0 + np.exp(-(g0 + g1 * (nS - 4.5))))
+        p_store = np.clip(p_store, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Policy evaluation
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            pe = r - Q_s[a]
+            e *= lambda_trace
+            e[s, :] = 0.0
+            e[s, a] = 1.0
+            q += lr * pe * e
+
+            # WM update: reward-gated overwrite toward one-hot
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - p_store) * w[s, :] + p_store * target
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with Pearce-Hall attention on learning rate + WM retrieval failures under load.
+
+    Policy:
+    - RL: softmax over Q with softmax_beta (scaled by 10).
+    - WM: softmax over W with fixed high inverse temperature (50).
+    - Arbitration: convex mixture with wm_weight; the WM policy itself is diluted by retrieval failures.
+
+    RL mechanisms:
+    - State-action-specific attention a(s,a) updated by prediction error magnitude:
+        a <- (1 - rho_attn) * a + rho_attn * |PE|
+      Effective learning rate: lr_eff = lr_base * (eps + attn_gain * a), clipped to [0,1].
+      This yields rapid learning after surprising outcomes and slower updates otherwise.
+
+    WM mechanisms:
+    - Retrieval failure probability increases with set size:
+        p_retrieve = (3 / nS) ** eta_load
+      The effective WM policy becomes:
+        p_wm_eff = p_retrieve * p_wm + (1 - p_retrieve) * (1/3)
+    - Passive decay toward uniform at a small fixed rate each trial (0.05).
+    - Reward-contingent storage: when r=1, W_s moves toward one-hot(a) with step size lr_base.
+
+    Parameters:
+    - lr_base: Base RL learning rate (0..1), also used as WM encoding step size.
+    - wm_weight: Arbitration weight on WM (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - rho_attn: Attention update rate (0..1).
+    - attn_gain: Scales the influence of attention on lr_eff (>0).
+    - eta_load: Load sensitivity for WM retrieval; larger => stronger drop from 3->6.
+
+    Set-size effect:
+    - WM retrieval probability p_retrieve decreases with set size via eta_load.
+    """
+    lr_base, wm_weight, softmax_beta, rho_attn, attn_gain, eta_load = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    rho_attn = np.clip(rho_attn, 0.0, 1.0)
+    attn_gain = max(0.0, attn_gain)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        attn = np.zeros((nS, nA))  # Pearce-Hall attention
+
+        # WM retrieval probability given set size
+        p_retrieve = (3.0 / float(nS)) ** float(eta_load)
+        p_retrieve = np.clip(p_retrieve, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm_core = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm_eff = p_retrieve * p_wm_core + (1.0 - p_retrieve) * (1.0 / nA)
+
+            p_total = wm_weight * p_wm_eff + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with attention-modulated learning rate
+            pe = r - Q_s[a]
+            attn[s, a] = (1.0 - rho_attn) * attn[s, a] + rho_attn * abs(pe)
+            lr_eff = lr_base * (1e-3 + attn_gain * attn[s, a])
+            lr_eff = np.clip(lr_eff, 0.0, 1.0)
+            q[s, a] += lr_eff * pe
+
+            # WM passive decay
+            w = (1.0 - 0.05) * w + 0.05 * w_0
+            # Reward-contingent WM encoding
+            if r > 0.0:
+                step = np.clip(lr_base, 0.0, 1.0)
+                w[s, :] = (1.0 - step) * w[s, :]
+                w[s, a] += step
+                w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with count-based exploration bonus + WM binding errors under load.
+
+    Policy:
+    - RL: softmax over augmented values Q_aug = Q + bonus_weight * U,
+      where U(s,a) = 1 / sqrt(N(s,a) + 1) is a novelty bonus; inverse temperature softmax_beta (scaled by 10).
+    - WM: softmax over a load-distorted memory W_eff with fixed high inverse temperature (50).
+    - Arbitration: convex mixture with wm_weight.
+
+    RL mechanisms:
+    - Standard delta rule update of Q with learning rate lr.
+    - Count-based exploration: action values are augmented by a recency-based bonus inversely proportional
+      to the square root of visit counts; the bonus weight increases with set size:
+        bonus_weight = bonus_base + bonus_slope * (nS - 3) / 3
+
+    WM mechanisms:
+    - Binding/interference error across states increases with set size:
+        bind_err = clip(bind_base * (nS - 3) / 3, 0, 1)
+      Effective memory used for policy blends other states' associations:
+        W_eff[s] = (1 - bind_err) * W[s] + bind_err * mean_{s' != s} W[s']
+    - Reward-contingent strengthening toward one-hot(a) with step size lr.
+
+    Parameters:
+    - lr: Learning rate for RL updates and WM strengthening (0..1).
+    - wm_weight: Arbitration weight on WM (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - bonus_base: Baseline weight of the exploration bonus (>=0).
+    - bonus_slope: Change in bonus weight from set size 3 to 6.
+    - bind_base: Load sensitivity for WM binding errors (>=0), scaled by (nS - 3)/3.
+
+    Set-size effect:
+    - RL exploration bonus increases with set size via bonus_slope.
+    - WM binding error increases with set size via bind_base.
+    """
+    lr, wm_weight, softmax_beta, bonus_base, bonus_slope, bind_base = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    bonus_base = max(0.0, bonus_base)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        N = np.zeros((nS, nA))  # visit counts
+
+        bonus_weight = np.clip(bonus_base + bonus_slope * (nS - 3) / 3.0, 0.0, None)
+        bind_err = np.clip(bind_base * (nS - 3) / 3.0, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL with exploration bonus
+            novelty = 1.0 / np.sqrt(N[s, :] + 1.0)
+            Q_aug = q[s, :] + bonus_weight * novelty
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_aug - Q_aug[a])))
+
+            # WM with binding errors across states
+            if nS > 1:
+                others = np.arange(nS) != s
+                mean_others = np.mean(w[others, :], axis=0)
+                W_eff_s = (1.0 - bind_err) * w[s, :] + bind_err * mean_others
+            else:
+                W_eff_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_eff_s - W_eff_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update and counts
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+            N[s, a] += 1.0
+
+            # WM update: reward-contingent strengthening
+            if r > 0.0:
+                step = np.clip(lr, 0.0, 1.0)
+                w[s, :] = (1.0 - step) * w[s, :]
+                w[s, a] += step
+                w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

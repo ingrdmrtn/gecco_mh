@@ -1,0 +1,322 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited WM + win-stay/lose-shift arbitration.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax.
+    - WM: one-shot storage on reward; partial decay on error. WM influence and precision scale with capacity K relative to set size.
+    - Additional WSLS heuristic: repeat last action for the same state after reward; avoid last action after non-reward.
+      Arbitration is a convex mixture of WM/RL policy and the WSLS heuristic.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], base WM mixture weight.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - beta_wm0: >0, base WM inverse temperature before set-size scaling.
+    - K_cap: >=0, WM capacity in number of items (effective WM influence scales with K_cap / nS).
+    - wsls: [0,1], mixture weight placed on win-stay/lose-shift heuristic.
+
+    Set size effects:
+    - WM mixture: wm_mix = wm_weight * min(1, K_cap / nS)
+    - WM precision: beta_wm = beta_wm0 * min(1, K_cap / nS)
+    - WM decay on errors increases when capacity is exceeded: leak_err = max(0, 1 - K_cap / nS)
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, beta_wm0, K_cap, wsls = model_parameters
+    softmax_beta *= 10.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track previous action and outcome per state for WSLS
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_reward = -1.0 * np.ones(nS)
+
+        cap_ratio = min(1.0, float(K_cap) / max(nS, 1))
+        beta_wm_eff = max(1e-3, beta_wm0 * cap_ratio)
+        wm_mix_base = np.clip(wm_weight * cap_ratio, 0.0, 1.0)
+        leak_err = np.clip(1.0 - cap_ratio, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # WSLS heuristic policy for this state (if previous exists)
+            if last_action[s] >= 0:
+                if last_reward[s] > 0.0:
+                    # Prefer repeating last action
+                    if a == last_action[s]:
+                        p_wsls = 1.0 - 1e-6
+                    else:
+                        p_wsls = 1e-6 / (nA - 1)
+                else:
+                    # Prefer shifting away from last action
+                    if a == last_action[s]:
+                        p_wsls = 1e-6
+                    else:
+                        p_wsls = (1.0 - 1e-6) / (nA - 1)
+            else:
+                # If no prior, WSLS contributes uniform
+                p_wsls = 1.0 / nA
+
+            # Combine WM and RL, then mix with WSLS
+            wm_mix = wm_mix_base
+            p_core = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = (1.0 - wsls) * p_core + wsls * p_wsls
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: rewarded one-shot store, otherwise set-size dependent decay
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                # error-induced decay toward uniform; stronger when K_cap < nS
+                w[s, :] = (1.0 - leak_err) * w[s, :] + leak_err * w_0[s, :]
+
+            # Update WSLS memory
+            last_action[s] = a
+            last_reward[s] = r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + WM with retroactive interference and binding-swaps.
+
+    Idea:
+    - RL: Rescorla-Wagner with state-action eligibility traces, updated each trial and decaying by lambda.
+    - WM: one-shot mapping on rewarded trials but suffers:
+        (a) set-size dependent precision loss (beta_wm shrinks with set size),
+        (b) retroactive interference (continuous decay of all WM entries toward uniform each trial),
+        (c) binding-swap errors on storage (with probability growing with set size).
+    - Mixture between RL and WM is fixed by wm_weight.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], mixture weight for WM vs RL.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - lam: [0,1], eligibility-trace decay parameter (lambda).
+    - omega: >=0, set-size interference strength (larger set size => lower WM precision and more decay).
+    - swap: [0,1], base probability of binding swap on WM storage (scaled up with set size).
+
+    Set size effects:
+    - WM precision: beta_wm = 50 * exp(-omega * max(0, nS - 3))
+    - WM decay per trial: w <- (1 - gamma) * w + gamma * uniform, with gamma = 1 - exp(-omega / max(1, nS))
+    - Swap probability on rewarded storage: p_swap = swap * (nS - 3) / max(1, 3) for nS > 3
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, lam, omega, swap = model_parameters
+    softmax_beta *= 10.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size dependent WM parameters
+        beta_wm_eff = 50.0 * np.exp(-max(0.0, omega) * max(0, nS - 3))
+        gamma = 1.0 - np.exp(-max(0.0, omega) / max(1, nS))  # interference-driven decay per trial
+        p_swap_base = max(0.0, min(1.0, swap))
+        p_swap = p_swap_base * max(0, nS - 3) / 3.0
+
+        wm_mix = np.clip(wm_weight, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            delta = r - Q_s[a]
+            e *= lam
+            e[s, a] += 1.0
+            q += lr * delta * e
+
+            # WM retroactive interference (decay toward uniform every trial)
+            w = (1.0 - gamma) * w + gamma * w_0
+
+            # WM storage on reward with binding-swap
+            if r > 0.0:
+                target_state = s
+                # Swap with another random state (in expectation, approximate by diffusing a bit of mass)
+                if p_swap > 0.0 and nS > 1:
+                    # Move a fraction p_swap of the one-hot to a random other state uniformly
+                    # Implement deterministically by distributing p_swap across other states
+                    other_mass = p_swap
+                    self_mass = 1.0 - p_swap
+                    # Clear both target and others for action a, then assign masses
+                    w[:, a] *= 0.0  # clear the stored column to avoid accumulating mass
+                    # Assign self mass
+                    w[target_state, :] = 0.0
+                    w[target_state, a] = self_mass
+                    # Distribute other_mass uniformly across other states at the same action
+                    if nS > 1:
+                        per_other = other_mass / (nS - 1)
+                        for s2 in range(nS):
+                            if s2 != target_state:
+                                w[s2, :] = (1.0 - per_other) * w[s2, :]  # shrink other rows to make room
+                                w[s2, a] += per_other
+                else:
+                    w[s, :] = 0.0
+                    w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-based arbitration and set-size dependent WM precision and leak, plus lapse.
+
+    Idea:
+    - RL: standard Rescorla-Wagner.
+    - WM: one-shot storage on reward; continuous leak toward uniform that increases with set size.
+    - Arbitration: WM dominates early exposures to a state and hands off to RL as visits accumulate.
+      wm_mix = wm_base * exp(-tau * visits_s).
+    - Small epsilon lapse adds uniform random choice.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_base: [0,1], base WM mixture weight before uncertainty modulation.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - tau: >=0, rate at which arbitration shifts from WM to RL with state visit count.
+    - nu_wm: >=0, set-size cost controlling both WM precision and leak with larger set sizes.
+    - eps: [0,1), lapse rate mixing in uniform random choice.
+
+    Set size effects:
+    - WM precision: beta_wm = 50 * exp(-nu_wm * max(0, nS - 3))
+    - WM leak toward uniform each trial: leak = 1 - exp(-nu_wm * max(0, nS - 3) / max(1, nS))
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_base, softmax_beta, tau, nu_wm, eps = model_parameters
+    softmax_beta *= 10.0
+    eps = np.clip(eps, 0.0, 0.999)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        visits = np.zeros(nS, dtype=int)
+
+        size_term = max(0, nS - 3)
+        beta_wm_eff = 50.0 * np.exp(-max(0.0, nu_wm) * size_term)
+        leak = 1.0 - np.exp(-max(0.0, nu_wm) * size_term / max(1, nS))
+        wm_base = np.clip(wm_base, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Arbitration based on state visit count (uncertainty proxy)
+            wm_mix = wm_base * np.exp(-max(0.0, tau) * float(visits[s]))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            p_core = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = (1.0 - eps) * p_core + eps * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM leak toward uniform each trial
+            w = (1.0 - leak) * w + leak * w_0
+
+            # WM storage on reward
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update visit count for this state
+            visits[s] += 1
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

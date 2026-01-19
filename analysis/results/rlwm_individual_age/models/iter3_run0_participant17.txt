@@ -1,0 +1,315 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Capacity-limited WM mixture with valence-asymmetric RL learning and WM load-dependent decay.
+
+    Idea:
+    - Actions arise from a mixture of RL and WM policies.
+    - WM mixture weight equals the expected probability that the state is stored, approximated by
+      a capacity ratio: wm_weight = min(1, K_eff / set_size), where K_eff is reduced by age.
+    - RL learning has asymmetric learning rates for rewarded vs. unrewarded outcomes.
+    - WM stores one-shot rewarded associations and decays toward uniform with a rate that increases
+      with set size and age.
+
+    Parameters (list; all used):
+    - alpha_pos: RL learning rate after reward (0..1)
+    - alpha_neg: RL learning rate after no reward (0..1)
+    - beta_rl: RL inverse temperature baseline (scaled by 10 inside)
+    - beta_wm_base: Base WM inverse temperature multiplier (multiplied by 50 inside)
+    - K_capacity: Effective WM capacity (in "items" units)
+    - wm_decay_base: Base WM decay toward uniform per trial (0..1), scales with load and age
+
+    Inputs:
+    - states: array of state indices per trial (0..nS-1 of the current block)
+    - actions: array of chosen actions per trial (0..2)
+    - rewards: array of rewards per trial (0 or 1)
+    - blocks: array of block indices per trial
+    - set_sizes: array of set size for the current block on each trial (3 or 6)
+    - age: array with a single repeated value (participant age)
+    - model_parameters: list of parameters in the order above
+
+    Returns:
+    - Negative log-likelihood of observed actions under the model.
+    """
+    alpha_pos, alpha_neg, beta_rl, beta_wm_base, K_capacity, wm_decay_base = model_parameters
+    beta_rl *= 10.0
+    beta_wm = max(1e-6, beta_wm_base) * 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(beta_rl * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # Mixture weight from capacity ratio, reduced by age
+            K_eff = max(0.0, K_capacity) * (1.0 - 0.3 * age_group)
+            wm_weight = np.clip(K_eff / max(1.0, set_size), 0.0, 1.0)
+
+            p_total = np.clip(wm_weight * p_wm + (1.0 - wm_weight) * p_rl, eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # RL update with valence-asymmetric learning
+            delta = r - Q_s[a]
+            lr = alpha_pos if r > 0 else alpha_neg
+            q[s, a] += lr * delta
+
+            # WM update: single-shot storage on reward, decay otherwise and over time
+            wm_decay = np.clip(wm_decay_base * (set_size / 3.0) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = target
+            # Global decay of WM for this state toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM arbitration by relative reliability with time-based WM success and exploration bonus.
+
+    Idea:
+    - Mixture weight is proportional to WM "success probability," which declines with set size and
+      with time since the last presentation of the same state. Age reduces WM success.
+    - RL softmax includes an exploration bonus inversely proportional to sqrt(visits) to encourage
+      exploration early on, especially under high load.
+    - WM stores rewarded associations; when not rewarded, WM gently decays toward uniform.
+    - RL uses a single learning rate.
+
+    Parameters (list; all used):
+    - lr: RL learning rate (0..1)
+    - beta_rl_base: RL inverse temperature baseline (scaled by 10 inside)
+    - wm_success_base: Baseline WM success probability scale (0..1)
+    - time_decay: Exponential time-decay parameter for WM success with time since last state
+    - age_effect: Scales reduction of WM success for older adults (>=0)
+    - exploration_bonus: Strength of exploration bonus added to RL values (>=0)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age, model_parameters: as specified
+
+    Returns:
+    - Negative log-likelihood of observed actions under the model.
+    """
+    lr, beta_rl_base, wm_success_base, time_decay, age_effect, exploration_bonus = model_parameters
+    beta_rl = beta_rl_base * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Visit counts per (s,a) for exploration bonus
+        N_sa = np.zeros((nS, nA)) + 1e-9  # avoid division by zero
+        # Track last time each state was seen to model WM success decay
+        last_seen = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # Compute time since last seen for this state
+            if last_seen[s] < 0:
+                dt = 0
+            else:
+                dt = t - last_seen[s]
+            last_seen[s] = t
+
+            # RL policy with exploration bonus
+            bonus = exploration_bonus / np.sqrt(N_sa[s, :] + 1.0)
+            Q_s = q[s, :] + bonus
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(beta_rl * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(softmax_beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # WM success probability as mixture weight
+            size_factor = 3.0 / max(3.0, float(set_size))
+            age_factor = 1.0 - age_effect * age_group
+            time_factor = np.exp(-max(0.0, time_decay) * float(dt))
+            wm_weight = np.clip(wm_success_base * size_factor * age_factor * time_factor, 0.0, 1.0)
+
+            p_total = np.clip(wm_weight * p_wm + (1.0 - wm_weight) * p_rl, eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # Update counts and RL values
+            N_sa[s, a] += 1.0
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: store on reward, otherwise gentle decay
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = target
+            # Gentle decay scaled by load and age
+            wm_decay = np.clip(0.2 * (set_size / 6.0) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces + WM Hebbian store with interference and lapse.
+
+    Idea:
+    - RL values are updated using eligibility traces across state-actions, suitable for rapid credit
+      assignment when states repeat. This provides recency sensitivity beyond simple delta rule.
+    - WM forms one-shot associations on rewarded trials with a learning rate (wm_eta_store).
+      WM experiences global interference proportional to set size and age.
+    - The mixture weight is derived from WM confidence (how peaked the WM distribution is).
+    - A lapse (uniform-choice) component increases with set size and age.
+
+    Parameters (list; all used):
+    - lr: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature baseline (scaled by 10 inside)
+    - lambda_elig: Eligibility trace decay parameter (0..1)
+    - wm_eta_store: WM learning rate for Hebbian storage on reward (0..1)
+    - interference_rate: Base interference/decay rate toward uniform (0..1), scaled by load and age
+    - lapse_base: Baseline lapse rate (0..1), scaled by load and age
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age, model_parameters: as specified
+
+    Returns:
+    - Negative log-likelihood of observed actions under the model.
+    """
+    lr, beta_rl, lambda_elig, wm_eta_store, interference_rate, lapse_base = model_parameters
+    beta_rl *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility traces for all state-action pairs
+        e = np.zeros((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(beta_rl * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(softmax_beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # Mixture weight from WM confidence (peakedness)
+            conf = np.max(W_s) - (1.0 / nA)
+            wm_weight = np.clip(2.0 * conf, 0.0, 1.0)
+
+            # Lapse increases with load and age
+            lapse = np.clip(lapse_base * (set_size / 6.0) * (0.5 + 0.5 * age_group), 0.0, 1.0)
+
+            p_mix = np.clip(wm_weight * p_wm + (1.0 - wm_weight) * p_rl, eps, 1.0 - eps)
+            p_total = np.clip((1.0 - lapse) * p_mix + lapse * (1.0 / nA), eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            # Decay all traces
+            e *= lambda_elig
+            # Set trace for current (s,a)
+            e[s, :] *= 0.0
+            e[s, a] = 1.0
+            delta = r - q[s, a]
+            q += lr * delta * e
+
+            # WM update with Hebbian store and interference
+            inter_effect = np.clip(interference_rate * (set_size / 3.0) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_eta_store) * w[s, :] + wm_eta_store * target
+            # Interference/global decay toward uniform
+            w = (1.0 - inter_effect) * w + inter_effect * w_0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

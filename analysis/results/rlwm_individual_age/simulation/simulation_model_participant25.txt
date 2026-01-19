@@ -1,0 +1,145 @@
+def simulate_model(stimulus, blocks, set_sizes, correct_answer, age, parameters):
+    """
+    Simulate choices and rewards for the Hybrid RL + WM model with PE-sensitive WM gating
+    and interference-driven WM degradation.
+
+    Arguments:
+    - stimulus: sequence of stimuli (state IDs) for each trial (array)
+    - blocks: block index for each trial (array)
+    - set_sizes: block set size on each trial (array) [used to determine nS per block]
+    - correct_answer: correct action on each trial (array)
+    - age: participant's age (array, single repeated value)
+    - parameters: [lr, softmax_beta, wm_weight, pe_sens, wm_interf, age_penalty]
+
+    Returns:
+    - simulated_actions: simulated action choices (array, int)
+    - simulated_rewards: simulated binary rewards (array, int)
+    """
+    import numpy as np
+
+    lr, softmax_beta, wm_weight, pe_sens, wm_interf, age_penalty = parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    nA = 3
+    eps = 1e-12
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    n_trials = len(stimulus)
+    simulated_actions = np.zeros(n_trials, dtype=int)
+    simulated_rewards = np.zeros(n_trials, dtype=int)
+
+    # Iterate blocks in chronological order
+    unique_blocks = []
+    # preserve order
+    seen = set()
+    for b in blocks:
+        if b not in seen:
+            unique_blocks.append(b)
+            seen.add(b)
+
+    for b in unique_blocks:
+        block_indices = np.where(blocks == b)[0]
+        block_states_raw = stimulus[block_indices]
+        block_correct_ans = correct_answer[block_indices]
+        # Determine set size for this block
+        nS_reported = int(set_sizes[block_indices][0]) if len(block_indices) > 0 else len(np.unique(block_states_raw))
+
+        # Map raw state IDs to 0..nS-1 to index arrays
+        unique_states = np.unique(block_states_raw)
+        state_to_idx = {s: i for i, s in enumerate(unique_states)}
+        block_states = np.array([state_to_idx[s] for s in block_states_raw], dtype=int)
+        nS = len(unique_states)
+        # If provided set size differs, we still use the actual number of unique states for indexing,
+        # while using nS for interference and gating factors consistent with model (prefer provided nS if sensible)
+        if nS_reported > 0:
+            nS_for_factors = nS_reported
+        else:
+            nS_for_factors = nS
+
+        # Build per-state correct action (assume stable within block; take first occurrence)
+        correct_actions_per_state = np.zeros(nS, dtype=int)
+        seen_state = np.zeros(nS, dtype=bool)
+        for t_idx, s in enumerate(block_states):
+            if not seen_state[s]:
+                correct_actions_per_state[s] = int(block_correct_ans[t_idx])
+                seen_state[s] = True
+
+        # Initialize RL and WM tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Keep last positive PE per state to gate WM on next visit (resolves circularity)
+        last_pos_pe = np.zeros(nS)
+
+        # Precompute factors
+        ss_factor = 3.0 / float(max(3, nS_for_factors))  # 1.0 for 3, 0.5 for 6
+        age_factor = 1.0 - 0.3 * age_group
+
+        for local_t, s in enumerate(block_states):
+            idx = block_indices[local_t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # Compute RL and WM policies (softmax)
+            rl_logits = softmax_beta * Q_s
+            rl_logits -= np.max(rl_logits)
+            p_rl = np.exp(rl_logits)
+            p_rl /= np.sum(p_rl)
+
+            wm_logits = softmax_beta_wm * W_s
+            wm_logits -= np.max(wm_logits)
+            p_wm = np.exp(wm_logits)
+            p_wm /= np.sum(p_wm)
+
+            # WM gating depends on last positive PE for this state
+            wm_weight_eff = wm_weight * (1.0 + pe_sens * last_pos_pe[s]) * ss_factor * age_factor
+            wm_weight_eff = float(np.clip(wm_weight_eff, 0.0, 1.0))
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.maximum(p_total, eps)
+            p_total /= np.sum(p_total)
+
+            # Sample action
+            a = int(np.random.choice(nA, p=p_total))
+            simulated_actions[idx] = a
+
+            # Outcome
+            correct_a = int(correct_actions_per_state[s])
+            r = 1 if a == correct_a else 0
+            simulated_rewards[idx] = r
+
+            # Compute PE
+            pe = r - Q_s[a]
+            pos_pe = max(0.0, pe)
+
+            # RL update
+            q[s, a] = q[s, a] + lr * pe
+
+            # WM interference-driven decay toward uniform
+            extra_decay = wm_interf * max(0, nS_for_factors - 3) / 3.0
+            extra_decay += age_penalty * age_group
+            extra_decay = float(np.clip(extra_decay, 0.0, 1.0))
+            w[s, :] = (1.0 - extra_decay) * w[s, :] + extra_decay * (1.0 / nA)
+
+            # WM strengthening on positive PE toward chosen action
+            if pos_pe > 0.0:
+                k_pos = min(1.0, 0.7 + 0.3 * pos_pe)
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - k_pos) * w[s, :] + k_pos * onehot
+
+            # WM eviction on negative PE toward uniform
+            if pe < 0.0:
+                evict = min(1.0, 0.4 + 0.4 * (-pe))
+                w[s, :] = (1.0 - evict) * w[s, :] + evict * (1.0 / nA)
+
+            # Update last positive PE for gating on next visit
+            last_pos_pe[s] = pos_pe
+
+    return simulated_actions, simulated_rewards

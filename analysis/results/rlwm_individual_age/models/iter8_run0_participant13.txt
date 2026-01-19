@@ -1,0 +1,313 @@
+Below are three standalone cognitive models that implement RL–WM hybrids tailored to the rlwm task. Each model returns the negative log-likelihood of observed choices, uses up to 6 parameters, includes meaningful age and set-size effects, and fills in both the WM policy and WM updating within the provided template logic.
+
+Note: Assume numpy as np is already imported.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + error-driven WM gating with set-size and age modulation.
+
+    Idea:
+    - RL learns action values per state with a standard delta rule.
+    - WM is a one-shot store of the last rewarded action per state (deterministic template with soft retrieval).
+    - The trial-by-trial WM mixture weight is gated by a logistic function that integrates:
+        - A base WM tendency (wm_logit_base).
+        - An error-driven term: after large surprise (|PE|), down-weight WM; after low surprise (confidence), up-weight WM.
+        - A set-size penalty: larger sets reduce WM weight.
+        - An age shift: older adults may have different WM gating (shift on the logit scale).
+    - Choice probability is a mixture of RL softmax and WM softmax.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature; scaled by 10 internally
+    - wm_beta: WM inverse temperature (retrieval precision)
+    - wm_logit_base: baseline logit for WM weight
+    - gate_pe_scale: scales error-driven gating input; larger -> stronger modulation by |PE|
+    - size_age_gate_mix: coefficient that does two things on the WM logit:
+        - subtracts size_age_gate_mix*(set_size-3) (penalize larger set)
+        - adds size_age_gate_mix if participant is older (age_group=1), else 0
+
+    Age group:
+    - age_group = 0 for <=45 (young), 1 for >45 (old)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_beta, wm_logit_base, gate_pe_scale, size_age_gate_mix = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        # Keep a running previous PE per state to drive gating; start neutral (0)
+        prev_pe = np.zeros(nS)
+
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            # RL policy probability of chosen action a
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            # WM policy probability of chosen action a
+            p_wm = 1.0 / np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+
+            # Error-driven WM gating on the logit scale
+            # Low |prev_pe| -> trust WM more; high |prev_pe| -> trust WM less
+            # Set-size penalty (larger sets -> lower WM weight)
+            # Age shift adds size_age_gate_mix for older adults
+            wm_logit = (
+                wm_logit_base
+                - gate_pe_scale * abs(prev_pe[s])
+                - size_age_gate_mix * max(0, nS - 3)
+                + (size_age_gate_mix if age_group == 1 else 0.0)
+            )
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # Store rewarded action into WM (one-shot), otherwise leave as-is
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update prev PE for next trial gating
+            prev_pe[s] = delta
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with lag-dependent decay, capacity pressure via set size, and age-modulated WM reliance.
+
+    Idea:
+    - RL: standard delta learning.
+    - WM: one-shot correct action storage; retrieved with softmax precision wm_beta.
+    - WM reliability decays with the number of trials since the state was last seen (lag).
+      The decay is exponential with rate 'decay_per_lag'; larger lags -> more uniform WM.
+    - WM mixture weight is scaled by:
+        - a baseline weight (wm_weight_base)
+        - an age shift (age_wm_shift applied only if older)
+        - an implicit set-size pressure: effective weight is reduced by a factor 3/nS.
+          This approximates capacity limits without an extra parameter.
+    - On each trial, the WM distribution is blended with uniform based on lag.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature; scaled by 10 internally
+    - wm_beta: WM inverse temperature (retrieval precision)
+    - wm_weight_base: baseline WM mixture weight (on probability scale via sigmoid)
+    - decay_per_lag: WM decay rate per trial of lag (>=0). Larger -> faster forgetting.
+    - age_wm_shift: additive shift on the WM logit for older adults (can be +/-)
+
+    Age group:
+    - age_group = 0 for <=45 (young), 1 for >45 (old)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_beta, wm_weight_base, decay_per_lag, age_wm_shift = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last seen time per state to compute lags
+        last_seen = -np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Compute lag for this state
+            lag = 0 if last_seen[s] < 0 else (t - last_seen[s])
+
+            # Build a decayed WM distribution for the current state
+            decay = 1.0 - np.exp(-decay_per_lag * lag) if decay_per_lag > 0 else 0.0
+            W_s_mem = w[s, :]
+            W_s = (1.0 - decay) * W_s_mem + decay * w_0[s, :]  # blend with uniform
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            p_wm = 1.0 / np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+
+            # WM mixture weight: logistic of baseline with age shift,
+            # then scaled by 3/nS to reflect capacity pressure from set size.
+            wm_logit = np.log(wm_weight_base / (1.0 - wm_weight_base + 1e-12))
+            if age_group == 1:
+                wm_logit += age_wm_shift
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_weight *= (3.0 / float(nS))
+
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: store rewarded action deterministically; otherwise leave as-is
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update last seen
+            last_seen[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with binding-error interference that scales with set size and age.
+
+    Idea:
+    - RL: standard delta learning for Q-values.
+    - WM: one-shot storage upon reward, but with a binding error:
+        when a reward occurs, the intended state can be mis-bound, causing the stored
+        action to be written into a random other state with some probability.
+    - Binding error increases with set size (more items -> more interference) and with age.
+    - WM retrieval uses a softmax with inverse temperature wm_beta.
+    - Mixture with a fixed WM weight that can be age-modulated on the logit scale.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature; scaled by 10 internally
+    - wm_beta: WM inverse temperature (retrieval precision)
+    - wm_weight_base: baseline WM mixture weight on probability scale via sigmoid transform
+    - bind_noise_base: baseline binding error probability (0..1) before size/age scaling
+    - age_bind_shift: additive shift to binding error for older adults (can be +/-)
+
+    Age group:
+    - age_group = 0 for <=45 (young), 1 for >45 (old)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_beta, wm_weight_base, bind_noise_base, age_bind_shift = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Fixed WM weight with age effect on the logit scale
+        wm_logit = np.log(wm_weight_base / (1.0 - wm_weight_base + 1e-12))
+        if age_group == 1:
+            wm_logit += 0.5  # small generic age shift toward WM unless overridden by binding; keeps param usage clean
+        wm_weight_fixed = 1.0 / (1.0 + np.exp(-wm_logit))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+
+            p_total = wm_weight_fixed * p_wm + (1.0 - wm_weight_fixed) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update with binding error upon reward
+            if r > 0.0:
+                # Binding error increases with set size and can shift with age
+                # Scale bind prob in [0,1]: base * ((nS-1)/5) gives 0 at nS=1 and ~1 at nS~6 if base near 1
+                size_scale = (max(1, nS) - 1) / 5.0
+                bind_prob = bind_noise_base * size_scale
+                if age_group == 1:
+                    bind_prob = np.clip(bind_prob + age_bind_shift, 0.0, 1.0)
+                else:
+                    bind_prob = np.clip(bind_prob, 0.0, 1.0)
+
+                if np.random.rand() < bind_prob and nS > 1:
+                    # Mis-bind: write to a random other state
+                    other_states = [i for i in range(nS) if i != s]
+                    s_bind = other_states[int(np.floor(np.random.rand() * len(other_states)))]
+                    w[s_bind, :] = 0.0
+                    w[s_bind, a] = 1.0
+                else:
+                    # Correct binding
+                    w[s, :] = 0.0
+                    w[s, a] = 1.0
+            else:
+                # No change on negative feedback
+                pass
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on age and set-size effects
+- Model 1: WM mixture weight is dynamically gated by prediction error, penalized in larger sets, and shifted by age (older group gets an additive shift on the WM logit). Younger participant here (20) would not get the age shift.
+- Model 2: WM trust decays with lag; effective WM weight is scaled by 3/nS, and older adults get an additive shift on the WM logit. Younger participant receives no age shift.
+- Model 3: WM is subject to binding error that grows with set size and is further shifted by age; WM weight itself has a fixed baseline with a small generic age shift for the mixture. For this participant (young), the age binding shift does not apply.

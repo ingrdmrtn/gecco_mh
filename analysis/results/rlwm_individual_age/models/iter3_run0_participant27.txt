@@ -1,0 +1,317 @@
+Below are three standalone cognitive models that compute the negative log-likelihood of the participant’s choices in the RL+WM task. Each model integrates effects of set size (3 vs 6) and age group (young=0, old=1), uses all parameters meaningfully (≤ 6 parameters), and follows the requested API.
+
+Note: Assume numpy as np is already imported.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Capacity-gated RLWM with probabilistic encoding and decay.
+    - RL: Q-learning with softmax.
+    - WM: state-action table that stores rewarded associations if encoded; WM decays toward uniform.
+    - Arbitration: mixture weight equals the current probability that the state is stored in WM (memory occupancy).
+      Storage probability depends on effective capacity vs set size and age.
+
+    Parameters (len=6):
+      0) lr_rl            : RL learning rate (0..1)
+      1) beta_rl          : RL inverse temperature (>0), internally scaled by 10
+      2) K_cap            : WM capacity in number of states (0..6)
+      3) p_encode_base    : Base probability to encode on rewarded trials (0..1)
+      4) wm_decay         : WM decay toward uniform per trial (0..1)
+      5) age_cap_shift    : Age-dependent capacity shift (positive increases capacity if young, decreases if old)
+
+    Age effect:
+      - Effective capacity = K_cap + sign*(age_cap_shift), where sign = +1 for young, -1 for old.
+        This modulates the probability of encoding a state in WM and hence the arbitration weight.
+
+    Set size effect:
+      - Probability to encode a rewarded association is scaled by min(1, capacity_eff / set_size).
+        Larger set size (6) reduces encoding and thus the WM contribution.
+
+    Returns:
+      Negative log-likelihood of observed choices.
+    """
+    lr_rl, beta_rl, K_cap, p_encode_base, wm_decay, age_cap_shift = model_parameters
+    beta_rl = beta_rl * 10.0
+    beta_wm = 50.0  # near-deterministic WM policy
+    age_group = 0 if age[0] <= 45 else 1
+    eps = 1e-12
+    total_log_p = 0.0
+
+    # Age-adjusted capacity shift (+ for young, - for old)
+    cap_adj = age_cap_shift if age_group == 0 else -abs(age_cap_shift)
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        ba = actions[mask].astype(int)
+        br = rewards[mask].astype(float)
+        bs = states[mask].astype(int)
+        bsz = int(set_sizes[mask][0])
+
+        nA = 3
+        nS = bsz
+
+        # Initialize RL and WM
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        W = (1.0 / nA) * np.ones((nS, nA))
+        W_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        # Memory occupancy per state: probability that state is currently in WM
+        M = np.zeros(nS)  # start with empty WM
+
+        # Effective capacity and encoding gate
+        capacity_eff = max(0.0, float(K_cap) + cap_adj)
+        cap_ratio = min(1.0, capacity_eff / max(1, nS))
+
+        for t in range(len(bs)):
+            s = int(bs[t]); a = int(ba[t]); r = float(br[t])
+
+            # RL policy
+            Q_s = Q[s, :]
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy
+            W_s = W[s, :]
+            denom_wm = np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Arbitration weight equals occupancy (probability state is in WM)
+            wm_weight = np.clip(M[s], 0.0, 1.0)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            total_log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += lr_rl * pe
+
+            # WM decay toward uniform
+            W = (1.0 - wm_decay) * W + wm_decay * W_uniform
+
+            # Attempt to encode only on rewarded trials
+            if r > 0.5:
+                p_encode = np.clip(p_encode_base * cap_ratio, 0.0, 1.0)
+                # Update occupancy probabilistically (in expectation) without sampling:
+                # New occupancy probability after an encoding attempt
+                # M[s] -> M[s] + (1 - M[s]) * p_encode
+                M[s] = M[s] + (1.0 - M[s]) * p_encode
+
+                # Update WM entry toward one-hot for chosen action (overwrite-like)
+                target = np.full(nA, 1e-6)
+                target[a] = 1.0 - (nA - 1) * 1e-6
+                W[s, :] = (1.0 - p_encode) * W[s, :] + p_encode * target
+            else:
+                # If unrewarded, occupancy softly decays as well (forgetting)
+                M[s] = (1.0 - wm_decay) * M[s]
+
+    return -float(total_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Precision-weighted WM with load and age effects; precision also governs WM learning/decay.
+    - RL: Q-learning with softmax.
+    - WM: probability table; on reward, WM overwrites toward chosen action with strength = WM precision.
+           WM decays toward uniform with rate = (1 - WM precision).
+    - Arbitration: mixture weight equals WM precision (interpreted as confidence).
+    - WM policy has a lapse (epsilon) that mixes with uniform, capturing age-related noisiness indirectly.
+
+    Parameters (len=6):
+      0) lr_rl                 : RL learning rate (0..1)
+      1) beta_rl               : RL inverse temperature (>0), internally scaled by 10
+      2) wm_prec_base          : Base WM precision (real), passed through sigmoid to [0,1]
+      3) load_slope            : Load penalty on precision per extra item (>=0)
+      4) age_prec_bonus        : Additive bonus to precision if young, subtracted if old
+      5) wm_lapse              : WM lapse rate (0..1) that mixes WM policy with uniform
+
+    Age effect:
+      - Effective WM precision increases by age_prec_bonus if young, decreases if old.
+
+    Set size effect:
+      - Effective WM precision decreases linearly with load_slope * (set_size - 3).
+
+    Returns:
+      Negative log-likelihood of observed choices.
+    """
+    lr_rl, beta_rl, wm_prec_base, load_slope, age_prec_bonus, wm_lapse = model_parameters
+    beta_rl = beta_rl * 10.0
+    beta_wm_max = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+    eps = 1e-12
+    total_log_p = 0.0
+
+    # Helper: sigmoid to map real -> (0,1)
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    age_term = age_prec_bonus if age_group == 0 else -abs(age_prec_bonus)
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        ba = actions[mask].astype(int)
+        br = rewards[mask].astype(float)
+        bs = states[mask].astype(int)
+        bsz = int(set_sizes[mask][0])
+
+        nA = 3
+        nS = bsz
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        W = (1.0 / nA) * np.ones((nS, nA))
+        W_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute a block-wise WM precision (confidence)
+        load_penalty = max(0, bsz - 3) * max(0.0, load_slope)
+        wm_precision = sigmoid(wm_prec_base + age_term - load_penalty)
+        wm_precision = np.clip(wm_precision, 0.0, 1.0)
+        # Map precision to an effective WM inverse temperature and to arbitration weight
+        beta_wm = beta_wm_max * max(wm_precision, eps)
+        wm_weight = wm_precision
+
+        # WM lapse
+        epsilon_wm = np.clip(wm_lapse, 0.0, 1.0)
+
+        for t in range(len(bs)):
+            s = int(bs[t]); a = int(ba[t]); r = float(br[t])
+
+            # RL policy
+            Q_s = Q[s, :]
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy with lapse
+            W_s = W[s, :]
+            denom_wm = np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+            p_wm_soft = 1.0 / max(denom_wm, eps)
+            p_wm = (1.0 - epsilon_wm) * p_wm_soft + epsilon_wm * (1.0 / nA)
+
+            # Mixture by precision
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            total_log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q[s, a]
+            Q[s, a] += lr_rl * pe
+
+            # WM decay toward uniform governed by (1 - precision)
+            decay = 1.0 - wm_precision
+            W = (1.0 - decay) * W + decay * W_uniform
+
+            # Reward-based WM overwrite with strength = precision
+            if r > 0.5:
+                alpha_wm = wm_precision
+                target = np.full(nA, 1e-6)
+                target[a] = 1.0 - (nA - 1) * 1e-6
+                W[s, :] = (1.0 - alpha_wm) * W[s, :] + alpha_wm * target
+
+    return -float(total_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Win-stay/lose-shift gated mixture with RL forgetting and age-dependent exploration.
+    - RL: Q-learning with softmax and per-trial forgetting toward uniform.
+    - WM: heuristic WM that stores last rewarded action per state; unrewarded trials decay WM.
+    - Arbitration: WM weight is higher following recent reward for that state (win-stay) and is
+      penalized by load; if previous trial for the state was a loss, weight is reduced (lose-shift).
+    - Final policy includes age-dependent exploration (epsilon-greedy-like mixing to uniform).
+
+    Parameters (len=6):
+      0) lr_rl            : RL learning rate (0..1)
+      1) beta_rl          : RL inverse temperature (>0), internally scaled by 10
+      2) rl_forget        : RL forgetting rate toward uniform per trial (0..1)
+      3) wsls_weight_base : Base weight scaling for WM after a win (0..1)
+      4) age_explore_bias : Age effect on exploration; sigmoid-transformed. Larger => more exploration in young,
+                            reduced in old (asymmetrically).
+      5) wm_decay         : WM decay toward uniform per trial (0..1)
+
+    Age effect:
+      - Exploration epsilon = sigmoid(age_explore_bias) for young; for old, epsilon is reduced to half that amount.
+
+    Set size effect:
+      - WM weight is penalized by load: weight *= 1 / (1 + max(0, set_size - 3)).
+
+    Returns:
+      Negative log-likelihood of observed choices.
+    """
+    lr_rl, beta_rl, rl_forget, wsls_weight_base, age_explore_bias, wm_decay = model_parameters
+    beta_rl = beta_rl * 10.0
+    beta_wm = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+    eps = 1e-12
+    total_log_p = 0.0
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    # Age-dependent exploration
+    base_eps = sigmoid(age_explore_bias)
+    if age_group == 0:
+        epsilon = base_eps
+    else:
+        epsilon = 0.5 * base_eps  # reduced exploration if old
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        ba = actions[mask].astype(int)
+        br = rewards[mask].astype(float)
+        bs = states[mask].astype(int)
+        bsz = int(set_sizes[mask][0])
+
+        nA = 3
+        nS = bsz
+
+        Q = (1.0 / nA) * np.ones((nS, nA))
+        W = (1.0 / nA) * np.ones((nS, nA))
+        W_uniform = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last outcome per state to implement WSLS gating
+        last_reward = np.zeros(nS)  # 1 if previously rewarded on state, else 0
+
+        # Load penalty for WM weight
+        load_penalty = 1.0 / (1.0 + max(0, nS - 3))  # 1 for size=3, 1/4 for size=6
+
+        for t in range(len(bs)):
+            s = int(bs[t]); a = int(ba[t]); r = float(br[t])
+
+            # RL policy
+            Q_s = Q[s, :]
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy
+            W_s = W[s, :]
+            denom_wm = np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+            p_wm_core = 1.0 / max(denom_wm, eps)
+
+            # WSLS-based arbitration: emphasize WM after a win on this state
+            wm_weight = wsls_weight_base * last_reward[s] * load_penalty
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Combine RL and WM, then apply age-dependent exploration to uniform
+            p_mix = wm_weight * p_wm_core + (1.0 - wm_weight) * p_rl
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = max(p_total, eps)
+            total_log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform
+            pe = r - Q[s, a]
+            Q[s, a] += lr_rl * pe
+            Q = (1.0 - rl_forget) * Q + rl_forget * (1.0 / nA)
+
+            # WM decay toward uniform
+            W = (1.0 - wm_decay) * W + wm_decay * W_uniform
+
+            # WM update: win-store (overwrite), lose-shift (erase)
+            if r > 0.5:
+                target = np.full(nA, 1e-6)
+                target[a] = 1.0 - (nA - 1) * 1e-6
+                W[s, :] = target  # overwrite on win
+                last_reward[s] = 1.0
+            else:
+                # On loss, shift toward uniform (already decayed), and mark as loss for gating
+                last_reward[s] = 0.0
+
+    return -float(total_log_p)

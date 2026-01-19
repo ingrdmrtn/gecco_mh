@@ -1,0 +1,316 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + fast, leaky Working Memory with adaptive arbitration by conflict and load.
+
+    Policy:
+    - Total policy is a mixture of RL softmax and WM softmax.
+    - Arbitration (mixture) weight for WM is adaptive and depends on:
+        (a) whether RL and WM agree on the best action (agreement bonus),
+        (b) set size (WM favored for small nS), and
+        (c) a global bias.
+      wm_weight = sigmoid(arb_bias + 1.0*agreement + arb_load*(3.5 - nS)).
+
+    RL:
+    - Standard delta rule with learning rate lr and softmax inverse temperature (internally scaled by 10).
+
+    WM:
+    - Fast delta-like update with learning rate wm_eta toward a one-hot for rewarded actions.
+    - Leaky forgetting toward uniform at rate wm_forget each trial (stronger leak yields weaker WM).
+    - WM choice is via a high-temperature softmax on the WM table.
+
+    Parameters (all used):
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: wm_eta (float in [0,1]) WM learning rate toward one-hot on reward.
+    - model_parameters[2]: wm_forget (float in [0,1]) WM leak toward uniform each trial.
+    - model_parameters[3]: softmax_beta (float >= 0) RL inverse temperature (scaled by 10 internally).
+    - model_parameters[4]: arb_bias (float) Baseline arbitration bias favoring WM (>0) or RL (<0).
+    - model_parameters[5]: arb_load (float) Load sensitivity; positive values favor WM more for small sets.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_eta, wm_forget, softmax_beta, arb_bias, arb_load = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy (softmax evaluated at chosen action)
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (softmax with high temperature)
+            W_s = w[s, :]
+            p_wm_clean = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute agreement: 1 if RL and WM best actions align, else 0
+            rl_best = int(np.argmax(Q_s))
+            wm_best = int(np.argmax(W_s))
+            agreement = 1.0 if rl_best == wm_best else 0.0
+
+            # Adaptive arbitration weight (block-level nS affects WM favorability)
+            x = arb_bias + agreement + arb_load * (3.5 - float(nS))
+            wm_weight = 1.0 / (1.0 + np.exp(-x))
+            wm_weight = float(np.clip(wm_weight, 0.0, 1.0))
+
+            # Total probability
+            p_total = p_wm_clean * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: leak + reward-driven sharpening toward one-hot if rewarded
+            # Leak toward uniform
+            w[s, :] = (1.0 - wm_forget) * w[s, :] + wm_forget * w_0[s, :]
+
+            if r > 0.5:
+                # Move toward one-hot on chosen action
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_eta) * w[s, :] + wm_eta * target
+            # else: no additional update beyond leak
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with UCB exploration bonus + WM with load-driven cross-state interference.
+
+    Policy:
+    - Total policy is a fixed mixture of RL softmax and WM softmax using wm_weight.
+    - RL action preferences include an Upper Confidence Bound (UCB) exploration bonus that shrinks with visits.
+      We implement UCB by adding a bonus to Q before the softmax:
+        bonus[a] = ucb_c * sqrt(ln(1 + t_state) / (1 + N_s_a[a]))
+      where t_state is the number of visits to state s so far, and N_s_a[a] visits to a in that state.
+    - WM is a per-state associative table updated by reward; at decision time,
+      WM experiences interference that blends the current state's WM with the average of other states.
+      Interference grows with set size.
+
+    RL:
+    - Standard delta rule with learning rate lr, softmax inverse temperature (scaled by 10).
+
+    WM:
+    - Rewarded trials push W_s toward a one-hot on the chosen action; unrewarded trials apply a mild decay to uniform.
+    - WM softmax inverse temperature beta_wm controls WM determinism.
+    - Interference: W_s_eff = (1 - alpha) * W_s + alpha * mean(W_{other states}),
+      with alpha = sigmoid(wm_interference * (nS - 3)).
+
+    Parameters (all used):
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: wm_weight (float in [0,1]) Mixture weight for WM vs RL.
+    - model_parameters[2]: softmax_beta (float >= 0) RL inverse temperature (scaled by 10 internally).
+    - model_parameters[3]: ucb_c (float >= 0) Strength of UCB exploration bonus.
+    - model_parameters[4]: wm_interference (float) Load sensitivity of WM cross-state interference.
+    - model_parameters[5]: beta_wm (float >= 0) WM inverse temperature.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, ucb_c, wm_interference, beta_wm = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = float(beta_wm)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Counts for UCB
+        N_s_a = np.zeros((nS, nA))
+        N_s = np.zeros(nS)  # visits per state
+
+        # Precompute interference factor alpha based on load
+        alpha = 1.0 / (1.0 + np.exp(-wm_interference * (float(nS) - 3.0)))
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL with UCB bonus
+            Q_s = q[s, :].copy()
+            # Avoid log(0) by using ln(1 + t_state)
+            t_state = N_s[s]
+            bonus = np.zeros(nA)
+            for aa in range(nA):
+                bonus[aa] = ucb_c * np.sqrt(np.log(1.0 + max(1.0, t_state)) / (1.0 + N_s_a[s, aa]))
+            Q_s_bonus = Q_s + bonus
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s_bonus - Q_s_bonus[a])))
+
+            # WM with cross-state interference
+            if nS > 1:
+                if nS - 1 > 0:
+                    mean_other = (np.sum(w, axis=0) - w[s, :]) / max(1, (nS - 1))
+                else:
+                    mean_other = w[s, :]
+            else:
+                mean_other = w[s, :]
+            W_s_eff = (1.0 - alpha) * w[s, :] + alpha * mean_other
+
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s_eff - W_s_eff[a])))
+
+            # Mixture policy
+            weight = float(np.clip(wm_weight, 0.0, 1.0))
+            p_total = p_wm * weight + (1.0 - weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # Update counts for UCB
+            N_s[s] += 1.0
+            N_s_a[s, a] += 1.0
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update
+            if r > 0.5:
+                # Push toward one-hot on rewarded action
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = 0.7 * w[s, :] + 0.3 * target
+            else:
+                # Mild decay toward uniform on non-reward
+                w[s, :] = 0.95 * w[s, :] + 0.05 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with value decay and optimistic initialization + WM as last-reward memory with load-dependent lapses.
+
+    Policy:
+    - Total policy is a mixture of RL softmax and WM policy.
+    - WM policy is a near-deterministic lookup of the last rewarded action for the current state,
+      corrupted by a load-dependent lapse that mixes WM with uniform.
+
+    RL:
+    - Standard delta rule with learning rate lr and softmax inverse temperature (scaled by 10).
+    - Value decay (forgetting) after each update toward uniform: q <- (1 - rl_decay) * q + rl_decay * uniform.
+    - Optimistic initialization of Q-values using init_Q relative to uniform (higher init_Q => initial exploration).
+
+    WM:
+    - On reward, the WM for state s is set to a one-hot on the chosen action.
+    - On non-reward, WM decays toward uniform.
+    - Decision-time lapse grows with set size: lapse = 1 - exp(-wm_lapse_load * nS),
+      final WM policy: p_wm = (1 - lapse) * softmax_wm + lapse * uniform.
+
+    Parameters (all used):
+    - model_parameters[0]: lr (float in [0,1]) RL learning rate.
+    - model_parameters[1]: softmax_beta (float >= 0) RL inverse temperature (scaled by 10 internally).
+    - model_parameters[2]: wm_weight (float in [0,1]) Mixture weight for WM.
+    - model_parameters[3]: wm_lapse_load (float >= 0) Controls how lapses increase with set size.
+    - model_parameters[4]: rl_decay (float in [0,1]) RL value decay toward uniform after each update.
+    - model_parameters[5]: init_Q (float) Optimistic initialization added to uniform baseline.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight, wm_lapse_load, rl_decay, init_Q = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL with optimistic values around uniform
+        q = (1.0 / nA) * np.ones((nS, nA)) + init_Q * np.ones((nS, nA))
+        # Clip to keep within reasonable numeric bounds
+        q = np.clip(q, -10.0, 10.0)
+
+        # Initialize WM
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Precompute load-driven lapse
+        lapse = 1.0 - np.exp(-wm_lapse_load * max(1, nS))
+        lapse = float(np.clip(lapse, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: clean (deterministic) then lapse to uniform
+            W_s = w[s, :]
+            p_wm_clean = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = (1.0 - lapse) * p_wm_clean + lapse * (1.0 / nA)
+
+            # Mixture
+            wweight = float(np.clip(wm_weight, 0.0, 1.0))
+            p_total = p_wm * wweight + (1.0 - wweight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update then decay toward uniform
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+            q = (1.0 - rl_decay) * q + rl_decay * (1.0 / nA) * np.ones_like(q)
+
+            # WM update
+            if r > 0.5:
+                # Store last rewarded action deterministically
+                eps = 1e-6
+                w[s, :] = eps
+                w[s, a] = 1.0 - (nA - 1) * eps
+            else:
+                # Decay toward uniform when no reward
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

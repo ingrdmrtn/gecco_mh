@@ -1,0 +1,283 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL(eligibility-trace) + capacity-limited WM
+
+    Description:
+    - RL component uses an eligibility trace to generalize credit within a state across actions,
+      enabling faster consolidation after rewarded feedback.
+    - WM component stores the last rewarded action per state as a high-fidelity one-hot memory,
+      subject to decay. WM softmax temperature can be boosted for more deterministic recall.
+    - WM mixture weight is capacity-limited: wm_eff = wm_weight * min(1, cap_k / nS).
+
+    Parameters (tuple):
+    - lr: Base RL learning rate (0..1)
+    - wm_weight: Base WM mixture weight (0..1)
+    - softmax_beta: Inverse temperature for RL (internally scaled x10)
+    - lam: Eligibility trace parameter for RL (0..1)
+    - cap_k: Effective WM capacity in number of items (>0). Scales WM in larger set sizes.
+    - wm_beta_boost: Multiplier (>0) for WM temperature, increasing WM determinism
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, lam, cap_k, wm_beta_boost = model_parameters
+
+    softmax_beta *= 10.0
+    base_wm_beta = 50.0
+    softmax_beta_wm = base_wm_beta * max(1e-6, wm_beta_boost)
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility traces for RL per state-action
+        e = np.zeros((nS, nA))
+
+        # Capacity-limited WM mixture
+        wm_mix = wm_weight * min(1.0, max(0.0, cap_k) / max(1.0, nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(eps, denom_rl)
+
+            # WM policy
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(eps, denom_wm)
+
+            # Mixture policy
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            log_p += np.log(max(eps, p_total))
+
+            # RL update with eligibility traces
+            delta = r - Q_s[a]
+
+            # Update eligibilities: decay all, then set chosen to 1 (replacing traces)
+            e[s, :] *= lam
+            e[s, a] = 1.0
+
+            # Apply update across actions in the chosen state proportionally to eligibility
+            q[s, :] += lr * delta * e[s, :]
+
+            # WM update:
+            # - Decay towards baseline (interference/forgetting)
+            w[s, :] = 0.5 * w[s, :] + 0.5 * w_0[s, :]
+            # - If rewarded, store a strong one-hot memory; else, slightly suppress chosen action
+            if r > 0.5:
+                w[s, :] = 0.05 * w[s, :]
+                w[s, a] = 1.0
+            else:
+                # Penalize the chosen action slightly to avoid perseverating on errors
+                w[s, a] = 0.75 * w[s, a] + 0.25 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with uncertainty-adaptive learning + WM with uncertainty-gated mixture and decay
+
+    Description:
+    - RL component uses a state-wise uncertainty tracker U_s (EMA of squared prediction errors).
+      Learning rate is reduced when uncertainty is high: lr_eff = lr_base / (1 + tau_unc*U_s).
+    - WM component decays toward baseline and strengthens the chosen action when rewarded.
+    - WM mixture is gated by both set size and uncertainty: wm_eff = wm_weight * exp(-tau_unc*U_s*(nS-1)).
+    - Includes a uniform lapse probability.
+
+    Parameters (tuple):
+    - lr_base: Base RL learning rate (0..1)
+    - wm_weight: Base WM mixture weight (0..1)
+    - softmax_beta: RL inverse temperature (internally scaled x10)
+    - tau_unc: Uncertainty sensitivity (>0) affecting both RL lr and WM mixture
+    - lapse: Lapse probability (0..1), adds uniform choice noise
+    - wm_decay: WM decay rate toward baseline per trial (0..1)
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr_base, wm_weight, softmax_beta, tau_unc, lapse, wm_decay = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # State-wise uncertainty (EMA of squared PEs), initialize low
+        U = np.zeros(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(eps, denom_rl)
+
+            # WM policy
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(eps, denom_wm)
+
+            # Uncertainty-gated WM and lapse
+            wm_mix = wm_weight * np.exp(-max(0.0, tau_unc) * U[s] * max(0, nS - 1))
+            wm_mix = min(1.0, max(0.0, wm_mix))
+            p_mix = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            log_p += np.log(max(eps, p_total))
+
+            # RL update with uncertainty-adaptive learning rate
+            delta = r - Q_s[a]
+            # Update uncertainty (EMA of squared PE)
+            U[s] = 0.9 * U[s] + 0.1 * (delta * delta)
+            lr_eff = lr_base / (1.0 + max(0.0, tau_unc) * U[s])
+            q[s, a] += lr_eff * delta
+
+            # WM update with decay and reward-based strengthening
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.5:
+                # Move W_s toward a one-hot at chosen action
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] += 0.5 * (target - w[s, :])
+            else:
+                # Slight suppression of erroneous action
+                w[s, a] = 0.8 * w[s, a] + 0.2 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with state-wise success-driven WM gating + stay bias
+
+    Description:
+    - RL component is standard Q-learning.
+    - WM component decays over time and encodes rewarded actions as high values.
+    - Mixture weight is adapted by recent success rate per state: when success exceeds a threshold,
+      WM is trusted more; otherwise RL dominates. Also scaled by set size (interference).
+    - Adds a stay bias to the RL logits favoring the last chosen action in that state.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1)
+    - wm_weight: Base WM mixture (0..1)
+    - softmax_beta: RL inverse temperature (internally scaled x10)
+    - theta: Success threshold (0..1) controlling WM gating
+    - time_decay: Decay rate (0..1) for WM values and running success
+    - bias_stay: Stay bias strength (>=0) added to last chosen action in RL logits
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, theta, time_decay, bias_stay = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # State-wise running success rate and last action
+        succ = 0.5 * np.ones(nS)
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with stay bias on logits
+            Q_s = q[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += max(0.0, bias_stay)
+
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(eps, denom_rl)
+
+            # WM policy
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(eps, denom_wm)
+
+            # Success-driven WM gating and set-size interference
+            # Gate increases when succ > theta; also scale by 1/nS
+            gate = np.clip((succ[s] - theta), 0.0, 1.0)  # 0 if below theta, up to 1 above
+            wm_mix = wm_weight * gate * (1.0 / max(1, nS))
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            log_p += np.log(max(eps, p_total))
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update with decay and reward-based boost
+            w[s, :] = (1.0 - time_decay) * w[s, :] + time_decay * w_0[s, :]
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] += 0.6 * (target - w[s, :])
+            else:
+                # Slightly demote chosen action on errors
+                w[s, a] = 0.85 * w[s, a] + 0.15 * (1.0 / nA)
+
+            # Update success rate and last action
+            succ[s] = (1.0 - time_decay) * succ[s] + time_decay * r
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

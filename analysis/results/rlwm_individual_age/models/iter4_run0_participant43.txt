@@ -1,0 +1,343 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with confidence-weighted arbitration and age- and load-dependent WM leak.
+
+    Mechanism
+    - RL: standard Q-learning with softmax choice.
+    - WM: one-shot encoding of rewarded associations; decays (leaks) toward uniform each trial.
+    - Arbitration: mixture weight for WM depends on RL confidence (lower RL confidence -> greater WM weight),
+      further modulated down under higher set size and in older adults.
+
+    Parameters
+    ----------
+    model_parameters : list or array
+        [lr, wm_weight0, softmax_beta, kappa_conf, wm_leak, age_conf_scale]
+        - lr: RL learning rate (0..1)
+        - wm_weight0: base WM mixture weight (0..1)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - kappa_conf: sensitivity of arbitration to RL (1 - confidence)
+        - wm_leak: WM leak per trial toward uniform (0..1); amplified by set size
+        - age_conf_scale: multiplicative factor (>0) scaling arbitration sensitivity in older adults
+
+    Notes
+    -----
+    - Age group: 0 for young (<=45), 1 for old (>45).
+    - WM policy uses a high-precision softmax over WM values; leak increases with set size (6 > 3).
+    - Confidence is computed as max(p_rl) - second_max(p_rl). Smaller values mean low confidence.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, kappa_conf, wm_leak, age_conf_scale = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Baseline WM weight adjusted by set size (downweight WM at load 6)
+        base_wm_scaler = 1.0 if nS == 3 else 0.6
+        wm_weight_base = np.clip(wm_weight0 * base_wm_scaler, 0.0, 1.0)
+
+        # Effective WM leak grows with set size (more interference at load 6)
+        leak_scale = 1.0 if nS == 3 else 1.5
+        leak_eff = np.clip(wm_leak * leak_scale, 0.0, 1.0)
+
+        # Arbitration sensitivity to confidence; older adults rely more on confidence signal
+        kappa_eff = kappa_conf * (1.0 + age_conf_scale * age_group)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            Qc = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Qc)
+            p_vec_rl /= np.sum(p_vec_rl)
+            p_rl = p_vec_rl[a]
+
+            # RL confidence as separation between best and runner-up action probabilities
+            sorted_probs = np.sort(p_vec_rl)
+            if len(sorted_probs) >= 2:
+                confidence = sorted_probs[-1] - sorted_probs[-2]
+            else:
+                confidence = 0.0
+
+            # WM policy
+            Wc = W_s - np.max(W_s)
+            p_vec_wm = np.exp(softmax_beta_wm * Wc)
+            p_vec_wm /= np.sum(p_vec_wm)
+            p_wm = p_vec_wm[a]
+
+            # Confidence-weighted mixture: more WM when RL is uncertain
+            # wm_weight = wm_weight_base + kappa_eff * (1 - confidence), clipped to [0,1]
+            wm_weight = np.clip(wm_weight_base + kappa_eff * (1.0 - confidence), 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM leak toward uniform
+            w = (1.0 - leak_eff) * w + leak_eff * w_0
+            # WM one-shot overwrite upon reward
+            if r > 0.0:
+                row = np.full(nA, 1e-6)
+                row[a] = 1.0
+                row /= np.sum(row)
+                w[s, :] = row
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Kalman RL + interference-limited WM.
+
+    Mechanism
+    - RL: Bayesian/Kalman updating per state-action with adaptive learning rate (Kalman gain).
+      Each (s,a) has a value mean and uncertainty; gains shrink as uncertainty decreases.
+    - WM: associative map that decays toward uniform and suffers interference that scales with set size
+      and is exacerbated in older adults (reducing WM precision).
+    - Policy: convex combination of RL softmax and WM softmax with fixed mixture within a block.
+
+    Parameters
+    ----------
+    model_parameters : list or array
+        [reward_var, q_var0, softmax_beta, wm_weight, wm_decay, age_interference]
+        - reward_var: assumed reward noise variance for Kalman filter (>0)
+        - q_var0: initial Q variance per (s,a) (>0)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - wm_weight: base WM mixture weight (0..1)
+        - wm_decay: WM decay per trial toward uniform (0..1)
+        - age_interference: factor increasing WM imprecision with set size in older adults
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    reward_var, q_var0, softmax_beta, wm_weight, wm_decay, age_interference = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL with uncertainty
+        q = (1.0 / nA) * np.ones((nS, nA))
+        var_q = q_var0 * np.ones((nS, nA))
+
+        # WM store
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM mixture weight reduced for larger set size
+        wm_w_block = np.clip(wm_weight * (1.0 if nS == 3 else 0.5), 0.0, 1.0)
+
+        # WM precision penalty due to interference and age
+        interference_load = max(0, nS - 3)
+        wm_prec_scale = 1.0 / (1.0 + interference_load * (0.5 + age_interference * age_group))
+        beta_wm_eff = softmax_beta_wm * wm_prec_scale
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Qc)
+            p_vec_rl /= np.sum(p_vec_rl)
+            p_rl = p_vec_rl[a]
+
+            # WM policy
+            W_s = w[s, :].copy()
+            Wc = W_s - np.max(W_s)
+            p_vec_wm = np.exp(beta_wm_eff * Wc)
+            p_vec_wm /= np.sum(p_vec_wm)
+            p_wm = p_vec_wm[a]
+
+            p_total = wm_w_block * p_wm + (1.0 - wm_w_block) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # Kalman RL update
+            # Prediction error
+            pe = r - q[s, a]
+            # Kalman gain for (s,a)
+            k_gain = var_q[s, a] / (var_q[s, a] + reward_var)
+            # Update mean and variance
+            q[s, a] += k_gain * pe
+            var_q[s, a] = (1.0 - k_gain) * var_q[s, a]
+
+            # WM decay and overwrite on reward
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+            if r > 0.0:
+                row = np.full(nA, 1e-6)
+                row[a] = 1.0
+                row /= np.sum(row)
+                w[s, :] = row
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL mixed with a WSLS-like WM heuristic with recency and age-dependent arbitration.
+
+    Mechanism
+    - RL: standard Q-learning with softmax policy.
+    - WM: win-stay-lose-shift heuristic, implemented as a state-specific policy distribution:
+        * After reward: choose the same action with high probability (wsls_determinism).
+        * After no reward: avoid the last action and choose among others; determinism controls avoidance strength.
+      WM recency is implemented via leak toward uniform when a state is not recently reinforced.
+    - Arbitration: fixed base weight scaled down by set size and further down for older adults.
+
+    Parameters
+    ----------
+    model_parameters : list or array
+        [lr, wm_weight, softmax_beta, wsls_determinism, wm_leak, age_wm_downscale]
+        - lr: RL learning rate (0..1)
+        - wm_weight: base WM mixture weight (0..1)
+        - softmax_beta: RL inverse temperature; scaled by 10 internally
+        - wsls_determinism: strength of WSLS policy (0..1). 1=deterministic, 0=uniform.
+        - wm_leak: leak per trial of WM distribution toward uniform (0..1)
+        - age_wm_downscale: multiplicative factor (>0) reducing WM weight in older adults
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wsls_determinism, wm_leak, age_wm_downscale = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0  # not directly used; WM uses heuristic distribution below
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL values
+        q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM as a policy distribution initialized uniform
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last action and outcome per state for WSLS
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_reward = np.zeros(nS)
+
+        # Arbitration weight scaled by load and age
+        wm_w_block = wm_weight * (1.0 if nS == 3 else 0.5)
+        wm_w_block *= (1.0 / (1.0 + age_wm_downscale * age_group))
+        wm_w_block = float(np.clip(wm_w_block, 0.0, 1.0))
+
+        # Leak amplified at set size 6
+        leak_eff = wm_leak * (1.0 if nS == 3 else 1.5)
+        leak_eff = float(np.clip(leak_eff, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            p_vec_rl = np.exp(softmax_beta * Qc)
+            p_vec_rl /= np.sum(p_vec_rl)
+            p_rl = p_vec_rl[a]
+
+            # Construct WSLS-based WM policy for this state
+            wm_dist = np.full(nA, 1.0 / nA)
+            la = last_action[s]
+            if la >= 0:
+                if last_reward[s] > 0.0:
+                    # Win-stay: prefer la
+                    p_stay = 1.0 - (1.0 - wsls_determinism)  # equals wsls_determinism + (1-wsls_determinism)*0
+                    wm_dist = np.full(nA, (1.0 - p_stay) / (nA - 1))
+                    wm_dist[la] = p_stay
+                else:
+                    # Lose-shift: avoid la
+                    p_avoid = wsls_determinism
+                    wm_dist = np.full(nA, (1.0 + p_avoid) / (nA - 1))  # distribute mass to others
+                    wm_dist[la] = max(1e-12, 1.0 - p_avoid)  # small if deterministic
+                    wm_dist /= np.sum(wm_dist)
+            # Blend current WM heuristic with decayed stored distribution
+            # First leak stored w toward uniform
+            w = (1.0 - leak_eff) * w + leak_eff * w_0
+            # Then set current state's distribution to the heuristic
+            w[s, :] = wm_dist
+
+            p_wm = w[s, a]
+            p_total = wm_w_block * p_wm + (1.0 - wm_w_block) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # Update last action/outcome memory
+            last_action[s] = a
+            last_reward[s] = r
+
+        blocks_log_p += log_p
+
+    return -float(blocks_log_p)

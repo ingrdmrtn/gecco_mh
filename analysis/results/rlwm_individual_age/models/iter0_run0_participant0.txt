@@ -1,0 +1,293 @@
+Below are three standalone cognitive models that implement RL–WM mixture policies and return the negative log-likelihood of the observed choices. Each model uses age group and set size in a meaningful way and keeps the total number of free parameters ≤ 6.
+
+Note: Assumes numpy is available as np.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + one-shot WM mixture with leaky WM and lapse.
+    - WM stores the last rewarded action per state (one-shot), with leaky decay to uniform.
+    - WM weight is scaled by set size (inverse: stronger at 3 than 6) and by age group.
+    - RL is standard delta rule with softmax action selection.
+    - Lapse adds choice noise independent of state/action values.
+
+    Parameters
+    - model_parameters: [lr, wm_weight_base, softmax_beta, phi, epsilon, age_wm_bias]
+        lr: RL learning rate in [0,1]
+        wm_weight_base: baseline WM weight before modulation (unbounded, squashed internally)
+        softmax_beta: inverse temperature for RL (scaled by 10 inside)
+        phi: WM decay/leak toward uniform in [0,1]; higher means faster decay
+        epsilon: lapse rate in [0,1], mixed with uniform policy
+        age_wm_bias: bias added for young (age_group=0) vs old (age_group=1) in WM reliance
+
+    Age group coding
+    - age_group = 0 if age <= 45 (young), else 1 (old). Young get a positive bias to WM if age_wm_bias > 0.
+    """
+    lr, wm_weight_base, softmax_beta, phi, epsilon, age_wm_bias = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM readout
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute effective WM weight for this block (set-size and age mod)
+        # Base on logistic transform to keep in [0,1]
+        base_w = 1.0 / (1.0 + np.exp(-(wm_weight_base + age_wm_bias * (1 - age_group))))
+        size_scale = 3.0 / float(nS)  # 1.0 for set size 3, 0.5 for set size 6
+        wm_weight_eff_block = np.clip(base_w * size_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Compute RL policy probability for chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / (denom_rl + eps)
+
+            # Compute WM policy probability for chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / (denom_wm + eps)
+
+            # Mixture with lapse
+            p_mix = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            log_p += np.log(p_total + eps)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w = (1.0 - phi) * w + phi * w_0
+
+            # WM one-shot update on rewarded trials (encode correct action)
+            if r > 0:
+                # Near one-hot with a tiny smoothing to avoid zero probabilities
+                w[s, :] = (eps) * np.ones(nA)
+                w[s, a] = 1.0 - (nA - 1) * eps
+                # Renormalize for safety
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM (win-stay memory) with decay; set-size and age modulate WM availability.
+    - WM is a win-stay memory: only stores the last rewarded action per state. On reward=0, WM does not overwrite.
+    - WM decays toward uniform with rate phi.
+    - WM contribution is scaled by an effective capacity K_eff relative to set size: min(1, K_eff / nS).
+      Older age reduces K_eff, lowering WM influence in larger set sizes.
+    - RL is standard delta rule; softmax action selection.
+
+    Parameters
+    - model_parameters: [lr, wm_weight_base, softmax_beta, K, phi, beta_age]
+        lr: RL learning rate in [0,1]
+        wm_weight_base: baseline WM weight (squashed to [0,1] internally)
+        softmax_beta: RL inverse temperature (scaled by 10 inside)
+        K: WM capacity in number of items (3..6 range is sensible)
+        phi: WM decay toward uniform in [0,1]
+        beta_age: reduction of capacity per unit of age_group (>=0 reduces capacity for older adults)
+
+    Age group coding
+    - age_group = 0 if age <= 45 (young), else 1 (old). K_eff = max(0, K - beta_age*age_group).
+    """
+    lr, wm_weight_base, softmax_beta, K, phi, beta_age = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    # Effective capacity accounting for age
+    K_eff_base = max(0.0, K - beta_age * age_group)
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM reliance scales with both base and capacity fraction
+        base_w = 1.0 / (1.0 + np.exp(-wm_weight_base))
+        cap_scale = min(1.0, K_eff_base / float(nS)) if nS > 0 else 0.0
+        wm_weight_eff_block = np.clip(base_w * cap_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / (denom_rl + eps)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / (denom_wm + eps)
+
+            p_total = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+            log_p += np.log(p_total + eps)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay
+            w = (1.0 - phi) * w + phi * w_0
+
+            # Win-stay WM: store action only on rewarded trials
+            if r > 0:
+                w[s, :] = eps * np.ones(nA)
+                w[s, a] = 1.0 - (nA - 1) * eps
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL–WM arbitration by uncertainty (entropy-based), with leaky WM:
+    - Arbitration weight is dynamic: higher when WM is confident (low entropy) relative to RL.
+    - Weight also includes an age bias and a set-size term favoring smaller sets.
+    - WM updated with leaky accumulation toward the last outcome (r=1 strengthens chosen action; r=0 weakly
+      suppresses it), plus decay toward uniform.
+    - RL is standard delta rule.
+
+    Parameters
+    - model_parameters: [lr, w0, w1, softmax_beta, phi, age_bias]
+        lr: RL learning rate in [0,1]
+        w0: baseline bias for WM arbitration (unbounded, squashed via logistic)
+        w1: sensitivity of arbitration to entropy difference H_rl - H_wm
+        softmax_beta: RL inverse temperature (scaled by 10 inside)
+        phi: WM decay toward uniform in [0,1]
+        age_bias: additive bias favoring WM for young (positive) vs old (negative). Applied as age_factor*(age term)
+
+    Arbitration details
+    - weight = sigmoid(w0 + w1*(H_rl - H_wm) + age_term + size_term)
+      where H_rl and H_wm are entropies of the current policies for the state.
+      size_term = log(3/nS) boosts WM for small sets, penalizes for large sets.
+      age_term = age_bias * (1 - age_group), giving young a boost if age_bias>0.
+
+    Age group coding
+    - age_group = 0 if age <= 45 (young), else 1 (old).
+    """
+    lr, w0, w1, softmax_beta, phi, age_bias = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    def entropy(p):
+        p_safe = np.clip(p, eps, 1.0)
+        p_safe /= np.sum(p_safe)
+        return -np.sum(p_safe * np.log(p_safe))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL softmax policy over actions for state s
+            Q_s = q[s, :]
+            rl_pref = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            rl_pi = rl_pref / (np.sum(rl_pref) + eps)
+            p_rl = rl_pi[a]
+
+            # WM softmax policy over actions for state s
+            W_s = w[s, :]
+            wm_pref = np.exp(softmax_beta_wm * (W_s - np.max(W_s)))
+            wm_pi = wm_pref / (np.sum(wm_pref) + eps)
+            p_wm = wm_pi[a]
+
+            # Arbitration weight based on entropy difference and modifiers
+            H_rl = entropy(rl_pi)
+            H_wm = entropy(wm_pi)
+            size_term = np.log(max(eps, 3.0 / float(nS)))  # favors smaller set sizes
+            age_term = age_bias * (1 - age_group)          # favors young if age_bias>0
+            w_lin = w0 + w1 * (H_rl - H_wm) + age_term + size_term
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-w_lin))
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(p_total + eps)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w = (1.0 - phi) * w + phi * w_0
+
+            # WM leaky accumulation:
+            # - If rewarded: push w[s] toward the chosen action
+            # - If not rewarded: slight suppression of the chosen action
+            alpha_pos = 0.8  # fixed internal gain toward chosen action on reward
+            alpha_neg = 0.2  # fixed internal suppression on no-reward
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - alpha_pos) * w[s, :] + alpha_pos * target
+            else:
+                suppress = np.zeros(nA)
+                suppress[a] = 1.0
+                w[s, :] = (1.0 - alpha_neg) * w[s, :] + alpha_neg * (w_0[s, :] - suppress / nA)
+
+            # Normalize WM state distribution for numerical stability
+            w[s, :] = np.maximum(w[s, :], eps)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Modeling notes
+- Set size effects: Model1 scales WM weight by 3/nS; Model2 scales WM weight by min(1, K_eff/nS); Model3 adds a size-dependent arbitration bias via log(3/nS).
+- Age effects: Model1 uses an age-dependent bias on WM weight; Model2 reduces effective capacity K for older adults; Model3 adds an age-dependent bias in arbitration favoring WM more in younger adults.
+- All models implement: p_total = mixture of RL and WM, with state-wise RL updates and WM updates plus decay.

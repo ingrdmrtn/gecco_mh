@@ -1,0 +1,289 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with load-dependent leak and WM policy temperature.
+
+    Idea:
+    - RL: simple delta-rule.
+    - WM: a probabilistic action distribution per state that decays (leaks) toward uniform each trial.
+    - Cognitive load (set size) increases WM leak and decreases WM policy precision.
+    - Final policy is a mixture of RL and WM with a fixed WM mixture weight.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight0: Mixture weight for WM contribution (0..1).
+    - softmax_beta: Inverse temperature for RL choice (scaled internally by 10).
+    - kappa_load: Controls how strongly set size increases WM leak (>=0).
+    - wm_beta0: Baseline inverse temperature for WM policy (>=0).
+    - wm_leak: Baseline WM leak toward uniform at minimal load (0..1).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight0, softmax_beta, kappa_load, wm_beta0, wm_leak = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # baseline max determinism (will be reduced by load)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-dependent WM leak and precision
+        # Effective leak increases with set size; bounded by [wm_leak, 1)
+        eff_leak = 1.0 - (1.0 - wm_leak) * np.exp(-kappa_load * float(nS))
+        eff_leak = np.clip(eff_leak, 0.0, 1.0)
+        # WM precision decreases with leak (more load -> less precise WM policy)
+        eff_beta_wm = max(1.0, wm_beta0 * softmax_beta_wm * (1.0 - 0.9 * eff_leak))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(1e-12, denom_rl)
+
+            # WM policy: softmax on WM distribution (interpreted as preferences)
+            denom_wm = np.sum(np.exp(eff_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight0 * p_wm + (1.0 - wm_weight0) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM leak toward uniform (load-dependent)
+            w[s, :] = (1.0 - eff_leak) * w[s, :] + eff_leak * w_0[s, :]
+
+            # If rewarded, overwrite WM with the rewarded action (fast encoding)
+            if r > 0.5:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # stabilize
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with choice perseveration + WM with capacity-limited storage.
+
+    Idea:
+    - RL: delta-rule with a perseveration bias favoring repetition of the previous action.
+    - WM: a near-veridical store for rewarded state-action pairs, but only a fraction of states
+      can be reliably stored due to limited capacity. Storage success probability scales with C/nS.
+    - WM policy uses its own inverse temperature; on trials where the state is not stored, WM drifts to uniform.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Mixture weight for WM contribution (0..1).
+    - softmax_beta: Inverse temperature for RL choice (scaled internally by 10).
+    - C_slots: WM capacity (>=0). Effective storage probability is min(1, C_slots / nS).
+    - perseveration: Tendency to repeat the previous action in RL policy (can be >=0).
+    - wm_beta: Inverse temperature for WM choice policy (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, C_slots, perseveration, wm_beta = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # baseline cap
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # per-block previous action for perseveration
+        prev_action = None
+
+        # Probability that a rewarded state is successfully stored in WM
+        p_store = min(1.0, max(0.0, float(C_slots) / float(nS)))
+        eff_beta_wm = max(1.0, softmax_beta_wm * max(0.0, wm_beta))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+
+            # RL perseveration bias: add bias to the previously chosen action
+            if prev_action is not None and 0 <= prev_action < nA:
+                Q_s[prev_action] += perseveration
+
+            # RL policy with biased Q
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(1e-12, denom_rl)
+
+            # WM policy: if memory holds a sharp distribution it will be confident, else close to uniform
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(eff_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # Updates
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay slightly toward uniform each encounter of the state
+            # Small passive decay to avoid sticking forever if not re-encountered
+            decay = 0.05
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # Capacity-limited storage on reward: store with probability p_store
+            if r > 0.5:
+                # Bernoulli draw using p_store without random sampling: use expected update
+                # Expected update: move toward one-hot by weight p_store
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - p_store) * w[s, :] + p_store * one_hot
+
+            # normalize/stabilize
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+            # update perseveration memory
+            prev_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Uncertainty-based arbitration with load penalty + leaky WM.
+
+    Idea:
+    - RL: delta-rule maintains Q-values.
+    - Arbitration: WM weight increases when RL is uncertain for the current state and decreases with higher load.
+      Uncertainty is approximated as 1 / (1 + visit_count[state]).
+    - WM: leaky distribution per state that resets toward uniform and encodes rewarded action as one-hot.
+    - The effective WM mixture is state- and time-dependent via a logistic transform.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - b0: Baseline logit for WM mixture (can be negative or positive).
+    - softmax_beta: Inverse temperature for RL choice (scaled internally by 10).
+    - alpha_unc: Weight of RL uncertainty in the WM arbitration (>0 means more WM when uncertain).
+    - gamma_load: Load penalty on WM mixture with set size (>=0).
+    - wm_leak: WM leak toward uniform on each encounter (0..1).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, b0, softmax_beta, alpha_unc, gamma_load, wm_leak = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        visits = np.zeros(nS)  # state visit counts for uncertainty
+
+        # Load penalty term centered roughly between 3 and 6
+        load_term = gamma_load * float(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(1e-12, denom_rl)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(1e-12, denom_wm)
+
+            # State-specific arbitration: more WM when RL is uncertain (few visits), less WM when load is high
+            unc_s = 1.0 / (1.0 + max(0.0, visits[s]))
+            wm_logit = b0 + alpha_unc * unc_s - load_term
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM leak toward uniform
+            w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+
+            # Reward-driven encoding
+            if r > 0.5:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # stabilize
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+            # update uncertainty (visit count)
+            visits[s] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

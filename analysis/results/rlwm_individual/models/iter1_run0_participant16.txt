@@ -1,0 +1,285 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + reward-gated, leaky working memory; WM weight scales with set size.
+
+    Idea:
+    - RL learns Q(s,a) with a single learning rate.
+    - WM stores rewarded actions with leaky decay; unrewarded trials only decay WM.
+    - Policy is a mixture of RL and WM. WM contribution is reduced at larger set sizes via
+      a multiplicative attenuation factor (3/nS)^gamma.
+    - WM softmax is highly deterministic (template), but its value trace w(s,a) is updated
+      via leaky accumulation and reward-gated boosts.
+
+    Parameters (tuple/list):
+    - lr: float in [0,1]. RL learning rate.
+    - wm_weight: float in [0,1]. Base mixture weight on WM before set-size attenuation.
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10 (per template).
+    - wm_decay: float in [0,1]. Trial-wise WM decay toward uniform (higher -> faster forgetting).
+    - wm_correct_boost: float >= 0. Additive boost to the chosen action in WM on rewarded trials.
+    - gamma_size: float >= 0. Controls how strongly WM is attenuated by set size: wm_weight_eff = wm_weight * (3/nS)^gamma_size.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, wm_decay, wm_correct_boost, gamma_size = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size attenuation of WM mixture weight
+        wm_att = (3.0 / nS) ** max(gamma_size, 0.0)
+        wm_weight_eff = np.clip(wm_weight * wm_att, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            # RL policy (template softmax with difference trick)
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy: softmax over WM values
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: leaky decay toward uniform, then reward-gated boost to chosen action
+            w[s, :] = (1 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.0:
+                w[s, a] += wm_correct_boost
+            # Renormalize WM trace to a proper distribution
+            w[s, :] = np.maximum(w[s, :], 0.0)
+            norm = np.sum(w[s, :])
+            if norm > 0:
+                w[s, :] /= norm
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with per-state choice kernel (stickiness) + capacity-limited WM with decay.
+
+    Idea:
+    - RL learns Q(s,a). RL action values are augmented by a choice kernel bias that favors
+      repeating the last action taken in that state (perseveration).
+    - WM stores last rewarded action per state, decays toward uniform, and contributes when
+      the state is within WM capacity. Effective WM mixture is wm_weight * min(1, K/nS).
+    - Policy combines RL (with stickiness bias) and WM.
+
+    Parameters (tuple/list):
+    - lr: float in [0,1]. RL learning rate.
+    - wm_weight: float in [0,1]. Base mixture weight on WM before capacity scaling.
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10 (per template).
+    - K: float >= 0. Effective WM capacity (in number of items). WM availability scales as min(1, K/nS).
+    - kappa: float >= 0. Choice stickiness weight added to the last chosen action in each state for RL policy.
+    - wm_decay: float in [0,1]. WM decay toward uniform each trial.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, K, kappa, wm_decay = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last chosen action per state for RL stickiness
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # WM availability due to capacity limit
+        wm_availability = min(1.0, float(K) / float(nS))
+        wm_weight_eff = np.clip(wm_weight * wm_availability, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with stickiness bias
+            Q_s = q[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += kappa
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy from w
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update uses original Q without stickiness in learning rule
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # Update last action
+            last_action[s] = a
+
+            # WM update: decay toward uniform; if rewarded, store chosen action strongly
+            w[s, :] = (1 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Overwrite toward one-hot but keep some residual mixture to avoid zeros
+                w[s, :] = 0.9 * one_hot + 0.1 * w[s, :]
+
+            # Renormalize WM trace
+            w[s, :] = np.maximum(w[s, :], 0.0)
+            norm = np.sum(w[s, :])
+            if norm > 0:
+                w[s, :] /= norm
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with value decay + error-gated WM encoding that is penalized by set size.
+
+    Idea:
+    - RL learns Q(s,a) with learning rate and includes passive value decay (forgetting) each trial.
+      Larger set sizes hamper stable RL via the same decay applied to all actions of the visited state.
+    - WM encodes the chosen action probabilistically with a gate that depends on prediction-error magnitude
+      and is penalized by larger set size. WM decays toward uniform otherwise.
+    - Policy is a mixture of RL and WM with a global WM weight.
+
+    Parameters (tuple/list):
+    - lr: float in [0,1]. RL learning rate.
+    - wm_weight: float in [0,1]. Mixture weight on WM (not set-size specific; set size acts via gating).
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10 (per template).
+    - decay_q: float in [0,1]. Per-trial decay of Q-values toward uniform within the visited state.
+    - gate_base: float. Baseline term for WM gating before PE and size effects.
+    - gate_size_penalty: float >= 0. Strength by which larger set sizes reduce WM gating probability.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, decay_q, gate_base, gate_size_penalty = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Size penalty factor on WM gating
+        size_pen = gate_size_penalty * max(0, nS - 3)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight * p_wm + (1 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with decay toward uniform within visited state
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+            # Apply decay on the entire state's action values toward uniform
+            q[s, :] = (1 - decay_q) * q[s, :] + decay_q * (1.0 / nA)
+
+            # WM update: decay, then gated overwrite based on PE magnitude and set size penalty
+            w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]  # mild decay toward uniform each trial
+            gate_input = gate_base + np.abs(pe) - size_pen
+            # Squashed to [0,1] via logistic
+            gate_prob = 1.0 / (1.0 + np.exp(-gate_input))
+            if np.random.rand() < gate_prob:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.95 * one_hot + 0.05 * w_0[s, :]
+
+            # Renormalize WM trace
+            w[s, :] = np.maximum(w[s, :], 0.0)
+            norm = np.sum(w[s, :])
+            if norm > 0:
+                w[s, :] /= norm
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set-size effects:
+- Model 1: WM mixture weight is attenuated by (3/nS)^gamma_size, directly reducing WM influence at set size 6.
+- Model 2: WM availability scales as min(1, K/nS), implementing limited capacity; larger nS reduces WM contribution. RL is unaffected directly by set size but behavior shifts due to lower WM.
+- Model 3: Larger set sizes reduce WM encoding probability via gate_size_penalty, and RL stability is reduced by value decay that applies regardless of set size (can interact with longer revisit intervals in larger sets).

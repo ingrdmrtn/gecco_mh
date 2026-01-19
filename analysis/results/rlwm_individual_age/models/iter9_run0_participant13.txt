@@ -1,0 +1,295 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with set-size-driven interference and action stickiness.
+
+    Mechanism
+    - RL: single learning rate. Choice precision beta is shared across set sizes.
+      Add a state-independent action stickiness (perseveration) bias to the last executed action in the block.
+    - WM: stores the last rewarded action for each state as a one-hot vector.
+      WM contribution is down-weighted by set-size-driven interference.
+      WM also decays toward uniform on non-rewarded trials (interference within set).
+    - Arbitration: mixture of WM and RL policies with a weight that depends on set size (interference_rate)
+      and age group (age_mix_shift).
+
+    Parameters (model_parameters; all are used)
+    - 0) lr: RL learning rate (0..1)
+    - 1) beta_base: base inverse temperature for RL; scaled by 10 internally
+    - 2) wm_mix_base: baseline WM mixture weight (0..1 in logit space via sigmoid)
+    - 3) interference_rate: how strongly larger set sizes reduce WM contribution and increase WM decay (>0)
+    - 4) age_mix_shift: additive shift in WM mixture for older group (applied in logit space; young = 0)
+    - 5) stickiness: perseveration bias added to the most recent action in the block
+
+    Age and set size effects
+    - Age: age_mix_shift is added to the WM mixture logit for older adults (age_group=1), otherwise 0.
+    - Set size: WM mixture is reduced as set size increases via interference_rate; WM decay on non-rewarded trials
+      also increases with set size.
+
+    Returns
+    - Negative log-likelihood of observed choices
+    """
+    lr, beta_base, wm_mix_base, interference_rate, age_mix_shift, stickiness = model_parameters
+    beta = 10.0 * beta_base
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    nll = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL and WM stores
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # not directly used, serves as uniform prior anchor
+
+        # Set-size dependent interference for WM mixture and decay
+        sz_excess = max(0, nS - 3)
+        # WM mixture in logit space
+        def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
+        wm_logit = np.log(np.clip(wm_mix_base, 1e-6, 1-1e-6) / (1 - np.clip(wm_mix_base, 1e-6, 1-1e-6)))
+        # Reduce WM weight with set size; older adults get an additional shift
+        wm_logit_eff = wm_logit - interference_rate * sz_excess + (age_mix_shift if age_group == 1 else 0.0)
+        wm_weight = sigmoid(wm_logit_eff)
+        # WM retrieval precision (fixed high)
+        softmax_beta_wm = 50.0
+        # WM decay amount on non-rewarded trials increases with set size
+        wm_decay = 1.0 - np.exp(-interference_rate * max(1, sz_excess))  # in [0,1)
+
+        prev_action = None
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL logits with stickiness
+            Q_s = q[s, :].copy()
+            if prev_action is not None and 0 <= prev_action < nA:
+                Q_s[prev_action] += stickiness
+
+            # Compute P_RL(a|s) via stable chosen-action probability
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy from stored association
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: rewarded -> one-shot store; else decay toward uniform (interference)
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            prev_action = a
+
+        nll -= log_p
+
+    return nll
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with binding-error noise that grows with set size and age.
+
+    Mechanism
+    - RL: single learning rate and softmax inverse temperature.
+    - WM: stores last rewarded action per state as a one-shot association.
+      Retrieval is corrupted by binding errors that increase with set size and are worse for older adults.
+      Binding error converts a sharp one-hot WM distribution toward uniform.
+    - Arbitration: fixed WM mixture weight baseline, but the effective WM signal is degraded by binding errors.
+
+    Parameters (model_parameters; all are used)
+    - 0) lr: RL learning rate (0..1)
+    - 1) beta_base: RL inverse temperature; scaled by 10 internally
+    - 2) wm_weight_base: baseline mixture weight for WM (0..1 in probability space)
+    - 3) bind_slope: increase of binding error per extra item beyond 3 (>0)
+    - 4) age_bind_shift: additive binding error shift for older adults (>=0)
+    - 5) wm_temp: WM retrieval temperature (>0); effective WM beta = 1 / wm_temp
+
+    Age and set size effects
+    - Set size: binding error e = sigmoid(bind_slope*(set_size-3) + age_term) pushes WM toward uniform as sets grow.
+    - Age: age_bind_shift raises binding error for older adults.
+
+    Returns
+    - Negative log-likelihood of observed choices
+    """
+    lr, beta_base, wm_weight_base, bind_slope, age_bind_shift, wm_temp = model_parameters
+    beta = 10.0 * beta_base
+    beta_wm = 1.0 / max(1e-6, wm_temp)
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
+
+    nll = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Binding error increases with set size and age
+        sz_excess = max(0, nS - 3)
+        age_term = (age_bind_shift if age_group == 1 else 0.0)
+        bind_error = sigmoid(bind_slope * sz_excess + age_term)  # in (0,1)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        wm_weight = np.clip(wm_weight_base, 1e-6, 1.0 - 1e-6)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL chosen-action probability
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM retrieval with binding errors: blur the one-hot vector toward uniform
+            W_s = w[s, :]
+            W_blurred = (1.0 - bind_error) * W_s + bind_error * w_0[s, :]
+            p_wm = 1.0 / np.sum(np.exp(beta_wm * (W_blurred - W_blurred[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: store on reward; otherwise leave as is (no active forgetting here; forgetting is via bind_error)
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        nll -= log_p
+
+    return nll
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with entropy-based arbitration, set-size ceiling on WM, and age penalty on RL precision.
+
+    Mechanism
+    - RL: single learning rate; inverse temperature is penalized for older adults (less precise).
+    - WM: one-shot win-stay memory per state; retrieved with high precision.
+    - Arbitration: WM weight increases when RL policy is uncertain (high entropy) and decreases when RL is confident.
+      The maximum WM engagement is capped by a set-size-dependent ceiling (smaller in larger sets).
+
+    Parameters (model_parameters; all are used)
+    - 0) lr: RL learning rate (0..1)
+    - 1) beta_base: base RL inverse temperature; scaled by 10 internally
+    - 2) wm_ceiling: maximum WM mixture weight at set size 3 (0..1)
+    - 3) arb_temp: softness of entropy-based arbitration (>0). Larger = more sensitivity to entropy.
+    - 4) size_penalty: reduction of wm_ceiling per extra item beyond 3 (>=0)
+    - 5) age_beta_penalty: reduction applied to RL beta for older adults (after scaling); >=0
+
+    Age and set size effects
+    - Age: older adults have beta_eff = beta_base*10 - age_beta_penalty*10 (floored at small positive).
+    - Set size: wm_ceiling_eff = max(0, wm_ceiling - size_penalty*(set_size-3)).
+
+    Returns
+    - Negative log-likelihood of observed choices
+    """
+    lr, beta_base, wm_ceiling, arb_temp, size_penalty, age_beta_penalty = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+    beta_eff = 10.0 * beta_base - (10.0 * age_beta_penalty if age_group == 1 else 0.0)
+    beta_eff = max(1e-3, beta_eff)
+
+    def softmax_probs(beta, vals):
+        # Stable softmax
+        z = vals - np.max(vals)
+        e = np.exp(beta * z)
+        return e / np.sum(e)
+
+    nll = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+        sz_excess = max(0, nS - 3)
+        wm_ceiling_eff = max(0.0, wm_ceiling - size_penalty * sz_excess)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        softmax_beta_wm = 50.0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy distribution and chosen prob
+            Q_s = q[s, :]
+            pi_rl = softmax_probs(beta_eff, Q_s)
+            p_rl = np.clip(pi_rl[a], 1e-12, 1.0)
+
+            # RL entropy for arbitration (natural log)
+            H_rl = -np.sum(np.clip(pi_rl, 1e-12, 1.0) * np.log(np.clip(pi_rl, 1e-12, 1.0)))
+
+            # Map entropy to WM weight via sigmoid; scale by wm_ceiling_eff
+            # Entropy range for nA=3 is [0, ln(3)]; center around ln(3)/2 using arb_temp
+            H_center = 0.5 * np.log(nA)
+            wm_weight = wm_ceiling_eff * (1.0 / (1.0 + np.exp(-(H_rl - H_center) / max(1e-6, arb_temp))))
+
+            # WM policy from memory
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: one-shot on reward
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                # No change on non-rewarded trials
+                pass
+
+        nll -= log_p
+
+    return nll

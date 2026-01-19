@@ -1,0 +1,318 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with entropy- and load-gated arbitration and WM leak.
+
+    Mechanism:
+    - RL: delta-rule with softmax.
+    - WM: per-state action weights; rewarded choices are encoded; WM leaks toward uniform.
+    - Arbitration: WM mixture weight is a sigmoid over a logit:
+        wm_logit0 - ss_cost*(set_size-3) - age_cost*age_group - H(Q_s),
+      where H(Q_s) is the softmax entropy of the RL policy in the current state.
+      Thus, larger set sizes and older age reduce WM reliance; higher RL uncertainty
+      (higher entropy) also reduces WM reliance.
+
+    Parameters (model_parameters):
+    - alpha_rl: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature; scaled by 10 internally
+    - wm_logit0: baseline logit for WM mixture weight
+    - ss_cost: penalty per item beyond 3 on WM mixture weight (>=0)
+    - age_cost: penalty applied when age_group == 1 (>=0 reduces WM in older)
+    - wm_leak: WM leak rate toward uniform each trial (0..1)
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block index per trial
+    - set_sizes: set size per trial (3 or 6)
+    - age: array with a single age value repeated
+    Returns:
+    - Negative log-likelihood of observed choices
+    """
+    alpha_rl, beta_rl, wm_logit0, ss_cost, age_cost, wm_leak = model_parameters
+    beta_rl *= 10.0
+    beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    nA = 3
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            rl_logits = beta_rl * (Q_s - np.max(Q_s))
+            rl_exp = np.exp(rl_logits)
+            p_rl_vec = rl_exp / np.sum(rl_exp)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # RL entropy (natural log)
+            H_rl = -np.sum(p_rl_vec * np.log(np.clip(p_rl_vec, 1e-12, 1.0)))
+
+            # WM policy
+            wm_logits = beta_wm * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            p_wm_vec = wm_exp / np.sum(wm_exp)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Arbitration logit with set size, age, and entropy gating
+            ss_penalty = ss_cost * max(nS - 3, 0)
+            age_penalty = age_cost * (1 if age_group == 1 else 0)
+            wm_logit = wm_logit0 - ss_penalty - age_penalty - H_rl
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            # Mixture probability of observed action
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] = Q_s[a] + alpha_rl * delta
+
+            # WM leak toward uniform
+            w[s, :] = (1.0 - wm_leak) * W_s + wm_leak * (1.0 / nA)
+
+            # WM encode on reward (sharpen toward one-hot)
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Blend with existing to avoid full overwrite
+                w[s, :] = 0.5 * W_s + 0.5 * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with valence-asymmetric learning + probabilistic WM storage that declines with load and age.
+
+    Mechanism:
+    - RL: delta-rule with separate alpha_pos and alpha_neg; softmax policy.
+    - WM: per-state weights; on each trial, with probability p_store the current
+      rewarded choice is stored (if r=1). Otherwise only decay. Decay toward uniform
+      scales with (1 - p_store) so that when storage is unlikely, WM also becomes less reliable.
+    - Arbitration: WM mixture weight equals the current state's WM peak strength
+      (max over actions), which reflects how confident/peaked the WM trace is.
+
+    Parameters (model_parameters):
+    - alpha_pos: RL learning rate for positive prediction errors (0..1)
+    - alpha_neg: RL learning rate for negative prediction errors (0..1)
+    - beta_rl: RL inverse temperature; scaled by 10 internally
+    - wm_store0: base logit for WM storage probability
+    - ss_penalty_store: penalty per item beyond 3 on WM storage logit (>=0)
+    - age_store_penalty: additional penalty applied when age_group == 1 (>=0)
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block index per trial
+    - set_sizes: set size per trial
+    - age: array with a single age value repeated
+    Returns:
+    - Negative log-likelihood of observed choices
+    """
+    alpha_pos, alpha_neg, beta_rl, wm_store0, ss_penalty_store, age_store_penalty = model_parameters
+    beta_rl *= 10.0
+    beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    nA = 3
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute storage probability for this block
+        ss_penalty = ss_penalty_store * max(nS - 3, 0)
+        age_penalty = age_store_penalty * (1 if age_group == 1 else 0)
+        store_logit = wm_store0 - ss_penalty - age_penalty
+        p_store = 1.0 / (1.0 + np.exp(-store_logit))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            rl_logits = beta_rl * (Q_s - np.max(Q_s))
+            rl_exp = np.exp(rl_logits)
+            p_rl_vec = rl_exp / np.sum(rl_exp)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # WM policy
+            wm_logits = beta_wm * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            p_wm_vec = wm_exp / np.sum(wm_exp)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Arbitration by WM peak strength
+            wm_weight = float(np.max(W_s))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Mixture probability of observed action
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with valence asymmetry
+            pe = r - Q_s[a]
+            alpha = alpha_pos if pe >= 0 else alpha_neg
+            q[s, a] = Q_s[a] + alpha * pe
+
+            # WM decay toward uniform scales with 1 - p_store
+            decay = 0.5 * (1.0 - p_store)
+            w[s, :] = (1.0 - decay) * W_s + decay * (1.0 / nA)
+
+            # WM encode with probability p_store if rewarded
+            if r > 0.0:
+                # Expected update under Bernoulli(p_store): blend toward one-hot
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - p_store) * w[s, :] + p_store * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with choice stickiness + WM with lateral inhibition; capacity-based arbitration.
+
+    Mechanism:
+    - RL: delta-rule with softmax and choice stickiness added to policy logits.
+    - WM: reward-driven sharpening with lateral inhibition: when rewarded, increase the
+      chosen action weight and suppress others by 'inhibit', then renormalize; otherwise,
+      light drift toward uniform.
+    - Arbitration: WM mixture weight follows a rational capacity rule: K_eff/(K_eff + nS),
+      where K_eff = max(0, K_base - age_deltaK*age_group). Thus, larger sets or older age
+      reduce WM reliance.
+
+    Parameters (model_parameters):
+    - alpha_rl: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature; scaled by 10 internally
+    - stickiness: choice perseveration weight added to the previously chosen action's logit
+    - K_base: baseline WM capacity parameter (>0)
+    - age_deltaK: capacity reduction applied when age_group == 1 (>=0)
+    - inhibit: lateral inhibition strength applied to non-chosen WM entries on reward (0..1)
+
+    Inputs:
+    - states, actions, rewards: arrays per trial
+    - blocks: block index per trial
+    - set_sizes: set size per trial
+    - age: array with a single age value repeated
+    Returns:
+    - Negative log-likelihood of observed choices
+    """
+    alpha_rl, beta_rl, stickiness, K_base, age_deltaK, inhibit = model_parameters
+    beta_rl *= 10.0
+    beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    nA = 3
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective capacity and arbitration weight for this block
+        K_eff = max(0.0, K_base - age_deltaK * (1 if age_group == 1 else 0))
+        wm_weight = K_eff / (K_eff + float(nS)) if (K_eff + float(nS)) > 0 else 0.0
+        wm_weight = float(np.clip(wm_weight, 0.0, 1.0))
+
+        log_p = 0.0
+        prev_action = None
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :]
+
+            # RL policy with stickiness
+            rl_logits = beta_rl * (Q_s - np.max(Q_s))
+            if prev_action is not None:
+                rl_logits[prev_action] += stickiness
+            rl_exp = np.exp(rl_logits)
+            p_rl_vec = rl_exp / np.sum(rl_exp)
+            p_rl = max(p_rl_vec[a], 1e-12)
+
+            # WM policy
+            wm_logits = beta_wm * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            p_wm_vec = wm_exp / np.sum(wm_exp)
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Mixture probability
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] = q[s, a] + alpha_rl * pe
+
+            # WM update:
+            # light drift to uniform every visit
+            drift = 0.05
+            w[s, :] = (1.0 - drift) * W_s + drift * (1.0 / nA)
+
+            # if rewarded: lateral inhibition sharpen
+            if r > 0.0:
+                sharpen = W_s.copy()
+                # boost chosen
+                sharpen[a] = min(1.0, sharpen[a] + inhibit)
+                # suppress others
+                others = [i for i in range(nA) if i != a]
+                for i in others:
+                    sharpen[i] = max(0.0, sharpen[i] - inhibit / (nA - 1))
+                # renormalize to sum to 1 to keep it a distribution-like trace
+                total = np.sum(sharpen)
+                if total > 0:
+                    w[s, :] = sharpen / total
+                else:
+                    w[s, :] = (1.0 / nA) * np.ones(nA)
+
+            prev_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

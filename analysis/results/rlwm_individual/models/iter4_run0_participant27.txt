@@ -1,0 +1,365 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-weighted arbitration and set-size bias.
+
+    Mechanism
+    ---------
+    - RL: single learning rate; softmax choice (kept from template).
+    - WM: tabular action weights per state (w) that are updated toward one-hot
+      after rewarded choices and toward uniform after unrewarded choices, with a
+      leak toward uniform on each visit.
+    - Arbitration: wm_weight is transformed into a state- and set-size–dependent
+      effective weight via:
+        wm_weight_eff = sigmoid( logit(wm_weight) + k_size*(3/nS - 0.5) + k_unc*(1 - H(W_s)) )
+      where H(W_s) is the normalized entropy of the WM distribution at the current state.
+      This increases reliance on WM when the WM distribution is sharp (low entropy) and
+      when set size is small.
+
+    Set-size effects
+    ----------------
+    - Arbitration bias term: k_size*(3/nS - 0.5) increases WM weight in small sets (nS=3)
+      and decreases it in large sets (nS=6).
+    - WM inverse temperature is also scaled by (3/nS) to make WM more deterministic in
+      small sets.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, beta_wm, wm_leak, k_size)
+        - lr: Learning rate for RL and WM table updates (0..1).
+        - wm_weight: Baseline mixture weight on WM policy (0..1).
+        - softmax_beta: RL inverse temperature (>0, internally scaled by 10).
+        - beta_wm: Baseline WM inverse temperature (>0).
+        - wm_leak: Leak of WM toward uniform on each visit (0..1).
+        - k_size: Set-size bias for arbitration; positive means greater WM use in small sets.
+
+    Returns
+    -------
+    Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, beta_wm, wm_leak, k_size = model_parameters
+
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic (baseline, we will combine with beta_wm)
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Fixed set-size scaling for WM temperature
+        size_scale_temp = (3.0 / float(nS))
+        beta_wm_eff_base = (softmax_beta_wm * beta_wm) * size_scale_temp
+
+        # Precompute constants for arbitration
+        def logit(p):
+            p = np.clip(p, eps, 1 - eps)
+            return np.log(p) - np.log(1 - p)
+
+        base_logit = logit(wm_weight)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (template line)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax with effective beta
+            beta_wm_eff = beta_wm_eff_base
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Uncertainty (entropy) of WM distribution at s, normalized by log(nA)
+            W_clip = np.clip(W_s, eps, 1.0)
+            H = -np.sum(W_clip * np.log(W_clip)) / np.log(nA)
+            certainty = 1.0 - H  # 0..1
+
+            # Arbitration: state- and set-size–dependent effective WM weight
+            size_bias = k_size * (3.0 / float(nS) - 0.5)
+            # Also include a small contribution of certainty to arbitration (reuse k_size magnitude)
+            arb_logit = base_logit + size_bias + k_size * certainty
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-arb_logit))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update:
+            # 1) Leak toward uniform for visited state
+            w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+            # 2) Move toward one-hot if rewarded, else toward uniform
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * target
+            else:
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+
+            # Normalize WM row to be a proper distribution
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + WM with capacity-biased temperature and decay.
+
+    Mechanism
+    ---------
+    - RL: single learning rate with a replacing eligibility trace lambda:
+           e_t(s,a) = 1 for visited (s,a), other eligibilities decay by lambda.
+           Q updated by lr * delta * e.
+    - WM: tabular distribution updated toward one-hot on reward and toward uniform on no reward.
+           WM also decays toward uniform on each visit (wm_decay).
+           WM temperature increases in smaller sets via a capacity-bias function.
+    - Arbitration: fixed wm_weight across trials, but WM temperature is scaled
+      by a capacity bias favoring smaller set sizes.
+
+    Set-size effects
+    ----------------
+    - WM inverse temperature is multiplied by cap_bias = 1 / (1 + exp(kappa*(nS - 4.5))).
+      For positive kappa, WM is sharper in small sets and flatter in large sets.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        (lr, lam, softmax_beta, wm_weight, wm_decay, kappa)
+        - lr: Learning rate for RL and WM updates (0..1).
+        - lam: Eligibility trace parameter lambda (0..1).
+        - softmax_beta: RL inverse temperature (>0, internally scaled by 10).
+        - wm_weight: Mixture weight on WM policy (0..1).
+        - wm_decay: WM leak toward uniform on each visit (0..1).
+        - kappa: Controls set-size bias in WM temperature (>0 means stronger bias).
+
+    Returns
+    -------
+    Negative log-likelihood of observed choices.
+    """
+    lr, lam, softmax_beta, wm_weight, wm_decay, kappa = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility traces for RL
+        e = np.zeros((nS, nA))
+
+        # Capacity-biased WM temperature
+        cap_bias = 1.0 / (1.0 + np.exp(kappa * (float(nS) - 4.5)))
+        beta_wm_eff = softmax_beta_wm * cap_bias
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility trace
+            delta = r - Q_s[a]
+            # Decay eligibilities
+            e *= lam
+            # Replacing trace for visited (s,a)
+            e[s, :] = 0.0
+            e[s, a] = 1.0
+            # Update Q for all state-actions via eligibility
+            q += lr * delta * e
+
+            # WM update with decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * target
+            else:
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+
+            # Normalize WM row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + gated WM storage with capacity and lapse.
+
+    Mechanism
+    ---------
+    - RL: single learning rate; softmax choice (template).
+    - WM: updates are gated by reward prediction error magnitude and scaled by capacity.
+           If the gate opens, WM for the current state is updated strongly toward one-hot
+           when rewarded and toward uniform otherwise; if gate remains closed, WM drifts
+           only slightly toward uniform.
+    - Arbitration: fixed wm_weight between RL and WM; WM inverse temperature scales with set size.
+    - Lapse: with probability epsilon, choice is random (implemented as mixture with uniform).
+
+    Set-size effects
+    ----------------
+    - Gate open probability is scaled by min(1, capacity/nS): larger sets reduce probability
+      of storing/updating WM.
+    - WM temperature is scaled by (3/nS) so that WM is sharper in small sets.
+
+    Parameters
+    ----------
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, gate_sensitivity, capacity, epsilon)
+        - lr: Learning rate for RL and WM updates (0..1).
+        - wm_weight: Mixture weight on WM policy (0..1).
+        - softmax_beta: RL inverse temperature (>0, internally scaled by 10).
+        - gate_sensitivity: Scales the influence of |RPE| on WM gate opening (>0).
+        - capacity: WM capacity in number of items; affects storage probability (>0).
+        - epsilon: Lapse rate; mixture with uniform choice (0..1).
+
+    Returns
+    -------
+    Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, gate_sensitivity, capacity, epsilon = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size scaling for WM temperature and gate capacity
+        beta_wm_eff = softmax_beta_wm * (3.0 / float(nS))
+        cap_scale = min(1.0, float(capacity) / float(nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+
+            # Mixture of WM and RL
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            # Lapse mixture with uniform
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM gated update
+            # Gate open probability based on |delta| and capacity scaling
+            g_logit = gate_sensitivity * abs(delta)
+            # Convert to probability via logistic and capacity scaling
+            p_gate = (1.0 / (1.0 + np.exp(-g_logit))) * cap_scale
+
+            # Expected update (mean-field): use p_gate as weight of a strong update,
+            # and (1-p_gate) as a weak drift toward uniform
+            # Weak drift
+            w[s, :] = (1.0 - lr * (1.0 - p_gate)) * w[s, :] + lr * (1.0 - p_gate) * w_0[s, :]
+            # Strong gated update toward one-hot on reward or toward uniform on no reward
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+            else:
+                target = w_0[s, :]
+            w[s, :] = (1.0 - lr * p_gate) * w[s, :] + lr * p_gate * target
+
+            # Normalize WM row
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] /= row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set-size sensitivity across models:
+- Model 1: Set size modulates both WM temperature (via 3/nS) and arbitration weight (k_size term).
+- Model 2: Set size modulates WM temperature via a capacity-bias function controlled by kappa.
+- Model 3: Set size reduces WM effectiveness via capacity scaling of the storage gate (capacity/nS) and via WM temperature scaling (3/nS).

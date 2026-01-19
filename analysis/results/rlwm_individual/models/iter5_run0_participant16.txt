@@ -1,0 +1,314 @@
+Below are three alternative cognitive models tailored to the RL-WM task. Each function returns the negative log-likelihood of the observed choices under its assumptions. All models implement:
+- An RL module with a softmax policy (beta scaled by 10 as in the template).
+- A WM module with a near-deterministic softmax (beta_wm = 50).
+- A mixture policy combining WM and RL.
+- Per-block resets of values.
+- Load (set size) effects, but via distinct mechanisms in each model.
+
+Note: Assume numpy as np is already imported.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Adaptive WM weighting by RL uncertainty and set size; leaky WM with reward-gated overwrite.
+
+    Idea:
+    - RL: standard delta-rule.
+    - WM: leaky action-trace per state that is refreshed on reward and decays globally toward uniform.
+    - Mixture weight: dynamically determined each trial from (a) set size and (b) RL policy uncertainty
+      (Shannon entropy of RL softmax). Higher entropy => higher reliance on WM; larger set size => lower reliance on WM.
+
+    Parameters (model_parameters):
+    - lr: float in [0,1]. RL learning rate.
+    - beta_rl: float >= 0. RL inverse temperature (internally scaled by 10).
+    - wm_bias: float. Intercept for WM weight logistic.
+    - wm_size_penalty: float >= 0. Reduction of WM weight per unit set size above 3.
+    - wm_decay: float in [0,1]. Per-trial decay of WM traces toward uniform (applied to all states).
+    - entropy_temp: float >= 0. Sensitivity of WM weight to normalized RL entropy (0..1).
+
+    Set size effects:
+    - Larger set sizes linearly reduce WM reliance via wm_size_penalty.
+    - RL uncertainty (entropy) increases WM reliance via entropy_temp.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, beta_rl, wm_bias, wm_size_penalty, wm_decay, entropy_temp = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy for chosen action
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # Full RL policy (for entropy)
+            logits_rl = softmax_beta * Q_s
+            logits_rl = logits_rl - np.max(logits_rl)
+            p_rl_vec = np.exp(logits_rl)
+            p_rl_vec = p_rl_vec / max(np.sum(p_rl_vec), eps)
+            H_rl = -np.sum(p_rl_vec * np.log(p_rl_vec + eps)) / np.log(nA)  # normalized entropy in [0,1]
+
+            # WM policy for chosen action
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Adaptive WM weight via logistic transform
+            size_term = -wm_size_penalty * max(0, nS - 3)
+            ent_term = entropy_temp * H_rl
+            wm_weight_t = 1.0 / (1.0 + np.exp(-(wm_bias + size_term + ent_term)))
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM global decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # Reward-gated WM overwrite toward chosen action
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Strengthen the chosen action trace for that state
+                w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+            else:
+                # On negative feedback, mildly suppress the chosen action in WM
+                suppress = np.zeros(nA)
+                suppress[a] = -1.0
+                w[s, :] = 0.95 * w[s, :] + 0.05 * (w_0[s, :] + 0.1 * suppress)
+                # Renormalize softmax-invariant by recentering (keep scale for policy)
+                w[s, :] = w[s, :] - np.mean(w[s, :]) + 1.0 / nA
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Asymmetric RL (separate positive/negative learning rates) and capacity-limited WM precision.
+
+    Idea:
+    - RL: delta-rule with different lr for positive vs negative prediction errors.
+    - WM: stores leaky action preference traces updated more strongly on reward. WM softmax precision
+      is scaled down when set size exceeds capacity K, capturing load-induced noisier WM.
+    - Policy: fixed mixture between WM and RL.
+
+    Parameters (model_parameters):
+    - lr_pos: float in [0,1]. RL learning rate for positive prediction errors (r - Q > 0).
+    - lr_neg: float in [0,1]. RL learning rate for negative prediction errors (r - Q < 0).
+    - beta_rl: float >= 0. RL inverse temperature (internally scaled by 10).
+    - wm_weight: float in [0,1]. Mixture weight on WM policy.
+    - wm_precision_base: float in [0,1]. Base scaling of WM precision before capacity adjustment.
+    - K_capacity: float > 0. Effective WM capacity in number of items; precision scales with min(1, K/nS).
+
+    Set size effects:
+    - WM softmax precision is multiplied by min(1, K_capacity / set_size). Larger sets => lower precision.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr_pos, lr_neg, beta_rl, wm_weight, wm_precision_base, K_capacity = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm_base = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM precision given set size
+        precision_scale = wm_precision_base * min(1.0, K_capacity / max(1.0, nS))
+        beta_wm_eff = softmax_beta_wm_base * max(precision_scale, 1e-3)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy for chosen action
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy for chosen action, capacity-limited precision
+            denom_wm = np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetry
+            delta = r - Q_s[a]
+            if delta >= 0:
+                q[s, a] += lr_pos * delta
+            else:
+                q[s, a] += lr_neg * delta
+
+            # Small RL drift toward uniform to prevent unbounded divergence
+            q[s, :] = 0.995 * q[s, :] + 0.005 * (1.0 / nA)
+
+            # WM leaky update: global slight decay
+            w = 0.98 * w + 0.02 * w_0
+
+            # Reward-gated WM strengthening; update magnitude tied to precision_scale
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                alpha_wm = 0.2 + 0.6 * precision_scale  # stronger overwrite when capacity suffices
+                w[s, :] = (1.0 - alpha_wm) * w[s, :] + alpha_wm * one_hot
+            else:
+                # Mild punishment of chosen action in WM
+                w[s, a] = 0.9 * w[s, a] + 0.1 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with load-dependent forgetting and lapse; WM with reward-based refresh.
+
+    Idea:
+    - RL: delta-rule plus load-dependent forgetting toward uniform each trial.
+    - Lapse: additional exploration probability that increases with set size.
+    - WM: stores recent correct action per state; refreshed on reward; decays to uniform otherwise.
+    - Policy: mixture of WM and RL, then blended with uniform according to lapse.
+
+    Parameters (model_parameters):
+    - lr: float in [0,1]. RL learning rate.
+    - beta_rl: float >= 0. RL inverse temperature (internally scaled by 10).
+    - wm_weight: float in [0,1]. Mixture weight on WM vs RL.
+    - eta_forget_base: float in [0,1]. Baseline RL forgetting rate toward uniform per trial.
+    - phi_size_gain: float >= 0. Gain on forgetting as set size increases (additive on eta).
+    - lapse_slope: float >= 0. Lapse probability increment per item above 3.
+
+    Set size effects:
+    - Effective RL forgetting: eta = clamp(eta_forget_base + phi_size_gain * max(0, nS - 3), 0, 1).
+    - Lapse: epsilon = clamp(lapse_slope * max(0, nS - 3), 0, 0.49) mixed with uniform.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, beta_rl, wm_weight, eta_forget_base, phi_size_gain, lapse_slope = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-dependent forgetting and lapse parameters
+        eta = eta_forget_base + phi_size_gain * max(0, nS - 3)
+        eta = min(max(eta, 0.0), 1.0)
+        epsilon = lapse_slope * max(0, nS - 3)
+        epsilon = min(max(epsilon, 0.0), 0.49)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy for chosen action
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy for chosen action
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Mixture of WM and RL
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+
+            # Lapse mixture with uniform (set-size dependent)
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # RL forgetting toward uniform (load-dependent)
+            q = (1.0 - eta) * q + eta * (1.0 / nA)
+
+            # WM decay toward uniform
+            w = 0.95 * w + 0.05 * w_0
+
+            # Reward-based WM refresh
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+            else:
+                # Slight de-emphasis of the incorrect action
+                w[s, a] = 0.97 * w[s, a] + 0.03 * (1.0 / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

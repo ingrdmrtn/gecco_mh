@@ -1,0 +1,307 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with valence-asymmetric learning and probabilistic WM encoding under age/load interference.
+
+    Mechanism:
+    - RL: Separate learning rates for positive and negative prediction errors.
+    - WM: Each state is encoded in WM with a probability that decreases with set size (load) and age.
+      If encoded, WM stores a one-hot action policy that decays toward uniform when not reinforced.
+    - Arbitration: Effective WM weight is the product of a base weight and the encoding probability for that state.
+    - Age/Load effects: Encoding probability decreases with both age group (older=1) and larger set sizes.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive PE (0..1).
+    - lr_neg: RL learning rate for negative PE (0..1).
+    - beta_base: Base RL inverse temperature; internally scaled by 10.
+    - wm_weight0: Baseline arbitration weight (0..1).
+    - enc_base: Baseline logit for WM encoding probability (can be any real).
+    - interference_slope: Increase in encoding difficulty per unit load/age (>0 recommended).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, beta_base, wm_weight0, enc_base, interference_slope = model_parameters
+    softmax_beta = beta_base * 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Define per-state encoding probability based on load and age
+        # load = (nS-3)/3 in [0,1] for set sizes 3 and 6; plus age group contribution.
+        load = max(nS - 3, 0) / 3.0 + age_group
+        # Convert logit to probability with a sigmoidal transform
+        p_enc = 1.0 / (1.0 + np.exp(-(enc_base - interference_slope * load)))
+        p_enc = float(np.clip(p_enc, 0.0, 1.0))
+
+        # WM decay toward uniform increases with interference
+        wm_decay = float(np.clip(0.1 + 0.4 * load, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            # WM policy: softmax over w row
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            # Arbitration weight scales with encoding probability
+            wm_weight = wm_weight0 * p_enc
+            wm_weight = float(np.clip(wm_weight, 0.0, 1.0))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update with valence asymmetry
+            pe = r - Q_s[a]
+            eta = lr_pos if pe >= 0 else lr_neg
+            q[s, a] += eta * pe
+
+            # WM updating:
+            # - With probability p_enc, encode toward one-hot on reward; otherwise mild decay to uniform.
+            if np.random.rand() < p_enc:
+                if r > 0:
+                    onehot = np.zeros(nA)
+                    onehot[a] = 1.0
+                    w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * onehot
+                else:
+                    # No reward: slight decay toward uniform
+                    w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            else:
+                # Not encoded this trial: passive decay toward uniform
+                leak = 0.5 * wm_decay
+                w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+            # Renormalize WM row
+            rs = w[s, :].sum()
+            if rs > 0:
+                w[s, :] /= rs
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with surprise-based metaplasticity and WM with reward-gated plasticity and leak; arbitration fixed.
+
+    Mechanism:
+    - RL: Learning rate is scaled by surprise (|PE|) via a metaplasticity gain; eligibility-like trace per state (simple on-policy).
+    - WM: Reward-gated plasticity moves WM toward a one-hot action; otherwise leaks toward uniform.
+    - Arbitration: Base WM weight reduced under age/load via a gating function.
+    - Age/Load effects: Increase WM leak and reduce effective WM weight as set size increases and in older adults.
+
+    Parameters (model_parameters):
+    - lr_base: Base RL learning rate (0..1).
+    - beta0: Base RL inverse temperature; scaled by 10 internally.
+    - wm_weight0: Baseline arbitration weight (0..1).
+    - meta_gain: Scales metaplasticity (>=0), controls how much |PE| boosts the RL step.
+    - wm_leak0: Baseline WM leak toward uniform (0..1).
+    - trace: Trace factor for carrying over last updated action value within a state (0..1).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_base, beta0, wm_weight0, meta_gain, wm_leak0, trace = model_parameters
+    softmax_beta = beta0 * 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Per-state last-action to implement a simple trace within each state
+        last_action = -np.ones(nS, dtype=int)
+
+        # Age/load: reduces WM weight and increases leak
+        load = max(nS - 3, 0) / 3.0 + age_group
+        wm_weight = wm_weight0 * np.exp(-0.8 * load)
+        wm_weight = float(np.clip(wm_weight, 0.0, 1.0))
+        wm_leak = float(np.clip(wm_leak0 + 0.5 * load, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL with surprise-based metaplasticity and simple within-state trace
+            if last_action[s] >= 0 and last_action[s] != a:
+                # Apply a small trace carryover to the previously chosen action in this state
+                q[s, last_action[s]] = (1.0 - trace) * q[s, last_action[s]] + trace * q[s, last_action[s]]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            pe = r - Q_s[a]
+            eta = lr_base * (1.0 + meta_gain * abs(pe))
+            eta = float(np.clip(eta, 0.0, 1.0))
+            q[s, a] += eta * pe
+            last_action[s] = a
+
+            # WM update: reward-gated plasticity, otherwise leak to uniform
+            if r > 0:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Move toward one-hot guided by plasticity factor tied to surprise (more surprise -> stronger update)
+                plast = float(np.clip(0.5 * (1.0 + meta_gain * abs(pe)), 0.0, 1.0))
+                w[s, :] = (1.0 - plast) * w[s, :] + plast * onehot
+            else:
+                w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+
+            rs = w[s, :].sum()
+            if rs > 0:
+                w[s, :] /= rs
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Shared-resource arbitration: resource limits reduce RL precision, increase lapses, and diminish WM influence.
+
+    Mechanism:
+    - RL: Single learning rate; RL inverse temperature and lapse rate are governed by a common resource R.
+    - WM: Fast, reward-boosted Hebbian update toward the chosen action with slow decay; WM influence is scaled by R.
+    - Arbitration: WM weight scales with resource; total policy includes a lapse that mixes in uniform choice.
+    - Age/Load effects: Resource declines with set size and age; this simultaneously reduces RL precision, WM weight,
+      and increases lapse.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - beta0: Base RL inverse temperature; scaled by 10 internally.
+    - wm_weight0: Baseline WM weight (0..1).
+    - epsilon0: Baseline lapse rate (0..1).
+    - resource_slope: How strongly age/load reduces the available resource (>=0).
+    - wm_boost: Additional WM learning boost on rewarded trials (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta0, wm_weight0, epsilon0, resource_slope, wm_boost = model_parameters
+    softmax_beta = beta0 * 10.0
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute resource as a function of load and age
+        load = max(nS - 3, 0) / 3.0 + age_group
+        R = np.exp(-resource_slope * load)  # in (0,1], smaller with more load/age
+
+        # Derive effective parameters from resource
+        beta_eff = softmax_beta * R
+        wm_weight = float(np.clip(wm_weight0 * R, 0.0, 1.0))
+        eps = float(np.clip(1.0 - (1.0 - epsilon0) * R, 0.0, 1.0))  # higher load/age -> higher lapse
+        wm_decay = float(np.clip(0.1 + 0.4 * (1.0 - R), 0.0, 1.0))  # more decay with lower resource
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            denom_rl = np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+            p_rl = 1.0 / denom_rl
+
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm
+
+            # Mix RL and WM, then apply lapse toward uniform
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = (1.0 - eps) * p_mix + eps * (1.0 / nA)
+            p_total = float(np.clip(p_total, 1e-12, 1.0))
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: reward-boosted Hebbian with decay
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            wm_eta = float(np.clip(wm_decay + wm_boost * r, 0.0, 1.0))
+            w[s, :] = (1.0 - wm_eta) * w[s, :] + wm_eta * ((1.0 - r) * w_0[s, :] + r * onehot)
+
+            rs = w[s, :].sum()
+            if rs > 0:
+                w[s, :] /= rs
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

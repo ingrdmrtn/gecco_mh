@@ -1,0 +1,323 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited one-shot WM caching with set-size-sensitive decay.
+
+    Mechanism
+    - RL: standard delta-rule with a single learning rate and softmax choice.
+    - WM: caches the last rewarded action per state as a near-deterministic policy.
+      If no recent reward, WM drifts toward uniform. WM cache decays faster with larger set sizes.
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr: float
+            RL learning rate for Q-values.
+        - wm_base_weight: float in [0,1]
+            Baseline mixture weight of WM policy in final action probability.
+        - softmax_beta: float
+            Inverse temperature for RL softmax (scaled internally by 10).
+        - cache_confidence: float in [0,1]
+            Strength with which a rewarded action is cached (how peaked the WM policy becomes after reward).
+        - cap_steepness: float
+            Controls how sharply WM fidelity decays as set size increases (larger -> stronger decay for bigger sets).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_base_weight, softmax_beta, cache_confidence, cap_steepness = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Precompute a set-size-sensitive decay using a logistic on (nS-3)
+        # Decay grows with set size, bounded in [0,1]
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-x))
+        decay_set = sigmoid(cap_steepness * (nS - 3))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: softmax over WM weights.
+            # When recently rewarded, W_s is near one-hot for the cached action; otherwise closer to uniform.
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture with baseline WM weight (capacity limitations already embedded via decay_set)
+            p_total = p_wm*wm_base_weight + (1-wm_base_weight)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            # RL update
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM update:
+            # 1) Global decay toward uniform that scales with set size (larger sets -> more decay)
+            w[s,:] = (1 - decay_set) * w[s,:] + decay_set * w_0[s,:]
+
+            # 2) If rewarded, cache chosen action: push WM distribution toward one-hot on a
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s,:] = (1 - cache_confidence) * w[s,:] + cache_confidence * one_hot
+            else:
+                # If not rewarded, nudge back toward uniform slightly (additional to decay)
+                w[s,:] = 0.95 * w[s,:] + 0.05 * w_0[s,:]
+
+            # Normalize and stabilize
+            w[s,:] = np.maximum(w[s,:], 1e-12)
+            w[s,:] = w[s,:] / np.sum(w[s,:])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Bayesian WM (Dirichlet evidence) with set-size-dependent leak.
+
+    Mechanism
+    - RL: standard delta-rule with softmax.
+    - WM: maintains Dirichlet-like evidence counts per state-action, converted to a policy.
+      On reward: increment evidence for chosen action strongly.
+      On no reward: weak global diffusion (small boost to non-chosen) to represent uncertainty.
+      WM evidence leaks toward the prior faster with larger set sizes.
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr: float
+            RL learning rate for Q-values.
+        - wm_weight: float in [0,1]
+            Mixture weight of WM policy in the final action probability.
+        - softmax_beta: float
+            Inverse temperature for RL softmax (scaled internally by 10).
+        - prior_conc: float > 0
+            Dirichlet prior concentration per action (higher -> flatter prior).
+        - leak_base: float in [0,1]
+            Baseline leak rate of WM evidence toward prior each trial.
+        - leak_slope: float >= 0
+            Additional leak per unit increase in set size (controls load sensitivity).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, prior_conc, leak_base, leak_slope = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-8
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))  # will hold normalized counts each step for policy
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Dirichlet-like counts for WM evidence
+        counts = prior_conc * np.ones((nS, nA))
+
+        # Set-size-dependent leak toward prior
+        leak = np.clip(leak_base + leak_slope * (nS - 1), 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Convert counts to probabilities for policy
+            probs = counts[s, :] / np.maximum(np.sum(counts[s, :]), eps)
+            w[s, :] = probs  # keep w synchronized for the policy layer
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy from evidence-based distribution (softmax over WM probabilities)
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = p_wm*wm_weight + (1-wm_weight)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            # RL update
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM evidence leak toward prior
+            counts[s, :] = (1 - leak) * counts[s, :] + leak * prior_conc
+
+            # WM update based on outcome:
+            if r > 0:
+                # Reward: strong increment to chosen action evidence
+                counts[s, a] += 1.0
+            else:
+                # No reward: slight diffusion to non-chosen to reflect uncertainty
+                others = np.arange(nA) != a
+                counts[s, others] += 0.05
+
+            # Keep counts positive
+            counts[s, :] = np.maximum(counts[s, :], eps)
+
+            # Update w to reflect new counts
+            probs = counts[s, :] / np.maximum(np.sum(counts[s, :]), eps)
+            w[s, :] = probs
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Uncertainty-gated WM with set-size penalty and recency boosting.
+
+    Mechanism
+    - RL: standard delta-rule with softmax.
+    - WM: a recency-weighted action distribution that is boosted by reward (toward chosen action)
+      and decays toward uniform. The WM influence is dynamically gated by RL uncertainty and set size:
+        - Higher RL uncertainty (higher entropy) increases reliance on WM.
+        - Larger set sizes decrease reliance on WM (capacity/load penalty).
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr: float
+            RL learning rate for Q-values.
+        - base_mix: float
+            Baseline mixture logit controlling WM usage (higher -> more WM).
+        - softmax_beta: float
+            Inverse temperature for RL softmax (scaled internally by 10).
+        - wm_eta: float in [0,1]
+            Strength of WM recency boost toward the chosen action when rewarded.
+        - wm_forget: float >= 0
+            Controls both WM decay toward uniform and the set-size penalty on WM usage.
+        - unc_sensitivity: float
+            Sensitivity of the WM/RL mixture to RL policy entropy (uncertainty).
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    lr, base_mix, softmax_beta, wm_eta, wm_forget, unc_sensitivity = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+
+    def safe_softmax(x, beta):
+        x = x - np.max(x)
+        ex = np.exp(beta * x)
+        return ex / np.sum(ex)
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = block_set_sizes[0]
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size dependent forgetting magnitude for WM state distributions
+        forget = np.clip(wm_forget * (nS - 1) / max(1, (6 - 1)), 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+
+            # RL action probability for chosen action
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # Also compute full RL policy to estimate uncertainty (entropy)
+            rl_pi = safe_softmax(Q_s, softmax_beta)
+            entropy = -np.sum(rl_pi * np.log(np.clip(rl_pi, 1e-12, 1.0)))
+
+            # WM policy (deterministic softmax over WM distribution)
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Dynamic mixing weight:
+            # - Base tendency (base_mix in logit space)
+            # - + uncertainty drive (more entropy -> more WM)
+            # - - set-size penalty (larger nS -> less WM) via wm_forget
+            mix_logit = base_mix + unc_sensitivity * entropy - (nS - 3) * wm_forget
+            wm_weight_eff = sigmoid(mix_logit)
+
+            p_total = p_wm*wm_weight_eff + (1-wm_weight_eff)*p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+      
+            # RL update
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM update:
+            # 1) Forget toward uniform with set-size dependent magnitude
+            w[s,:] = (1 - forget) * w[s,:] + forget * w_0[s,:]
+
+            # 2) Reward-based recency boost toward chosen action
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s,:] = (1 - wm_eta) * w[s,:] + wm_eta * one_hot
+            else:
+                # On non-reward, slight broadening to reduce overcommitment
+                w[s,:] = 0.98 * w[s,:] + 0.02 * w_0[s,:]
+
+            # Normalize and ensure positivity
+            w[s,:] = np.maximum(w[s,:], 1e-12)
+            w[s,:] = w[s,:] / np.sum(w[s,:])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

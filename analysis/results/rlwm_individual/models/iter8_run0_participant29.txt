@@ -1,0 +1,270 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM with adaptive WM gating (meta-learned within block) and load shift.
+
+    Summary:
+    - RL updates Q-values with a fixed learning rate.
+    - WM stores the most recently rewarded action as a one-hot vector with decay.
+    - Policy is a mixture: pi = wm_gate * pi_WM + (1 - wm_gate) * pi_RL
+    - wm_gate is initialized from a base wm_weight shifted by set size, and then
+      meta-learned online from feedback (increasing WM reliance when rewards are
+      under-predicted by RL, and vice versa).
+
+    Parameters (model_parameters):
+    - lr:             RL learning rate (0..1)
+    - wm_weight:      Base WM mixture weight (0..1), used to initialize wm_gate
+    - softmax_beta:   Base RL inverse temperature (scaled x10 internally)
+    - wm_meta_lr:     Meta-learning rate for adapting wm_gate from feedback (0..1)
+    - wm_load_shift:  Additive logit shift of WM weight as set size increases; wm_gate0 = sigmoid(logit(wm_weight) + wm_load_shift*(nS-3))
+    - wm_decay:       WM decay toward uniform on each visit (0..1)
+
+    Set-size impact:
+    - wm_gate initialization is shifted by wm_load_shift*(nS-3), changing WM reliance between set sizes 3 vs 6.
+    """
+    lr, wm_weight, softmax_beta, wm_meta_lr, wm_load_shift, wm_decay = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    def clip01(x):
+        return max(0.0, min(1.0, x))
+
+    def logit(p):
+        p = clip01(p)
+        p = min(max(p, 1e-6), 1 - 1e-6)
+        return np.log(p) - np.log(1 - p)
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize wm_gate with load-dependent shift
+        wm_gate = sigmoid(logit(wm_weight) + wm_load_shift * float(nS - 3))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_gate * p_wm + (1.0 - wm_gate) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay and reward-triggered write
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+
+            # Meta-learn wm_gate: move toward the policy that predicted reward better
+            # Proxy: if RL underpredicts reward (positive delta), increase WM reliance slightly only if WM was more confident on chosen action than RL.
+            # Implemented via signed update proportional to (r - p_rl) and bounded to [0,1].
+            wm_gate = clip01(wm_gate + wm_meta_lr * (r - p_rl))
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with uncertainty-adaptive temperature + noisy WM degraded by load.
+
+    Summary:
+    - RL maintains per-state uncertainty (volatility proxy) and reduces inverse temperature
+      when uncertainty is high, encouraging exploration.
+    - WM policy is degraded by set-size-dependent noise (interference), mixing WM with uniform.
+    - WM stores rewarded actions as one-hot with noised decay.
+
+    Parameters (model_parameters):
+    - lr:              RL learning rate (0..1)
+    - wm_weight:       Mixture weight of WM (0..1)
+    - softmax_beta:    Base RL inverse temperature (scaled x10)
+    - vol_lr:          Learning rate for per-state uncertainty (0..1)
+    - beta_unc:        Strength of uncertainty in reducing RL beta; beta_eff = beta/(1 + beta_unc*sigma_s)
+    - wm_noise_slope:  Load-driven WM noise; noise = sigmoid(wm_noise_slope*(nS-3)) in [0,1]
+
+    Set-size impact:
+    - WM degradation increases with set size via wm_noise_slope, making WM less precise in larger sets.
+    """
+    lr, wm_weight, softmax_beta, vol_lr, beta_unc, wm_noise_slope = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Set-size-dependent WM noise
+        wm_noise = sigmoid(wm_noise_slope * float(nS - 3))
+        uniform = (1.0 / nA) * np.ones(nA)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        sigma = np.zeros(nS)  # state uncertainty proxy
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # Uncertainty-adaptive RL temperature
+            beta_eff = softmax_beta / (1.0 + beta_unc * max(0.0, sigma[s]))
+
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # WM degraded by load-dependent noise toward uniform
+            W_mix = (1.0 - wm_noise) * W_s + wm_noise * uniform
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_mix - W_mix[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update and uncertainty tracking
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+            # Update uncertainty as an EWMA of absolute prediction error
+            sigma[s] = (1.0 - vol_lr) * sigma[s] + vol_lr * abs(pe)
+
+            # WM update: decay to uniform and reward-based write
+            w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]  # mild drift toward uniform each visit
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_noise) * one_hot + wm_noise * uniform
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Hebbian choice kernel as WM with load-dependent interference.
+
+    Summary:
+    - RL updates Q-values with a fixed learning rate.
+    - WM is a Hebbian choice kernel that integrates the recent chosen action,
+      enhanced on reward, and decays toward uniform. Interference from larger sets
+      reduces the effective Hebbian learning rate.
+    - Policy mixes WM and RL.
+
+    Parameters (model_parameters):
+    - lr:            RL learning rate (0..1)
+    - wm_weight:     Mixture weight of WM (0..1)
+    - softmax_beta:  RL inverse temperature (scaled x10)
+    - hebb_eta:      Base Hebbian learning rate for WM (0..1)
+    - reward_gain:   Multiplicative boost of WM update on reward (>0)
+    - load_interf:   Load interference scaling; wm_eta_eff = hebb_eta / (1 + load_interf*(nS-3))
+
+    Set-size impact:
+    - Effective WM (Hebbian) learning rate is reduced as set size increases via load_interf.
+    """
+    lr, wm_weight, softmax_beta, hebb_eta, reward_gain, load_interf = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Load-dependent effective Hebbian learning
+        wm_eta_eff = hebb_eta / (1.0 + max(0.0, load_interf * float(nS - 3)))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # Hebbian WM update:
+            # - decay slightly toward uniform
+            # - add a pulse at chosen action, amplified by reward
+            w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+            pulse = np.zeros(3)
+            pulse[a] = 1.0
+            gain = 1.0 + reward_gain * (r - 0.5) * 2.0  # >1 on reward, <1 on no-reward if reward_gain>0
+            w[s, :] = w[s, :] + wm_eta_eff * gain * (pulse - w[s, :])
+
+            # Renormalize to a probability simplex to ensure a valid softmax target
+            w_row_sum = np.sum(w[s, :])
+            if w_row_sum > 0:
+                w[s, :] = w[s, :] / w_row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

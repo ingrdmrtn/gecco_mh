@@ -1,0 +1,293 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with capacity-limited WM gating and state-specific perseveration in WM policy.
+
+    Mechanism:
+    - RL: single learning rate over Q-values with softmax choice.
+    - WM: a fast, near-deterministic policy that stores the last rewarded action per state.
+    - Set-size gating: the WM mixture weight is reduced as set size exceeds a capacity Nc via a logistic gate.
+    - Perseveration: within the WM policy, the last action taken in the current state is biased by kappaP.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0-1).
+    - wm_weight0: Base WM mixture weight before set-size gating (0-1).
+    - softmax_beta: RL inverse temperature (scaled internally by 10).
+    - Nc: WM capacity inflection point for gating; larger Nc preserves WM weight at larger set sizes.
+    - slope_g: Slope of the logistic gating vs. set size; higher => sharper drop in WM weight as nS > Nc.
+    - kappaP: Perseveration bias added to the WM values for the last action in the current state.
+
+    Set-size impact:
+    - Effective WM weight is wm_weight0 * sigmoid(slope_g*(Nc - nS)), directly modulated by set size (3 vs 6).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, Nc, slope_g, kappaP = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last action per state for perseveration in WM policy
+        last_action = -np.ones(nS, dtype=int)
+
+        # Logistic gating of WM weight by set size
+        gate = 1.0 / (1.0 + np.exp(slope_g * (nS - Nc)))
+        wm_weight_eff = wm_weight0 * gate
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :].copy()
+
+            # Add perseveration bias on WM values for the last action in this state
+            if last_action[s] >= 0:
+                W_s[last_action[s]] += kappaP
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy from W_s with a strong softmax
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # Update RL
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # Update WM: if rewarded, store near one-hot for chosen action; otherwise keep as is
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = target
+
+            # Update last action for perseveration
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + finite-horizon WM cache with set-size-dependent misbinding and global lapses.
+
+    Mechanism:
+    - RL: single learning rate with softmax choice.
+    - WM cache: stores most recent rewarded action for each state with a finite retention horizon T_wm
+                measured in trials since last visit to that state.
+    - Misbinding: WM can confuse items more at larger set sizes; misbinding probability increases with nS.
+    - Lapse: a set-size-independent lapse adds a small uniform choice probability.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0-1).
+    - wm_weight0: Base WM mixture weight before set size effects (0-1).
+    - softmax_beta: RL inverse temperature (scaled by 10).
+    - T_wm: Retention horizon (in trials since last visit) for WM cache; beyond this, WM reverts to uniform.
+    - misbind_ns_slope: Controls how misbinding probability grows with set size; higher => more misbinding at nS=6.
+    - pi_lapse: Lapse rate mixed with uniform policy globally (0-1).
+
+    Set-size impact:
+    - Effective misbinding probability increases with set size via a logistic function of (nS-3)*misbind_ns_slope.
+    - WM weight is not directly gated by set size here; set size harms WM via misbinding.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, T_wm, misbind_ns_slope, pi_lapse = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # For WM cache: track last visit time and stored one-hot choice if rewarded
+        last_visit = -np.ones(nS, dtype=int)
+        stored_action = -np.ones(nS, dtype=int)
+
+        # Misbinding based on set size
+        # m_ns ~ logistic growth from 0 to ~0.5 as nS increases from 3 to 6 (scalable via slope)
+        m_ns = 1.0 / (1.0 + np.exp(-misbind_ns_slope * (nS - 3)))
+
+        wm_weight_eff = wm_weight0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+
+            # Build WM distribution for this state from cache with finite horizon
+            use_cache = False
+            if last_visit[s] >= 0:
+                isi = t - last_visit[s]
+                use_cache = (isi <= T_wm)
+
+            if use_cache and stored_action[s] >= 0:
+                # Start from one-hot at stored action
+                W_s = np.zeros(nA)
+                W_s[stored_action[s]] = 1.0
+                # Misbinding: with probability m_ns, flip to a random different action (uniform over the other two)
+                # Implemented as mixing toward a distribution that has mass on other actions
+                wrong = np.ones(nA) / (nA - 1)
+                wrong[stored_action[s]] = 0.0
+                W_s = (1.0 - m_ns) * W_s + m_ns * wrong
+            else:
+                # No usable WM: revert to uniform baseline
+                W_s = w_0[s, :].copy()
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            # Global lapse to uniform
+            p_total = (1.0 - pi_lapse) * p_total + pi_lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM cache update: store only if rewarded; otherwise keep previous
+            if r > 0.5:
+                stored_action[s] = a
+                w[s, :] = np.zeros(nA)
+                w[s, a] = 1.0  # keep w aligned with stored_action for consistency
+            # Update last visit
+            last_visit[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL-WM arbitration by RL uncertainty and set size, with graded WM encoding.
+
+    Mechanism:
+    - RL: single learning rate with softmax choice.
+    - WM: fast channel updated toward a one-hot of the rewarded action with strength wm_eta.
+    - Arbitration: WM weight increases when RL is uncertain (high entropy) and decreases with set size.
+      Specifically: wm_weight_eff = wm_weight0 * sigmoid(k_unc*(H_rl - H0)) * (nS/3)^(-ns_alpha),
+      where H_rl is the entropy of the RL softmax policy for the current state, H0 is a fixed reference (=log nA).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0-1).
+    - wm_weight0: Base WM weight before arbitration (0-1).
+    - softmax_beta: RL inverse temperature (scaled by 10).
+    - k_unc: Sensitivity of WM gating to RL entropy (higher => more WM weight when RL is uncertain).
+    - ns_alpha: Exponent of set-size penalty on WM weight; larger => stronger drop in nS=6 blocks.
+    - wm_eta: WM encoding strength toward a one-hot target upon reward (0-1).
+
+    Set-size impact:
+    - WM weight is multiplicatively penalized by (nS/3)^(-ns_alpha), reducing WM contribution at larger set sizes.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, k_unc, ns_alpha, wm_eta = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size penalty factor (relative to 3)
+        ns_pen = (nS / 3.0) ** (-ns_alpha) if nS > 0 else 1.0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy distribution for entropy
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(softmax_beta * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            H_rl = -np.sum(pi_rl * (np.log(pi_rl + 1e-12)))
+            H0 = np.log(nA)
+
+            # Uncertainty-based WM gating
+            gate_unc = 1.0 / (1.0 + np.exp(-k_unc * (H_rl - H0 / 2.0)))
+            wm_weight_eff = wm_weight0 * gate_unc * ns_pen
+            wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+            # Chosen-action RL probability (per template form)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: on reward, move toward one-hot action; otherwise slight decay to baseline
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_eta) * w[s, :] + wm_eta * target
+            else:
+                # small passive decay toward uniform baseline when not rewarded
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

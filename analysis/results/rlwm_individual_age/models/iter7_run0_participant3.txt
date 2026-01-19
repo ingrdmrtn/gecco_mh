@@ -1,0 +1,323 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + gated capacity-limited WM with age- and load-dependent gating and decay.
+
+    Mechanisms:
+    - RL system: Q-learning with softmax.
+    - WM system: per-state association that stores the most recent rewarded action if a gate opens.
+      Gating success declines with set size relative to a capacity and with age.
+      WM traces decay toward uniform, faster under higher load and for older age.
+    - Arbitration: mixture between WM and RL, where WM weight equals the probability that WM is available
+      for the current state (gate success) times the current WM certainty for that state.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1]
+    - beta_rl: RL inverse temperature; internally scaled by 10 for sharper policies
+    - gate0: baseline WM gating probability in [0,1]
+    - wm_store: strength of storing toward one-hot on reward in [0,1]
+    - C: WM capacity (in states), >0; load penalty derives from nS/C
+    - age_gate_pen: age penalty applied to gating, >=0 (penalizes older group)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, gate0, wm_store, C, age_gate_pen = model_parameters
+    beta_rl *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0  # deterministic WM when clean
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load and age effects on gating and decay
+        load_ratio = max(1.0, nS / max(1.0, float(C)))
+        gate_pen = (load_ratio - 1.0)
+        gate_eff = gate0 * (1.0 / load_ratio) ** (1.0 + age_gate_pen * age_group)
+        gate_eff = min(max(gate_eff, 0.0), 1.0)
+
+        # Decay toward uniform increases with load and age
+        decay_base = 0.1 * (load_ratio - 1.0)  # 0 when nS<=C, grows with load
+        decay = min(1.0, max(0.0, decay_base * (1.0 + 0.5 * age_group)))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy: high precision if state has a strong item; else near-uniform
+            W_s = w[s, :]
+            # WM certainty as deviation from uniform
+            certainty = max(0.0, (W_s.max() - 1.0 / nA) / (1.0 - 1.0 / nA + 1e-12))
+            beta_wm_eff = softmax_beta_wm * certainty
+            p_wm_vec = np.exp(beta_wm_eff * (W_s - W_s.max()))
+            p_wm_vec /= (p_wm_vec.sum() + 1e-12)
+            p_wm = p_wm_vec[a]
+
+            # Arbitration: WM available with prob gate_eff times current certainty
+            wm_weight = gate_eff * certainty
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay
+            w = (1.0 - decay) * w + decay * w_0
+
+            # WM gated storage on reward
+            if r > 0.5:
+                # If gate "opens" probabilistically, we approximate with expected update weight = gate_eff
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                eta = wm_store * gate_eff
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * onehot
+                w[s, :] /= (w[s, :].sum() + 1e-12)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning rates + WM eligibility traces with interference.
+
+    Mechanisms:
+    - RL system: Q-learning with separate learning rates for positive and negative prediction errors.
+    - WM system: for each state, maintains a short-term trace that favors the last rewarded action.
+      The trace decays over time and suffers interference that grows with set size and age,
+      diffusing some trace mass to non-chosen actions.
+    - Arbitration: mixture of RL and WM where WM weight increases with the current WM trace strength,
+      but decreases with set size and age via an interference-controlled factor.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive PE (in [0,1])
+    - lr_neg: RL learning rate for negative PE (in [0,1])
+    - beta_rl: RL inverse temperature; internally scaled by 10
+    - wm_trace: base WM trace learning/retention factor in [0,1] (higher = stronger trace and slower decay)
+    - interference0: base interference strength in [0,1] that scales with load
+    - age_interact: age multiplier for interference (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, beta_rl, wm_trace, interference0, age_interact = model_parameters
+    beta_rl *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM trace starts uniform; will shift mass toward preferred action for each state
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Interference grows with set size and age
+        load_scale = max(1.0, nS / 3.0)
+        interference = interference0 * load_scale * (1.0 + age_interact * age_group)
+        interference = min(max(interference, 0.0), 1.0)
+
+        # Effective decay of WM trace
+        decay = (1.0 - wm_trace)
+        # Additional decay due to interference
+        decay_eff = min(1.0, max(0.0, decay + 0.5 * interference))
+
+        # Mixture scaling: WM gets down-weighted with load and age via interference
+        base_wm_weight = wm_trace * (1.0 - 0.7 * interference)
+        base_wm_weight = min(max(base_wm_weight, 0.0), 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy from trace
+            W_s = w[s, :]
+            # Confidence from how peaked WM is
+            wm_conf = max(0.0, (W_s.max() - 1.0 / nA) / (1.0 - 1.0 / nA + 1e-12))
+            beta_wm_eff = softmax_beta_wm * wm_conf
+            p_wm_vec = np.exp(beta_wm_eff * (W_s - W_s.max()))
+            p_wm_vec /= (p_wm_vec.sum() + 1e-12)
+            p_wm = p_wm_vec[a]
+
+            # Arbitration: increase with current WM confidence but penalize by interference
+            wm_weight = base_wm_weight * wm_conf
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - q[s, a]
+            lr_use = lr_pos if pe >= 0.0 else lr_neg
+            q[s, a] += lr_use * pe
+
+            # WM trace decay toward uniform
+            w = (1.0 - decay_eff) * w + decay_eff * w_0
+
+            # WM reinforcement of chosen action on reward, with interference diffusion
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Strengthen chosen action
+                eta = wm_trace * (1.0 - interference)
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * onehot
+                # Interference: leak some mass to non-chosen actions for this state
+                if interference > 0.0:
+                    leak = interference * w[s, a] / max(1.0, nA - 1)
+                    for aa in range(nA):
+                        if aa != a:
+                            w[s, aa] += leak
+                    # renormalize and slightly reduce chosen to conserve mass
+                    w[s, a] = max(0.0, w[s, a] - interference * w[s, a])
+                # Normalize
+                w[s, :] = np.maximum(w[s, :], 0.0)
+                w[s, :] /= (w[s, :].sum() + 1e-12)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with uncertainty-based arbitration and age/load-sensitive WM noise.
+
+    Mechanisms:
+    - RL system: Q-learning with softmax.
+    - WM system: associative matrix updated toward chosen action on reward; otherwise diffuses.
+      WM noise increases with set size and age, reducing its effective precision.
+    - Arbitration: dynamic, based on relative certainty. WM certainty = peakiness of WM row.
+      RL uncertainty approximated by softmax entropy at the current state.
+      Mixture weight is the sigmoid of a weighted difference (WM certainty - RL certainty - penalties).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1]
+    - beta_base: base inverse temperature for RL; internally scaled by 10
+    - wm_learn: WM learning rate toward one-hot on reward in [0,1]
+    - wm_noise0: base WM diffusion/noise level in [0,1]
+    - arbitralpha: slope of arbitration sigmoid (>=0)
+    - age_load: penalty weight multiplying (age_group + load-1) in arbitration (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, wm_learn, wm_noise0, arbitralpha, age_load = model_parameters
+    beta_rl = beta_base * 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    beta_wm_max = 60.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM noise scales with load and age
+        load_factor = max(1.0, nS / 3.0)
+        wm_noise = wm_noise0 * load_factor * (1.0 + 0.5 * age_group)
+        wm_noise = min(max(wm_noise, 0.0), 1.0)
+        # Effective WM inverse temperature
+        beta_wm = beta_wm_max * (1.0 - wm_noise)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy and entropy proxy (uncertainty)
+            Q_s = q[s, :]
+            logits_rl = beta_rl * (Q_s - Q_s.max())
+            pi_rl = np.exp(logits_rl)
+            pi_rl /= (pi_rl.sum() + 1e-12)
+            p_rl = max(pi_rl[a], 1e-12)
+            # Entropy normalized to [0,1]
+            ent_rl = -np.sum(pi_rl * np.log(pi_rl + 1e-12)) / np.log(nA)
+
+            # WM policy and certainty
+            W_s = w[s, :]
+            logits_wm = beta_wm * (W_s - W_s.max())
+            pi_wm = np.exp(logits_wm)
+            pi_wm /= (pi_wm.sum() + 1e-12)
+            p_wm = max(pi_wm[a], 1e-12)
+            wm_cert = max(0.0, (W_s.max() - 1.0 / nA) / (1.0 - 1.0 / nA + 1e-12))
+
+            # Arbitration based on relative certainty minus penalties for age+load
+            penalty = age_load * (age_group + (load_factor - 1.0))
+            arb_input = (wm_cert - ent_rl) - penalty
+            wm_weight = 1.0 / (1.0 + np.exp(-arbitralpha * arb_input))
+            wm_weight = min(max(wm_weight, 0.0), 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM diffusion toward uniform with noise and learning on reward
+            # Diffusion/noise step
+            w = (1.0 - wm_noise) * w + wm_noise * w_0
+            # Reward-driven storage toward one-hot
+            if r > 0.5:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * onehot
+                w[s, :] /= (w[s, :].sum() + 1e-12)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

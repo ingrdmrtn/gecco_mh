@@ -1,0 +1,311 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, parameters):
+    """
+    RL (dual learning rates) + capacity-gated WM (reward-gated storage).
+
+    Idea:
+    - RL updates use separate learning rates for positive vs. negative outcomes.
+    - WM acts like a fast one-shot store but is capacity-limited: effective WM weight scales with K/nS.
+    - WM only stores the chosen action when it is rewarded (gated by outcome); otherwise WM decays to prior.
+    - Final choice is a mixture of RL and WM policies.
+
+    Parameters
+    ----------
+    parameters : list/tuple
+        lr : float in [0,1]
+            Learning rate baseline; used as the positive RL learning rate (for r=1).
+        wm_weight : float in [0,1]
+            Base WM mixture weight. Scaled by capacity factor K/nS within each block.
+        softmax_beta : float >= 0
+            RL inverse temperature; internally scaled by 10.
+        neg_ratio : float in [0,1], optional (default=1.0)
+            Scales the negative RL learning rate: lr_neg = lr * neg_ratio.
+        K : float >= 0, optional (default=3.0)
+            WM capacity proxy; effective WM mixture scales as min(1, K/nS).
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+
+    Set-size impact
+    ---------------
+    - WM mixture is scaled by min(1, K/nS), so larger nS reduces WM influence when K < nS.
+    - RL is unaffected directly by set size, but reduced WM support at nS=6 will lower performance early.
+    """
+    # Unpack mandatory params and optional extras
+    lr, wm_weight, softmax_beta = parameters[:3]
+    neg_ratio = parameters[3] if len(parameters) > 3 else 1.0
+    K = parameters[4] if len(parameters) > 4 else 3.0
+
+    softmax_beta *= 10.0  # RL temperature scaling per template
+    softmax_beta_wm = 50.0  # deterministic WM
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM mixture scaled by capacity relative to set size
+        cap_scale = min(1.0, float(K) / max(1.0, float(nS)))
+        wm_mix = np.clip(wm_weight * cap_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy: probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax on W_s (high inverse temp)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture policy
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with dual learning rates
+            lr_pos = lr
+            lr_neg = lr * np.clip(neg_ratio, 0.0, 1.0)
+            alpha = lr_pos if r > 0.5 else lr_neg
+            delta = r - Q_s[a]
+            q[s, a] += alpha * delta
+
+            # WM update: reward-gated storage with decay-to-prior otherwise
+            if r > 0.5:
+                # Strongly store the chosen action as the remembered response
+                # Implement as decay to prior then add a strong bump on chosen action
+                w[s, :] = 0.0 * w[s, :] + w_0[s, :]  # reset row to prior before storing
+                w[s, a] += 1.0  # one-shot spike on chosen action
+            else:
+                # No storage on error; decay toward prior
+                w[s, :] = (1.0 - alpha) * w[s, :] + alpha * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, parameters):
+    """
+    RL with decay and choice stickiness + WM mixture with set-size scaling and lapse.
+
+    Idea:
+    - RL values decay toward a neutral prior each trial (to capture memory leak).
+    - RL policy includes a choice stickiness (perseveration) term favoring repeating last action in a state.
+    - WM contributes as a mixture that scales with 3/nS, but a global lapse epsilon mixes in a uniform policy.
+    - WM updates are recency-based (decay to prior + add chosen action), independent of reward.
+
+    Parameters
+    ----------
+    parameters : list/tuple
+        lr : float in [0,1]
+            RL learning rate.
+        wm_weight : float in [0,1]
+            Base WM mixture weight before set-size scaling.
+        softmax_beta : float >= 0
+            RL inverse temperature; internally scaled by 10.
+        kappa : float >= 0, optional (default=0.0)
+            Choice stickiness weight added to the last action taken in each state.
+        epsilon : float in [0,1], optional (default=0.0)
+            Lapse probability mixing a uniform random policy into the final choice.
+        decay_rl : float in [0,1], optional (default=0.0)
+            Per-trial decay of RL Q-values toward the prior.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+
+    Set-size impact
+    ---------------
+    - WM mixture is scaled by (3/nS): stronger in set size 3, weaker in set size 6.
+    - Lapse affects both sizes equally, but its effect is more pronounced when policies are sharp.
+    """
+    lr, wm_weight, softmax_beta = parameters[:3]
+    kappa = parameters[3] if len(parameters) > 3 else 0.0
+    epsilon = parameters[4] if len(parameters) > 4 else 0.0
+    decay_rl = parameters[5] if len(parameters) > 5 else 0.0
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    # Track last action per state for stickiness
+    # We'll reinitialize per block given states reset
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        wm_scale = (3.0 / max(1.0, float(nS)))
+        wm_mix = np.clip(wm_weight * wm_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL decay toward prior before computing policy
+            q[s, :] = (1.0 - decay_rl) * q[s, :] + decay_rl * (1.0 / nA)
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :]
+
+            # Add stickiness to the previous action for this state
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += kappa
+
+            # RL softmax probability for chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM softmax probability for chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture of RL and WM
+            p_mix = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+
+            # Lapse toward uniform
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: recency-based independent of reward
+            w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+            w[s, a] += 1.0
+
+            # Update last action for stickiness
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, parameters):
+    """
+    EWA-style RL (with recency) + probabilistic WM storage with capacity K.
+
+    Idea:
+    - RL uses experience-weighted attraction via a recency/forgetting parameter (rho), combining decay with learning.
+    - WM storage is probabilistic: on each trial, WM stores the chosen action with probability p_store = min(1, K/nS).
+    - WM decays to prior at rate wm_decay each time the state is visited.
+    - Final choice is a mixture of RL and WM; WM base weight also scales by (K/nS) to reflect capacity.
+
+    Parameters
+    ----------
+    parameters : list/tuple
+        lr : float in [0,1]
+            RL learning rate for updating Q-values.
+        wm_weight : float in [0,1]
+            Base WM mixture weight (before capacity scaling).
+        softmax_beta : float >= 0
+            RL inverse temperature; internally scaled by 10.
+        K : float >= 0, optional (default=3.0)
+            WM capacity; determines storage probability and mixture scaling via K/nS.
+        wm_decay : float in [0,1], optional (default=0.2)
+            Per-visit decay of WM weights to prior for the current state.
+        rho : float in [0,1], optional (default=0.0)
+            RL recency/forgetting toward prior each time the state is visited.
+
+    Returns
+    -------
+    nll : float
+        Negative log-likelihood of observed choices.
+
+    Set-size impact
+    ---------------
+    - WM mixture scales with K/nS; larger sets reduce WM influence and storage p_store.
+    - RL is indirectly affected because reduced WM support at larger set size shifts behavior toward RL.
+    """
+    lr, wm_weight, softmax_beta = parameters[:3]
+    K = parameters[3] if len(parameters) > 3 else 3.0
+    wm_decay = parameters[4] if len(parameters) > 4 else 0.2
+    rho = parameters[5] if len(parameters) > 5 else 0.0
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        cap = min(1.0, float(K) / max(1.0, float(nS)))
+        wm_mix = np.clip(wm_weight * cap, 0.0, 1.0)
+        p_store = cap  # probability to store chosen action on each visit
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL recency/forgetting toward prior for visited state
+            q[s, :] = (1.0 - rho) * q[s, :] + rho * (1.0 / nA)
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy: chosen action probability
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay for this state
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            # Probabilistic storage of chosen action (regardless of reward)
+            if np.random.rand() < p_store:
+                w[s, a] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

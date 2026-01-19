@@ -1,0 +1,291 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and Hebbian WM with lateral inhibition.
+
+    Idea:
+    - RL: standard delta-rule.
+    - WM: one-shot Hebbian write on rewarded trials; lateral inhibition suppresses non-chosen actions.
+    - Arbitration: trial-wise WM weight is driven by the relative policy uncertainty (entropy) of RL vs WM.
+      When RL is uncertain and WM is confident, the mixture shifts toward WM, and vice versa.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight_base: Baseline WM mixture weight (0..1).
+    - softmax_beta: Inverse temperature for RL policy (scaled internally by 10).
+    - wm_learn: WM learning strength; mapped via sigmoid to (0,1) for write/decay magnitudes.
+    - arb_temp: Arbitration sensitivity to entropy difference (positive => stronger shifts).
+    - inhibit_strength: Lateral inhibition strength applied to non-chosen WM values on rewarded trials (0..1).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, wm_learn, arb_temp, inhibit_strength = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # deterministic WM retrieval baseline
+
+    # map wm_learn to (0,1)
+    wm_eta = 1.0 / (1.0 + np.exp(-wm_learn))
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Compute full RL policy distribution to get entropy
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_probs = np.exp(rl_logits)
+            rl_probs = rl_probs / np.sum(rl_probs)
+            rl_entropy = -np.sum(rl_probs * (np.log(rl_probs + 1e-12)))
+
+            # WM policy
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            p_wm = wm_probs[a]
+            wm_entropy = -np.sum(wm_probs * (np.log(wm_probs + 1e-12)))
+
+            # Arbitration weight based on entropy difference (RL_uncertain - WM_uncertain)
+            # Use a smooth mapping around the baseline weight
+            deltaH = rl_entropy - wm_entropy
+            shift = 0.5 * np.tanh(arb_temp * deltaH)  # in (-0.5, 0.5)
+            wm_weight = np.clip(wm_weight_base + shift, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: Hebbian write with lateral inhibition and mild decay on errors
+            if r > 0.0:
+                # Hebbian push toward chosen action
+                w[s, :] = (1.0 - wm_eta) * w[s, :]
+                w[s, a] += wm_eta
+
+                # Lateral inhibition on non-chosen actions
+                for j in range(nA):
+                    if j != a:
+                        w[s, j] *= (1.0 - inhibit_strength * wm_eta)
+
+                # Renormalize to sum to 1 (keep WM in probability-simplex)
+                sum_w = np.sum(w[s, :])
+                if sum_w > 0:
+                    w[s, :] = w[s, :] / sum_w
+                else:
+                    w[s, :] = w_0[s, :].copy()
+            else:
+                # On errors, gentle decay toward uniform
+                decay = 0.5 * wm_eta
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM resource-rational capacity scaling with time-based WM leak.
+
+    Idea:
+    - WM contribution and write strength scale as a continuous resource function of set size: f(nS) = 1 / (1 + (nS/c)^gamma).
+      This penalizes larger sets smoothly.
+    - WM representation passively leaks toward uniform each trial (time_leak), regardless of feedback.
+    - RL: standard delta learning.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight_base: Baseline WM mixture weight (0..1).
+    - softmax_beta: Inverse temperature for RL policy (scaled internally by 10).
+    - capacity_c: Capacity scale parameter c (>0) for resource function.
+    - gamma: Exponent controlling how sharply performance declines with set size (>0).
+    - time_leak: Per-trial WM leak toward uniform (0..1).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, capacity_c, gamma, time_leak = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # WM is near-deterministic given its contents
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Resource factor as a function of set size
+        f = 1.0 / (1.0 + (float(nS) / max(1e-6, capacity_c)) ** max(1e-6, gamma))
+        wm_weight = np.clip(wm_weight_base * f, 0.0, 1.0)
+        write_rate = np.clip(f, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Passive WM leak each trial
+            w = (1.0 - time_leak) * w + time_leak * w_0
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            p_wm = wm_probs[a]
+
+            # Mixture policy
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: reward-gated one-shot write; no write on errors
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - write_rate) * w[s, :] + write_rate * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric negative learning + WM mixture boosted by RL entropy and load-scaled,
+    with WM retrieval lapse.
+
+    Idea:
+    - RL: standard delta learning with stronger/weaker updates on negative outcomes via a multiplicative factor.
+    - WM: reward-based associative update; retrieval has a lapse (mixture with uniform).
+    - Arbitration: WM mixture weight increases when RL policy is uncertain (higher entropy), and decreases with load.
+
+    Parameters (model_parameters):
+    - lr: RL base learning rate (0..1).
+    - neg_mult: Multiplier for negative PEs (lr_neg = lr * neg_mult), controls asymmetry (>0).
+    - wm_weight_base: Baseline WM mixture weight (0..1).
+    - softmax_beta: Inverse temperature for RL policy (scaled internally by 10).
+    - entropy_gain: Sensitivity of WM mixture to RL entropy (>=0).
+    - wm_noise: WM retrieval lapse probability mixed with uniform (0..1).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, neg_mult, wm_weight_base, softmax_beta, entropy_gain, wm_noise = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # base WM readout
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load penalty factor for WM reliance (reduces mixture weight at higher set sizes)
+        load_scale = min(1.0, 3.0 / float(max(1, nS)))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy and entropy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_probs = np.exp(rl_logits)
+            rl_probs = rl_probs / np.sum(rl_probs)
+            rl_entropy = -np.sum(rl_probs * (np.log(rl_probs + 1e-12)))
+
+            # WM policy with retrieval lapse
+            W_s = w[s, :]
+            wm_logits = softmax_beta_wm * (W_s - np.max(W_s))
+            wm_probs = np.exp(wm_logits)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            wm_probs = (1.0 - wm_noise) * wm_probs + wm_noise * (1.0 / nA)
+            p_wm = wm_probs[a]
+
+            # Entropy-boosted WM weight, scaled by load
+            wm_weight = wm_weight_base + entropy_gain * rl_entropy
+            wm_weight *= load_scale
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric negative learning
+            pe = r - q[s, a]
+            alpha = lr if pe >= 0.0 else lr * neg_mult
+            q[s, a] += alpha * pe
+
+            # WM update: reward-based attraction and mild repulsion on errors
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.4 * w[s, :] + 0.6 * one_hot
+            else:
+                # Slight push away from chosen and small renormalization toward uniform
+                w[s, a] = 0.8 * w[s, a]
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

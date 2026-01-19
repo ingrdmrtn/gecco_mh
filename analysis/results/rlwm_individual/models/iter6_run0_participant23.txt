@@ -1,0 +1,297 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-based arbitration and Q-value forgetting.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax choice and per-decision forgetting of Q toward uniform.
+    - WM: one-shot storage upon reward; deterministic recall via softmax on WM weights.
+    - Arbitration: WM vs RL mixture depends on RL policy uncertainty (entropy). When RL is
+      uncertain (high entropy), arbitration shifts toward WM. When RL is confident, it
+      shifts toward RL.
+    - Set size effect: indirectly impacts arbitration via the entropy of the RL policy.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], baseline WM mixture weight (logit-transformed internally for arbitration).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - gamma: >=0, sensitivity of arbitration to RL entropy (higher -> WM used more when RL uncertain).
+    - beta_wm: >0, WM inverse temperature for WM policy.
+    - q_forget: [0,1], amount of Q forgetting per decision toward the uniform prior in the visited state.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, gamma, beta_wm, q_forget = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # not used directly; we use beta_wm provided
+    blocks_log_p = 0.0
+
+    # helper for stable logit/sigmoid arbitration
+    def _logit(p, eps=1e-6):
+        p = np.clip(p, eps, 1.0 - eps)
+        return np.log(p) - np.log(1.0 - p)
+
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # RL policy probability of chosen action a
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Compute full RL softmax to get entropy
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            exp_logits = np.exp(logits)
+            probs = exp_logits / np.sum(exp_logits)
+            # entropy in nats, normalized by log(nA)
+            H = -np.sum(probs * (np.log(probs + 1e-12)))
+            H_norm = H / np.log(nA)
+
+            # WM policy from WM weights
+            W_s = w[s, :]
+            wm_logits = beta_wm * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            wm_probs = wm_exp / np.sum(wm_exp)
+            p_wm = wm_probs[a]
+
+            # Arbitration: sigmoid on (baseline + gamma * (H_norm - 0.5))
+            z = _logit(wm_weight) + gamma * (H_norm - 0.5)
+            wm_mix = _sigmoid(z)
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform for the visited state
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            q[s, :] = (1.0 - q_forget) * q[s, :] + q_forget * (1.0 / nA)
+
+            # WM update: one-shot store on rewarded trials
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            # else: leave WM unchanged to reflect no-update on errors
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with uncertainty bonus + WM with set-size scaling of mixture weight.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax. Adds an exploration/uncertainty bonus inversely
+      proportional to the square root of visit counts for each state-action.
+    - WM: one-shot storage on reward; deterministic recall via softmax on WM weights.
+    - Arbitration: WM mixture weight decreases with set size via a power-law.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], base WM mixture weight for set size 1 (scaled by set size below).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - zeta: >=0, strength of exploration bonus added to RL values as zeta / sqrt(N[s,a]).
+    - psi: >=0, exponent controlling how WM weight declines with set size: wm_mix = wm_weight / (nS^psi).
+    - beta_wm: >0, WM inverse temperature.
+
+    Set size effects:
+    - WM mixture weight: wm_mix = clip(wm_weight * nS^(-psi), 0, 1). Larger nS reduces WM influence.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, zeta, psi, beta_wm = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # constant, not used; we use beta_wm
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # visit counts for uncertainty bonus (initialize with 1 to avoid div by zero and start with modest bonus)
+        N = np.ones((nS, nA))
+
+        # set-size scaled WM mixture
+        wm_mix = wm_weight * (nS ** (-max(psi, 0.0)))
+        wm_mix = float(np.clip(wm_mix, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL with uncertainty bonus
+            bonus = zeta / np.sqrt(N[s, :])
+            Q_aug = q[s, :] + bonus
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_aug - Q_aug[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            wm_logits = beta_wm * (W_s - np.max(W_s))
+            wm_exp = np.exp(wm_logits)
+            wm_probs = wm_exp / np.sum(wm_exp)
+            p_wm = wm_probs[a]
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+            # increment counts after observing the choice
+            N[s, a] += 1.0
+
+            # WM update: one-shot on reward
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with cross-talk interference and graded WM learning.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax.
+    - WM: graded update toward the chosen action on reward; row is renormalized to a probability
+      distribution. WM choice policy uses a state-specific memory contaminated by cross-talk from
+      other states (set-size dependent).
+    - Arbitration: WM mixture slightly boosted if the last outcome in that state was rewarded.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], base WM mixture weight.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - eta_wm: [0,1], WM learning rate toward a one-hot on rewarded trials.
+    - chi_x: >=0, base cross-talk factor; effective cross-talk grows with set size.
+    - temp_wm: >0, WM inverse temperature for the WM policy.
+
+    Set size effects:
+    - Cross-talk increases with set size: x = clip(chi_x * max(nS - 3, 0) / 3, 0, 0.99).
+      Larger sets increase interference from other states' WM traces, reducing WM precision.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, eta_wm, chi_x, temp_wm = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # constant, not used; we use temp_wm
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # last reward by state to boost WM arbitration after success
+        last_r_state = np.zeros(nS)
+
+        # precompute cross-talk coefficient for this block
+        x = chi_x * max(nS - 3, 0) / 3.0
+        x = float(np.clip(x, 0.0, 0.99))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with cross-talk: blend current state's WM with the mean of others
+            if nS > 1:
+                others = [i for i in range(nS) if i != s]
+                mean_others = np.mean(w[others, :], axis=0)
+            else:
+                mean_others = w[s, :]
+            W_eff = (1.0 - x) * w[s, :] + x * mean_others
+
+            wm_logits = temp_wm * (W_eff - np.max(W_eff))
+            wm_exp = np.exp(wm_logits)
+            wm_probs = wm_exp / np.sum(wm_exp)
+            p_wm = wm_probs[a]
+
+            # Arbitration: boost WM weight if last outcome for this state was rewarded
+            wm_mix = wm_weight * (1.0 + 0.5 * last_r_state[s])
+            wm_mix = float(np.clip(wm_mix, 0.0, 1.0))
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: graded toward one-hot on reward, with renormalization
+            if r > 0.0:
+                # move row toward one-hot on action a
+                w[s, :] = (1.0 - eta_wm) * w[s, :]
+                w[s, a] += eta_wm
+                # renormalize to sum to 1
+                row_sum = np.sum(w[s, :])
+                if row_sum > 0:
+                    w[s, :] /= row_sum
+
+            # track last reward for arbitration
+            last_r_state[s] = r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

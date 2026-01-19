@@ -1,0 +1,346 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + reward-gated Hebbian WM with confidence- and set-size–based arbitration.
+
+    Description:
+    - RL: single learning rate; softmax policy.
+    - WM: fast Hebbian map (state -> action) updated when rewarded; decays toward uniform otherwise.
+      Represented as w[s,:] probabilities.
+    - Arbitration weight is dynamic: increases with WM confidence (peakedness) and decreases with set size.
+      wm_weight_eff = sigmoid(wm_base + arb_slope*(max(W_s)-1/nA) - setsize_penalty*(nS-3))
+    - Mixture of WM and RL policies.
+
+    Parameters
+    - model_parameters[0] = lr (float): RL learning rate (0..1).
+    - model_parameters[1] = wm_base (float): Base logit for WM weight before sigmoid (real).
+    - model_parameters[2] = softmax_beta (float): RL inverse temperature; internally x10.
+    - model_parameters[3] = wm_lr (float): WM Hebbian learning rate toward one-hot when rewarded (0..1).
+    - model_parameters[4] = arb_slope (float): Sensitivity of WM weight to WM confidence (>=0).
+    - model_parameters[5] = setsize_penalty (float): Linear penalty of WM weight per +3 items (>=0).
+
+    Returns
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_base, softmax_beta, wm_lr, arb_slope, setsize_penalty = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))  # WM policy probabilities per state
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM confidence: peakedness (max prob minus chance)
+            confidence = np.max(W_s) - (1.0 / nA)
+
+            # Arbitration weight depends on confidence and set size
+            wm_logit = wm_base + arb_slope * confidence - setsize_penalty * (nS - 3.0)
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+            # WM policy via near-deterministic softmax on W_s
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: reward-gated Hebbian + mild decay toward uniform when not rewarded
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_lr) * W_s + wm_lr * target
+            else:
+                # Small decay toward uniform when error occurs (use wm_lr/3 as decay)
+                decay = wm_lr / 3.0
+                w[s, :] = (1.0 - decay) * W_s + decay * w_0[s, :]
+
+            # Renormalize to avoid drift
+            ssum = w[s, :].sum()
+            if ssum > 0:
+                w[s, :] /= ssum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited WM cache with intrusion and lapses.
+
+    Description:
+    - RL: single learning rate; softmax with set-size–scaled inverse temperature.
+    - WM: slot-like cache that can store up to K states. If s is cached and has a stored action,
+          WM policy is peaked on that action; else near-uniform.
+      - Intrusion: with probability 'intrusion', WM retrieves a different cached state's action (swap error).
+      - Lapse: with probability 'wm_lapse', WM produces uniform.
+      - WM is updated with a win-stay rule: if rewarded, store the chosen action for that state; otherwise do nothing.
+      - Cache management: if adding a new state when full, evict a random cached state.
+    - Mixture of WM and RL policies.
+
+    Parameters
+    - model_parameters[0] = lr (float): RL learning rate (0..1).
+    - model_parameters[1] = wm_weight (float): Mixture weight of WM (0..1).
+    - model_parameters[2] = softmax_beta (float): Base RL inverse temperature; internally x10 and divided by (nS/3).
+    - model_parameters[3] = K (float): WM capacity in number of states (0..6); effective K_eff = round(min(K, nS)).
+    - model_parameters[4] = intrusion (float): Probability of swap error when using WM (0..1).
+    - model_parameters[5] = wm_lapse (float): Probability WM outputs uniform (0..1).
+
+    Returns
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, K, intrusion, wm_lapse = model_parameters
+    softmax_beta *= 10  # base beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic WM when it applies
+    blocks_log_p = 0
+    eps = 1e-12
+    rng = np.random.default_rng(0)  # deterministic behavior for eviction decisions (no effect on likelihood calc)
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL value function
+        q = (1 / nA) * np.ones((nS, nA))
+
+        # WM: store mapping s -> stored_action or -1 if unknown
+        stored_action = -1 * np.ones(nS, dtype=int)
+        in_cache = np.zeros(nS, dtype=bool)
+        cache_order = []  # list of states currently cached
+        K_eff = int(np.clip(np.round(min(K, nS)), 0, nS))
+
+        # For computing WM policy probabilities
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy with set-size temperature scaling (larger set -> lower beta)
+            beta_eff = softmax_beta / max(1.0, (nS / 3.0))
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # Construct WM logits for current state
+            W_logits = np.log(w_0[s, :] + eps)
+
+            use_wm = in_cache[s] and (stored_action[s] >= 0)
+
+            if use_wm:
+                # By default, peak on stored action
+                wm_vec = w_0[s, :].copy()
+                wm_vec[stored_action[s]] = 1.0 - (nA - 1) * 1e-3
+                for aa in range(nA):
+                    if aa != stored_action[s]:
+                        wm_vec[aa] = 1e-3
+
+                # Intrusion: with probability 'intrusion', swap to a random other cached state's stored action
+                # For likelihood, treat as mixture between correct WM and intruded WM.
+                if np.any(in_cache) and (np.sum(in_cache) > 1):
+                    # Build intrusion distribution averaged across other cached states
+                    other_states = np.where(in_cache)[0]
+                    other_states = other_states[other_states != s]
+                    intr_vec = w_0[s, :].copy()
+                    if len(other_states) > 0:
+                        counts = np.zeros(nA)
+                        for ss in other_states:
+                            if stored_action[ss] >= 0:
+                                counts[stored_action[ss]] += 1
+                        if counts.sum() > 0:
+                            intr_vec = counts / counts.sum()
+                    wm_vec = (1.0 - intrusion) * wm_vec + intrusion * intr_vec
+
+                # Lapse: mix with uniform
+                wm_vec = (1.0 - wm_lapse) * wm_vec + wm_lapse * w_0[s, :]
+
+                W_logits = np.log(np.clip(wm_vec, eps, 1.0))
+
+            # WM policy softmax
+            W_s = np.exp(W_logits - np.max(W_logits))
+            W_s = W_s / W_s.sum()
+            w[s, :] = W_s.copy()
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: win-stay rule and cache management
+            if r > 0:
+                # Ensure s is cached
+                if not in_cache[s]:
+                    if np.sum(in_cache) < K_eff:
+                        in_cache[s] = True
+                        cache_order.append(s)
+                    else:
+                        # evict the oldest cached state
+                        evict_idx = 0
+                        if len(cache_order) > 0:
+                            evict_state = cache_order[evict_idx]
+                            in_cache[evict_state] = False
+                            stored_action[evict_state] = -1
+                            cache_order.pop(evict_idx)
+                        in_cache[s] = True
+                        cache_order.append(s)
+                stored_action[s] = a
+            else:
+                # Do nothing on errors (pure win-stay)
+                pass
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with PE-adaptive learning rate + WM hypothesis elimination; set-size–sensitive WM gating.
+
+    Description:
+    - RL: learning rate increases with unsigned prediction error magnitude (adaptive meta-learning).
+      lr_eff = sigmoid(lr0 + kappa*|PE|).
+    - WM: maintains action-probabilities per state that perform hypothesis elimination:
+      - On reward: move distribution toward one-hot on chosen action by wm_conf.
+      - On error: downweight chosen action by wm_conf and renormalize (i.e., eliminate hypotheses).
+    - WM weight is penalized by set size: wm_weight_eff = sigmoid(wm_base - wm_setsize_sens*(nS-3)).
+    - Mixture of WM and RL policies.
+
+    Parameters
+    - model_parameters[0] = lr0 (float): Base logit for RL learning rate (real; mapped via sigmoid to 0..1).
+    - model_parameters[1] = kappa (float): PE sensitivity of RL learning rate (>=0).
+    - model_parameters[2] = wm_base (float): Base logit for WM weight before sigmoid (real).
+    - model_parameters[3] = softmax_beta (float): RL inverse temperature; internally x10.
+    - model_parameters[4] = wm_conf (float): WM confidence step size for updates (0..1).
+    - model_parameters[5] = wm_setsize_sens (float): Penalty strength of WM weight per +3 items (>=0).
+
+    Returns
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr0, kappa, wm_base, softmax_beta, wm_conf, wm_setsize_sens = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))  # WM hypothesis distribution per state
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size sensitive WM weight (static within block)
+        wm_weight_eff = sigmoid(wm_base - wm_setsize_sens * (nS - 3.0))
+        wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with PE-adaptive learning rate
+            pe = r - Q_s[a]
+            lr_eff = sigmoid(lr0 + kappa * np.abs(pe))
+            q[s][a] += lr_eff * pe
+
+            # WM hypothesis elimination / confirmation
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_conf) * W_s + wm_conf * target
+            else:
+                # Reduce probability of chosen action and renormalize
+                W_new = W_s.copy()
+                W_new[a] = max(eps, W_new[a] * (1.0 - wm_conf))
+                # Distribute removed mass proportionally to other actions
+                removed = max(0.0, W_s[a] - W_new[a])
+                if removed > 0:
+                    denom = max(eps, 1.0 - W_s[a])
+                    for aa in range(nA):
+                        if aa != a:
+                            w_share = W_s[aa] / denom
+                            W_new[aa] += removed * w_share
+                # Normalize
+                ssum = W_new.sum()
+                if ssum > 0:
+                    W_new /= ssum
+                else:
+                    W_new = w_0[s, :].copy()
+                w[s, :] = W_new
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

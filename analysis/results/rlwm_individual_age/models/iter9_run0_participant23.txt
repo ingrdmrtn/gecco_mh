@@ -1,0 +1,357 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Capacity-limited WM with load- and age-modulated gating and decay.
+
+    Idea
+    - RL: Standard Q-learning with softmax.
+    - WM: Probabilistic cache per state, pushed toward the last rewarded action and otherwise
+      decays toward uniform. The WM arbitration weight is reduced by higher set size (load)
+      and by being in the older group.
+    - Both the WM gate (mixture weight) and WM decay are penalized by load and age, but via distinct
+      mechanisms controlled by shared penalty parameters (parsimony).
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index per trial (0..set_size-1 within a block).
+    actions : array-like of int
+        Chosen action per trial (0..2).
+    rewards : array-like of {0,1}
+        Reward per trial.
+    blocks : array-like of int
+        Block index per trial.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6).
+    age : array-like or scalar
+        Participant age; age_group = 0 if <=45 (young), 1 if >45 (older).
+    model_parameters : list or array-like
+        [lr_raw, beta_raw, wm_conf_raw, decay_raw, age_wm_cost, load_wm_cost]
+        - lr_raw: RL learning rate (logistic-bounded to 0..1).
+        - beta_raw: RL inverse temperature, scaled by 10.
+        - wm_conf_raw: base WM gate confidence (logistic 0..1).
+        - decay_raw: base WM decay toward uniform (logistic 0..1).
+        - age_wm_cost: penalty to WM gate and decay when older (>=0 increases penalty).
+        - load_wm_cost: penalty to WM gate and decay when set size is 6 relative to 3.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr_raw, beta_raw, wm_conf_raw, decay_raw, age_wm_cost, load_wm_cost = model_parameters
+
+    # Transforms
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    wm_conf_base = 1.0 / (1.0 + np.exp(-wm_conf_raw))  # 0..1
+    decay_base = 1.0 / (1.0 + np.exp(-decay_raw))      # 0..1
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Normalize set-size to a 0..1 "load level": 0 for 3, 1 for 6
+        load_level = (nS - 3) / 3.0
+
+        # Effective WM gate after penalties (in logit space)
+        wm_conf_logit = np.log(wm_conf_base + eps) - np.log(1.0 - wm_conf_base + eps)
+        wm_gate_eff = 1.0 / (1.0 + np.exp(-(wm_conf_logit - age_wm_cost * age_group - load_wm_cost * load_level)))
+        wm_gate_eff = np.clip(wm_gate_eff, 0.0, 1.0)
+
+        # Effective decay increased by load and age via exponentiation (keeps in [0,1])
+        decay_penalty = 1.0 + age_wm_cost * age_group + load_wm_cost * load_level
+        decay_eff = 1.0 - (1.0 - decay_base) ** max(1e-6, decay_penalty)
+        decay_eff = np.clip(decay_eff, 0.0, 1.0)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy probability of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture policy with fixed (but load/age-modulated) WM gate
+            p_total = wm_gate_eff * p_wm + (1.0 - wm_gate_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: rewarded trials push toward chosen action with strength tied to wm_gate_eff
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_gate_eff) * w[s, :] + wm_gate_eff * onehot
+
+            # Decay toward uniform each visit (interference/forgetting)
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Surprise-gated WM with state-wise prediction-error trace.
+
+    Idea
+    - RL: Standard Q-learning with softmax.
+    - WM: Probabilistic memory per state that sharpens on reward; decays otherwise.
+    - Arbitration: WM weight increases when recent absolute prediction error (surprise) is low,
+      and decreases when surprise is high; larger set size and older age bias against WM.
+      Surprise is tracked per state via an EWMA of absolute RL prediction error.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like or scalar
+    model_parameters : list or array-like
+        [lr_raw, beta_raw, wm_base_raw, pe_sens_raw, age_bias, load_bias]
+        - lr_raw: RL learning rate (logistic 0..1).
+        - beta_raw: RL inverse temperature (scaled by 10).
+        - wm_base_raw: baseline WM tendency (logistic 0..1).
+        - pe_sens_raw: sensitivity of gating to (1 - surprise); higher means greater boost when surprise is low.
+        - age_bias: subtractive bias on WM gating for older adults.
+        - load_bias: subtractive bias on WM gating at larger set size.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood.
+    """
+    lr_raw, beta_raw, wm_base_raw, pe_sens_raw, age_bias, load_bias = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    wm_base = 1.0 / (1.0 + np.exp(-wm_base_raw))  # 0..1
+    pe_sens = pe_sens_raw  # can be negative/positive; used linearly in gate formation
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+        load_level = (nS - 3) / 3.0
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # State-wise EWMA of absolute PE (surprise), initialized moderately high
+        surprise = 0.5 * np.ones(nS)
+        # Fixed smoothing for surprise trace derived from pe_sens magnitude (more sensitive -> faster updates)
+        kappa = 1.0 / (1.0 + np.exp(-np.abs(pe_sens_raw)))  # 0..1
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute current absolute PE using RL expectation
+            pe = np.abs(r - q[s, a])
+            # Update surprise EWMA
+            surprise[s] = (1.0 - kappa) * surprise[s] + kappa * pe
+            # Reliability signal (higher when surprise is low)
+            reliability = 1.0 - np.clip(surprise[s], 0.0, 1.0)
+
+            # WM gate: base + boost from reliability - penalties from age/load
+            gate_logit = (np.log(wm_base + eps) - np.log(1.0 - wm_base + eps)) \
+                         + pe_sens * (reliability - 0.5) \
+                         - age_bias * age_group \
+                         - load_bias * load_level
+            wm_weight = 1.0 / (1.0 + np.exp(-gate_logit))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update:
+            # - Reward: sharpen toward chosen action with strength tied to reliability (confident -> stronger)
+            # - No reward: relax toward uniform with strength tied to surprise (more surprise -> faster relax)
+            if r == 1:
+                sharpen = 0.5 + 0.5 * reliability  # in [0.5,1.0]
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - sharpen) * w[s, :] + sharpen * onehot
+            else:
+                relax = 0.25 + 0.5 * np.clip(surprise[s], 0.0, 1.0)  # in [0.25,0.75]
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + Exposure-gated WM (practice-based arbitration) with age/load penalties.
+
+    Idea
+    - RL: Q-learning with softmax.
+    - WM: One-shot caching of last rewarded action per state (deterministic when present),
+      with mild decay toward uniform.
+    - Arbitration: Early in learning for a state, rely more on WM; as exposures accumulate,
+      shift control to RL. The decay of WM and the gating both depend on set size and age group.
+      Thus, with larger set sizes or in older adults, WM advantage fades faster.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like or scalar
+    model_parameters : list or array-like
+        [lr_raw, beta_raw, gate_base_raw, gate_slope_raw, age_gate_drop, load_gate_drop]
+        - lr_raw: RL learning rate (logistic 0..1).
+        - beta_raw: RL inverse temperature (scaled by 10).
+        - gate_base_raw: baseline tendency to rely on WM at first exposure (logistic 0..1).
+        - gate_slope_raw: how quickly WM reliance declines with exposures (positive => faster decline).
+        - age_gate_drop: additional drop in WM gate for older group.
+        - load_gate_drop: additional drop in WM gate for larger set size.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood.
+    """
+    lr_raw, beta_raw, gate_base_raw, gate_slope_raw, age_gate_drop, load_gate_drop = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    gate_base = 1.0 / (1.0 + np.exp(-gate_base_raw))  # 0..1
+    gate_slope = 1.0 / (1.0 + np.exp(-gate_slope_raw))  # convert to 0..1 scale, then use to set decline rate
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+        load_level = (nS - 3) / 3.0
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        exposures = np.zeros(nS)  # count of how many times each state has been seen
+
+        # Base WM decay derived from gate_slope (more slope -> faster decay)
+        base_decay = 0.1 + 0.7 * gate_slope  # in [0.1,0.8]
+        # Age/load amplify decay
+        decay_eff = 1.0 - (1.0 - base_decay) ** (1.0 + 0.5 * age_group + 0.5 * load_level)
+        decay_eff = np.clip(decay_eff, 0.0, 1.0)
+
+        # Convert base gate to logit for stable penalties
+        base_logit = np.log(gate_base + eps) - np.log(1.0 - gate_base + eps)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL and WM policies
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Exposure-normalized count for gating (0 at first view, saturates by ~3)
+            n_norm = min(exposures[s], 3.0) / 3.0  # 0..1
+            # Exposure-driven decline in WM weight
+            decline = gate_slope * n_norm  # 0..1
+            # Effective gate with age/load penalties
+            gate_logit = base_logit - 4.0 * decline - age_gate_drop * age_group - load_gate_drop * load_level
+            wm_weight = 1.0 / (1.0 + np.exp(-gate_logit))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot  # cache the rewarded mapping deterministically
+            else:
+                # Mild decay toward uniform
+                w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+            # Increment exposure count for this state
+            exposures[s] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,277 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty- and set-size-weighted arbitration; WM is a decaying associative map.
+
+    Mechanism
+    - RL: standard delta-rule update with learning rate lr; softmax with inverse temperature softmax_beta (scaled by 10).
+    - WM: for each state, maintains a probability-like preference vector over actions (w[s,:]) that:
+        * Decays toward uniform with rate wm_decay (interference/forgetting).
+        * Is updated associatively: after reward, shifts toward a one-hot for the chosen action; after no reward, shifts mass away from the chosen action toward alternatives.
+      WM policy is a near-deterministic softmax over w[s,:].
+    - Arbitration: trial-wise WM weight is scaled by WM certainty and set size:
+        wm_weight_eff = wm_base_weight * (1 - H(WM)/log(nA)) / (1 + size_penalty * max(0, nS - 3)),
+      where H(WM) is the entropy of the WM policy in the current state.
+
+    Parameters
+    - lr: [0,1], RL learning rate.
+    - wm_base_weight: [0,1], baseline mixture weight on WM (before modulation).
+    - softmax_beta: >=0, RL inverse temperature (internally multiplied by 10).
+    - wm_decay: [0,1], WM decay toward uniform and WM learning step size.
+    - size_penalty: >=0, increases arbitration penalty on WM when set size is larger.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_base_weight, softmax_beta, wm_decay, size_penalty = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM readout
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        size_factor = 1.0 + size_penalty * max(0.0, float(nS) - 3.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # WM certainty via entropy of WM policy
+            wm_policy = np.exp(softmax_beta_wm * W_s)
+            wm_policy = wm_policy / np.sum(wm_policy)
+            entropy = -np.sum(wm_policy * np.log(np.clip(wm_policy, 1e-12, 1.0)))
+            entropy_norm = entropy / np.log(nA)
+            wm_certainty = max(0.0, 1.0 - entropy_norm)
+
+            wm_weight_eff = wm_base_weight * wm_certainty / size_factor
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: decay toward uniform, then associative learning
+            # Decay/interference
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            learn = wm_decay  # tie learning step to decay parameter to keep param count limited
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - learn) * w[s, :] + learn * one_hot
+            else:
+                # Move probability mass away from chosen action toward others
+                redistribute = np.ones(nA) / (nA - 1.0)
+                redistribute[a] = 0.0
+                # First reduce chosen action, then add to others
+                w[s, a] = (1.0 - learn) * w[s, a]
+                w[s, :] += learn * redistribute
+            # Renormalize to keep w a proper distribution
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + PE-gated WM: WM preferences are strengthened in proportion to RL prediction error magnitude;
+    RL exploration temperature is weakened by larger set sizes.
+
+    Mechanism
+    - RL: delta-rule with learning rate lr; inverse temperature is scaled down for larger sets:
+        beta_eff = (softmax_beta * 10) / (1 + beta_size_slope * max(0, nS - 3)).
+    - WM: maintains an action-preference vector w[s,:] per state (not constrained to sum to 1).
+        After each trial, WM decays slightly toward a neutral baseline, and then:
+        * If reward: add pe_to_wm_gain * |delta| to the chosen action's WM value (credit assignment).
+        * If no reward: subtract pe_to_wm_gain * |delta| from the chosen action and distribute that mass to unchosen actions equally.
+      WM readout uses a near-deterministic softmax over w[s,:].
+    - Mixture: fixed wm_weight between WM and RL policies.
+
+    Parameters
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], mixture weight on WM policy.
+    - softmax_beta: >=0, base RL inverse temperature (scaled by 10 internally).
+    - pe_to_wm_gain: >=0, how strongly RL prediction error magnitude gates WM strengthening/weakening.
+    - beta_size_slope: >=0, how much set size reduces RL inverse temperature.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, pe_to_wm_gain, beta_size_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = np.zeros((nS, nA))  # neutral baseline at zero
+        w_0 = np.zeros((nS, nA))
+
+        beta_eff = softmax_beta / (1.0 + beta_size_slope * max(0.0, float(nS) - 3.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy with set-size adjusted temperature
+            denom_rl = np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: mild decay toward baseline, then PE-gated adjustment
+            leak = 0.05 * pe_to_wm_gain
+            w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+            k = pe_to_wm_gain * abs(delta)
+            if r > 0.5:
+                w[s, a] += k
+            else:
+                # Move mass from chosen to unchosen
+                w[s, a] -= k
+                redistribute = k / (nA - 1.0)
+                for aa in range(nA):
+                    if aa != a:
+                        w[s, aa] += redistribute
+            # Optional clipping to keep numerical stability
+            w[s, :] = np.clip(w[s, :], -50.0, 50.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + novelty-driven WM (count-based exploration), with set-size scaling of novelty influence.
+
+    Mechanism
+    - RL: standard delta-rule with learning rate lr; softmax with inverse temperature softmax_beta (scaled by 10).
+    - WM: encodes novelty values per state-action that start high and decay each time an action is sampled in that state:
+        * w[s,a] initially = 1.0 for all actions.
+        * On choosing a in state s, w[s,a] <- (1 - novelty_decay) * w[s,a].
+        This yields higher WM preference for untried/rarely tried actions (exploration drive).
+      WM policy uses near-deterministic softmax over w[s,:].
+    - Mixture: WM weight is scaled down in larger set sizes to reflect reduced effectiveness of novelty search:
+        wm_weight_eff = wm_weight / (1 + size_novelty_scale * max(0, nS - 3)).
+
+    Parameters
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], baseline weight for novelty WM.
+    - softmax_beta: >=0, RL inverse temperature (internally scaled by 10).
+    - novelty_decay: [0,1], how quickly novelty value declines upon sampling an action.
+    - size_novelty_scale: >=0, how strongly larger set sizes reduce the novelty component.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, novelty_decay, size_novelty_scale = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = np.ones((nS, nA))  # novelty map starts high
+        w_0 = np.ones((nS, nA))  # unused baseline but retained per template
+
+        wm_weight_eff_block = wm_weight / (1.0 + size_novelty_scale * max(0.0, float(nS) - 3.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM (novelty) policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM novelty update: decrease novelty for the sampled action only
+            w[s, a] = (1.0 - novelty_decay) * w[s, a]
+            # Optional small floor to avoid exact ties
+            w[s, a] = max(w[s, a], 1e-6)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

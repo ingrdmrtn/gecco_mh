@@ -1,0 +1,316 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with load- and age-modulated WM weight, WM decay, and WM noise.
+
+    Idea:
+    - Choice is a mixture of RL softmax and WM softmax.
+    - WM mixture weight is a logistic function of a base parameter, modulated by set size (load)
+      and age. Higher load reduces WM reliance; older age reduces WM reliance further.
+    - WM policy is a sharp softmax over a WM state-action table, but with controllable noise
+      by mixing with a uniform distribution.
+    - WM table decays toward uniform and is updated Hebbian-style after feedback:
+        - If rewarded, move WM distribution toward a one-hot on the chosen action.
+        - If not rewarded, mildly move toward uniform.
+    
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - wm_weight_logit: base WM mixture logit (real-valued; transformed via sigmoid to 0..1)
+    - softmax_beta: base RL inverse temperature; internally scaled by 10
+    - wm_decay: per-trial decay of WM toward uniform (0..1)
+    - wm_noise: amount of uniform noise mixed into WM policy (0..1)
+    - age_wm_shift: additive shift (in logit space) reducing WM for older adults (>=0 typical)
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_logit, softmax_beta, wm_decay, wm_noise, age_wm_shift = model_parameters
+    softmax_beta *= 10.0  # keep consistent scaling
+
+    # Age group coding
+    age_group = 0 if age[0] <= 45 else 1
+
+    # Fixed high beta for WM policy
+    softmax_beta_wm = 50.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM value tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # baseline/uniform
+
+        # Compute a block-level WM weight from base logit plus load and age terms
+        # Load reduces WM reliance: add negative term proportional to log(nS/3)
+        load_term = -np.log(max(1.0, float(nS) / 3.0))
+        # Effective WM logit with age penalty applied to older group
+        wm_logit_eff = wm_weight_logit + load_term - age_group * abs(age_wm_shift)
+        wm_weight_eff = 1.0 / (1.0 + np.exp(-wm_logit_eff))
+        wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy (fixed by template line)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # [FILL IN THE POLICY FOR THE WORKING MEMORY]
+            # Add controllable WM noise by mixing with uniform before softmax
+            W_s_noisy = (1.0 - wm_noise) * W_s + wm_noise * (np.ones(nA) / nA)
+            Wc = W_s_noisy - np.max(W_s_noisy)
+            den_wm = np.sum(np.exp(softmax_beta_wm * Wc))
+            p_wm = np.exp(softmax_beta_wm * Wc[a]) / max(eps, den_wm)
+
+            p_total = p_wm * wm_weight_eff + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # [FILL IN THE VALUE UPDATING FOR THE WORKING MEMORY]
+            # Decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            # Hebbian update: if reward, move toward one-hot of chosen; else a small drift to uniform
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Learning rate for WM depends on how far from target we are (implicit step size 1.0 here)
+                w[s, :] += (target - W_s)
+            else:
+                # If not rewarded, apply a small additional drift to uniform
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (np.ones(nA) / nA)
+
+            # Renormalize WM row
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with surprise-based arbitration and WM decay.
+
+    Idea:
+    - Choice mixes WM and RL policies; the mixture weight on each trial depends on:
+        - Base wm_weight parameter,
+        - Surprise |R - Q(s,a)| (high surprise -> shift weight toward RL),
+        - Load (set size: larger -> less WM),
+        - Age (older -> less WM).
+    - WM policy is a sharp softmax over WM values.
+    - WM values decay toward uniform and update with alpha_wm toward a one-hot target if rewarded,
+      and toward uniform if not.
+    
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - wm_weight: base WM mixture weight (0..1)
+    - softmax_beta: base RL inverse temperature; internally scaled by 10
+    - alpha_wm: WM learning rate toward its target (0..1)
+    - wm_decay: per-trial WM decay toward uniform (0..1)
+    - gamma_surprise: strength of surprise modulation (>=0); larger -> more RL under surprise
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, alpha_wm, wm_decay, gamma_surprise = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Block-level corrections
+        load_penalty = float(nS) / 3.0  # >1 for nS=6, equals 1 for nS=3
+        age_penalty = 0.15 if age_group == 1 else 0.0  # small reduction if older
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy (per template line)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # [FILL IN THE POLICY FOR THE WORKING MEMORY]
+            Wc = W_s - np.max(W_s)
+            den_wm = np.sum(np.exp(softmax_beta_wm * Wc))
+            p_wm = np.exp(softmax_beta_wm * Wc[a]) / max(eps, den_wm)
+
+            # Surprise-based arbitration: higher surprise -> reduce WM weight
+            surprise = abs(r - Q_s[a])
+            # Effective weight starts from base, then divide by load_penalty and subtract age_penalty
+            wm_eff = wm_weight / load_penalty - age_penalty
+            wm_eff = np.clip(wm_eff, 0.0, 1.0)
+            # Modulate by surprise via convex combination with RL (toward 0)
+            wm_eff = wm_eff * (1.0 / (1.0 + gamma_surprise * surprise))
+            wm_eff = np.clip(wm_eff, 0.0, 1.0)
+
+            p_total = wm_eff * p_wm + (1.0 - wm_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # [FILL IN THE VALUE UPDATING FOR THE WORKING MEMORY]
+            # Decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            # Target: one-hot if rewarded; otherwise uniform
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+            else:
+                target = np.ones(nA) / nA
+            w[s, :] += alpha_wm * (target - W_s)
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with binding confusion across states and age-modulated RL temperature.
+
+    Idea:
+    - Choice mixes WM and RL policies.
+    - WM features binding confusion: with some probability, memory for the current state is
+      contaminated by the average memory of other states (swap-like errors). Confusion increases
+      with set size and with age.
+    - WM updates toward one-hot on rewarded trials; otherwise mild drift to uniform.
+    - RL temperature is modulated by age (older -> lower inverse temperature).
+    
+    Parameters:
+    - lr: RL learning rate (0..1)
+    - wm_weight: base WM mixture weight (0..1)
+    - softmax_beta: base RL inverse temperature; internally scaled by 10
+    - confusion_rate: base probability of binding confusion (0..1)
+    - alpha_store: WM learning rate toward target (0..1)
+    - age_rl_bias: amount to subtract from beta for older adults (>=0)
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, confusion_rate, alpha_store, age_rl_bias = model_parameters
+    # Age group coding
+    age_group = 0 if age[0] <= 45 else 1
+
+    # Age-modulated RL inverse temperature
+    beta_eff = max(0.0, softmax_beta - age_group * abs(age_rl_bias))
+    beta_eff *= 10.0
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-adjusted WM weight: reduce with set size
+        wm_eff_block = wm_weight * (3.0 / float(nS))
+        wm_eff_block = np.clip(wm_eff_block, 0.0, 1.0)
+
+        # Binding confusion increases with set size and age
+        conf_eff_block = confusion_rate * (float(nS) / 3.0) * (1.0 + 0.3 * age_group)
+        conf_eff_block = np.clip(conf_eff_block, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+
+            # RL policy (per template form)
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # [FILL IN THE POLICY FOR THE WORKING MEMORY]
+            # Confused WM vector: mix current state's WM with the mean of other states
+            if nS > 1:
+                other_idx = [i for i in range(nS) if i != s]
+                mean_other = np.mean(w[other_idx, :], axis=0)
+            else:
+                mean_other = np.ones(nA) / nA
+            W_s_clean = w[s, :].copy()
+            W_s_confused = (1.0 - conf_eff_block) * W_s_clean + conf_eff_block * mean_other
+
+            Wc = W_s_confused - np.max(W_s_confused)
+            den_wm = np.sum(np.exp(softmax_beta_wm * Wc))
+            p_wm = np.exp(softmax_beta_wm * Wc[a]) / max(eps, den_wm)
+
+            p_total = wm_eff_block * p_wm + (1.0 - wm_eff_block) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # [FILL IN THE VALUE UPDATING FOR THE WORKING MEMORY]
+            # Update WM for the current state toward one-hot on rewarded trials
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] += alpha_store * (target - W_s_clean)
+            else:
+                # Mild drift to uniform when not rewarded
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (np.ones(nA) / nA)
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

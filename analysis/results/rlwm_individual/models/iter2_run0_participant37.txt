@@ -1,0 +1,286 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture with uncertainty-gated WM and set-size–dependent WM precision.
+
+    Policy:
+    - RL channel: softmax over Q-values with inverse temperature beta (scaled by 10 internally).
+    - WM channel: softmax over WM weights W with an effective WM temperature that degrades with set size.
+    - Mixture: p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl.
+      wm_weight_eff is dynamically gated by RL uncertainty (higher WM when RL is uncertain).
+
+    WM dynamics:
+    - Leak toward uniform with rate wm_leak each time a state is visited.
+    - Reward-contingent storage: after feedback, increase WM weight on the chosen action proportionally to reward.
+      On errors, apply only leak (no strengthening).
+
+    Set-size effects:
+    - WM precision degrades with set size via softmax temperature: beta_wm_eff = softmax_beta_wm / (1 + wm_temp_scale * max(0, nS - 3)).
+      Larger set sizes make WM policy more diffuse.
+    - Gate amplification with set size: uncertainty gate is scaled by (1 + gate_size_gain * max(0, nS - 3)).
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Baseline WM mixture weight (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_leak: WM leak toward uniform when a state is visited (0..1).
+    - wm_temp_scale: Increase in WM noise per extra item beyond 3 (>=0).
+    - gate_size_gain: How much set size amplifies the uncertainty gate (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_leak, wm_temp_scale, gate_size_gain = model_parameters
+    softmax_beta *= 10.0
+    base_softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size–dependent WM precision
+        beta_wm_eff = base_softmax_beta_wm / (1.0 + wm_temp_scale * max(0, nS - 3))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Uncertainty gate based on RL entropy: higher entropy -> more WM
+            # Compute RL choice probabilities for entropy
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            prl_full = np.exp(logits) / np.sum(np.exp(logits))
+            rl_entropy = -np.sum(prl_full * np.log(np.maximum(prl_full, 1e-12))) / np.log(nA)
+            gate = rl_entropy * (1.0 + gate_size_gain * max(0, nS - 3))
+            gate = np.clip(gate, 0.0, 1.0)
+            wm_weight_eff = (1.0 - (1.0 - wm_weight) * (1.0 - gate))  # increases from wm_weight toward 1 with uncertainty
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM leak and reward-gated strengthening
+            w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+            if r > 0.5:
+                # Move mass toward the chosen action, normalized
+                w[s, a] = min(1.0, w[s, a] + (1.0 - w[s, a]))  # saturate at 1 on reward
+                # Normalize to avoid drift
+                w_sum = np.sum(w[s, :])
+                if w_sum > 0:
+                    w[s, :] /= w_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with forgetting + PE-gated WM storage diluted by set size.
+
+    Policy:
+    - RL channel: softmax over Q-values with inverse temperature beta (scaled by 10 internally).
+    - WM channel: softmax over WM weights W with high inverse temperature (deterministic-ish).
+    - Mixture: p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl, with set-size–dependent wm_weight_eff.
+
+    RL dynamics:
+    - Standard delta rule plus RL forgetting toward uniform with rate rl_forget on each visit to a state.
+
+    WM dynamics:
+    - Storage strength proportional to the absolute prediction error |PE| passed through a logistic transform with slope pe_slope.
+    - The effective storage is divided by (1 + cap_share * max(0, nS - 3)) to capture limited capacity at larger set sizes.
+    - On storage, shift WM toward a one-hot for the chosen action by the computed storage strength.
+
+    Set-size effects:
+    - WM mixture weight declines with set size: wm_weight_eff = wm_weight / (1 + cap_share * max(0, nS - 3)).
+    - WM storage strength is additionally diluted by the same factor.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Baseline WM mixture weight (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - rl_forget: RL forgetting toward uniform (0..1).
+    - pe_slope: Slope of logistic transform on |PE| controlling WM storage strength (>0).
+    - cap_share: Set-size dilution factor for WM weight and storage (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, rl_forget, pe_slope, cap_share = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        size_factor = 1.0 + cap_share * max(0, nS - 3)
+        wm_weight_eff = wm_weight / size_factor
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform for the visited state
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+            q[s, :] = (1.0 - rl_forget) * q[s, :] + rl_forget * (1.0 / nA)
+
+            # WM update: PE-gated storage diluted by set size
+            store_strength = 1.0 / (1.0 + np.exp(-pe_slope * np.abs(pe)))
+            store_strength /= size_factor
+            # Move w[s,:] toward one-hot on a
+            target = np.zeros(nA)
+            target[a] = 1.0
+            w[s, :] = (1.0 - store_strength) * w[s, :] + store_strength * target
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture with cross-state chunking and set-size–scaled interference.
+
+    Policy:
+    - RL channel: softmax over Q-values with inverse temperature beta (scaled by 10 internally).
+    - WM channel: softmax over WM weights with high beta (deterministic).
+    - Mixture: p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl.
+
+    WM dynamics:
+    - Within-state decay toward uniform at rate wm_decay each visit.
+    - On reward, store the chosen action (one-hot) in the current state.
+    - Cross-state chunking: after reward, also nudge the same action in all other states toward that action,
+      with magnitude proportional to chunking / (1 + size_gate * max(0, nS - 3)).
+      This captures a bias to reuse a rewarded action across states, which should be stronger at small set sizes.
+
+    Set-size effects:
+    - WM mixture weight declines linearly with set size: wm_weight_eff = wm_weight / (1 + size_gate * max(0, nS - 3)).
+    - Cross-state chunking interference is dampened by the same factor, reducing spurious generalization when nS is large.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Baseline WM mixture weight (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_decay: WM decay toward uniform on each visit (0..1).
+    - chunking: Magnitude of cross-state action reuse after reward (>=0).
+    - size_gate: Controls how set size reduces WM weight and chunking (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_decay, chunking, size_gate = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        size_factor = 1.0 + size_gate * max(0, nS - 3)
+        wm_weight_eff = wm_weight / size_factor
+        chunk_eff = chunking / size_factor
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay in current state
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            if r > 0.5:
+                # Store one-hot in the current state
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+                # Cross-state chunking: nudge same action in other states
+                if chunk_eff > 0:
+                    for s2 in range(nS):
+                        if s2 == s:
+                            continue
+                        # Move a small portion toward choosing action a in state s2
+                        target = np.zeros(nA)
+                        target[a] = 1.0
+                        w[s2, :] = (1.0 - chunk_eff) * w[s2, :] + chunk_eff * target
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

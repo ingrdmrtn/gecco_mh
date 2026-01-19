@@ -1,0 +1,273 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM mixture with age-modulated capacity and WM decay.
+
+    Idea:
+    - RL: standard Q-learning with inverse temperature softmax_beta.
+    - WM: a fast one-shot store that, upon reward, writes a one-hot associative mapping for that state.
+      WM decays toward uniform with rate wm_decay each trial (state-local).
+    - Mixture: WM vs RL mixture weight increases when the (age-modulated) effective WM capacity exceeds the block set size.
+      Older adults are modeled as having lower effective WM capacity (via age_capacity_shift).
+    
+    Parameters
+    - lr: RL learning rate in [0,1]
+    - softmax_beta: inverse temperature for RL (scaled internally by 10)
+    - wm_weight_base: baseline logit for WM mixture weight (sigmoid to 0-1)
+    - capacity_logit: determines effective WM capacity via sigmoid; capacity = 3 + 3*sigmoid(capacity_logit + age term)
+    - wm_decay: WM decay rate toward uniform (0=no decay, 1=full reset to uniform each step)
+    - age_capacity_shift: shift applied to capacity_logit for older adults (negative values reduce capacity for age_group=1)
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, capacity_logit, wm_decay, age_capacity_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM readout
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute block-level WM mixture weight from capacity match
+        # Effective capacity in [3,6]: older adults get a shifted capacity (reduced if age_capacity_shift < 0)
+        cap_sig = 1.0 / (1.0 + np.exp(-(capacity_logit + age_capacity_shift * age_group)))
+        effective_capacity = 3.0 + 3.0 * cap_sig
+        capacity_match = effective_capacity - nS  # positive when capacity exceeds set size
+        wm_weight = 1.0 / (1.0 + np.exp(-(wm_weight_base + capacity_match)))
+        wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (deterministic readout with softmax_beta_wm)
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            # WM write on reward: store the rewarded action deterministically
+            if r > 0:
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM mixture with lapse noise that increases with set size and with age, and WM decay.
+
+    Idea:
+    - RL: standard Q-learning with inverse temperature softmax_beta.
+    - WM: fast table with decay toward uniform at rate wm_decay; upon reward, write one-hot association for that state.
+    - Lapse: with probability epsilon, a uniform random choice occurs; epsilon increases with set size and for older adults.
+    - Mixture: convex combination of WM and RL with fixed wm_weight (0-1).
+    
+    Parameters
+    - lr: RL learning rate
+    - softmax_beta: RL inverse temperature (scaled internally by 10)
+    - wm_weight: fixed mixture weight for WM contribution (0-1 after sigmoid transform)
+    - wm_decay: WM decay rate toward uniform (per trial, state-local)
+    - lapse_base: base logit of lapse probability epsilon
+    - age_lapse_effect: additive effect on lapse logit for older adults (positive => more lapses for age_group=1)
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight, wm_decay, lapse_base, age_lapse_effect = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    # squash weights to proper ranges
+    wm_weight = 1.0 / (1.0 + np.exp(-wm_weight))
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Lapse probability increases with set size and age
+        setsize_term = 0.5 * (nS - 3)  # fixed slope: larger sets => higher lapse
+        lapse_logit = lapse_base + setsize_term + age_lapse_effect * age_group
+        epsilon = 1.0 / (1.0 + np.exp(-lapse_logit))
+        epsilon = np.clip(epsilon, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture between WM and RL
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+
+            # Lapse mixture with uniform
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update with decay and reward-based write
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0:
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with state-local forgetting + WM gating by prediction error magnitude, modulated by age.
+
+    Idea:
+    - RL: Q-learning with inverse temperature softmax_beta and per-trial forgetting toward uniform on the visited state.
+      Forgetting rate rl_forget shrinks Q toward uniform values each time the state is visited.
+    - WM: fast store; on reward, write one-hot; otherwise, keep current with mild passive decay.
+    - Control: mixture weight for WM is dynamically gated by the magnitude of the previous prediction error in that state
+      (|delta_prev|): larger surprise increases WM reliance. Age modulates this gating (older adults show weaker WM gating
+      if age_gate_effect is negative). Gating also has a baseline (wm_weight_base).
+    
+    Parameters
+    - lr: RL learning rate
+    - softmax_beta: RL inverse temperature (scaled internally by 10)
+    - wm_weight_base: baseline logit for WM mixture weight
+    - pe_gate_slope: slope mapping |delta_prev| to WM logit (positive => more WM after larger surprise)
+    - rl_forget: forgetting rate toward uniform for Q values on visited state (0=no forgetting, 1=full reset toward uniform)
+    - age_gate_effect: additive term on WM logit multiplied by signed age (-1 for young, +1 for old); negative reduces WM in older
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, pe_gate_slope, rl_forget, age_gate_effect = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    # Signed age code: -1 for young, +1 for old
+    age_group = 0 if age[0] <= 45 else 1
+    age_signed = -1 if age_group == 0 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last prediction error per state for gating (initialize to 0)
+        last_delta = np.zeros(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Dynamic WM gating by |delta_prev| and age
+            wm_logit = wm_weight_base + pe_gate_slope * np.abs(last_delta[s]) + age_gate_effect * age_signed
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform (on visited state)
+            delta = r - Q_s[a]
+            # apply forgetting toward uniform for all actions in state s
+            q[s, :] = (1.0 - rl_forget) * q[s, :] + rl_forget * w_0[s, :]
+            # then standard Q-learning on chosen action
+            q[s, a] += lr * delta
+
+            # WM passive mild decay toward uniform
+            w[s, :] = 0.2 * w_0[s, :] + 0.8 * w[s, :]
+            # reward-based write
+            if r > 0:
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+
+            # update last delta for gating
+            last_delta[s] = delta
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set size and age use across models:
+- Model 1: WM reliance depends on how the block set size compares to an age-modulated effective capacity (older adults have reduced capacity via age_capacity_shift), thereby reducing WM weight in larger sets and for older adults.
+- Model 2: Lapse noise increases with set size and with age (age_lapse_effect), degrading performance particularly in larger set-size blocks and for older participants; WM has independent decay.
+- Model 3: WM gating is driven by surprise (|PE|) and is attenuated or enhanced by age (age_gate_effect with signed age), while RL incorporates forgetting that can mimic load-related interference.

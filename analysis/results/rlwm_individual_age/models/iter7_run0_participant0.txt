@@ -1,0 +1,327 @@
+Below are three alternative cognitive models for the RLWM task. Each function is standalone, uses all its parameters, adheres to the requested interface, and returns the negative log-likelihood of observed choices. All models implement a mixture policy between an RL system and a WM system; they differ in how WM encodes/decays/interferes and how arbitration depends on set size and age.
+
+Note: Assume numpy as np is already imported in the environment (no imports inside the functions).
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning + WM with reward-based encoding and load/age-dependent decay.
+    
+    Mechanism
+    - RL: Tabular Q-learning with separate learning rates for positive vs negative prediction errors.
+    - WM: One-shot encoding toward the chosen action on rewarded trials; soft decay toward uniform.
+    - Arbitration: Fixed mixture with a logit that is penalized by higher set size and by age.
+    
+    Parameters (model_parameters)
+    - alpha_pos: RL learning rate for positive PE in [0,1].
+    - alpha_neg: RL learning rate for negative PE in [0,1].
+    - softmax_beta: RL inverse temperature (internally scaled by *10).
+    - wm_logit_base: baseline mixture logit for WM; transformed by sigmoid.
+    - wm_decay_base: base WM decay factor per trial; larger => stronger decay toward uniform.
+    - age_decay_add: additional penalty to WM (both reduced weight and stronger decay) for older adults.
+    
+    Age and set-size effects
+    - WM mixture weight per trial: sigmoid(wm_logit_base - wm_decay_base*(set_size/3) - age_group*age_decay_add).
+    - WM decay per trial: decay_eff = clip(wm_decay_base*(set_size/3)*(1 + age_group*age_decay_add), 0, 1).
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, softmax_beta, wm_logit_base, wm_decay_base, age_decay_add = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            set_size = float(block_set_sizes[t])
+
+            # RL policy probability of chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / (denom_rl + eps)
+
+            # WM policy probability of chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / (denom_wm + eps)
+
+            # Arbitration: load- and age-penalized WM weight
+            wm_logit = wm_logit_base - wm_decay_base * (set_size / 3.0) - age_group * age_decay_add
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + eps)
+
+            # RL update with asymmetry
+            pe = r - Q_s[a]
+            alpha = alpha_pos if pe >= 0.0 else alpha_neg
+            q[s, a] += alpha * pe
+
+            # WM encoding on rewarded trials (toward one-hot) + global decay toward uniform
+            # Encoding strength linked to decay_base (so both interact with load/age)
+            decay_eff = np.clip(wm_decay_base * (set_size / 3.0) * (1.0 + age_group * age_decay_add), 0.0, 1.0)
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Use (1 - decay_eff) as encoding strength so high decay reduces encoding
+                enc = np.clip(1.0 - decay_eff, 0.0, 1.0)
+                w[s, :] = (1.0 - enc) * w[s, :] + enc * target
+
+            # Soft decay of entire WM table to reflect time/interference
+            w = (1.0 - decay_eff) * w + decay_eff * w_0
+            # Normalize rows for numerical stability
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            w = np.maximum(w, eps)
+            w = w / row_sums
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with choice-stickiness (state-specific choice kernel) + WM with interference across states.
+    
+    Mechanism
+    - RL: Tabular Q-learning; policy uses augmented Q with a state-specific choice kernel (stickiness).
+    - Choice kernel: Tracks recency of actions per state; decays with an interference factor
+      that worsens under higher set sizes.
+    - WM: Reward-based one-shot encoding for the current state; writing in one state induces
+      interference-driven decay toward uniform in other states.
+    - Arbitration: WM gate is penalized by set size and by age.
+    
+    Parameters (model_parameters)
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature (internally scaled by *10).
+    - wm_gate: baseline WM mixture logit; transformed by sigmoid per trial.
+    - stickiness: weight of the choice kernel added to Q-values in the softmax.
+    - interference: base interference strength in [0,1], scales decay of K and cross-state WM decay.
+    - age_gate_penalty: reduces WM reliance for older adults (>=0).
+    
+    Age and set-size effects
+    - Effective WM gate per trial: wm_logit = wm_gate - interference*(set_size/3) - age_group*age_gate_penalty.
+    - Choice-kernel decay per trial: kernel_decay = clip(interference*(set_size/3), 0, 1).
+    - WM cross-state interference per trial when encoding: same kernel_decay applied to non-current states.
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_gate, stickiness, interference, age_gate_penalty = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # State-specific choice kernel
+        K = np.zeros((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            set_size = float(block_set_sizes[t])
+
+            # Effective interference factor scales with load
+            inter_eff = np.clip(interference * (set_size / 3.0), 0.0, 1.0)
+
+            # RL policy on augmented Q by choice kernel
+            Q_aug = q[s, :] + stickiness * K[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_aug - Q_aug[a])))
+            p_rl = 1.0 / (denom_rl + eps)
+
+            # WM policy
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / (denom_wm + eps)
+
+            # Arbitration: reduce WM weight with load and age
+            wm_logit = wm_gate - inter_eff - age_group * age_gate_penalty
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + eps)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # Update choice kernel: decay then increment chosen action
+            K = (1.0 - inter_eff) * K  # global decay (more interference -> faster decay)
+            K[s, a] += 1.0
+
+            # WM encoding for current state and cross-state interference
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Encoding strength diminishes under interference
+                enc = 1.0 - inter_eff
+                enc = np.clip(enc, 0.0, 1.0)
+                w[s, :] = (1.0 - enc) * w[s, :] + enc * target
+
+                # Cross-state interference: push other states toward uniform
+                if nS > 1:
+                    for s2 in range(nS):
+                        if s2 == s:
+                            continue
+                        w[s2, :] = (1.0 - inter_eff) * w[s2, :] + inter_eff * w_0[s2, :]
+
+            # Normalize WM rows
+            w = np.maximum(w, eps)
+            w = w / np.sum(w, axis=1, keepdims=True)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and load/age-driven WM noise.
+    
+    Mechanism
+    - RL: Tabular Q-learning with softmax policy.
+    - WM: Reward-based encoding; before policy computation, WM contents are blurred
+      toward uniform with a noise level that increases with set size and for older adults.
+    - Arbitration: Mixture weight is a sigmoid of an entropy contrast (H_rl - H_wm),
+      biased against WM under higher set size and for older adults.
+    
+    Parameters (model_parameters)
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature (internally scaled by *10).
+    - wm_temp_base: base WM blurring strength; higher -> more mixing with uniform before policy.
+    - cap_scale: bias that penalizes WM under higher set sizes in the mixture (capacity limitation).
+    - arb_slope: sensitivity of the mixture to entropy contrast (H_rl - H_wm).
+    - age_temp_mult: increases WM blurring and reduces WM weight for older adults (>=0).
+    
+    Age and set-size effects
+    - WM blurring per trial: noise = sigmoid(wm_temp_base * (set_size/3) * (1 + age_group*age_temp_mult)).
+      W_eff = (1 - noise)*w[s,:] + noise*uniform.
+    - Mixture logit: bias = -cap_scale * ((set_size - 3.0)/3.0) - age_group * age_temp_mult.
+      wm_weight = sigmoid(bias + arb_slope * (H_rl - H_wm)).
+    
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_temp_base, cap_scale, arb_slope, age_temp_mult = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    nA = 3
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nS = int(block_set_sizes[0])
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            set_size = float(block_set_sizes[t])
+
+            # RL full softmax for entropy
+            Q_s = q[s, :]
+            logits_rl = softmax_beta * (Q_s - np.max(Q_s))
+            exp_rl = np.exp(logits_rl)
+            pi_rl = exp_rl / (np.sum(exp_rl) + eps)
+            H_rl = -np.sum(pi_rl * np.log(pi_rl + eps))
+
+            # WM blurring toward uniform depends on set size and age
+            noise = 1.0 / (1.0 + np.exp(-wm_temp_base * (set_size / 3.0) * (1.0 + age_group * age_temp_mult)))
+            uniform = np.ones(nA) / nA
+            W_s = (1.0 - noise) * w[s, :] + noise * uniform
+
+            # WM full softmax for entropy and chosen-action probability
+            logits_wm = softmax_beta_wm * (W_s - np.max(W_s))
+            exp_wm = np.exp(logits_wm)
+            pi_wm = exp_wm / (np.sum(exp_wm) + eps)
+            H_wm = -np.sum(pi_wm * np.log(pi_wm + eps))
+
+            # Probabilities of chosen action from each system
+            p_rl = pi_rl[a]
+            p_wm = pi_wm[a]
+
+            # Entropy-based arbitration with capacity/age bias
+            bias = -cap_scale * ((set_size - 3.0) / 3.0) - age_group * age_temp_mult
+            wm_weight = 1.0 / (1.0 + np.exp(-(bias + arb_slope * (H_rl - H_wm))))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(p_total + eps)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM encoding toward chosen action when rewarded; small avoidance when not
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Encoding strength inversely related to noise
+                enc = np.clip(1.0 - noise, 0.0, 1.0)
+                w[s, :] = (1.0 - enc) * w[s, :] + enc * target
+            else:
+                # Mild smoothing when unrewarded
+                w[s, :] = 0.9 * w[s, :] + 0.1 * uniform
+
+            # Normalize WM row
+            w[s, :] = np.maximum(w[s, :], eps)
+            w[s, :] = w[s, :] / np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+How age and set size enter the models
+- Model 1: Larger set sizes reduce WM weight and increase WM decay; older age further reduces WM weight and increases decay.
+- Model 2: Larger set sizes increase interference, which reduces WM gate, decays the choice kernel faster, and increases cross-state WM interference; older age reduces WM gate.
+- Model 3: Larger set sizes increase WM blurring and bias arbitration away from WM; older age increases blurring and pushes arbitration away from WM.

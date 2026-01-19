@@ -1,0 +1,288 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Uncertainty-gated WM mixture with set-size attenuation.
+
+    Idea:
+    - Choices are a mixture of a gradual RL policy and a fast WM policy.
+    - The WM weight is computed dynamically from RL uncertainty (state-entropy),
+      and attenuated by set size.
+    - WM stores rewarded actions per state deterministically; no storage for non-reward.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1). Updates Q(s,a) after each outcome.
+    - wm_base: baseline WM mixture weight (0..1), before gating/attenuation.
+    - softmax_beta: RL inverse temperature; internally scaled up by 10.
+    - k_unc: sensitivity of WM gating to RL uncertainty (>=0). Higher => more WM use when RL is uncertain.
+    - h0: uncertainty offset (0..log(nA)). Shifts the entropy operating point for gating.
+    - gamma_ss: set-size attenuation (>=0). Effective WM weight decays as exp(-gamma_ss*(nS-3)).
+
+    Set-size impact:
+    - Effective WM weight per block is scaled by exp(-gamma_ss*(nS-3)); thus larger sets reduce WM influence.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, wm_base, softmax_beta, k_unc, h0, gamma_ss = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic WM
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Precompute WM set-size attenuation for this block
+        ss_att = np.exp(-gamma_ss * max(0, nS - 3))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy probability of chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy probability of chosen action
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute RL uncertainty via entropy of softmax over Q_s (temperature = 1)
+            logits = Q_s - np.max(Q_s)
+            pr = np.exp(logits)
+            pr = pr / np.sum(pr)
+            # numerical guard
+            pr = np.clip(pr, 1e-12, 1.0)
+            H = -np.sum(pr * np.log(pr))  # entropy in nats
+
+            # Uncertainty-gated WM weight (sigmoid) with set-size attenuation
+            gate = 1.0 / (1.0 + np.exp(-k_unc * (H - h0)))
+            wm_weight_eff = wm_base * gate * ss_att
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM updating: push toward one-hot for rewarded action; no change on non-reward
+            if r > 0.0:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # fast overwrite toward one-hot using same lr for parsimony
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * onehot
+            # No explicit decay term; WM attenuation handled by gating/ss_att
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Capacity-limited WM cache with availability and perseveration bias.
+
+    Idea:
+    - RL learns Q-values via delta rule.
+    - WM caches rewarded mappings but is only available with probability K/nS (capacity K).
+      If a state is not in the cache (or capacity too small), WM contributes less.
+    - Choices are a mixture of WM and RL when WM is available; otherwise mostly RL.
+    - Perseveration adds a bias toward repeating the last action in the same state.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled up by 10.
+    - wm_weight: mixture weight when WM is available (0..1).
+    - K: WM capacity in number of items (>=0). Effective availability is min(1, K/nS).
+    - rho: WM decay toward uniform on each same-state visit (0..1).
+    - phi: perseveration bias added to the last action in state s (>0 favors repetition).
+
+    Set-size impact:
+    - WM availability scales as min(1, K/nS); larger set sizes reduce WM access probability.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, softmax_beta, wm_weight, K, rho, phi = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track whether WM has a cached item for each state (1 if stored)
+        cached = np.zeros(nS, dtype=bool)
+        # Track last action per state for perseveration
+        last_action = -np.ones(nS, dtype=int)
+
+        # Availability based on capacity
+        p_avail = min(1.0, float(K) / max(1, nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Apply perseveration bias to both RL and WM preference vectors
+            stick = np.zeros(3)
+            if last_action[s] >= 0:
+                stick[last_action[s]] = phi
+
+            Q_s = q[s, :].copy() + stick
+            W_s = w[s, :].copy() + stick
+
+            # RL and WM policies
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Effective mixture weight depends on cache presence and capacity availability
+            wm_avail = 1.0 if cached[s] else 0.0
+            wm_weight_eff = wm_weight * wm_avail * p_avail
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - (q[s, a])
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform on each visit
+            w[s, :] = (1.0 - rho) * w[s, :] + rho * w_0[s, :]
+
+            # WM storage on reward
+            if r > 0.0:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Store deterministically using same lr to set a sharp cache
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * onehot
+                cached[s] = True
+
+            # Update perseveration memory
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with forgetting + WM as win-stay cache, with set-size-specific WM weights and lapse.
+
+    Idea:
+    - RL updates Q(s,a) with learning and per-visit forgetting toward uniform baseline.
+    - WM is a one-step win-stay cache: after a rewarded action in a state, WM sets a
+      deterministic policy to repeat that action; otherwise WM is uniform.
+    - Mixture weight for WM differs between small and large set sizes to capture load effects.
+    - A small lapse (epsilon) mixes in uniform choice noise.
+
+    Parameters (tuple):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_w_small: WM mixture weight for set size 3 (0..1).
+    - wm_w_large: WM mixture weight for set size 6 (0..1).
+    - forget: RL forgetting toward uniform on each state visit (0..1).
+    - lapse: lapse rate mixing uniform choice into final policy (0..0.2 recommended).
+
+    Set-size impact:
+    - WM mixture weight equals wm_w_small for 3-state blocks and wm_w_large for 6-state blocks.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, softmax_beta, wm_w_small, wm_w_large, forget, lapse = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        wm_weight_eff_block = wm_w_small if nS <= 3 else wm_w_large
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL and WM policies
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture of WM and RL
+            p_mix = wm_weight_eff_block * p_wm + (1.0 - wm_weight_eff_block) * p_rl
+
+            # Lapse: mix with uniform
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL forgetting toward uniform baseline on each state visit
+            q[s, :] = (1.0 - forget) * q[s, :] + forget * (1.0 / nA)
+
+            # RL delta update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: win-stay cache (overwrite to one-hot if rewarded; else uniform)
+            if r > 0.0:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                # Overwrite quickly using same lr for simplicity
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * onehot
+            else:
+                # No win; reset WM toward uniform for this state
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,290 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture with reward-gated WM writes, interference-by-load, and state-wise perseveration.
+
+    Policy:
+    - RL system: softmax over Q with softmax_beta (internally scaled x10).
+    - WM system: softmax over W with high inverse temperature (softmax_beta_wm=50).
+    - Mixture: trial-wise WM weight decays with the number of distinct states encountered so far
+               within the block (interference), scaled by phi_interference.
+               wm_weight_eff = wm_weight_base * exp(-phi_interference * exposure), where
+               exposure = (n_unique_states_seen-1)/(nS-1), so larger sets induce stronger decline.
+
+    Learning:
+    - RL: delta rule with learning rate lr.
+    - WM: decay toward uniform with wm_decay each visit; reward-gated writing:
+          On rewarded trials, write one-hot of chosen action; on unrewarded trials, only decay.
+    - Perseveration: a state-wise additive bias (perseveration) added to the last action taken
+          in that state, applied to both RL and WM action values before softmax.
+
+    Set-size effects:
+    - WM reliance is reduced more quickly as more unique states are seen in larger set sizes (nS=6),
+      via phi_interference and the exposure term.
+
+    Parameters (6):
+    - lr: RL learning rate (0-1).
+    - wm_weight_base: base WM mixture weight before interference (0-1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_decay: WM decay toward uniform per visit (0=no decay, 1=full reset toward uniform).
+    - phi_interference: rate at which WM reliance declines with number of unique states experienced.
+    - perseveration: additive bias applied to the last action taken in a state (stickiness).
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, wm_decay, phi_interference, perseveration = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last action per state for perseveration, and unique states encountered
+        last_action = -1 * np.ones(nS, dtype=int)
+        seen_states = set()
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            seen_states.add(s)
+            n_unique = len(seen_states)
+
+            # Interference-based WM weight (monotonic decline with exposure)
+            if nS > 1:
+                exposure = (n_unique - 1) / (nS - 1)
+            else:
+                exposure = 0.0
+            wm_weight_eff = np.clip(wm_weight_base * np.exp(-phi_interference * exposure), 0.0, 1.0)
+
+            # Apply perseveration to value vectors
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += perseveration
+                W_s[last_action[s]] += perseveration
+
+            # RL and WM choice probabilities for observed action a
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform, then reward-gated write
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Rewarded trials overwrite more strongly (full write)
+                w[s, :] = one_hot
+
+            # Update last action for perseveration
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture where the mixture is uncertainty-gated by WM confidence and RL forgets.
+
+    Policy:
+    - RL system: softmax over Q with softmax_beta (scaled x10).
+    - WM system: softmax over W with fixed high inverse temperature.
+    - Mixture: wm_weight_eff = sigmoid(wm_bias + wm_slope * conf),
+               where conf = max(W_s) - second_max(W_s) (confidence/sharpness of WM).
+               Thus, when WM is sharp/confident, it dominates; when diffuse, RL dominates.
+
+    Learning:
+    - RL: delta rule with learning rate lr, plus per-visit forgetting toward uniform for visited state
+          with rate lambda_rl (captures larger load challenges via slower consolidation and decay).
+    - WM: classic delta write toward one-hot of the chosen action with learning rate wm_learn
+          (reward-agnostic), gradually forming a sharp WM trace; no explicit reward gate here.
+
+    Set-size effects:
+    - Larger set sizes naturally yield lower WM confidence (conf), reducing wm_weight_eff via the
+      uncertainty gate; RL forgetting (lambda_rl) further penalizes performance when revisits are sparse.
+
+    Parameters (6):
+    - lr: RL learning rate (0-1).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_bias: offset for the WM-gated mixture (negative favors RL; positive favors WM).
+    - wm_slope: gain of confidence gating (how strongly conf modulates the mixture).
+    - lambda_rl: RL forgetting rate toward uniform for the visited state (0=no forgetting).
+    - wm_learn: learning rate for WM delta write toward one-hot of chosen action (0-1).
+    
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_bias, wm_slope, lambda_rl, wm_learn = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # Confidence: margin between top-1 and top-2 WM action values
+            order = np.argsort(W_s)[::-1]
+            conf = W_s[order[0]] - W_s[order[1]]
+
+            # Uncertainty-gated mixture via logistic transform
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-(wm_bias + wm_slope * conf)))
+            wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update with forgetting toward uniform on the visited state
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+            q[s, :] = (1.0 - lambda_rl) * q[s, :] + lambda_rl * w_0[s, :]
+
+            # WM delta write toward one-hot of chosen action
+            one_hot = np.zeros(nA)
+            one_hot[a] = 1.0
+            w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL+WM mixture with size-dependent RL temperature and lapse, and reward-dependent WM writes.
+
+    Policy:
+    - RL system: softmax over Q with beta_eff = softmax_beta * (1 + tau_temp_size / nS),
+                 capturing that smaller sets (nS=3) can afford higher exploitativeness.
+    - WM system: softmax over W with fixed high inverse temperature.
+    - Mixture: constant wm_weight across trials within a block.
+    - Lapse: with probability lapse, respond uniformly at random; otherwise follow the mixture.
+
+    Learning:
+    - RL: delta rule with learning rate lr.
+    - WM: decay toward uniform with wm_decay each visit; reward-dependent writes:
+          when r=1, strong write toward chosen action; when r=0, only decay (no write).
+
+    Set-size effects:
+    - RL temperature increases as set size decreases through tau_temp_size/nS,
+      creating a stronger exploitation tendency in the low-load (nS=3) condition.
+
+    Parameters (6):
+    - lr: RL learning rate (0-1).
+    - wm_weight: mixture weight of WM (0-1).
+    - softmax_beta: base RL inverse temperature; internally scaled by 10, then modulated by set size.
+    - wm_decay: WM decay toward uniform per visit (0=no decay, 1=full reset toward uniform).
+    - tau_temp_size: magnitude of set-size modulation of RL temperature (>0 means hotter for small sets).
+    - lapse: lapse probability (0-1) for random responding, independent of state.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_decay, tau_temp_size, lapse = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Size-dependent RL temperature
+        beta_eff = softmax_beta * (1.0 + (tau_temp_size / max(nS, 1)))
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        wm_weight_eff = np.clip(wm_weight, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay, reward-dependent write (only on reward)
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

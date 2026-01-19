@@ -1,0 +1,350 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + reward-prediction-error-gated WM arbitration with age- and set-size-modulated WM decay.
+
+    Idea
+    - RL: Q-learning with separate learning rates for positive vs negative prediction errors.
+    - WM: fast one-shot storage that strengthens on reward and decays toward uniform otherwise.
+    - Arbitration: WM weight is dynamically gated by the unsigned prediction error (|RPE|),
+      and is reduced by larger set size and by being in the older age group.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State index on each trial (0..nS-1 within each block).
+    actions : array-like of int
+        Chosen action on each trial (0..2).
+    rewards : array-like of {0,1}
+        Feedback on each trial.
+    blocks : array-like of int
+        Block index for each trial.
+    set_sizes : array-like of int
+        Set size (3 or 6) for the block corresponding to each trial.
+    age : array-like or scalar
+        Age; age_group = 0 if age <= 45 else 1.
+    model_parameters : list or array-like
+        [alpha_pos, alpha_neg, beta_base, wm_gate_bias, wm_decay_base, age_wm_penalty]
+        - alpha_pos: positive RL learning rate (logistic-bounded 0..1).
+        - alpha_neg: negative RL learning rate (logistic-bounded 0..1).
+        - beta_base: base inverse temperature for RL policy (scaled by *10).
+        - wm_gate_bias: baseline gating bias for WM weight (logit space).
+        - wm_decay_base: scales both WM decay and the penalty of set size on WM gating.
+        - age_wm_penalty: additional penalty on WM gating weight for the older group.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, beta_base, wm_gate_bias, wm_decay_base, age_wm_penalty = model_parameters
+
+    # Parameter transforms
+    lr_pos = 1.0 / (1.0 + np.exp(-alpha_pos))
+    lr_neg = 1.0 / (1.0 + np.exp(-alpha_neg))
+    beta = max(1e-6, beta_base * 10.0)
+    decay_strength = 1.0 / (1.0 + np.exp(-wm_decay_base))  # 0..1
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0  # highly deterministic WM readout
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # RPE-gated arbitration; set size and age reduce WM weight
+            delta = r - Q_s[a]
+            setsize_pen = ((nS - 3) / 3.0)  # 0 for 3, 1 for 6
+            logit_wm = wm_gate_bias + np.abs(delta) - (decay_strength * setsize_pen) - (age_wm_penalty * age_group)
+            wm_weight_t = 1.0 / (1.0 + np.exp(-logit_wm))
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            if delta >= 0:
+                q[s, a] += lr_pos * delta
+            else:
+                q[s, a] += lr_neg * delta
+
+            # WM update: reward strengthens one-hot; no-reward decays toward uniform
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - decay_strength) * w[s, :] + decay_strength * onehot
+            else:
+                w[s, :] = (1.0 - decay_strength) * w[s, :] + decay_strength * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with stickiness + capacity-limited WM (LRU) and capacity-driven arbitration.
+
+    Idea
+    - RL: Q-learning with action stickiness at the state level (bias toward repeating last action).
+    - WM: caches up to K states' correct actions when rewarded (LRU replacement).
+      Cache capacity K is reduced in the older group; arbitration weight scales with K/nS.
+    - Arbitration: if the current state is in cache, rely more on WM; otherwise rely on RL.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like or scalar
+    model_parameters : list or array-like
+        [lr, beta, kappa_stick, wm_strength, cap_base, age_cap_drop]
+        - lr: RL learning rate (logistic-bounded 0..1).
+        - beta: RL inverse temperature (scaled by *10).
+        - kappa_stick: stickiness bias added to the last chosen action's value at this state.
+        - wm_strength: baseline WM arbitration weight when state is cached (logit space).
+        - cap_base: baseline WM capacity (approx. number of states; clamped to [1,6]).
+        - age_cap_drop: capacity decrement applied if in the older group.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood.
+    """
+    lr_raw, beta_raw, kappa_stick, wm_strength, cap_base, age_cap_drop = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    kappa = kappa_stick
+    wm_base_weight = 1.0 / (1.0 + np.exp(-wm_strength))  # 0..1
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Effective WM capacity with age decrement
+        K = int(np.round(cap_base - age_cap_drop * age_group))
+        K = max(1, min(6, K))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # LRU cache bookkeeping
+        cache_order = []  # list of state indices in order of recent use
+        in_cache = np.zeros(nS, dtype=bool)
+
+        # Stickiness memory (last action per state)
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL with stickiness: add bias to last chosen action at this state
+            Q_s = q[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += kappa
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration: stronger when state is in cache; scale by K/nS (capacity relative to set size)
+            in_wm = 1.0 if in_cache[s] else 0.0
+            cap_ratio = K / float(nS)
+            wm_weight_t = in_wm * wm_base_weight * cap_ratio
+            wm_weight_t = max(0.0, min(1.0, wm_weight_t))
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update with LRU capacity
+            if r == 1:
+                # Write one-hot for rewarded action
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = onehot
+
+                # Update cache: move to most recent
+                if in_cache[s]:
+                    # Move s to end
+                    cache_order = [x for x in cache_order if x != s] + [s]
+                else:
+                    # Add s; evict oldest if over capacity
+                    cache_order.append(s)
+                    in_cache[s] = True
+                    if len(cache_order) > K:
+                        evict = cache_order.pop(0)
+                        in_cache[evict] = False
+                        w[evict, :] = w_0[evict, :]  # clear evicted state's WM trace
+            else:
+                # On no-reward, gently decay this state's WM toward uniform
+                decay = 0.2
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # Update stickiness memory
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with forgetting + uncertainty-based WM arbitration (entropy-weighted), age/set-size modulate WM precision.
+
+    Idea
+    - RL: Q-learning with per-state forgetting toward uniform action values.
+    - WM: probabilistic memory distribution over actions that sharpens on reward and relaxes otherwise.
+    - Arbitration: WM weight is proportional to its certainty (1 - normalized entropy),
+      and WM certainty (precision) is reduced by larger set size and by being in the older group.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    age : array-like or scalar
+    model_parameters : list or array-like
+        [lr, beta, forget_rate, wm_precision, age_uncertainty, setsize_uncertainty]
+        - lr: RL learning rate (logistic-bounded 0..1).
+        - beta: RL inverse temperature (scaled by *10).
+        - forget_rate: state-local forgetting toward uniform after each update (logistic 0..1).
+        - wm_precision: base WM sharpening strength on reward (logistic 0..1, acts like learning rate for WM).
+        - age_uncertainty: increases WM uncertainty (reduces precision) for older group.
+        - setsize_uncertainty: increases WM uncertainty as set size grows.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood.
+    """
+    lr_raw, beta_raw, forget_raw, wm_prec_raw, age_uncertainty, setsize_uncertainty = model_parameters
+
+    lr = 1.0 / (1.0 + np.exp(-lr_raw))
+    beta = max(1e-6, beta_raw * 10.0)
+    f = 1.0 / (1.0 + np.exp(-forget_raw))  # 0..1
+    wm_prec_base = 1.0 / (1.0 + np.exp(-wm_prec_raw))  # 0..1
+
+    age_val = age[0] if hasattr(age, "__len__") else age
+    age_group = 0 if age_val <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask]
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Effective WM precision factoring age and set size
+        setsize_level = (nS - 3) / 3.0  # 0 for 3, 1 for 6
+        precision_penalty = age_uncertainty * age_group + setsize_uncertainty * setsize_level
+        wm_precision_eff = 1.0 / (1.0 + np.exp(-(np.log(wm_prec_base + eps) - np.log(1 - wm_prec_base + eps) - precision_penalty)))
+        wm_precision_eff = max(0.0, min(1.0, wm_precision_eff))
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Uncertainty-based arbitration using entropy of WM distribution
+            H = -np.sum(W_s * np.log(W_s + eps))
+            H_norm = H / np.log(nA)
+            wm_weight_t = max(0.0, min(1.0, (1.0 - H_norm) * wm_precision_eff))
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with forgetting toward uniform
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+            # Apply forgetting to the whole state's action values toward uniform baseline
+            q[s, :] = (1.0 - f) * q[s, :] + f * (1.0 / nA)
+
+            # WM update: sharpen on reward, relax otherwise
+            if r == 1:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_precision_eff) * w[s, :] + wm_precision_eff * onehot
+            else:
+                relax = 0.5 * wm_precision_eff
+                w[s, :] = (1.0 - relax) * w[s, :] + relax * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

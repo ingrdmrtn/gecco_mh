@@ -1,0 +1,281 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + capacity-limited WM with decay and load-dependent dilution.
+
+    Core ideas:
+    - RL learns state-action values with softmax policy (beta scaled by 10).
+    - WM stores a per-state action distribution, updated quickly on rewarded trials (wm_encode),
+      and decays toward uniform (wm_decay).
+    - Set-size (nS) imposes a capacity limit: when nS exceeds a WM capacity (wm_capacity),
+      the WM content for any state is diluted toward uniform before policy computation.
+      This reduces WM policy informativeness at higher load without changing wm_weight.
+    - WM policy is softmax over WM values with a high fixed temperature.
+
+    Parameters (6 total):
+    - lr: RL learning rate (0..1)
+    - wm_weight: arbitration weight between WM and RL (0..1); applied as-is in the mixture
+    - softmax_beta: RL inverse-temperature; internally multiplied by 10 for range
+    - wm_encode: WM learning rate toward the observed (rewarded) action (0..1)
+    - wm_decay: per-trial decay of WM for the visited state toward uniform (0..1)
+    - wm_capacity: effective WM capacity in number of bindings; load effect when nS > wm_capacity
+
+    Set-size impact:
+    - When set size nS > wm_capacity, WM policy is diluted toward uniform proportionally to
+      overload = (nS - wm_capacity) / max(1, wm_capacity), capped to [0,1].
+      This weakens WM influence under higher load without changing wm_weight.
+
+    Returns:
+    - Negative log-likelihood of observed choices under the mixture policy.
+    """
+    lr, wm_weight, softmax_beta, wm_encode, wm_decay, wm_capacity = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Precompute load-dependent dilution factor
+        overload = max(0.0, (nS - wm_capacity) / max(1.0, wm_capacity))
+        dilution = np.clip(overload, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: apply load-dependent dilution toward uniform, then softmax
+            W_eff = (1 - dilution) * W_s + dilution * w_0[s,:]
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_eff - W_eff[a])))
+
+            p_total = p_wm*wm_weight + (1-wm_weight)*p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+      
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+            # WM update: decay toward uniform, then encode on reward toward chosen action
+            # Decay current state's WM content
+            w[s, :] = (1 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r == 1:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1 - wm_encode) * w[s, :] + wm_encode * target
+            # Renormalize to keep as a probability vector
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + gated WM update by prediction error and load-dependent WM confidence.
+
+    Core ideas:
+    - RL performs standard Q-learning with softmax policy.
+    - WM stores a per-state action distribution updated only when surprise (|PE|) exceeds a gate
+      threshold (pe_gate), implementing selective encoding.
+    - WM policy reliability is reduced under higher load by mixing WM logits with uniform according
+      to a load-dependent noise level (wm_load_noise).
+    - WM policy sharpness is controlled by wm_beta_scale.
+
+    Parameters (6 total):
+    - lr: RL learning rate (0..1)
+    - wm_weight: arbitration weight between WM and RL (0..1); applied in the mixture
+    - softmax_beta: RL inverse temperature; internally scaled by 10
+    - wm_learn: WM learning rate toward chosen action when gate is open (0..1)
+    - pe_gate: prediction-error gate (>=0); WM encodes when |r - Q_s[a]| > pe_gate
+    - wm_load_noise: scale of additional WM noise due to set size; noise = wm_load_noise * (nS-3)/3
+
+    Set-size impact:
+    - WM noise grows linearly with set size: for nS=3, no added noise; for nS=6, noise = wm_load_noise.
+      Noise mixes WM logits with uniform, reducing confidence at higher load.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_learn, pe_gate, wm_load_noise = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Load-dependent WM noise (0 at nS=3; wm_load_noise at nS=6)
+        load_factor = max(0.0, (nS - 3) / 3.0)
+        wm_noise = np.clip(wm_load_noise * load_factor, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:]
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: soften WM by mixing with uniform in logit-space via convex combination
+            # Here we implement mixing directly on probability vectors:
+            wm_logits = W_s  # using WM values as logits proxy
+            wm_probs = np.exp(softmax_beta_wm * (wm_logits - np.max(wm_logits)))
+            wm_probs /= np.sum(wm_probs)
+            wm_probs = (1 - wm_noise) * wm_probs + wm_noise * w_0[s, :]
+            wm_probs = np.clip(wm_probs, 1e-12, None)
+            wm_probs /= np.sum(wm_probs)
+            p_wm = wm_probs[a]
+
+            p_total = p_wm*wm_weight + (1-wm_weight)*p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+      
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+            # WM update: gated by prediction error magnitude
+            if abs(delta) > pe_gate:
+                target = np.zeros(nA)
+                target[a] = 1.0 if r == 1 else 0.0
+                # If unrewarded, we move slightly away from chosen action by blending with uniform
+                if r == 1:
+                    w[s, :] = (1 - wm_learn) * w[s, :] + wm_learn * target
+                else:
+                    w[s, :] = (1 - wm_learn) * w[s, :] + wm_learn * w_0[s, :]
+            # Renormalize
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with state-specific stay bias and load-scaled WM strength.
+
+    Core ideas:
+    - RL is standard Q-learning with softmax policy.
+    - WM stores per-state action preferences updated toward the chosen action when rewarded,
+      and slightly away when not. WM also incorporates a state-specific stay bias toward the
+      most recent action in that state (stay_bias), implementing short-term recency.
+    - Under higher load (larger nS), WM strength is reduced by scaling (1 / (1 + load_scale*(nS-3))).
+
+    Parameters (6 total):
+    - lr: RL learning rate (0..1)
+    - wm_weight: arbitration weight between WM and RL (0..1)
+    - softmax_beta: RL inverse temperature; internally scaled by 10
+    - stay_bias: extra logit bonus added to the last action taken in the same state (>=0)
+    - wm_strength: step size for WM value update toward/away from chosen action (0..1)
+    - load_scale: scales how much larger set size weakens WM policy (>=0)
+
+    Set-size impact:
+    - WM policy logits are scaled by 1 / (1 + load_scale * max(0, nS - 3)), so WM is weaker at nS=6.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, stay_bias, wm_strength, load_scale = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Track last action per state for stay bias (-1 means none yet)
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Load-dependent WM attenuation factor
+        load_att = 1.0 / (1.0 + load_scale * max(0.0, nS - 3.0))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s,:]
+            W_s = w[s,:].copy()
+
+            p_rl = 1 / np.sum(np.exp(softmax_beta*(Q_s-Q_s[a])))
+
+            # WM policy: add stay bias on last action in this state, then attenuate by load
+            if last_action[s] >= 0:
+                W_s[last_action[s]] += stay_bias
+            W_centered = W_s - np.max(W_s)  # stabilize
+            wm_logits = load_att * W_centered
+            wm_probs = np.exp(softmax_beta_wm * wm_logits)
+            wm_probs /= np.sum(wm_probs)
+            p_wm = wm_probs[a]
+
+            p_total = p_wm*wm_weight + (1-wm_weight)*p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+      
+            delta = r-Q_s[a]
+            q[s][a] += lr*delta
+
+            # WM update: move toward chosen action if rewarded, slight repulsion if not
+            if r == 1:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1 - wm_strength) * w[s, :] + wm_strength * target
+            else:
+                # Nudge distribution away from chosen action by mixing with uniform and small penalty
+                w[s, :] = (1 - wm_strength) * w[s, :] + wm_strength * w_0[s, :]
+                # small extra decrease on chosen slot to instantiate "avoidance"
+                dec = 0.05 * wm_strength
+                w[s, a] = max(1e-12, w[s, a] * (1 - dec))
+
+            # Renormalize
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+            # Update last action for stay bias
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,332 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with resource-rational WM weight, global WM leakage, and state-wise perseveration.
+
+    Idea:
+    - RL: standard Rescorla-Wagner with softmax choice.
+    - WM: fast one-shot binding on rewarded trials; no overwrite on errors, but a global
+          leak toward uniform at every trial to capture interference/forgetting.
+    - Resource-rational mixture: effective WM weight decreases with set size via a power law.
+      wm_eff = wm_weight * (3.0 / nS) ** eta
+    - State-wise perseveration: bias toward repeating the last chosen action for the same state.
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], baseline WM mixture weight (before set-size scaling).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - eta: >=0, exponent controlling how WM weight declines with set size.
+    - leak: [0,1], global WM leak toward uniform applied each trial: w <- (1-leak)*w + leak*w0.
+    - kappa: >=0, state-wise perseveration strength, added as a bias to the RL logits for
+             repeating the last action taken in the same state.
+
+    Set size effects:
+    - Only the WM contribution is scaled by set size: wm_eff = wm_weight * (3/nS)^eta.
+      Larger sets reduce the WM influence.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, eta, leak, kappa = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # deterministic WM readout
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last chosen action per state for perseveration (initialize as -1 = none)
+        last_action_state = -1 * np.ones(nS, dtype=int)
+
+        # Precompute set-size scaled WM weight
+        wm_mix_base = np.clip(wm_weight, 0.0, 1.0)
+        wm_mix_scaled = wm_mix_base * (3.0 / float(nS)) ** max(eta, 0.0)
+        wm_mix_scaled = np.clip(wm_mix_scaled, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            # Global WM leak toward uniform (captures ongoing interference)
+            if leak > 0.0:
+                w = (1.0 - leak) * w + leak * w_0
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # Add state-wise perseveration bias to RL logits
+            if last_action_state[s] >= 0:
+                pref = np.zeros(nA)
+                pref[last_action_state[s]] = kappa
+                # Incorporate as additive bias in the RL softmax logits
+                Q_eff = Q_s + pref / max(softmax_beta, 1e-8)
+            else:
+                Q_eff = Q_s
+
+            # RL chosen-action probability (softmax trick relative to chosen action)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_eff - Q_eff[a])))
+
+            # WM policy: softmax over the WM row
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_mix_scaled * p_wm + (1.0 - wm_mix_scaled) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward writes a one-hot; non-reward does not overwrite (only leak applies)
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update state-wise last action
+            last_action_state[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with interference-by-time (ISI) scaling of WM weight, set-size noise on WM precision,
+    and global choice stickiness.
+
+    Idea:
+    - RL: standard Rescorla-Wagner with softmax.
+    - WM: one-shot mapping on rewarded trials; no overwrite on errors.
+    - WM weight is reduced by the time since the state's last appearance (ISI) to capture
+      temporal interference: wm_eff = wm_weight * exp(-decay * ISI_s).
+    - WM precision decreases exponentially with set size: beta_wm = 50 * exp(-nu * (nS - 3)).
+    - Global stickiness: bias to repeat the previous action (independent of state).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], base WM mixture weight before ISI scaling.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - decay: >=0, temporal interference rate; larger -> faster WM weight decay with ISI.
+    - nu: >=0, set-size noise; larger -> lower WM precision as set size grows.
+    - stick: >=0, strength of global choice stickiness bias toward last global action.
+
+    Set size effects:
+    - WM precision: beta_wm = 50 * exp(-nu * (nS - 3)); larger sets make WM less deterministic.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, decay, nu, stick = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track ISI (in trials) for each state; initialize large to reflect low confidence initially
+        last_seen = -1 * np.ones(nS, dtype=int)
+
+        # Global previous action for stickiness
+        prev_action_global = -1
+
+        # Set-size dependent WM precision
+        beta_wm_eff = softmax_beta_wm * np.exp(-max(nu, 0.0) * max(nS - 3, 0))
+
+        wm_mix_base = np.clip(wm_weight, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Compute ISI for this state
+            if last_seen[s] < 0:
+                isi = 1e6  # effectively very large if never seen
+            else:
+                isi = t - last_seen[s]
+
+            # ISI-scaled WM weight
+            wm_mix = wm_mix_base * np.exp(-max(decay, 0.0) * float(isi))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            Q_s = q[s, :]
+
+            # Add global stickiness bias to RL logits
+            if prev_action_global >= 0:
+                bias = np.zeros(nA)
+                bias[prev_action_global] = stick
+                Q_eff = Q_s + bias / max(softmax_beta, 1e-8)
+            else:
+                Q_eff = Q_s
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_eff - Q_eff[a])))
+
+            # WM policy with set-size adjusted precision and same global stickiness bias
+            W_s = w[s, :]
+            if prev_action_global >= 0:
+                W_eff = W_s + (bias / max(beta_wm_eff, 1e-8))
+            else:
+                W_eff = W_s
+            p_wm = 1.0 / np.sum(np.exp(beta_wm_eff * (W_eff - W_eff[a])))
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward binds; no-reward leaves as is (no explicit decay here)
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Update trackers
+            last_seen[s] = t
+            prev_action_global = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with confidence-gated WM use and punishment-based WM inhibition.
+
+    Idea:
+    - RL: standard Rescorla-Wagner with softmax.
+    - WM: deterministic one-shot write on reward; on no-reward, inhibit the chosen action in WM
+          by an amount mu (soft unlearning), then renormalize the WM row.
+    - Confidence gating: the contribution of WM depends on its internal certainty (margin between
+      best and second-best WM values) and on set size. Mixture weight:
+         wm_mix = sigmoid( logit(wm_weight) + alpha_margin * margin - alpha_load * (nS - 3) )
+      where margin = max(W_s) - second_max(W_s).
+    - WM readout uses a high inverse temperature (50).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], baseline WM mixture weight (intercept in the gating function).
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - alpha_margin: real, gain on WM margin (larger -> more WM usage when WM is confident).
+    - alpha_load: >=0, penalty of set size on WM usage (larger set -> lower WM usage).
+    - mu: [0,1], WM inhibition on errors: W_s[a] <- (1-mu)*W_s[a]; row is renormalized.
+
+    Set size effects:
+    - Enters the gating function via -alpha_load * (nS - 3), reducing WM reliance for larger sets.
+
+    Returns:
+    - Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, alpha_margin, alpha_load, mu = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    def _logit(p):
+        p = np.clip(p, 1e-6, 1.0 - 1e-6)
+        return np.log(p) - np.log(1.0 - p)
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        base_logit = _logit(np.clip(wm_weight, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute WM margin (confidence)
+            sorted_vals = np.sort(W_s)[::-1]
+            if len(sorted_vals) >= 2:
+                margin = sorted_vals[0] - sorted_vals[1]
+            else:
+                margin = 0.0
+
+            # Confidence and load gated WM mixture
+            load_term = -max(alpha_load, 0.0) * max(nS - 3, 0)
+            wm_logit = base_logit + alpha_margin * margin + load_term
+            wm_mix = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            # Mixture likelihood
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward => one-hot; no-reward => inhibit chosen entry then renormalize
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+            else:
+                if mu > 0.0:
+                    w[s, a] = (1.0 - np.clip(mu, 0.0, 1.0)) * w[s, a]
+                    row_sum = np.sum(w[s, :])
+                    if row_sum <= 1e-12:
+                        w[s, :] = w_0[s, :]
+                    else:
+                        w[s, :] /= row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

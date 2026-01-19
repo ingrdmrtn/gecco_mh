@@ -1,0 +1,286 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-gated arbitration and WM decay.
+
+    Overview:
+    - RL system: delta-rule Q-learning with softmax policy.
+    - WM system: per-state action strengths that decay toward uniform and are reinforced by rewards.
+    - Arbitration: WM weight increases with RL uncertainty (entropy) and decreases under higher load (larger set size).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0..1).
+    - wm_weight_base: Baseline WM reliance at set size = 3 (0..1).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - ent_slope: Sensitivity scaling of WM reliance to RL policy entropy (>=0).
+    - wm_decay: Per-trial decay of WM traces toward uniform (0..1).
+    - wm_learn: Magnitude of WM reinforcement when rewarded (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, ent_slope, wm_decay, wm_learn = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (given)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Policy for the working memory:
+            # Use a near-deterministic softmax over WM strengths (normalized).
+            wm_row = np.maximum(W_s, 1e-12)
+            wm_row = wm_row / np.sum(wm_row)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_row - wm_row[a])))
+
+            # Arbitration weight:
+            # - Increase WM usage when RL policy is uncertain (high entropy).
+            # - Reduce WM usage in higher set sizes.
+            # Compute RL policy distribution for entropy
+            rl_logits = softmax_beta * (Q_s - np.max(Q_s))
+            rl_exp = np.exp(rl_logits)
+            rl_probs = rl_exp / np.sum(rl_exp)
+            entropy = -np.sum(rl_probs * np.log(np.maximum(rl_probs, 1e-12)))
+            entropy_norm = entropy / np.log(nA)  # in [0,1]
+
+            # Base WM reliance adjusted by uncertainty and load
+            wm_weight = wm_weight_base + ent_slope * entropy_norm
+            wm_weight *= min(1.0, 3.0 / max(3.0, float(nS)))  # down-weight WM under high load
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM updating:
+            # - Decay toward uniform baseline
+            # - Reward-dependent strengthening on chosen action
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0.0:
+                w[s, a] += wm_learn
+            # Renormalize to keep WM as a probability-like strength vector
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning + capacity-limited WM + lapse.
+
+    Overview:
+    - RL system: Q-learning with separate learning rates for positive and negative prediction errors.
+    - WM system: per-state memory that benefits from reward-driven writes.
+    - Capacity: WM weight scales with capacity cap_k relative to set size (cap_k / nS).
+    - Lapse: additional uniform-choice noise that increases with load.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive prediction errors (0..1).
+    - lr_neg: RL learning rate for negative prediction errors (0..1).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - cap_k: Effective WM capacity in number of state-action mappings (>=0).
+    - wm_write: Strength added to WM for rewarded chosen actions (>=0).
+    - lapse_base: Baseline lapse rate at nS=3; lapse increases with set size (0..1).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, cap_k, wm_write, lapse_base = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Capacity-based WM weight (bounded [0,1])
+        wm_weight_capacity = min(1.0, max(0.0, float(cap_k) / max(1.0, float(nS))))
+
+        # Lapse rate growing with load
+        load_factor = max(0.0, (float(nS) - 3.0) / 3.0)  # 0 at 3, 1 at 6
+        lapse = np.clip(lapse_base * (1.0 + load_factor), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (given)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy via sharp softmax over WM strengths
+            wm_row = np.maximum(W_s, 1e-12)
+            wm_row = wm_row / np.sum(wm_row)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_row - wm_row[a])))
+
+            # Mixture with capacity-limited WM weight
+            wm_weight = wm_weight_capacity
+            mix_prob = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+
+            # Lapse to uniform
+            p_total = (1.0 - lapse) * mix_prob + lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - Q_s[a]
+            lr_use = lr_pos if pe >= 0.0 else lr_neg
+            q[s][a] += lr_use * pe
+
+            # WM update:
+            # - Move slightly toward uniform baseline each trial
+            # - Reward-driven write to chosen action
+            w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+            if r > 0.0:
+                w[s, a] += wm_write
+            # Normalize WM strengths
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + WM win-stay memory with load-dependent interference.
+
+    Overview:
+    - RL system: Q-learning updated via eligibility traces within each block.
+      The trace assigns credit to recently chosen actions more strongly.
+    - WM system: stores the last rewarded action per state (win-stay bias) as graded strengths.
+      Rewards push WM toward the chosen action; interference increases with set size.
+    - Arbitration: base WM weight reduced by load; combined with RL via mixture.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight_base: Baseline WM mixture weight at low load (0..1).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - lambda_trace: Eligibility trace decay (0..1).
+    - wm_stick: Magnitude of WM strengthening after reward (>=0).
+    - load_scale: Strength of load-induced WM interference/weight reduction (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, lambda_trace, wm_stick, load_scale = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility traces per state-action
+        e = np.zeros((nS, nA))
+
+        # Load-dependent WM weight reduction
+        load_pen = max(0.0, float(nS) - 3.0)
+        wm_weight_load = wm_weight_base / (1.0 + load_scale * load_pen)
+        wm_weight_load = np.clip(wm_weight_load, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (given)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: sharp choice from WM strengths
+            wm_row = np.maximum(W_s, 1e-12)
+            wm_row = wm_row / np.sum(wm_row)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_row - wm_row[a])))
+
+            wm_weight = wm_weight_load
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            pe = r - Q_s[a]
+            # Decay traces and set current trace to 1 for chosen state-action
+            e *= lambda_trace
+            e[s, :] *= 0.0
+            e[s, a] = 1.0
+            # Update Q-values for all state-actions according to traces
+            q += lr * pe * e
+
+            # WM update:
+            # - Interference toward uniform increases with load
+            gamma = np.clip(load_scale * load_pen, 0.0, 1.0)
+            w[s, :] = (1.0 - gamma) * w[s, :] + gamma * w_0[s, :]
+            # - Win-stay strengthening on reward
+            if r > 0.0:
+                # push mass to chosen action
+                w[s, :] = (1.0 - wm_stick) * w[s, :]
+                w[s, a] += wm_stick
+            # Normalize
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

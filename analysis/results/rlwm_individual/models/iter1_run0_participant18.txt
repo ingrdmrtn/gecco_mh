@@ -1,0 +1,294 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Model 1: Dual learning-rates RL + Capacity-limited WM with interference and action perseveration.
+    - RL: separate learning rates for rewarded and non-rewarded outcomes; softmax choice with inverse temperature.
+      Includes an action perseveration bias that favors repeating the most recent action in the block.
+    - WM: fast, one-shot associative memory that stores the last rewarded action for a state.
+      WM traces decay toward uniform due to interference, which increases with set size.
+    - Mixture: Fixed mixture per block computed from an effective WM capacity relative to set size.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate when reward=1 (0..1)
+    - lr_neg: RL learning rate when reward=0 (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by *10)
+    - wm_capacity: Effective number of items WM can hold (>=0). WM weight = min(1, wm_capacity / set_size).
+    - wm_interference: Per-visit decay strength of WM toward uniform, scaled by set size (>=0).
+    - perseveration: Action stickiness bias added to the last taken action within the block (can be +/-).
+
+    Set-size effects:
+    - WM contribution is down-weighted as set size increases via wm_weight_eff = min(1, wm_capacity / nS).
+    - WM decay per visit increases with set size: decay_rate = min(1, wm_interference * (nS / max(1, wm_capacity))).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, wm_capacity, wm_interference, perseveration = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM mixture weight based on capacity vs set size
+        wm_weight_eff = min(1.0, wm_capacity / max(1.0, float(nS)))
+        # Action perseveration across trials within a block
+        last_action_global = None
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Apply WM interference/decay at visit to state s (set-size dependent)
+            decay_rate = min(1.0, wm_interference * (float(nS) / max(1.0, wm_capacity)))
+            w[s, :] = (1.0 - decay_rate) * w[s, :] + decay_rate * w_0[s, :]
+
+            # RL policy with perseveration bias
+            Q_s = q[s, :].copy()
+            if last_action_global is not None:
+                bias = np.zeros(nA)
+                bias[last_action_global] = perseveration
+                Q_s = Q_s + bias
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy (softmax over WM weights; when a state has a stored winner it's near-deterministic)
+            W_s = w[s, :].copy()
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with valence-specific learning rates
+            delta = r - q[s, a]
+            alpha = lr_pos if r > 0.0 else lr_neg
+            q[s, a] += alpha * delta
+
+            # WM update: store the rewarded action as the likely correct one (one-shot)
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot  # overwrite to reflect strong episodic memory for rewarded mapping
+
+            last_action_global = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Model 2: Surprise-gated mixture of RL and Bayesian WM with set-size-dependent lapse.
+    - RL: delta-rule with single learning rate and softmax choice.
+    - WM: per-state, per-action Beta-Bernoulli posterior (reward counts) producing expected reward probabilities.
+      Choice uses softmax over posterior means (near-deterministic).
+    - Mixture gating: trial-wise WM weight increases with unsigned RL prediction error (surprise),
+      via a logistic gate. Gate is attenuated by set size (scaled by 3/nS).
+    - Lapse: set-size-dependent lapse rate mixing in uniform choice.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by *10)
+    - gate_slope: Sensitivity of WM gating to unsigned PE (>=0)
+    - gate_bias: Baseline tendency to use WM (can be +/-)
+    - kappa_prior: Strength of symmetric Beta prior for WM counts (>=0)
+    - lapse_k: Increase in lapse per item beyond set size 3 (>=0); lapse = min(0.2, lapse_k * max(0, nS-3))
+
+    Set-size effects:
+    - WM gate is scaled by 3/nS (smaller in larger set sizes).
+    - Lapse grows with set size via lapse_k.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, gate_slope, gate_bias, kappa_prior, lapse_k = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM will use running Beta posteriors; we store the current posterior mean in w
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Reward/nonreward counts for WM
+        counts_r = np.zeros((nS, nA))
+        counts_n = np.zeros((nS, nA))
+
+        # Set-size-dependent lapse
+        lapse = min(0.2, max(0.0, lapse_k * max(0, nS - 3)))
+        gate_scale_ss = 3.0 / float(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            W_s = w[s, :].copy()
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Surprise-gated WM weight
+            pe = abs(r - q[s, a])
+            gate = 1.0 / (1.0 + np.exp(-(gate_bias + gate_slope * pe)))
+            wm_weight_eff = gate * gate_scale_ss
+
+            # Combine with lapse
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update: update Beta posterior and posterior means
+            counts_r[s, a] += r
+            counts_n[s, a] += (1.0 - r)
+            alpha_post = (kappa_prior / nA) + counts_r[s, :]
+            beta_post = (kappa_prior / nA) + counts_n[s, :]
+            w[s, :] = alpha_post / np.maximum(alpha_post + beta_post, 1e-12)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Model 3: RL with directed exploration + Win-Stay/Lose-Shift WM heuristic, with set-size-modulated WM weight.
+    - RL: delta-rule with softmax. Adds a directed exploration bonus inversely proportional to visit count
+      for each state-action, attenuated as set size increases.
+    - WM: heuristic policy based on the last outcome in the same state:
+        * If last trial in state s was rewarded, repeat last action with prob win_stay.
+        * If it was not rewarded, shift away from last action with total probability lose_shift
+          (distributed uniformly across the other actions); otherwise repeat with 1-lose_shift.
+        * If no history, uniform.
+      This defines a categorical WM policy directly (no value learning).
+    - Mixture: WM weight scales with set size as wm_weight_eff = wm_weight_base * (3 / nS).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature (scaled internally by *10)
+    - wm_weight_base: Baseline WM mixture weight at set size 3 (0..1); scales as 3/nS
+    - win_stay: Probability to repeat the last rewarded action in WM (0..1)
+    - lose_shift: Probability mass to distribute to other actions after a non-reward in WM (0..1)
+    - exploration_bonus: Magnitude of directed exploration bonus (>=0), scaled by 3/nS
+
+    Set-size effects:
+    - WM weight decreases as 3/nS.
+    - Exploration bonus decreases as 3/nS.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, win_stay, lose_shift, exploration_bonus = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # not used directly since WM is categorical; keep for consistency
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # unused for WM policy values; kept to respect template
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Directed exploration counts
+        N_sa = np.zeros((nS, nA))
+
+        # WM history per state
+        last_action_s = -np.ones(nS, dtype=int)
+        last_reward_s = -np.ones(nS, dtype=int)  # -1 indicates no history
+
+        wm_weight_eff = wm_weight_base * (3.0 / float(nS))
+        bonus_scale = exploration_bonus * (3.0 / float(nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with directed exploration bonus
+            bonus = bonus_scale / np.sqrt(N_sa[s, :] + 1.0)
+            Q_s = q[s, :] + bonus
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy: win-stay/lose-shift categorical probabilities
+            if last_action_s[s] >= 0:
+                la = last_action_s[s]
+                if last_reward_s[s] == 1:
+                    p_wm_vec = np.ones(nA) * ((1.0 - win_stay) / (nA - 1))
+                    p_wm_vec[la] = win_stay
+                else:
+                    p_wm_vec = np.ones(nA) * (lose_shift / (nA - 1))
+                    p_wm_vec[la] = 1.0 - lose_shift
+            else:
+                p_wm_vec = np.ones(nA) / nA
+
+            p_wm = max(p_wm_vec[a], 1e-12)
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # Update counts for exploration
+            N_sa[s, a] += 1.0
+
+            # Update WM history
+            last_action_s[s] = a
+            last_reward_s[s] = int(r)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

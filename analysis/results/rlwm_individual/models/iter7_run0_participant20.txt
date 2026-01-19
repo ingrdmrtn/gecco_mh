@@ -1,0 +1,280 @@
+Below are three alternative cognitive models that implement different RL–WM mechanisms and set-size effects. Each function returns the negative log-likelihood of the observed choices.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-driven arbitration and capacity-scaled WM precision.
+
+    Idea:
+    - Choices are a mixture of RL and WM policies.
+    - Arbitration favors WM when RL is uncertain (high entropy of Q(s,·)).
+    - WM precision (effective inverse temperature) is reduced by set size via a capacity parameter K.
+    - WM is updated in a supervised manner toward the rewarded action and otherwise decays toward uniform.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_beta_scale: Scales WM inverse temperature relative to a high base; higher means crisper WM policy.
+    - capacity_K: WM capacity (in number of items); precision scales by min(1, K / set_size).
+    - arb_temp: Arbitration gain on RL entropy to compute WM weight (higher -> stronger shift toward WM when RL uncertain).
+    - wm_lr: WM learning rate toward one-hot when rewarded; also sets decay speed toward uniform when not rewarded.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_beta_scale, capacity_K, arb_temp, wm_lr = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # base deterministic WM; will be scaled by precision below
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Capacity-scaled WM precision factor in [0,1]
+        wm_precision = min(1.0, max(0.0, capacity_K / max(1.0, float(nS))))
+        wm_beta_eff = softmax_beta_wm * wm_beta_scale * wm_precision
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(wm_beta_eff * (W_s - W_s[a])))
+
+            # Arbitration based on RL uncertainty (entropy)
+            # Compute RL softmax distribution explicitly to get entropy
+            Q_shift = Q_s - np.max(Q_s)
+            rl_probs = np.exp(softmax_beta * Q_shift)
+            rl_probs = rl_probs / np.sum(rl_probs)
+            rl_entropy = -np.sum(rl_probs * np.log(np.clip(rl_probs, 1e-12, 1.0)))
+            # Map entropy to WM weight via a saturating function
+            wm_w_eff = 1.0 - np.exp(-arb_temp * rl_entropy)
+            wm_w_eff = np.clip(wm_w_eff, 0.0, 1.0)
+
+            # Mixture and log-likelihood
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update: supervised toward one-hot on reward, otherwise decay toward uniform
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_lr) * w[s, :] + wm_lr * target
+            else:
+                w[s, :] = (1.0 - wm_lr) * w[s, :] + wm_lr * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces + episodic WM recall with set-size and time-based decay.
+
+    Idea:
+    - RL updates via eligibility traces (lambda), allowing credit assignment persistence.
+    - WM stores the last rewarded action per state (one-shot). Recall probability drives mixture weight.
+    - WM recall decays with set size (load) and with time since last correct encoding for that state.
+    - WM representations decay continuously toward uniform at a rate set by a time constant.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - lambda_trace: Eligibility-trace persistence in [0,1]; higher -> longer-lasting eligibility.
+    - wm_recall_base: Baseline recall probability in [0,1] when set size is minimal and freshly encoded.
+    - setsize_decay_slope: Nonnegative slope; recall decreases as exp(-slope*(set_size-3)).
+    - time_decay: Positive time constant; recall decreases as exp(-delta_t / time_decay), and WM values leak toward uniform.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, lambda_trace, wm_recall_base, setsize_decay_slope, time_decay = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # high WM inverse temperature for near-deterministic recall
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility traces for RL
+        e = np.zeros((nS, nA))
+
+        # Track time since last successful WM store per state
+        time_since_store = np.full(nS, np.inf)
+
+        # Precompute set-size penalty
+        setsize_penalty = np.exp(-setsize_decay_slope * max(0.0, float(nS) - 3.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute recall probability: depends on set size and recency of encoding for this state
+            dt = time_since_store[s]
+            recency_factor = np.exp(- (0.0 if not np.isfinite(dt) else (dt / max(1e-6, time_decay))))
+            wm_w_eff = wm_recall_base * setsize_penalty * recency_factor
+            wm_w_eff = np.clip(wm_w_eff, 0.0, 1.0)
+
+            # Mixture and log-likelihood
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            # Decay eligibilities
+            e *= lambda_trace
+            # Accumulate eligibility for chosen state-action
+            e[s, a] += 1.0
+            # TD error (bandit-style per state)
+            rpe = r - q[s, a]
+            q += lr * rpe * e
+
+            # WM decay toward uniform each trial
+            leak = 1.0 - np.exp(-1.0 / max(1e-6, time_decay))
+            w = (1.0 - leak) * w + leak * w_0
+
+            # WM update on reward: store one-shot and reset timer
+            if r > 0.5:
+                w[s, :] = 0.0 * w[s, :] + w_0[s, :]
+                w[s, a] = 1.0
+                time_since_store[s] = 0.0
+            else:
+                # Increment timers
+                time_since_store[np.isfinite(time_since_store)] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning + capacity-limited WM with interference across states.
+
+    Idea:
+    - RL uses separate learning rates for positive vs. negative outcomes.
+    - WM contribution depends on whether set size exceeds capacity K via a logistic mapping.
+    - When load exceeds capacity, WM suffers interference: each state's WM policy is blended
+      with the average WM distribution across all states, diluting distinctiveness.
+
+    Parameters (model_parameters):
+    - alpha_pos: RL learning rate for positive outcomes (reward=1).
+    - alpha_neg: RL learning rate for negative outcomes (reward=0).
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - capacity_K: Capacity (number of items) before sharp WM degradation.
+    - wm_slope: Slope of logistic mapping from (K - set_size) to WM mixture weight.
+    - interference_strength: Nonnegative factor scaling interference when set_size > K.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, softmax_beta, capacity_K, wm_slope, interference_strength = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # base WM determinism
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM mixture weight from capacity via logistic on (K - nS)
+        wm_w_eff = 1.0 / (1.0 + np.exp(-wm_slope * (capacity_K - float(nS))))
+        wm_w_eff = np.clip(wm_w_eff, 0.0, 1.0)
+
+        # Interference amount when nS > K
+        overload = max(0.0, float(nS) - capacity_K)
+        phi = np.clip(interference_strength * overload / max(1.0, float(nS)), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with interference blending toward the average WM pattern
+            W_s = w[s, :]
+            avg_W = np.mean(w, axis=0)
+            W_eff = (1.0 - phi) * W_s + phi * avg_W
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_eff - W_eff[a])))
+
+            # Mixture and log-likelihood
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            lr = alpha_pos if r > q[s, a] else alpha_neg
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update: supervised on reward, mild decay otherwise
+            if r > 0.5:
+                w[s, :] = 0.0 * w[s, :] + w_0[s, :]
+                w[s, a] = 1.0
+            else:
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set-size dependencies:
+- Model 1: Set size reduces WM precision via min(1, K/nS), making WM policy less deterministic under higher load; arbitration uses RL uncertainty, which tends to be higher in larger sets early on.
+- Model 2: Set size reduces WM recall probability exponentially via setsize_decay_slope; larger set sizes also cause longer time since store across states, compounding recall decay.
+- Model 3: Set size affects WM mixture weight via a logistic function around capacity K and increases interference blending when nS exceeds K, degrading WM distinctiveness.

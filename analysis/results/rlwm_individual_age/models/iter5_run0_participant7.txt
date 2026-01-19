@@ -1,0 +1,303 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM mixture with load- and age-modulated WM weight and decay.
+
+    Idea:
+    - Choices are a mixture of an RL policy and a WM policy with fixed mixing weight per trial.
+    - The WM weight is reduced by higher set size (load) and further reduced for older adults.
+    - WM decays between visits; decay scales up with load.
+    - RL learns via delta rule. WM learns by reward-contingent storing and renormalization.
+
+    Parameters (list):
+    - lr: RL learning rate (0..1)
+    - beta_rl: base RL inverse temperature; internally scaled by 10
+    - wm_mix0: baseline WM mixture weight (0..1)
+    - decay_wm: base WM decay toward uniform per trial visit (0..1)
+    - load_sensitivity: scales the effect of set size on WM decay and WM weight (>=0)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+
+    Age and load effects:
+    - Effective WM weight: wm_mix_eff = sigmoid(sigmoid^{-1}(wm_mix0) - load_sensitivity*(nS-3)/3 - 0.5*age_group)
+    - WM decay per visit: decay_eff = decay_wm * (1 + load_sensitivity*(nS-3)/3) * (1 + 0.3*age_group)
+    """
+    lr, beta_rl, wm_mix0, decay_wm, load_sensitivity = model_parameters
+    beta_rl *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        uniform_w = (1.0 / nA) * np.ones((nS, nA))
+
+        load_term = (float(nS) - 3.0) / 3.0
+        # Convert wm_mix0 to logit, apply penalties, then back via sigmoid to keep in (0,1)
+        eps = 1e-8
+        wm_mix0 = np.clip(wm_mix0, eps, 1 - eps)
+        logit = np.log(wm_mix0 / (1 - wm_mix0))
+        logit -= load_sensitivity * load_term
+        logit -= 0.5 * age_group
+        wm_weight = 1.0 / (1.0 + np.exp(-logit))
+        decay_eff = decay_wm * (1.0 + load_sensitivity * load_term) * (1.0 + 0.3 * age_group)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(beta_rl * Qc))
+            p_rl = np.exp(beta_rl * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy
+            # Apply decay toward uniform on each access (access-dependent leak)
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * (1.0 / nA)
+            W_s = w[s, :].copy()
+            Lc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(beta_wm * Lc))
+            p_wm = np.exp(beta_wm * Lc[a]) / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr * rpe
+
+            # WM update: reward-contingent storing with renormalization
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+            else:
+                # If incorrect, nudge weights slightly away from chosen action, toward uniform
+                target = uniform_w[s, :]
+            w[s, :] += 0.5 * (target - W_s)  # moderate step to avoid brittleness
+            w[s, :] = np.clip(w[s, :], 1e-8, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Entropy-weighted arbitration between RL and WM.
+
+    Idea:
+    - WM and RL each propose a policy.
+    - The arbitration weight for WM increases when RL is uncertain (high entropy),
+      decreases when RL is confident (low entropy).
+    - RL entropy is normalized by log(nA) and adjusted by load and age.
+
+    Parameters (list):
+    - lr: RL learning rate (0..1)
+    - beta_rl: RL inverse temperature (scaled by 10 internally)
+    - beta_wm: WM inverse temperature (determinism of WM policy)
+    - kappa: sensitivity of arbitration to entropy (>=0)
+    - theta0: bias term for arbitration (can be negative..positive)
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+
+    Age and load effects:
+    - Effective bias: theta_eff = theta0 + 0.2*age_group + 0.3*load_term
+    - WM gets relatively less weight in larger set sizes and older age (via theta_eff).
+    """
+    lr, beta_rl, beta_wm, kappa, theta0 = model_parameters
+    beta_rl *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        load_term = (float(nS) - 3.0) / 3.0
+        theta_eff = theta0 + 0.2 * age_group + 0.3 * load_term
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL softmax
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            expQ = np.exp(beta_rl * Qc)
+            p_rl_vec = expQ / max(1e-12, np.sum(expQ))
+            p_rl = np.clip(p_rl_vec[a], 1e-12, 1.0)
+
+            # WM softmax
+            W_s = w[s, :].copy()
+            Lc = W_s - np.max(W_s)
+            expW = np.exp(beta_wm * Lc)
+            p_wm_vec = expW / max(1e-12, np.sum(expW))
+            p_wm = np.clip(p_wm_vec[a], 1e-12, 1.0)
+
+            # RL entropy (normalized)
+            entropy_rl = -np.sum(p_rl_vec * np.log(np.clip(p_rl_vec, 1e-12, 1.0)))
+            entropy_rl /= np.log(nA)
+
+            # Arbitration weight based on entropy
+            gate = 1.0 / (1.0 + np.exp(-(kappa * (entropy_rl - theta_eff))))
+            gate = np.clip(gate, 0.0, 1.0)
+
+            p_total = gate * p_wm + (1.0 - gate) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr * rpe
+
+            # WM update (deterministic storage on reward, soft correction on no-reward)
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = 0.7 * w[s, :] + 0.3 * target
+            else:
+                # Slight pull toward uniform to avoid overconfidence in wrong action
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (1.0 / nA)
+            w[s, :] = np.clip(w[s, :], 1e-8, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with misbinding (swap) noise and load-/age-modulated RL learning.
+
+    Idea:
+    - RL provides a softmax policy; learning rate decreases with load and with age.
+    - WM stores rewarded associations but can misbind them to the wrong state with some
+      probability (swap noise), creating interference that grows with load.
+    - Choices are a convex mixture of WM and RL with age-modulated WM weight.
+
+    Parameters (list):
+    - lr_base: baseline RL learning rate (0..1)
+    - lr_load_penalty: how much load reduces RL learning (>=0)
+    - beta_rl: RL inverse temperature (scaled by 10 internally)
+    - wm_weight0: baseline WM mixture weight (0..1), reduced by age
+    - swap_noise: base probability of misbinding a rewarded association to an incorrect state (0..1)
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+
+    Age and load effects:
+    - Effective RL learning: lr_eff = lr_base * exp(-lr_load_penalty*load_term) * (1 - 0.2*age_group)
+    - Effective WM weight: wm_weight = wm_weight0 * (1 - 0.25*age_group) / (1 + load_term)
+    - Effective swap noise: swap_eff = swap_noise * (1 + load_term) * (1 + 0.3*age_group), clipped to [0,1]
+    """
+    lr_base, lr_load_penalty, beta_rl, wm_weight0, swap_noise = model_parameters
+    beta_rl *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        load_term = (float(nS) - 3.0) / 3.0
+        lr_eff = lr_base * np.exp(-lr_load_penalty * load_term) * (1.0 - 0.2 * age_group)
+        wm_weight = wm_weight0 * (1.0 - 0.25 * age_group) / (1.0 + load_term)
+        wm_weight = np.clip(wm_weight, 0.0, 1.0)
+        swap_eff = swap_noise * (1.0 + load_term) * (1.0 + 0.3 * age_group)
+        swap_eff = float(np.clip(swap_eff, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            Qc = Q_s - np.max(Q_s)
+            denom_rl = np.sum(np.exp(beta_rl * Qc))
+            p_rl = np.exp(beta_rl * Qc[a]) / max(1e-12, denom_rl)
+
+            # WM policy
+            W_s = w[s, :].copy()
+            Lc = W_s - np.max(W_s)
+            denom_wm = np.sum(np.exp(beta_wm * Lc))
+            p_wm = np.exp(beta_wm * Lc[a]) / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            rpe = r - Q_s[a]
+            q[s, a] += lr_eff * rpe
+
+            # WM update with misbinding on reward
+            if r > 0.5:
+                # With probability 1 - swap_eff, store in the correct state; else store in a random other state.
+                if np.random.rand() > swap_eff:
+                    target_state = s
+                else:
+                    # choose a random incorrect state to misbind
+                    others = [idx for idx in range(nS) if idx != s]
+                    if len(others) > 0:
+                        target_state = np.random.choice(others)
+                    else:
+                        target_state = s
+                # Write target: one-hot on chosen action
+                w[target_state, :] = 0.6 * w[target_state, :]  # keep some prior content
+                w[target_state, a] += 0.4
+                w[target_state, :] = np.clip(w[target_state, :], 1e-8, None)
+                w[target_state, :] /= np.sum(w[target_state, :])
+            else:
+                # On no reward, soften the current state's WM toward uniform to reduce perseveration
+                w[s, :] = 0.9 * w[s, :] + 0.1 * (1.0 / nA)
+                w[s, :] = np.clip(w[s, :], 1e-8, None)
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

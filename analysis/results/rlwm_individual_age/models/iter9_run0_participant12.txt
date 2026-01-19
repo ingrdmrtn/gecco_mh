@@ -1,0 +1,330 @@
+Below are three standalone cognitive models that implement different RL–WM interaction mechanisms. Each function follows the requested interface, returns the negative log-likelihood of the observed choices, uses all parameters meaningfully, integrates set size and age group, and fills in the “FILL IN” parts of the given template (RL policy, WM policy, arbitration, and WM updating).
+
+Note: Assume numpy as np is already imported. Epsilon constants are used to avoid log(0).
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with uncertainty-comparison arbitration and WM decay.
+
+    Idea:
+    - RL learns Q-values with softmax choice.
+    - WM stores action weights per state and produces a sharp softmax policy.
+    - Arbitration is driven by the relative confidence of WM vs RL: if WM is sharper than RL,
+      the model shifts weight toward WM; larger set sizes dampen WM use.
+    - Age modulates WM strength (young have higher WM impact if wm_strength_y > wm_strength_o).
+    - WM decays toward a uniform prior at each step.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - beta: Base RL inverse temperature (scaled internally by *10)
+    - wm_strength_y: WM arbitration gain for young (>=0)
+    - wm_strength_o: WM arbitration gain for old (>=0)
+    - wm_forget: WM decay rate toward prior per trial (0..1)
+    - setsize_drop: Linear penalty on WM weight per extra item beyond 3 (>=0)
+
+    Age and set size usage:
+    - Age determines which wm_strength is used in the arbitration transform.
+    - Set size reduces WM use via subtracting setsize_drop * (nS - 3) from the WM drive.
+    """
+    lr, beta, wm_strength_y, wm_strength_o, wm_forget, setsize_drop = model_parameters
+    softmax_beta = beta * 10.0
+    softmax_beta_wm = 50.0  # very deterministic working memory policy
+
+    age_group = 0 if age[0] <= 45 else 1
+    wm_strength = wm_strength_y if age_group == 0 else wm_strength_o
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy for chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Uncertainty-based arbitration:
+            # Compute "sharpness" as gap between top-1 and top-2 for WM and RL
+            # For RL, use Q gaps; for WM, use W gaps.
+            def top_gap(x):
+                idx_sorted = np.argsort(x)[::-1]
+                return x[idx_sorted[0]] - x[idx_sorted[1]] if nA >= 2 else 0.0
+
+            gap_rl = top_gap(Q_s)
+            gap_wm = top_gap(W_s)
+
+            # Drive toward WM if WM sharper than RL
+            size_penalty = setsize_drop * max(0, nS - 3)
+            wm_drive = wm_strength * (gap_wm - gap_rl) - size_penalty
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_drive))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM decay toward prior, then update Hebbian toward chosen action on reward
+            w[s, :] = (1.0 - wm_forget) * w[s, :] + wm_forget * w_0[s, :]
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Use lr as a proxy WM learning rate to keep params <= 6
+                eta_w = lr
+                w[s, :] = (1.0 - eta_w) * w[s, :] + eta_w * one_hot
+                # Renormalize to keep a valid distribution scale
+                w_sum = np.sum(w[s, :])
+                if w_sum > eps:
+                    w[s, :] = w[s, :] / w_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with correctness-and-uncertainty-driven gate and age/set-size penalty.
+
+    Idea:
+    - RL learns Q-values with softmax.
+    - WM stores action preferences per state and yields a sharp softmax policy.
+    - A scalar gate g in [0,1] is learned within each block:
+        g_t+1 = g_t + gate_learn * [ target_t - g_t ],
+      where target_t increases with (rewarded AND RL-uncertain) and decreases with set size and age.
+    - Age increases the penalty on WM use; set size also penalizes WM use.
+    - WM has Hebbian reinforcement on reward and decays otherwise.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - beta0: Base RL inverse temperature (scaled internally by *10)
+    - gate_learn: Gate adaptation rate (0..1)
+    - wm_learn: WM learning rate toward one-hot on reward (0..1)
+    - wm_forget: WM decay rate toward prior per trial (0..1)
+    - size_age_drop: Penalty weight multiplying (nS-3 + age_group) in target (>=0)
+
+    Age and set size usage:
+    - size_age_drop penalizes the target gate by (nS-3 + age_group).
+    """
+    lr, beta0, gate_learn, wm_learn, wm_forget, size_age_drop = model_parameters
+    softmax_beta = beta0 * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        g = 0.5  # initial arbitration gate
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy for chosen action
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy for chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            wm_weight = np.clip(g, 0.0, 1.0)
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: decay; if reward, Hebbian update toward chosen action
+            w[s, :] = (1.0 - wm_forget) * w[s, :] + wm_forget * w_0[s, :]
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * one_hot
+                w_sum = np.sum(w[s, :])
+                if w_sum > eps:
+                    w[s, :] = w[s, :] / w_sum
+
+            # Gate target: higher when rewarded and RL is uncertain (high entropy),
+            # lower with larger set size and older age.
+            # Approximate RL uncertainty by softmax entropy proxy from Q_s.
+            # Compute full RL policy over actions for entropy:
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            pi = np.exp(logits)
+            pi = pi / max(np.sum(pi), eps)
+            entropy = -np.sum(pi * np.log(np.clip(pi, eps, 1.0)))
+            entropy_norm = entropy / np.log(nA)  # normalize to [0,1]
+
+            base_target = (1.0 if r > 0.5 else 0.0) * entropy_norm
+            penalty = size_age_drop * (max(0, nS - 3) + age_group)
+            target = np.clip(base_target - penalty, 0.0, 1.0)
+
+            # Gate update
+            g = g + gate_learn * (target - g)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with asymmetric learning, capacity-limited episodic WM retrieval, and age-dependent perseveration.
+
+    Idea:
+    - RL uses separate learning rates for positive and negative PEs, with softmax choice.
+    - WM is an episodic store: for each state, it holds the most recent rewarded action and a memory strength.
+      Retrieval probability increases with memory strength and capacity (C/nS), and is reduced by age.
+    - If WM retrieves, the WM policy is sharply peaked at the stored action; otherwise it is uniform-like.
+    - Arbitration uses the retrieval probability as wm_weight.
+    - Perseveration bias (age-dependent) adds a bonus to the last chosen action in the RL policy.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive PE (0..1)
+    - lr_neg: RL learning rate for negative PE (0..1)
+    - beta: Base RL inverse temperature (scaled internally by *10)
+    - persev_y: Perseveration bonus for last chosen action (young)
+    - persev_o: Perseveration bonus for last chosen action (old)
+    - capacity_C: WM capacity parameter (scales retrieval as min(1, C/nS))
+
+    Age and set size usage:
+    - WM retrieval weight is scaled by min(1, capacity_C / nS) and further reduced by age (older retrieve less).
+    - Perseveration bonus depends on age group.
+    """
+    lr_pos, lr_neg, beta, persev_y, persev_o, capacity_C = model_parameters
+    softmax_beta = beta * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    persev_bonus = persev_y if age_group == 0 else persev_o
+    age_factor = 1.0 - 0.3 * age_group  # older group retrieves less
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+
+        # Episodic WM: store most recent rewarded action and memory strength per state
+        epi_action = -np.ones(nS, dtype=int)  # -1 means none
+        epi_strength = np.zeros(nS)           # in [0,1]
+        w = (1.0 / nA) * np.ones((nS, nA))    # used to produce WM policy via softmax
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        last_action = None  # for perseveration
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy for chosen action with perseveration bias on last action
+            Q_s = q[s, :].copy()
+            if last_action is not None:
+                Q_s[last_action] += persev_bonus
+
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # Episodic WM retrieval probability
+            cap_weight = min(1.0, max(0.0, capacity_C) / max(1.0, float(nS)))
+            retrieve_p = age_factor * cap_weight * np.clip(epi_strength[s], 0.0, 1.0)
+            retrieve_p = np.clip(retrieve_p, 0.0, 1.0)
+
+            # Build WM distribution w[s,:] based on episodic item
+            if epi_action[s] >= 0:
+                one_hot = np.zeros(nA)
+                one_hot[epi_action[s]] = 1.0
+                # Mix between one-hot and uniform by strength
+                w[s, :] = (1.0 - epi_strength[s]) * w_0[s, :] + epi_strength[s] * one_hot
+            else:
+                w[s, :] = w_0[s, :]
+
+            # WM policy for chosen action
+            W_s = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            wm_weight = retrieve_p
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - q[s, a]
+            lr_use = lr_pos if pe >= 0.0 else lr_neg
+            q[s, a] += lr_use * pe
+
+            # Episodic WM update:
+            # - If rewarded: store this action and strengthen memory toward 1
+            # - Else: decay memory toward 0
+            if r > 0.5:
+                epi_action[s] = a
+                epi_strength[s] = epi_strength[s] + (1.0 - epi_strength[s]) * 0.5  # strengthen
+            else:
+                epi_strength[s] = epi_strength[s] * 0.5  # decay
+
+            # Update last action for perseveration
+            last_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,300 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and set-size-scaled WM decay and precision.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax.
+    - WM: one-shot storage on rewarded trials; otherwise decays (leaks) toward uniform.
+    - Arbitration: trial-wise mixture weight favors the lower-entropy (more certain) system.
+      wm_mix = wm_weight0 * sigmoid(omega * (H_rl - H_wm)), where H is policy entropy.
+    - Set size (nS) reduces WM precision and increases WM decay:
+        beta_wm = 50 / (1 + kappa_ss * max(nS - 3, 0))
+        decay_wm = decay_base * (1 + kappa_ss * max(nS - 3, 0))
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight0: [0,1], baseline WM mixture weight before entropy arbitration.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - omega: >=0, arbitration sensitivity to entropy difference (higher -> rely more on lower-entropy system).
+    - decay_base: [0,1], base WM leak toward uniform each trial.
+    - kappa_ss: >=0, set-size sensitivity that reduces WM precision and increases WM decay as set size grows.
+
+    Set size effects:
+    - Larger sets increase WM decay and reduce WM precision, shifting control toward RL.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight0, softmax_beta, omega, decay_base, kappa_ss = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm_base = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Set-size-dependent WM precision and decay
+        ss_term = max(nS - 3, 0)
+        beta_wm = softmax_beta_wm_base / (1.0 + max(kappa_ss, 0.0) * ss_term)
+        decay_wm = np.clip(decay_base * (1.0 + max(kappa_ss, 0.0) * ss_term), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(beta_wm * (W_s - W_s[a])))
+
+            # Compute full distributions to get entropies
+            pi_rl = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            pi_rl = pi_rl / np.sum(pi_rl)
+            pi_wm = np.exp(beta_wm * (W_s - np.max(W_s)))
+            pi_wm = pi_wm / np.sum(pi_wm)
+
+            # Entropy of each system
+            H_rl = -np.sum(pi_rl * np.log(np.clip(pi_rl, 1e-12, 1.0)))
+            H_wm = -np.sum(pi_wm * np.log(np.clip(pi_wm, 1e-12, 1.0)))
+
+            # Entropy-based arbitration
+            wm_mix = wm_weight0 / (1.0 + np.exp(-omega * (H_rl - H_wm)))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            # Mixture policy likelihood of chosen action
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform, then one-shot update on reward
+            w[s, :] = (1.0 - decay_wm) * w[s, :] + decay_wm * w_0[s, :]
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Capacity-limited WM with stochastic encoding and LRU replacement.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax.
+    - WM: a fixed-capacity store (C_cap items). On rewarded trials, the mapping is encoded with
+      probability 1 - p_fail(nS). If capacity is full, the least-recently-used state is evicted.
+      If retrieval fails (state not in WM), WM policy is effectively noisier (falls back to current w).
+    - Set size effects:
+        - Encoding failure increases with set size: p_fail(nS) = enc_fail_base * (nS / 3).
+        - WM precision scales by beta_wm = 50 * beta_wm_scale (scales overall determinism).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_weight: [0,1], mixture weight on WM policy.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - C_cap: [1,6], WM capacity (number of states storable); treated as a real-valued parameter rounded at runtime.
+    - enc_fail_base: [0,1], baseline encoding failure probability at set size 3.
+    - beta_wm_scale: >0, multiplicative scale on WM inverse temperature (beta_wm = 50 * scale).
+
+    Set size effects:
+    - Larger sets raise encoding failure probability, making WM less available in nS=6.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, C_cap, enc_fail_base, beta_wm_scale = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0 * max(beta_wm_scale, 1e-6)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM capacity (rounded and clipped)
+        cap = int(np.clip(np.round(C_cap), 1, nS))
+        in_wm = np.zeros(nS, dtype=bool)
+        last_used = np.zeros(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy (if in store, higher precision; else whatever is in w[s] currently)
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            wm_mix = np.clip(wm_weight, 0.0, 1.0)
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM encoding on reward with stochastic failure and LRU replacement
+            # Failure increases with set size
+            p_fail = np.clip(enc_fail_base * (float(nS) / 3.0), 0.0, 1.0)
+
+            if r > 0.0:
+                # Attempt to encode with probability 1 - p_fail
+                if np.random.rand() > p_fail:
+                    # If state not yet in WM and WM is full, evict least-recently-used
+                    if not in_wm[s]:
+                        if np.sum(in_wm) >= cap:
+                            # Evict the LRU state among those in WM
+                            candidates = np.where(in_wm)[0]
+                            lru_state = candidates[np.argmin(last_used[candidates])]
+                            in_wm[lru_state] = False
+                            w[lru_state, :] = w_0[lru_state, :]
+                        in_wm[s] = True
+                    # Store deterministic mapping
+                    w[s, :] = 0.0
+                    w[s, a] = 1.0
+                # If encoding fails, do not change w[s] (implicit retrieval failure)
+            else:
+                # On errors, keep current WM content; no overwrite
+                pass
+
+            # Update recency
+            last_used[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with surprise-gated arbitration and WM leak, penalized by set size.
+
+    Idea:
+    - RL: Rescorla-Wagner with softmax.
+    - WM: leaky memory toward uniform; on reward, one-shot mapping is stored.
+    - Arbitration: WM weight decreases with unsigned RL prediction error (surprise).
+      wm_mix = sigmoid(wm_base - k_pe * |delta_rl| - ss_pen * max(nS - 3, 0)).
+      Thus, surprising outcomes and larger set sizes reduce WM influence.
+    - WM leak is a parameter (applies each trial before potential reward overwrite).
+
+    Parameters (6 total):
+    - lr: [0,1], RL learning rate.
+    - wm_base: real, baseline level setting WM contribution via sigmoid.
+    - softmax_beta: >0, RL inverse temperature (internally scaled by 10).
+    - k_pe: >=0, sensitivity of arbitration to unsigned RL prediction error magnitude.
+    - ss_pen: >=0, penalty on WM weight for larger set sizes.
+    - leak_wm: [0,1], WM leak toward uniform on each state visit.
+
+    Set size effects:
+    - Larger set size reduces WM control directly via ss_pen in the arbitration.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_base, softmax_beta, k_pe, ss_pen, leak_wm = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        ss_term = max(nS - 3, 0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Compute RL prediction error for gating (using current Q before update)
+            delta_rl = r - Q_s[a]
+
+            # Surprise-gated arbitration with set-size penalty
+            gate_arg = wm_base - max(k_pe, 0.0) * abs(delta_rl) - max(ss_pen, 0.0) * ss_term
+            wm_mix = 1.0 / (1.0 + np.exp(-gate_arg))
+            wm_mix = np.clip(wm_mix, 0.0, 1.0)
+
+            # Mixture likelihood
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * delta_rl
+
+            # WM leak toward uniform, then reward-based overwrite
+            w[s, :] = (1.0 - leak_wm) * w[s, :] + leak_wm * w_0[s, :]
+            if r > 0.0:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

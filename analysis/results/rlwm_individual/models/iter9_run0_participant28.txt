@@ -1,0 +1,297 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM + global rewarded-action priming with load-sensitive influence.
+
+    Idea:
+    - RL: standard delta rule on state-action values.
+    - WM: one-shot storage of the last rewarded action per state (deterministic retrieval).
+    - Priming: a global, action-level short-term memory that favors repeating the last rewarded action,
+      regardless of the current state. This captures action priming independent of state.
+    - Set-size effect: the influence of global priming decreases with larger set sizes.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Base mixture weight for WM policy in action selection (0..1).
+    - softmax_beta: Base RL inverse temperature; multiplied by 10 internally.
+    - prime_weight: Strength of global action-priming channel (0..1), mixed into WM policy.
+    - prime_decay: Decay for the priming trace per trial (0..1); higher = more dominated by recent rewards.
+    - prime_load: Load-sensitivity of priming influence (>=0); effective priming weight is divided by
+      (1 + prime_load*(nS-3)), so larger sets reduce action priming.
+
+    Set-size impacts:
+    - Larger set size reduces the contribution of global action priming to decisions.
+    """
+    lr, wm_weight, softmax_beta, prime_weight, prime_decay, prime_load = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # Global action priming vector
+        g = (1.0 / nA) * np.ones(nA)
+
+        prime_weight_eff = prime_weight / (1.0 + max(0.0, float(nS) - 3.0) * prime_load)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy for the current state (deterministic softmax)
+            p_wm_base = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Priming-induced policy (softmax over g; use same deterministic beta for WM channel)
+            p_prime = 1.0 / np.sum(np.exp(softmax_beta_wm * (g - g[a])))
+
+            # Combine WM with global priming before arbitration with RL
+            p_wm = (1.0 - prime_weight_eff) * p_wm_base + prime_weight_eff * p_prime
+
+            # Final arbitration between WM (with priming) and RL
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: store one-hot on reward; else keep previous WM
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+
+                # Update global priming strongly toward rewarded action
+                g = (1.0 - prime_decay) * g
+                g[a] += prime_decay
+            else:
+                # On no reward, just decay priming toward uniform
+                g = (1.0 - prime_decay) * g + (prime_decay) * (np.ones(nA) / nA)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with margin-based arbitration and load-sensitive WM temperature.
+
+    Idea:
+    - RL: standard delta rule.
+    - WM: one-shot storage (set to one-hot when rewarded). Retrieval is a finite-temperature softmax.
+    - Arbitration: dynamic, based on each system's decision margin (top1 - top2).
+      If WM has a larger margin than RL, arbitration shifts toward WM, and vice versa.
+    - Set-size effect: WM inverse temperature decreases with set size, making WM noisier under higher load.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Baseline WM weight in arbitration (in logit space; see margin_slope for modulation).
+                 It is mapped through a logistic to 0..1 as a baseline tendency for WM.
+    - softmax_beta: Base RL inverse temperature; multiplied by 10 internally (fixed across set sizes here).
+    - wm_beta_base: Base inverse temperature for WM decisions (scales the deterministic WM softmax).
+    - wm_beta_load: Load-sensitivity of WM temperature (>=0). Effective WM beta is
+                    wm_beta_base*50 / (1 + wm_beta_load*(nS-3)).
+    - margin_slope: Sensitivity of arbitration to the WM-vs-RL margin difference. Larger values
+                    make arbitration more strongly prefer the system with a clearer choice.
+
+    Set-size impacts:
+    - WM temperature decreases with larger set sizes, increasing WM noise.
+    - Arbitration remains margin-driven without explicit set-size term; however, noisier WM at nS=6
+      naturally weakens WM's relative margin, shifting arbitration toward RL.
+    """
+    lr, wm_weight, softmax_beta, wm_beta_base, wm_beta_load, margin_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm_base = 50.0  # base scale for WM; modulated by wm_beta_base/load
+    blocks_log_p = 0.0
+
+    def softmax_prob_of(a, vals, beta):
+        return 1.0 / np.sum(np.exp(beta * (vals - vals[a])))
+
+    def top_margin(vals, beta):
+        # Margin computed in the value space (pre-softmax), independent of beta scaling;
+        # we use raw value differences as a confidence proxy.
+        order = np.argsort(vals)[::-1]
+        v1, v2 = vals[order[0]], vals[order[1]]
+        return float(v1 - v2)
+
+    def logistic(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM temperature under load
+        beta_wm_eff = wm_beta_base * softmax_beta_wm_base / (1.0 + max(0.0, float(nS) - 3.0) * wm_beta_load)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # Compute system-specific policies
+            p_rl = softmax_prob_of(a, Q_s, softmax_beta)
+            p_wm = softmax_prob_of(a, W_s, beta_wm_eff)
+
+            # Compute margins to arbitrate
+            m_rl = top_margin(Q_s, softmax_beta)
+            m_wm = top_margin(W_s, beta_wm_eff)
+
+            # Arbitration weight on WM in logit space: baseline + slope * (m_wm - m_rl)
+            w0 = wm_weight  # interpreted as a logit-bias toward WM
+            wm_mix = logistic(w0 + margin_slope * (m_wm - m_rl))
+
+            p_total = wm_mix * p_wm + (1.0 - wm_mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: store one-hot on reward; persistent otherwise
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with load-sensitive forgetting of unchosen actions + WM with lag-dependent retrieval failures.
+
+    Idea:
+    - RL: standard delta rule for chosen action; additionally, within the chosen state, unchosen actions
+      are actively forgotten toward 0 with strength that increases under larger set sizes. This
+      captures competition/interference in memory/credit assignment under load.
+    - WM: one-shot storage of last rewarded action per state. At retrieval, WM can "omit" (fail to cue)
+      with a probability that grows with the time since last reward in that state and with set size.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Mixture weight for WM vs RL in action selection (0..1).
+    - softmax_beta: Base RL inverse temperature; multiplied by 10 internally.
+    - spread_base: Baseline forgetting/competition rate for unchosen actions (>=0).
+    - spread_load: Load-sensitivity of the forgetting (>=0); effective spread = spread_base*(1 + spread_load*(nS-3)).
+    - omission_base: Base rate of WM retrieval omission per trial lag (>=0). Omission probability is
+                     1 - exp(-omission_base * lag * (nS/3)).
+
+    Set-size impacts:
+    - RL: unchosen-action forgetting is stronger at nS=6, enhancing competition/interference.
+    - WM: retrieval failures increase with both lag and set size, reducing WM reliability at high load and long lags.
+    """
+    lr, wm_weight, softmax_beta, spread_base, spread_load, omission_base = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track the last trial index when a reward occurred in each state
+        last_reward_time = -np.ones(nS, dtype=int)
+
+        spread = spread_base * (1.0 + max(0.0, float(nS) - 3.0) * spread_load)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with lag-dependent omission
+            # Compute lag since last reward for this state
+            if last_reward_time[s] >= 0:
+                lag = t - last_reward_time[s]
+            else:
+                lag = 1e9  # effectively very large lag before any reward; promotes omission
+
+            omit_p = 1.0 - np.exp(-omission_base * float(lag) * (float(nS) / 3.0))
+            omit_p = np.clip(omit_p, 0.0, 1.0)
+
+            p_wm_det = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm_uniform = 1.0 / nA
+            p_wm = (1.0 - omit_p) * p_wm_det + omit_p * p_wm_uniform
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update: chosen action
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            # RL forgetting for unchosen actions in the same state
+            for k in range(nA):
+                if k == a:
+                    continue
+                q[s, k] += lr * spread * (0.0 - Q_s[k])
+
+            # WM update and lag tracking
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot
+                last_reward_time[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,329 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL(α, λ) with surprise-gated WM and load-/age-sensitive temperature.
+
+    Idea:
+    - RL uses a standard delta rule with an eligibility-like global forgetting for WM traces.
+    - WM is a one-shot binding updated when outcomes are surprising and rewarding.
+      Surprise |PE| gates WM storage via a sigmoid whose bias is load-sensitive.
+    - Choice policy is a mixture of WM and RL; RL inverse temperature is reduced in older adults.
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate for Q-values (0..1)
+    - softmax_beta: base inverse temperature for RL policy (scaled by 10)
+    - lambda_wm_decay: global WM decay toward uniform per trial (0..1)
+    - wm_gate_slope: sensitivity of WM gating to surprise |PE| (>=0)
+    - wm_gate_bias: baseline WM gating bias; scaled by set size (can be negative or positive)
+    - age_beta_scale: multiplicative temperature reduction for older adults (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    alpha, softmax_beta, lambda_wm_decay, wm_gate_slope, wm_gate_bias, age_beta_scale = model_parameters
+    softmax_beta *= 10.0
+
+    # Age group: 0=young, 1=old
+    age_group = 0 if age[0] <= 45 else 1
+
+    # Older adults assumed noisier: reduce effective beta
+    softmax_beta_eff = softmax_beta / (1.0 + age_beta_scale * age_group)
+    softmax_beta_wm = 50.0  # near-deterministic WM policy
+
+    total_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM value maps
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # uniform prior for WM
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta_eff * (Q_s - Q_s[a])))
+
+            # Surprise-based WM gating; bias is penalized by load
+            # Effective bias scales down with larger sets: (3/nS) in [0.5, 1.0]
+            pe = r - Q_s[a]
+            surprise = abs(pe)
+            gate_input = wm_gate_slope * surprise + wm_gate_bias * (3.0 / float(nS))
+            wm_weight_eff = 1.0 / (1.0 + np.exp(-gate_input))  # sigmoid in (0,1)
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += alpha * pe
+
+            # WM update: encode one-shot when reward arrives and gate is open
+            if r > 0:
+                # The magnitude of surprise modulates the probability/strength of updating:
+                # convert wm_weight_eff into an update strength in [0,1]
+                upd = wm_weight_eff
+                # move toward a one-hot distribution on chosen action with strength upd
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - upd) * w[s, :] + upd * target
+
+            # Global WM forgetting toward uniform
+            w = (1.0 - lambda_wm_decay) * w + lambda_wm_decay * w_0
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with directed exploration bonus (UCB-like) and WM with interference-based decay.
+
+    Idea:
+    - RL uses a single learning rate; action selection uses Q plus an uncertainty bonus
+      that decays with experience and is attenuated in older adults.
+    - WM stores one-shot correct bindings; their influence decays with the number of
+      distinct other states encountered since encoding (interference), which increases with set size.
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate for Q-values (0..1)
+    - softmax_beta: base inverse temperature for RL (scaled by 10)
+    - bonus_coef: coefficient for count-based exploration bonus (>=0)
+    - wm_strength_base: initial WM weight after successful encoding (0..1)
+    - interference_gain: decay per distinct interfering state (>=0)
+    - age_explore_penalty: reduces exploration bonus in older adults (>=0)
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    alpha, softmax_beta, bonus_coef, wm_strength_base, interference_gain, age_explore_penalty = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    total_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Visit counts for UCB bonus
+        N = np.zeros((nS, nA))
+
+        # WM interference bookkeeping
+        last_enc_time = -1 * np.ones(nS, dtype=int)
+        # Track distinct interfering states seen since last encoding for each s
+        seen_since_enc = np.zeros((nS, nS), dtype=bool)
+        distinct_interf = np.zeros(nS)
+
+        # Age-attenuated exploration
+        bonus_eff = bonus_coef / (1.0 + age_explore_penalty * age_group)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL with exploration bonus (UCB-like)
+            Q_s = q[s, :]
+            U_s = bonus_eff / np.sqrt(N[s, :] + 1.0)
+            Q_aug = Q_s + U_s
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_aug - Q_aug[a])))
+
+            # Compute WM effective weight as interference-decayed strength
+            # If never encoded, strength = 0
+            if last_enc_time[s] < 0:
+                wm_weight_eff = 0.0
+            else:
+                # decay with number of distinct interfering states since encoding
+                k = distinct_interf[s]
+                wm_weight_eff = wm_strength_base * np.exp(-interference_gain * k)
+                wm_weight_eff = float(np.clip(wm_weight_eff, 0.0, 1.0))
+
+            # WM policy from current w
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += alpha * pe
+
+            # Update counts for exploration
+            N[s, a] += 1.0
+
+            # WM update on reward: encode one-shot and reset interference bookkeeping for s
+            if r > 0:
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+                w[s, :] /= np.sum(w[s, :])
+                last_enc_time[s] = t
+                seen_since_enc[s, :] = False
+                seen_since_enc[s, s] = True  # do not count self
+                distinct_interf[s] = 0.0
+
+            # Update interference for all states s' ≠ current s
+            for sp in range(nS):
+                if sp == s:
+                    continue
+                # If we have an active WM for sp (encoded at some time)
+                if last_enc_time[sp] >= 0:
+                    if not seen_since_enc[sp, s]:
+                        seen_since_enc[sp, s] = True
+                        distinct_interf[sp] += 1.0
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with value decay and capacity-limited WM mixture plus lapses.
+
+    Idea:
+    - RL uses a delta rule with per-trial decay toward neutral values (forgetting).
+    - WM behaves like a capacity-limited look-up: on reward, a state is stored with an
+      effective availability equal to capacity/nS, reduced further in older adults.
+      We represent availability continuously and use it as the mixture weight.
+    - Final policy includes a lapse component (uniform random), slightly higher for older adults.
+
+    Parameters (model_parameters):
+    - alpha: RL learning rate (0..1)
+    - softmax_beta: base inverse temperature for RL (scaled by 10)
+    - rl_decay: per-trial decay of Q toward uniform (0..1)
+    - capacity_C: nominal WM capacity in items (>=0)
+    - age_capacity_scale: scales capacity down for older adults (>=0)
+    - lapse_rate: base lapse rate (0..1)
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    alpha, softmax_beta, rl_decay, capacity_C, age_capacity_scale, lapse_rate = model_parameters
+    softmax_beta *= 10.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50.0
+
+    # Age-adjusted lapse (older adults higher lapse)
+    lapse_eff_multiplier = 1.0 + 0.5 * age_group
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        q_neutral = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM representation: row-wise blend between uniform and one-hot target
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Continuous storage strength per state in [0,1]
+        store_strength = np.zeros(nS)
+
+        # Effective WM capacity (reduce in older adults)
+        capacity_eff = capacity_C / (1.0 + age_capacity_scale * age_group)
+
+        # Probability that a given state is in WM at asymptote: capacity/nS (capped at 1)
+        p_store_target = min(1.0, max(0.0, capacity_eff / float(nS)))
+
+        # Lapse for this block
+        lapse_eff = min(0.5, max(0.0, lapse_rate * lapse_eff_multiplier))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM mixture weight is the current storage strength for state s
+            wm_weight_eff = float(np.clip(store_strength[s], 0.0, 1.0))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture with lapse
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = (1.0 - lapse_eff) * p_mix + lapse_eff * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with decay toward neutral
+            pe = r - q[s, a]
+            q = (1.0 - rl_decay) * q + rl_decay * q_neutral
+            q[s, a] += alpha * pe
+
+            # WM update:
+            # On reward, set WM row toward one-hot and increase availability toward p_store_target
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                # Make WM contents one-hot deterministically
+                w[s, :] = target
+                # Move storage strength toward capacity-based target
+                store_strength[s] = store_strength[s] + (p_store_target - store_strength[s])
+            else:
+                # Without reward, gently relax contents toward uniform and reduce availability
+                w[s, :] = 0.5 * w[s, :] + 0.5 * w_0[s, :]
+                # Reduce availability proportional to lack of capacity allocation
+                store_strength[s] = store_strength[s] * (1.0 - (1.0 - p_store_target))
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+Explanation notes:
+- All three models respect the requested RL-WM mixture form and return negative log-likelihood of the observed actions.
+- Age group modulates behavior meaningfully:
+  - Model 1: older adults have lower RL temperature.
+  - Model 2: older adults have reduced directed exploration bonus.
+  - Model 3: older adults have effectively lower WM capacity and higher lapse.
+- Set size modulates WM differently across models:
+  - Model 1: load reduces WM gating bias via (3/nS).
+  - Model 2: interference grows with the number of distinct other states, which increases in larger sets.
+  - Model 3: WM availability target equals capacity/nS.

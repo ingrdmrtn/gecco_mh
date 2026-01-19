@@ -1,0 +1,339 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-gated WM contribution and load-dependent decay.
+
+    Idea
+    - RL learns Q-values with a single learning rate and softmax choice.
+    - WM stores state-specific action probabilities and produces a softmax policy.
+    - The WM mixture weight is dynamically reduced by two factors:
+        (a) higher set size (load) increases decay toward uniform representations,
+        (b) higher WM entropy (uncertainty) down-weights WM contribution via an entropy gate.
+    - WM updates are graded: rewards push WM toward the chosen action; non-rewards push WM
+      slightly away from the chosen action. An explicit WM learning rate scales these updates.
+
+    Parameters
+    ----------
+    states : array-like of int
+        State on each trial (0..nS-1 within block).
+    actions : array-like of int
+        Chosen action on each trial (0..2).
+    rewards : array-like of {0,1}
+        Binary feedback.
+    blocks : array-like of int
+        Block index.
+    set_sizes : array-like of int
+        Set size per trial (3 or 6).
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, wm_decay_gamma, entropy_gate, wm_learn_rate)
+        - lr: RL learning rate in [0,1]
+        - wm_weight: baseline mixture weight for WM in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled up
+        - wm_decay_gamma: base WM decay toward uniform per visit (>=0); scaled by load
+        - entropy_gate: exponent controlling how WM confidence (1 - normalized entropy)
+                        gates the WM mixture (>=0; higher means stronger gating)
+        - wm_learn_rate: WM learning/encoding strength per update in [0,1]
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_decay_gamma, entropy_gate, wm_learn_rate = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Load-scaled decay factor: more decay at higher nS
+        load_decay = wm_decay_gamma * max(0, nS - 3)  # 0 for nS=3; grows linearly for nS>3
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy-based confidence for WM: conf = 1 - H_norm
+            # H = -sum p log p; normalize by log(nA)
+            W_safe = np.clip(W_s, 1e-12, 1.0)
+            H = -np.sum(W_safe * np.log(W_safe))
+            H_norm = H / np.log(nA)
+            wm_conf = np.power(max(0.0, 1.0 - H_norm), max(0.0, entropy_gate))
+
+            wm_weight_eff = np.clip(wm_weight * wm_conf, 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM decay toward uniform that depends on load
+            if load_decay > 0:
+                w[s, :] = (1.0 - load_decay) * w[s, :] + load_decay * w_0[s, :]
+
+            # WM update: graded Hebbian with separate effect for reward vs no reward
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            if r > 0.0:
+                # Move toward chosen action
+                eta = wm_learn_rate
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * onehot
+            else:
+                # Slightly move away from chosen action toward the non-chosen pool
+                eta = 0.5 * wm_learn_rate
+                anti = (1.0 - onehot) / (nA - 1)
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * anti
+
+            # Renormalize/stabilize
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with precision-based arbitration and confidence-weighted WM learning.
+
+    Idea
+    - RL: standard Q-learning with softmax choice.
+    - WM: softmax over a state-specific distribution.
+    - Arbitration: the WM mixture weight is modulated by the relative precision of WM
+      vs RL at the current state. Precision is proxied by the dispersion (max-min)
+      of the respective value vectors passed through inverse temperatures.
+      A power parameter controls how strongly relative precision biases the mixture.
+    - WM learning rate is scaled by WM confidence (1 - entropy) so that certain WM
+      representations are consolidated more than uncertain ones.
+
+    Parameters
+    ----------
+    states, actions, rewards, blocks, set_sizes : as above
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, precision_power, wm_base_eta, conf_floor)
+        - lr: RL learning rate in [0,1]
+        - wm_weight: baseline mixture weight in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled
+        - precision_power: exponent >=0 controlling arbitration sensitivity to relative precision
+        - wm_base_eta: base WM learning rate in [0,1]
+        - conf_floor: small positive floor added to confidence to avoid vanishing learning (>=0)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, precision_power, wm_base_eta, conf_floor = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Precision proxies: scaled range of values
+            rl_prec = softmax_beta * max(0.0, np.max(Q_s) - np.min(Q_s))
+            wm_prec = softmax_beta_wm * max(0.0, np.max(W_s) - np.min(W_s))
+
+            # Arbitration: bias WM weight by relative precision
+            # eff_w = wm_weight * (wm_prec^p / (wm_prec^p + rl_prec^p))
+            pwr = max(0.0, precision_power)
+            wm_term = np.power(max(1e-12, wm_prec), pwr)
+            rl_term = np.power(max(1e-12, rl_prec), pwr)
+            rel = wm_term / (wm_term + rl_term)
+            wm_weight_eff = np.clip(wm_weight * rel, 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM learning rate scaled by confidence (1 - normalized entropy)
+            W_safe = np.clip(W_s, 1e-12, 1.0)
+            H = -np.sum(W_safe * np.log(W_safe))
+            H_norm = H / np.log(nA)
+            wm_conf = max(conf_floor, 1.0 - H_norm)  # ensure floor to avoid zero learning
+            eta = np.clip(wm_base_eta * wm_conf, 0.0, 1.0)
+
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            if r > 0.0:
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * onehot
+            else:
+                # For errors, update gently toward the non-chosen pool
+                anti = (1.0 - onehot) / (nA - 1)
+                w[s, :] = (1.0 - 0.5 * eta) * w[s, :] + 0.5 * eta * anti
+
+            # Normalize
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with thresholded WM gating and asymmetric WM plasticity.
+
+    Idea
+    - RL: standard Q-learning with softmax.
+    - WM: softmax over a state-specific distribution.
+    - Gating: the WM mixture weight is modulated by the "peakiness" of WM at the state:
+        wm_gain = sigmoid((max(W_s) - 1/nA - theta)/kappa).
+      This makes WM contribution kick in only when WM is confident enough.
+      Load reduces peakiness naturally; thus higher set sizes reduce WM influence.
+    - WM plasticity is asymmetric: reward drives strong attraction to the chosen action,
+      whereas non-reward drives milder repulsion. Both are controlled by separate gains.
+
+    Parameters
+    ----------
+    states, actions, rewards, blocks, set_sizes : as above
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, theta, kappa, wm_gains_posneg)
+        - lr: RL learning rate in [0,1]
+        - wm_weight: baseline WM mixture weight in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled
+        - theta: threshold offset applied to (max(W_s) - 1/nA) before sigmoid gating
+        - kappa: slope (temperature) of the sigmoid gating (>0); smaller -> sharper threshold
+        - wm_gains_posneg: controls the magnitude of WM plasticity for pos/neg outcomes (>0).
+                           Internally split as g_pos = 2*wm_gains_posneg/3 and
+                           g_neg = 1*wm_gains_posneg/3 (asymmetry: reward > error)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, theta, kappa, wm_gains_posneg = model_parameters
+
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+
+    # Derive asymmetric WM gains
+    g_pos = max(0.0, (2.0 / 3.0) * wm_gains_posneg)
+    g_neg = max(0.0, (1.0 / 3.0) * wm_gains_posneg)
+
+    blocks_log_p = 0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Thresholded WM gating via peakiness of WM for this state
+            peak = np.max(W_s) - (1.0 / nA)
+            denom = max(1e-6, kappa)
+            gate = 1.0 / (1.0 + np.exp(-(peak - theta) / denom))
+            wm_weight_eff = np.clip(wm_weight * gate, 0.0, 1.0)
+
+            p_total = wm_weight_eff * p_wm + (1 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update with asymmetric plasticity
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            if r > 0.0:
+                eta = np.clip(g_pos, 0.0, 1.0)
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * onehot
+            else:
+                eta = np.clip(g_neg, 0.0, 1.0)
+                anti = (1.0 - onehot) / (nA - 1)
+                w[s, :] = (1.0 - eta) * w[s, :] + eta * anti
+
+            # Normalize
+            w[s, :] = np.clip(w[s, :], 1e-12, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

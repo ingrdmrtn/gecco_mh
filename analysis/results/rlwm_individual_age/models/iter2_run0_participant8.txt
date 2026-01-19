@@ -1,0 +1,371 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL+WM mixture with set-size scaled WM and age-modulated WM contribution.
+    - RL: single learning rate with softmax.
+    - WM: per-state cached action with memory strength that decays over time and is refreshed by reward.
+          WM policy is softmax over a mixture of uniform and a one-hot memory, sharpened by a confidence gain.
+    - Arbitration: WM mixture weight scales down with set size and with an age-dependent bias.
+
+    Parameters
+    ----------
+    states : array-like
+        State index at each trial (0..set_size-1 for current block).
+    actions : array-like
+        Chosen actions at each trial (0..2).
+    rewards : array-like
+        Binary rewards at each trial (0/1).
+    blocks : array-like
+        Block index per trial.
+    set_sizes : array-like
+        Set size on each trial (constant within block; 3 or 6).
+    age : array-like
+        Participant age repeated across trials. Used to derive age group (0 young, 1 old).
+    model_parameters : list/tuple
+        [lr, wm_mix0, softmax_beta, wm_decay, wm_conf, age_wm_bias]
+        - lr: RL learning rate (0..1)
+        - wm_mix0: baseline WM mixture weight (0..1)
+        - softmax_beta: base inverse temperature for RL (scaled by 10 internally)
+        - wm_decay: per-trial decay of WM strength (0..1)
+        - wm_conf: gain mapping memory strength to WM determinism (>=0)
+        - age_wm_bias: fractional reduction of WM weight for older group (0..1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_mix0, softmax_beta, wm_decay, wm_conf, age_wm_bias = model_parameters
+    softmax_beta *= 10  # higher upper bound on beta
+
+    # Age group: 0 young (<=45), 1 old (>45)
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50  # very deterministic baseline for WM policy
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM value stores
+        q = (1.0 / nA) * np.ones((nS, nA))     # RL Q-values
+        w = (1.0 / nA) * np.ones((nS, nA))     # WM stored policy per state
+        w_0 = (1.0 / nA) * np.ones((nS, nA))   # Uniform prior for WM
+
+        # Per-state memory strength in [0,1]
+        m_strength = np.zeros(nS)
+
+        # Effective WM mixture weight: downscale with set size and with age (older less WM)
+        wm_weight_base = wm_mix0 * (3.0 / float(nS)) * (1.0 - age_wm_bias * age_group)
+        wm_weight_base = np.clip(wm_weight_base, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # Decay memory strength each trial
+            m_strength = (1.0 - wm_decay) * m_strength
+
+            Q_s = q[s, :].copy()
+            W_mem_pref = int(np.argmax(w[s, :]))
+
+            # Construct the WM policy vector for state s:
+            # mixture of uniform and a one-hot at remembered action, weighted by memory strength
+            W_s_vec = (1.0 - m_strength[s]) * w_0[s, :] + m_strength[s] * np.eye(nA)[W_mem_pref]
+
+            # RL policy probability for chosen action a
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy probability for chosen action a
+            # Sharpen WM with confidence depending on memory strength
+            beta_wm_eff = softmax_beta_wm * (1.0 + wm_conf * m_strength[s])
+            denom_wm = np.sum(np.exp(beta_wm_eff * (W_s_vec - W_s_vec[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture
+            p_total = wm_weight_base * p_wm + (1.0 - wm_weight_base) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update:
+            # - On reward, cache chosen action as the remembered one and set memory strong.
+            # - On non-reward, only mild decay already applied above (no overwrite).
+            if r > 0.5:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+                m_strength[s] = 1.0  # refresh to full
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL+WM mixture with PE-driven exploration and set-size dependent WM forgetting.
+    - RL: single learning rate; inverse temperature increases with recent surprise (|PE|),
+          reduced for older adults (more noise).
+    - WM: win-store memory per state with probability of retrieval that decays with set size.
+    - Arbitration: fixed WM mixture weight, but WM effectiveness depends on retrieval probability.
+
+    Parameters
+    ----------
+    states : array-like
+        State index at each trial.
+    actions : array-like
+        Chosen actions (0..2).
+    rewards : array-like
+        Rewards (0/1).
+    blocks : array-like
+        Block index per trial.
+    set_sizes : array-like
+        Set size per trial (constant within block; 3 or 6).
+    age : array-like
+        Participant age per trial; used for age group coding.
+    model_parameters : list/tuple
+        [lr, wm_weight, softmax_beta, kappa_pe, wm_forget, age_beta_scale]
+        - lr: RL learning rate (0..1)
+        - wm_weight: baseline mixture weight for WM in the decision (0..1)
+        - softmax_beta: base RL inverse temperature (scaled by 10 internally)
+        - kappa_pe: scaling of beta by recent unsigned prediction error (>=0)
+        - wm_forget: baseline WM forgetting rate per trial (0..1); increases with set size
+        - age_beta_scale: fractional reduction of RL inverse temperature for older group (0..1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, kappa_pe, wm_forget, age_beta_scale = model_parameters
+    softmax_beta *= 10
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Per-state last rewarded action indicator (for WM) and retrieval probability
+        mem_exists = np.zeros(nS, dtype=bool)
+        mem_action = np.zeros(nS, dtype=int)
+        mem_retrieval = np.zeros(nS)  # retrieval probability in [0,1]
+
+        # Age affects RL noise; set-size affects forgetting (more items -> more forgetting)
+        beta_base = softmax_beta * (1.0 - age_beta_scale * age_group)
+        beta_base = max(beta_base, 1e-6)
+        forget_rate = np.clip(wm_forget * (nS / 3.0), 0.0, 1.0)
+
+        # Track recent unsigned PE with exponential decay per state
+        last_abs_pe = np.zeros(nS)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy with PE-driven exploration/exploitation modulation
+            Q_s = q[s, :].copy()
+            beta_rl = beta_base * (1.0 + kappa_pe * last_abs_pe[s])
+            denom_rl = np.sum(np.exp(beta_rl * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM retrieval dynamics: retrieval decays with set size and time, boosted when rewarded
+            mem_retrieval = (1.0 - forget_rate) * mem_retrieval
+            if mem_exists[s]:
+                # Build WM policy: if retrieved, choose memorized action; else uniform
+                W_s = w_0[s, :].copy()
+                W_s[mem_action[s]] = 1.0  # will be sharpened by beta below
+            else:
+                W_s = w_0[s, :].copy()
+
+            # Effective WM probability for the chosen action is a mixture of retrieved memory and uniform
+            # We implement as softmax over W_s with deterministic beta, scaled by retrieval probability
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm_full = 1.0 / max(denom_wm, 1e-12)
+            p_wm = mem_retrieval[s] * p_wm_full + (1.0 - mem_retrieval[s]) * (1.0 / nA)
+
+            # Combine RL and WM
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            last_abs_pe[s] = 0.5 * last_abs_pe[s] + 0.5 * abs(delta)
+
+            # WM update (win-store; retrieval boosted by reward)
+            if r > 0.5:
+                mem_exists[s] = True
+                mem_action[s] = a
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+                # Boost retrieval to near 1 on success, but bounded
+                mem_retrieval[s] = 1.0 - (1.0 - mem_retrieval[s]) * 0.0
+            # Non-reward: no overwrite; retrieval continues to decay via forget_rate above
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-based arbitration between RL and WM with error-driven WM updating.
+    - RL: standard delta rule with softmax.
+    - WM: probabilistic policy vector per state that shifts mass toward rewarded action and
+          away from non-rewarded action, with decay toward uniform.
+    - Arbitration: WM weight determined by relative confidence: higher when WM is peaked and
+      RL is uncertain; modulated by set size and age.
+
+    Parameters
+    ----------
+    states : array-like
+        State index per trial.
+    actions : array-like
+        Chosen actions (0..2).
+    rewards : array-like
+        Rewards (0/1).
+    blocks : array-like
+        Block index.
+    set_sizes : array-like
+        Set size per trial (3 or 6).
+    age : array-like
+        Participant age per trial; used to compute age group.
+    model_parameters : list/tuple
+        [lr, softmax_beta, wm_gain, arb_bias, wm_decay, age_arb_gain]
+        - lr: RL learning rate (0..1)
+        - softmax_beta: base RL inverse temperature (scaled by 10 internally)
+        - wm_gain: step size for WM updates toward/away from actions (0..1)
+        - arb_bias: baseline arbitration bias toward WM (>0 favors WM, <0 favors RL)
+        - wm_decay: per-trial decay of WM policy toward uniform (0..1)
+        - age_arb_gain: additive arbitration boost for young and reduction for old
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_gain, arb_bias, wm_decay, age_arb_gain = model_parameters
+    softmax_beta *= 10
+
+    age_group = 0 if age[0] <= 45 else 1
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :].copy()
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM decay toward uniform each trial
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            # WM policy vector for state s
+            W_s = w[s, :].copy()
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Compute RL uncertainty (entropy of softmax over Q) and WM sharpness (Gini)
+            # RL entropy proxy using current beta-transformed probabilities
+            prl_all = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            prl_all = prl_all / np.sum(prl_all)
+            H_rl = -np.sum(prl_all * np.log(np.clip(prl_all, 1e-12, 1.0)))
+
+            # WM sharpness via Gini coefficient (0 uniform, higher = sharper)
+            w_norm = W_s / np.sum(W_s)
+            gini_wm = 1.0 - 2.0 * np.sum(np.sort(w_norm) * (np.arange(1, nA + 1) / nA))
+
+            # Arbitration weight: logistic of bias + relative confidence + set-size + age
+            # Larger set size reduces WM weight; young get boost via age_arb_gain
+            bias = arb_bias
+            rel_conf = gini_wm - H_rl  # WM sharpness minus RL uncertainty
+            set_term = -np.log(nS / 3.0)
+            age_term = (1.0 - age_group * 2.0) * age_arb_gain  # +age_arb_gain for young, - for old
+            gate = 1.0 / (1.0 + np.exp(-(bias + rel_conf + set_term + age_term)))
+            wm_weight_eff = np.clip(gate, 0.0, 1.0)
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: error-driven
+            # - If rewarded, push probability mass toward chosen action.
+            # - If not rewarded, push away from chosen action.
+            if r > 0.5:
+                inc = wm_gain * (1.0 - w[s, a])
+                w[s, a] += inc
+                # decrease others proportionally
+                others = [aa for aa in range(nA) if aa != a]
+                dec_each = inc / (len(others)) if len(others) > 0 else 0.0
+                for aa in others:
+                    w[s, aa] = max(0.0, w[s, aa] - dec_each)
+            else:
+                dec = wm_gain * w[s, a]
+                w[s, a] = max(0.0, w[s, a] - dec)
+                others = [aa for aa in range(nA) if aa != a]
+                inc_each = dec / (len(others)) if len(others) > 0 else 0.0
+                for aa in others:
+                    w[s, aa] = min(1.0, w[s, aa] + inc_each)
+
+            # Normalize WM row to maintain a proper distribution
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] = w[s, :] / row_sum
+            else:
+                w[s, :] = w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

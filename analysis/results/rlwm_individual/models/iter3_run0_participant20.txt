@@ -1,0 +1,293 @@
+Here are three distinct RL+WM models that respect your template structure and constraints. Each function is standalone, uses all parameters, computes a valid WM policy and WM updates, and returns the negative log-likelihood.
+
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with set-size–scaled WM reliance, WM time-decay, and choice stickiness.
+
+    Idea:
+    - Choices are a mixture of an RL policy and a WM policy.
+    - WM weight decreases with set size (capacity/load effect) via an exponential penalty.
+    - WM traces decay toward uniform each trial with a decay determined by a time constant that also sets the WM supervised learning step.
+    - RL includes a state-specific choice stickiness bonus (perseveration) for the last action taken in that state.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: inverse temperature (scaled internally by 10); higher -> more deterministic RL.
+    - wm_weight_base: base WM mixture weight in [0,1] before load scaling.
+    - stickiness: non-negative bonus added to the last-chosen action in that state for the RL policy.
+    - time_decay: positive constant setting both WM per-trial decay and WM supervised learning step size.
+                  Larger time_decay -> faster decay and faster WM supervised encoding.
+    - setsize_sensitivity: non-negative; scales the exponential down-weighting of WM as set size increases.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, stickiness, time_decay, setsize_sensitivity = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Per-state last action for stickiness; -1 means none yet
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Set-size–scaled WM weight (capacity/load effect)
+        wm_weight_eff = wm_weight_base * np.exp(-setsize_sensitivity * max(0, nS - 3))
+
+        # Convert time constant to per-trial decay and supervised step
+        wm_decay = 1.0 - np.exp(-time_decay / max(1, nS))  # faster decay at larger time_decay, slightly modulated by set size
+        wm_step = 1.0 - np.exp(-time_decay)                # supervised encoding step on rewarded trials
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with stickiness for last chosen action in this state
+            Q_s = q[s, :].copy()
+            if last_action[s] >= 0:
+                Q_s[last_action[s]] += stickiness
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            wm_w = np.clip(wm_weight_eff, 0.0, 1.0)
+            p_total = wm_w * p_wm + (1.0 - wm_w) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM global decay toward uniform
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+
+            # WM supervised update: strengthen chosen action on rewarded trials, mild reset otherwise
+            if r > 0.5:
+                # Move that state's WM distribution toward the chosen action
+                w[s, :] = (1.0 - wm_step) * w[s, :]
+                w[s, a] += wm_step
+            else:
+                # Mildly nudge back toward uniform when not rewarded (uses same step for parsimony)
+                w[s, :] = (1.0 - wm_step) * w[s, :] + wm_step * w_0[s, :]
+
+            # Update last action for stickiness
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Nonlinear-PE RL + uncertainty-gated WM mixture with set-size penalty.
+
+    Idea:
+    - RL uses a power-transformed prediction error: delta = sign(PE) * |PE|^gamma_pe.
+      This allows sensitivity to big surprises without using separate positive/negative learning rates.
+    - WM contribution is gated by current RL uncertainty (state-level entropy of Q policy).
+      The greater the RL uncertainty, the higher the WM weight, modulated by entropy_sensitivity.
+    - WM weight is further penalized as set size increases (setsize_penalty).
+    - WM stores supervised action beliefs and resets toward uniform on unrewarded outcomes.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: inverse temperature (scaled internally by 10).
+    - wm_base: base WM mixture weight in [0,1].
+    - gamma_pe: PE nonlinearity exponent >= 0. When 1 -> standard delta-rule; >1 emphasizes large PEs.
+    - entropy_sensitivity: >= 0; higher values increase WM reliance when RL policy is uncertain.
+    - setsize_penalty: >= 0; exponential penalty on WM weight as set size increases.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_base, gamma_pe, entropy_sensitivity, setsize_penalty = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    # Helper: safe softmax and entropy for a state s given Q_s
+    def rl_policy_and_entropy(Q_s, beta):
+        # Stabilized softmax
+        z = Q_s - np.max(Q_s)
+        exps = np.exp(beta * z)
+        p = exps / np.sum(exps)
+        # Entropy in nats
+        H = -np.sum(p * np.log(np.clip(p, 1e-12, 1.0)))
+        return p, H
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Static set-size penalty term
+        load_penalty = np.exp(-setsize_penalty * max(0, nS - 3))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy and state uncertainty (entropy)
+            Q_s = q[s, :]
+            p_rl_vec, H = rl_policy_and_entropy(Q_s, softmax_beta)
+            p_rl = p_rl_vec[a]
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Uncertainty-gated WM weight (sigmoid of entropy), scaled by base and set-size penalty
+            # Normalize entropy by log(nA) so it lies in [0,1]
+            H_norm = H / np.log(3.0)
+            gate = 1.0 / (1.0 + np.exp(-entropy_sensitivity * (H_norm - 0.5)))  # >0.5 when uncertainty high
+            wm_w = np.clip(wm_base * load_penalty * gate, 0.0, 1.0)
+
+            # Mixture likelihood
+            p_total = wm_w * p_wm + (1.0 - wm_w) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with nonlinear PE
+            pe = r - q[s, a]
+            mag = np.abs(pe) ** gamma_pe
+            delta = np.sign(pe) * mag
+            q[s, a] += lr * delta
+
+            # WM update: supervised on reward, reset toward uniform otherwise
+            if r > 0.5:
+                w[s, :] = (1.0 - lr) * w[s, :]
+                w[s, a] += lr
+            else:
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with decay + WM with cross-talk interference and precision scaling.
+
+    Idea:
+    - RL values forget toward uniform each trial (q_decay), capturing load/volatility and longer blocks.
+    - WM stores supervised associations but suffers interference (cross-talk) that diffuses updates
+      to other states, with diffusion proportional to set size (more states -> more interference).
+    - WM policy precision is controlled by wm_precision (scales WM softmax determinism).
+    - WM reliance uses a base weight; effective set-size impact emerges via cross-talk diffusion.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature (scaled internally by 10).
+    - wm_weight_base: base WM mixture weight in [0,1].
+    - q_decay: in [0,1]; per-trial decay of Q-values toward uniform (forgetting).
+    - cross_talk: in [0,1]; fraction of WM update that diffuses to other states each trial,
+                  distributed across the other states (stronger impact at larger set sizes).
+    - wm_precision: >= 0; scales WM softmax precision: beta_wm_eff = 50 * wm_precision.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, q_decay, cross_talk, wm_precision = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0 * max(0.0, wm_precision)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        wm_w = np.clip(wm_weight_base, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Mixture
+            p_total = wm_w * p_wm + (1.0 - wm_w) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL decay toward uniform, then delta update
+            q = (1.0 - q_decay) * q + q_decay * (1.0 / nA) * np.ones_like(q)
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM: decay mildly via q_decay shared parameter (parsimony), then supervised update with cross-talk
+            w = (1.0 - q_decay) * w + q_decay * w_0
+            if r > 0.5:
+                # Direct supervised update on current state
+                w[s, :] = (1.0 - lr) * w[s, :]
+                w[s, a] += lr
+
+                # Cross-talk: diffuse a fraction of the update to other states
+                if nS > 1 and cross_talk > 0.0:
+                    leak = cross_talk * lr / (nS - 1)
+                    for s_other in range(nS):
+                        if s_other == s:
+                            continue
+                        w[s_other, :] = (1.0 - leak) * w[s_other, :]
+                        w[s_other, a] += leak
+            else:
+                # On non-reward, nudge back toward uniform for the current state
+                w[s, :] = (1.0 - lr) * w[s, :] + lr * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set-size effects across models:
+- Model 1: WM weight is explicitly downscaled with set size (setsize_sensitivity) and WM decay is slightly faster with larger nS.
+- Model 2: WM weight is penalized by set size (setsize_penalty) and also dynamically gated by RL uncertainty (entropy) per state.
+- Model 3: Set size amplifies WM cross-talk interference because the same total diffusion spreads across more states, degrading WM precision as nS grows. Additionally, RL/WM both share a decay term that can interact with longer/larger-load blocks.

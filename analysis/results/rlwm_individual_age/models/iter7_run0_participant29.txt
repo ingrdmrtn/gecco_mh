@@ -1,0 +1,323 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with capacity-limited, load/age-dependent WM decay and dual RL learning rates.
+
+    Mechanism:
+    - RL: Q-learning with separate learning rates for positive and negative prediction errors.
+    - WM: per-state action weights that decay toward uniform; when rewarded, the chosen action
+      gets a strong boost (one-shot encoding blended with current trace). WM decay increases
+      with set size and age group (older/younger).
+    - Arbitration: mixture of WM and RL policies. The WM weight decreases with load and age via
+      a smooth logistic function, and is capped by a base WM weight parameter.
+
+    Parameters (model_parameters):
+    - lr_pos: RL learning rate for positive PE (0..1)
+    - lr_neg: RL learning rate for negative PE (0..1)
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - wm_decay_base: baseline WM persistence per trial (0..1), higher = more persistent
+    - wm_weight_base: baseline arbitration weight for WM (0..1)
+    - age_load_leak_gain: how much load and age increase WM leak (>=0)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays per trial
+    - Returns: Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, softmax_beta, wm_decay_base, wm_weight_base, age_load_leak_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        block_states = states[idx].astype(int)
+        block_set_sizes = set_sizes[idx].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL and WM value tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM decay increases with load and with age
+        # Convert decay_base (persistence) into leak; increase leak with (load+age), then convert back
+        extra_items = max(0, nS - 3)
+        leak_base = 1.0 - wm_decay_base
+        leak_eff = leak_base * (1.0 + age_load_leak_gain * (age_group + extra_items))
+        leak_eff = np.clip(leak_eff, 0.0, 1.0)
+        wm_decay_eff = 1.0 - leak_eff  # persistence after scaling
+
+        # WM arbitration weight diminishes with load and age via logistic
+        # higher (load+age) -> smaller weight
+        load_age = (age_group + extra_items)
+        wm_weight = wm_weight_base / (1.0 + np.exp(load_age - 1.0))  # sigmoid centered ~1
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+            W_s = w[s, :].copy()
+
+            # RL policy
+            logits_rl = softmax_beta * Q_s
+            logits_rl -= np.max(logits_rl)
+            prl_all = np.exp(logits_rl)
+            prl_all /= max(np.sum(prl_all), eps)
+            p_rl = prl_all[a]
+
+            # [FILL IN THE POLICY FOR THE WORKING MEMORY]
+            logits_wm = softmax_beta_wm * W_s
+            logits_wm -= np.max(logits_wm)
+            pwm_all = np.exp(logits_wm)
+            pwm_all /= max(np.sum(pwm_all), eps)
+            p_wm = pwm_all[a]
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update with dual learning rates
+            delta = r - q[s, a]
+            lr = lr_pos if delta >= 0.0 else lr_neg
+            q[s, a] += lr * delta
+
+            # [FILL IN THE VALUE UPDATING FOR THE WORKING MEMORY]
+            # Decay WM for this state toward uniform
+            w[s, :] = wm_decay_eff * w[s, :] + (1.0 - wm_decay_eff) * (1.0 / nA)
+            # If rewarded, store the chosen action strongly (blend toward one-hot)
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Strong write with load/age-robustness captured by wm_decay_eff already
+                w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with load/age-adaptive inverse temperature + stickiness, and slot-like WM storage.
+
+    Mechanism:
+    - RL: Q-learning with a single learning rate and a global choice stickiness bias.
+      Inverse temperature decreases with load and age (noisy choices under higher load/age).
+    - WM: probabilistic slot storage of rewarded associations. Storage probability declines
+      with load and age. A refresh parameter maintains stored items across time by pulling
+      toward the stored one-hot vector; otherwise traces drift toward uniform.
+    - Arbitration: WM policy is used in proportion to the confidence/max value in WM for that
+      state (max(w[s])). If nothing solid is stored, arbitration falls back to RL.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - beta_base: base RL inverse temperature (scaled by 10 internally)
+    - beta_size_age_gain: how strongly load+age reduce beta (>=0)
+    - wm_store_prob_base: base probability to store after reward (0..1)
+    - wm_refresh: WM refresh strength toward stored map (0..1)
+    - stickiness_kappa: choice perseveration strength (can be negative or positive)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays per trial
+    - Returns: Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, beta_size_age_gain, wm_store_prob_base, wm_refresh, stickiness_kappa = model_parameters
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    rng = np.random.RandomState(0)  # deterministic pseudo-randomness for likelihood; leaves model deterministic across runs
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        block_states = states[idx].astype(int)
+        block_set_sizes = set_sizes[idx].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load/age-adaptive beta and store prob
+        extra_items = max(0, nS - 3)
+        load_age = extra_items + age_group
+        softmax_beta = beta_base * 10.0 * np.exp(-beta_size_age_gain * load_age)
+        p_store = np.clip(wm_store_prob_base * np.exp(-0.5 * load_age), 0.0, 1.0)
+
+        prev_action = None
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL policy with stickiness
+            logits_rl = softmax_beta * q[s, :].copy()
+            if prev_action is not None:
+                logits_rl[prev_action] += stickiness_kappa
+            logits_rl -= np.max(logits_rl)
+            prl_all = np.exp(logits_rl)
+            prl_all /= max(np.sum(prl_all), eps)
+            p_rl = prl_all[a]
+
+            # WM policy from current w[s,:]
+            logits_wm = softmax_beta_wm * w[s, :].copy()
+            logits_wm -= np.max(logits_wm)
+            pwm_all = np.exp(logits_wm)
+            pwm_all /= max(np.sum(pwm_all), eps)
+            p_wm = pwm_all[a]
+
+            # Arbitration weight equals confidence in WM: max of w[s]
+            wm_conf = float(np.max(w[s, :]))
+            wm_weight = np.clip(wm_conf, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM drift toward uniform each visit
+            w[s, :] = (1.0 - wm_refresh) * w[s, :] + wm_refresh * (1.0 / nA)
+
+            # If rewarded, store one-hot with probability p_store
+            if r > 0.5:
+                # Use deterministic thresholding via RNG seeded once for reproducibility
+                if rng.rand() < p_store:
+                    one_hot = np.zeros(nA)
+                    one_hot[a] = 1.0
+                    # Write by blending toward one-hot; blend strength tied to wm_refresh complement
+                    w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+
+            prev_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with forgetting and directed exploration; WM recruited by recent error history.
+
+    Mechanism:
+    - RL: Q-learning with value forgetting toward uniform and an uncertainty-driven
+      directed exploration bonus (on less-visited actions). Exploration bonus increases
+      with load and age.
+    - WM: stores the last rewarded action per state (a fast mapping). WM recruitment
+      weight increases with recent error count in that state (error-sensitive gating).
+    - Arbitration: mixture of WM and RL policies; WM weight is a logistic function of
+      the recent error count.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1)
+    - softmax_beta: base RL inverse temperature (scaled by 10 internally)
+    - rl_forget: RL forgetting rate toward uniform (0..1)
+    - explore_bonus_base: base exploration bonus (>0)
+    - wm_error_sensitivity: scales how strongly recent errors recruit WM (>=0)
+    - size_age_explore_gain: how strongly load+age increase exploration bonus (>=0)
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age: arrays per trial
+    - Returns: Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, rl_forget, explore_bonus_base, wm_error_sensitivity, size_age_explore_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx].astype(int)
+        block_rewards = rewards[idx].astype(float)
+        block_states = states[idx].astype(int)
+        block_set_sizes = set_sizes[idx].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Visit counts for directed exploration
+        N = np.zeros((nS, nA)) + 1e-6  # small prior to avoid div-by-zero
+
+        # Error counters per state (for WM recruitment)
+        err_count = np.zeros(nS)
+
+        # Load/age increase exploration bonus
+        extra_items = max(0, nS - 3)
+        load_age = extra_items + age_group
+        explore_bonus = explore_bonus_base * (1.0 + size_age_explore_gain * load_age)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            # RL logits with directed exploration bonus ~ 1/sqrt(N)
+            bonus_sa = explore_bonus / np.sqrt(N[s, :])
+            logits_rl = softmax_beta * (q[s, :] + bonus_sa)
+            logits_rl -= np.max(logits_rl)
+            prl_all = np.exp(logits_rl)
+            prl_all /= max(np.sum(prl_all), eps)
+            p_rl = prl_all[a]
+
+            # [FILL IN THE POLICY FOR THE WORKING MEMORY]
+            logits_wm = softmax_beta_wm * w[s, :]
+            logits_wm -= np.max(logits_wm)
+            pwm_all = np.exp(logits_wm)
+            pwm_all /= max(np.sum(pwm_all), eps)
+            p_wm = pwm_all[a]
+
+            # WM recruitment weight is a logistic of recent errors
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_error_sensitivity * (err_count[s] - 0.5)))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # Update counts
+            N[s, a] += 1.0
+
+            # RL forgetting toward uniform then delta update
+            q = (1.0 - rl_forget) * q + rl_forget * (1.0 / nA)
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # [FILL IN THE VALUE UPDATING FOR THE WORKING MEMORY]
+            # Drift WM for this state toward uniform
+            w[s, :] = 0.9 * w[s, :] + 0.1 * (1.0 / nA)
+            # If rewarded, store last rewarded action (one-shot-like)
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+
+            # Update error count (bounded below at 0)
+            if r < 0.5:
+                err_count[s] += 1.0
+            else:
+                err_count[s] = max(0.0, err_count[s] - 0.5)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

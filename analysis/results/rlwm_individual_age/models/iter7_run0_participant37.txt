@@ -1,0 +1,314 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM with load- and age-scaled precision and decay.
+
+    Mechanism:
+    - RL: Q-learning with single learning rate.
+    - WM: capacity-limited associative memory per state; when an association is (re)stored after reward,
+      the WM row becomes one-hot for the rewarded action; otherwise it decays toward uniform.
+    - Mixture: choice probability is a convex combination of RL and WM policies.
+    - Load and age effects:
+        * Effective WM precision scales with K_slots / set_size (slot-based precision).
+        * Older age (age_group=1) reduces effective slots and WM weight; larger set size reduces both as well.
+        * WM decay increases with set size and age.
+
+    Parameters (model_parameters; all are used):
+    - lr: RL learning rate in [0,1].
+    - beta: RL inverse temperature; internally scaled by 10 for range.
+    - wm_base: base WM mixture weight in [0,1] before load/age scaling.
+    - K_base: baseline number of WM slots (real-valued, translated to an effective precision ratio).
+    - wm_decay: baseline WM decay rate toward uniform in [0,1] per trial; scaled by load and age.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta, wm_base, K_base, wm_decay = model_parameters
+    softmax_beta = beta * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 1 if age[0] > 45 else 0
+
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load- and age-scaled WM controls
+        # Effective slot precision ratio: cap at 1.0
+        K_eff = max(0.0, K_base * (1.0 - 0.4 * age_group))
+        wm_precision = np.clip(K_eff / float(nS), 0.0, 1.0)
+        wm_weight_base = np.clip(wm_base * wm_precision, 0.0, 1.0)
+
+        # WM decay grows with load and age
+        decay_scale = (float(nS) / 3.0) * (1.0 + 0.5 * age_group)
+        decay_eff = np.clip(wm_decay * decay_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture
+            p_mix = wm_weight_base * p_wm + (1.0 - wm_weight_base) * p_rl
+            p_total = max(p_mix, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM decay toward uniform each trial
+            w = (1.0 - decay_eff) * w + decay_eff * w0
+
+            # WM write on reward: store the association deterministically in WM
+            if r > 0.5:
+                w[s, :] = w0[s, :].copy()
+                w[s, a] = 1.0
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces + error-driven WM gating.
+
+    Mechanism:
+    - RL: Q-learning with eligibility traces (lambda) across state-action pairs within a block.
+      The current (s,a) gets eligibility incremented; all eligibilities decay each trial.
+    - WM: a fast system that stores recent associations; its weight is gated by the magnitude of the
+      current prediction error (|PE|) via a sigmoid, amplifying WM after surprising outcomes.
+    - Mixture: combine WM and RL policies.
+    - Load/Age effects:
+        * Base WM weight scales down with set size (3/nS) and with age (older rely less on WM).
+        * No extra parameters for age; age is used directly to scale WM reliance.
+
+    Parameters (model_parameters; all are used):
+    - lr: RL learning rate in [0,1].
+    - beta: RL inverse temperature; internally scaled by 10 for range.
+    - wm_weight0: baseline WM mixture weight prior to load/age and gating.
+    - lambda_et: eligibility trace decay parameter in [0,1] (higher -> longer traces).
+    - recall_gain: gain for the sigmoid gating by unsigned PE (higher -> stronger WM boost on surprise).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta, wm_weight0, lambda_et, recall_gain = model_parameters
+    softmax_beta = beta * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 1 if age[0] > 45 else 0
+    nA = 3
+    total_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Base WM weight scaled by load and age
+        wm_weight_base = np.clip(wm_weight0 * (3.0 / float(nS)) * (1.0 - 0.35 * age_group), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Qs = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Error-driven WM gating by unsigned PE (computed on current Q)
+            pe_preview = abs(r - q[s, a])
+            gate = 1.0 / (1.0 + np.exp(-recall_gain * (pe_preview - 0.5)))
+            wm_weight_eff = np.clip(wm_weight_base * gate, 0.0, 1.0)
+
+            # Mixture
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_mix, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            # Decay eligibilities, then increment current
+            e *= lambda_et
+            e[s, a] += 1.0
+            pe = r - q[s, a]
+            q += lr * pe * e  # update all entries proportionally to their eligibility
+
+            # WM update: quick store biased by outcome; partial write on no-reward
+            if r > 0.5:
+                w[s, :] = w0[s, :].copy()
+                w[s, a] = 1.0
+            else:
+                # partial move toward the chosen action to reflect attempted recall
+                w[s, :] = 0.7 * w[s, :] + 0.3 * w0[s, :]
+                w[s, a] = max(w[s, a], 0.6)
+
+        total_log_p += log_p
+
+    return -total_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM buffer with competitive queuing, lapses, and load-dependent interference.
+
+    Mechanism:
+    - RL: Q-learning with single learning rate.
+    - WM: a fixed-capacity buffer that holds state-action associations that were recently rewarded.
+      If a state is in the buffer, WM policy is near-deterministic for the stored action; otherwise uniform.
+      When buffer is full, new inserts evict the oldest item (queue policy).
+      Additionally, random interference can evict a random item each trial with load-dependent probability.
+    - Lapse: with small probability, choice is uniform irrespective of value (motor/attentional lapses).
+    - Mixture: combine WM and RL policies; lapse mixed in afterward.
+    - Load/Age effects:
+        * Effective buffer capacity decreases with older age.
+        * WM mixture weight scales down with set size and age.
+        * Interference probability increases with set size; older age also increases susceptibility.
+
+    Parameters (model_parameters; all are used):
+    - lr: RL learning rate in [0,1].
+    - beta: RL inverse temperature; internally scaled by 10 for range.
+    - wm_weight0: baseline WM mixture weight before load/age scaling.
+    - buffer_base: baseline buffer capacity (real-valued, rounded to nearest integer >=1).
+    - lapse_base: baseline lapse rate in [0,1], scaled by load and age.
+    - interference: baseline interference strength in [0,1] that scales the per-trial eviction probability.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta, wm_weight0, buffer_base, lapse_base, interference = model_parameters
+    softmax_beta = beta * 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 1 if age[0] > 45 else 0
+    nA = 3
+    total_log_p = 0.0
+    rng = np.random  # assumed available; used only for pseudo-random eviction index if needed
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Buffer data structures
+        buffer = []            # list of states currently in WM
+        buffer_action = {}     # mapping state -> stored action
+
+        # Effective parameters with load/age scaling
+        B_eff = int(max(1, round(buffer_base * (1.0 - 0.5 * age_group))))
+        wm_weight_base = np.clip(wm_weight0 * (3.0 / float(nS)) * (1.0 - 0.3 * age_group), 0.0, 1.0)
+        lapse_eff = np.clip(lapse_base * (float(nS) / 3.0) * (1.0 + 0.5 * age_group), 0.0, 0.5)
+        # Per-trial interference probability increases with load and age
+        p_interf = np.clip(interference * (float(nS) - 1.0) / float(nS) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Induce random interference: evict a random item with probability p_interf
+            if len(buffer) > 0 and p_interf > 0.0:
+                # Instead of sampling (which would add randomness to likelihood),
+                # we use expected-eviction approximation: shrink WM rows slightly toward uniform.
+                # This preserves differentiability and avoids stochastic likelihoods.
+                decay = p_interf / max(len(buffer), 1)
+                for st in buffer:
+                    w[st, :] = (1.0 - decay) * w[st, :] + decay * w0[st, :]
+
+            # RL policy
+            Qs = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Qs - Qs[a])))
+            p_rl = 1.0 / max(denom_rl, 1e-12)
+
+            # WM policy construction from buffer
+            if s in buffer_action:
+                # Strong one-hot for stored association
+                w[s, :] = w0[s, :].copy()
+                w[s, buffer_action[s]] = 1.0
+            # Else, w[s] remains as currently represented (likely near-uniform)
+
+            Ws = w[s, :]
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (Ws - Ws[a])))
+            p_wm = 1.0 / max(denom_wm, 1e-12)
+
+            # Mixture without lapse
+            p_choice = wm_weight_base * p_wm + (1.0 - wm_weight_base) * p_rl
+
+            # Lapse mixing with uniform
+            p_total = (1.0 - lapse_eff) * p_choice + lapse_eff * (1.0 / nA)
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM buffer update on reward: insert or refresh
+            if r > 0.5:
+                # Insert/refresh state in buffer
+                if s in buffer:
+                    # Move to most recent position (queue refresh)
+                    buffer.remove(s)
+                buffer.append(s)
+                buffer_action[s] = a
+                # Evict oldest if capacity exceeded
+                if len(buffer) > B_eff:
+                    st_evict = buffer.pop(0)
+                    if st_evict in buffer_action:
+                        del buffer_action[st_evict]
+                    # Reset evicted state's WM row to uniform
+                    w[st_evict, :] = w0[st_evict, :].copy()
+
+        total_log_p += log_p
+
+    return -total_log_p

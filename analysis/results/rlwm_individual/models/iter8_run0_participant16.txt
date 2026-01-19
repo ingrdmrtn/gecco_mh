@@ -1,0 +1,344 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces and entropy-gated WM mixture (load-sensitive).
+
+    Idea:
+    - RL: standard Q-learning but updates are spread over recent state-action pairs via an eligibility trace.
+    - WM: fast, precise mapping that is strengthened by rewarded outcomes and weakly suppressed by errors.
+      WM policy is highly precise (beta_wm=50).
+    - Mixture: WM weight is dynamically gated by the (low) entropy of the RL policy and by set size (more load -> less WM gating).
+
+    Parameters:
+    - lr: float in [0,1]. Base RL learning rate.
+    - wm_weight: float in [0,1]. Baseline mixture weight on WM vs RL policy.
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10.
+    - lambda_e: float in [0,1]. Eligibility trace decay; higher spreads credit further back.
+    - gate_k: float >= 0. Sensitivity of WM gating to RL entropy and set size (higher -> more gating modulation).
+      Effective WM weight decreases as set size increases and increases when RL policy is confident (low entropy).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, lambda_e, gate_k = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+    eps = 1e-12
+
+    def softmax_probs(values, beta):
+        v = beta * (values - np.max(values))
+        ev = np.exp(v)
+        return ev / np.sum(ev)
+
+    def policy_prob_of_action(values, beta, a):
+        # Numerically stable prob(action=a) under softmax
+        Q = values
+        denom = np.sum(np.exp(beta * (Q - Q[a])))
+        return 1.0 / max(denom, eps)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Eligibility trace for RL
+        e = np.zeros((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy probability of chosen action
+            p_rl = policy_prob_of_action(Q_s, softmax_beta, a)
+
+            # WM policy probability of chosen action
+            p_wm = policy_prob_of_action(W_s, softmax_beta_wm, a)
+
+            # Compute RL policy entropy to gate WM
+            p_rl_vec = softmax_probs(Q_s, softmax_beta)
+            H_rl = -np.sum(p_rl_vec * np.log(np.clip(p_rl_vec, eps, 1.0)))
+            H_rl_max = np.log(nA)
+
+            # Dynamic WM weight: baseline in logit space, increased by confidence (low entropy),
+            # decreased by set size (load).
+            def logit(x):
+                x = np.clip(x, 1e-6, 1 - 1e-6)
+                return np.log(x / (1 - x))
+
+            def inv_logit(z):
+                return 1.0 / (1.0 + np.exp(-z))
+
+            size_term = gate_k * max(0, nS - 3)  # penalty grows with set size
+            conf_term = gate_k * (H_rl_max - H_rl) / H_rl_max  # higher when RL is confident
+            wm_logit = logit(wm_weight) + conf_term - size_term
+            wm_gate = inv_logit(wm_logit)
+
+            p_total = wm_gate * p_wm + (1.0 - wm_gate) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility trace
+            delta = r - Q_s[a]
+            # Decay traces and add current eligibility
+            e *= lambda_e
+            e[s, a] += 1.0
+            # Update Q for all state-action pairs via eligibility
+            q += lr * delta * e
+
+            # Small Q stabilization toward uniform to avoid drift
+            q = 0.999 * q + 0.001 * (1.0 / nA)
+
+            # WM decay toward uniform (mild), and outcome-dependent refresh
+            w = 0.98 * w + 0.02 * w_0
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+            else:
+                # Mild suppression of the chosen but unrewarded action
+                suppress = np.zeros(nA)
+                suppress[a] = 1.0
+                w[s, :] = w[s, :] - 0.05 * suppress
+                # Renormalize and floor at eps
+                w[s, :] = np.clip(w[s, :], eps, None)
+                w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning rates and interference-based WM (load-amplified).
+
+    Idea:
+    - RL: separate learning rates for positive and negative prediction errors.
+    - WM: precise memory for rewarded mappings that redistributes probability mass within a state:
+      when a rewarded action is stored, competing actions are actively suppressed (interference).
+      The interference strength grows with set size (more items -> more competitive interference).
+    - Policy: mixture of RL and WM softmax policies (fixed WM weight parameter).
+
+    Parameters:
+    - lr_pos: float in [0,1]. RL learning rate for positive prediction errors (better-than-expected).
+    - lr_neg: float in [0,1]. RL learning rate for negative prediction errors (worse-than-expected).
+    - wm_weight: float in [0,1]. Mixture weight on WM vs RL policy.
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10.
+    - rho_interf: float >= 0. Base interference strength; effective interference scales with set size.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, wm_weight, softmax_beta, rho_interf = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+    eps = 1e-12
+
+    def policy_prob_of_action(values, beta, a):
+        Q = values
+        denom = np.sum(np.exp(beta * (Q - Q[a])))
+        return 1.0 / max(denom, eps)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Interference factor scales with set size
+        interf = rho_interf * max(0, nS - 3)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = policy_prob_of_action(Q_s, softmax_beta, a)
+            p_wm = policy_prob_of_action(W_s, softmax_beta_wm, a)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - Q_s[a]
+            alpha = lr_pos if pe >= 0 else lr_neg
+            q[s, a] += alpha * pe
+            # Small stabilization
+            q[s, :] = 0.999 * q[s, :] + 0.001 * (1.0 / nA)
+
+            # WM decay toward uniform
+            w = 0.98 * w + 0.02 * w_0
+
+            # WM interference update within the presented state
+            if r > 0:
+                # Boost chosen action sharply
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+                # Suppress competitors proportionally to their current mass (interference)
+                comp_idx = [aa for aa in range(nA) if aa != a]
+                suppression = interf * np.sum(w[s, comp_idx])
+                if suppression > 0:
+                    # Reallocate mass from competitors to chosen action
+                    give = min(suppression, np.sum(w[s, comp_idx]) - len(comp_idx) * eps)
+                    if give > 0:
+                        frac = w[s, comp_idx] / max(np.sum(w[s, comp_idx]), eps)
+                        w[s, comp_idx] -= give * frac
+                        w[s, a] += give
+            else:
+                # Error: mildly suppress chosen action, redistribute to others
+                give = 0.1 * w[s, a]
+                w[s, a] -= give
+                w[s, [aa for aa in range(nA) if aa != a]] += give / (nA - 1)
+
+            # Renormalize row to avoid drift
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with surprise- and load-modulated learning rate and confidence-based WM.
+
+    Idea:
+    - RL: learning rate is dynamically modulated by trial-by-trial surprise (|PE|) and set size (load).
+      Higher surprise -> larger effective learning rate; larger set size -> smaller effective learning rate.
+    - WM: a per-state action-confidence map that increases with reward and decays with load. Confidence is
+      converted into a sharp WM policy via a high beta. Errors reduce confidence for the chosen response.
+    - Policy: mixture of RL and WM policies with a fixed WM weight.
+
+    Parameters:
+    - lr_base: float in [0,1]. Baseline RL learning rate before modulation.
+    - wm_weight: float in [0,1]. Mixture weight on WM vs RL policy.
+    - softmax_beta: float >= 0. RL inverse temperature; internally scaled by 10.
+    - alpha_surprise: float >= 0. Sensitivity of RL learning rate to surprise (|prediction error|).
+    - gamma_size: float >= 0. Load sensitivity. Increases decay of WM confidence and reduces RL learning rate as set size grows.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_base, wm_weight, softmax_beta, alpha_surprise, gamma_size = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+    eps = 1e-12
+
+    def policy_prob_of_action(values, beta, a):
+        Q = values
+        denom = np.sum(np.exp(beta * (Q - Q[a])))
+        return 1.0 / max(denom, eps)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Confidence matrix for WM (initialized from uniform probs)
+        conf = np.copy(w)  # in [~1/nA, 1]
+
+        # Precompute load effects
+        load = max(0, nS - 3)
+        rl_load_factor = 1.0 / (1.0 + gamma_size * load)  # reduces effective LR with more load
+        wm_decay = min(0.2 + 0.15 * gamma_size * load, 0.9)  # increases WM decay with load
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = policy_prob_of_action(Q_s, softmax_beta, a)
+            p_wm = policy_prob_of_action(W_s, softmax_beta_wm, a)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with surprise- and load-modulated learning rate
+            pe = r - Q_s[a]
+            lr_eff = lr_base * rl_load_factor * (1.0 + alpha_surprise * abs(pe))
+            lr_eff = np.clip(lr_eff, 0.0, 1.0)
+            q[s, a] += lr_eff * pe
+
+            # Gentle stabilization
+            q[s, :] = 0.999 * q[s, :] + 0.001 * (1.0 / nA)
+
+            # WM confidence update and decay
+            # Decay all confidences toward uniform baseline
+            conf = (1.0 - wm_decay) * conf + wm_decay * (1.0 / nA)
+
+            if r > 0:
+                # Increase confidence for chosen action; small decay for competitors
+                conf[s, a] = 0.8 * conf[s, a] + 0.2 * 1.0
+                others = [aa for aa in range(nA) if aa != a]
+                conf[s, others] = 0.95 * conf[s, others] + 0.05 * (1.0 / nA)
+            else:
+                # Error reduces confidence for chosen action and slightly boosts competitors
+                conf[s, a] = 0.8 * conf[s, a] + 0.2 * 0.0
+                others = [aa for aa in range(nA) if aa != a]
+                conf[s, others] = 0.98 * conf[s, others] + 0.02 * (1.0 / (nA - 1))
+
+            # Map confidence to WM action probabilities for current state via normalization
+            # Then mix with prior w to ensure all states remain valid distributions
+            w[s, :] = conf[s, :]
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+Notes on set size effects:
+- Model 1: WM mixture weight is reduced as set size increases (size_term), capturing load-driven WM gating; RL eligibility trace is not directly load-dependent, isolating the gating mechanism.
+- Model 2: The WM interference parameter effectively scales with set size (interf = rho_interf * (nS - 3)), increasing competition among actions under higher load.
+- Model 3: RL learning rate is reduced by load (rl_load_factor), and WM decay increases with load (wm_decay), impairing both learning speed and memory retention under higher set size.

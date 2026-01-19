@@ -1,0 +1,321 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with dual learning rates + precision-weighted WM cache with set-size-scaled decay.
+
+    Description:
+    - RL: Q-learning with separate learning rates for positive and negative prediction errors; softmax policy.
+    - WM: a simple cache per state that, when rewarded, stores a peaked distribution over the chosen action
+      with a precision parameter; the cache decays toward uniform at a rate that increases with set size.
+    - Arbitration: fixed base WM weight reduced by set size (heavier load reduces reliance on WM).
+
+    Parameters
+    - model_parameters[0] = lr_pos (float, 0..1): RL learning rate for positive prediction errors.
+    - model_parameters[1] = lr_neg (float, 0..1): RL learning rate for negative prediction errors.
+    - model_parameters[2] = wm_weight_base (float, 0..1): Base mixture weight for WM versus RL.
+    - model_parameters[3] = softmax_beta (float, >0): Inverse temperature for RL softmax; internally scaled x10.
+    - model_parameters[4] = wm_precision (float, >=0): Precision with which WM favors a cached action when rewarded.
+    - model_parameters[5] = decay_scale (float, >=0): Scales WM decay with set size; higher means faster decay as set size grows.
+
+    Set-size effects
+    - WM weight is scaled by 3/nS (less WM reliance for larger set sizes).
+    - WM decay increases with set size: d_eff = 1 - exp(-decay_scale * nS/3).
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, wm_weight_base, softmax_beta, wm_precision, decay_scale = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # w stores a probability distribution per state over actions (starts uniform)
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size-dependent arbitration and decay
+        wm_weight_eff = np.clip(wm_weight_base * (3.0 / float(nS)), 0.0, 1.0)
+        decay_eff = 1.0 - np.exp(-decay_scale * (float(nS) / 3.0))
+        decay_eff = np.clip(decay_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: turn current WM distribution into logits using precision
+            W_logits = np.log(np.clip(W_s, eps, 1.0)) * max(1.0, wm_precision)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_logits - W_logits[a])))
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with dual learning rates
+            delta = r - Q_s[a]
+            lr = lr_pos if delta >= 0 else lr_neg
+            q[s][a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+            # WM update: if rewarded, cache a peaked distribution on the chosen action
+            if r > 0:
+                logits = np.zeros(nA)
+                logits[a] = wm_precision
+                # softmax of logits to get a peaked distribution
+                logits = logits - np.max(logits)
+                probs = np.exp(logits)
+                probs = probs / np.sum(probs)
+                w[s, :] = probs
+            else:
+                # If not rewarded, mildly demote chosen action by mixing with uniform via decay already applied
+                pass  # negative outcomes handled primarily by decay
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with single learning rate + WM from last outcome, with set-size-gated utilization.
+
+    Description:
+    - RL: standard Q-learning with single learning rate and softmax choice.
+    - WM: constructs a state-specific policy from the most recent action-outcome:
+        * If last outcome in this state was rewarded, boost that action's logit by wm_success_bonus.
+        * If last outcome was not rewarded, penalize that action's logit by wm_failure_penalty.
+      The WM "logits" are added to a uniform baseline each trial.
+    - Arbitration: WM mixture weight is a logistic transform of a base bias penalized by set size.
+
+    Parameters
+    - model_parameters[0] = lr (float, 0..1): RL learning rate.
+    - model_parameters[1] = softmax_beta (float, >0): Inverse temperature for RL; internally scaled x10.
+    - model_parameters[2] = wm_base (float, 0..1): Base WM usage level (as a probability).
+    - model_parameters[3] = wm_success_bonus (float, >=0): Additive bonus to WM logits for last rewarded action.
+    - model_parameters[4] = wm_failure_penalty (float, >=0): Additive penalty to WM logits for last unrewarded action.
+    - model_parameters[5] = kappa_setsize (float, >=0): Strength of set-size penalty on WM usage.
+
+    Set-size effects
+    - WM mixture weight is wm_weight = sigmoid(logit(wm_base) - kappa_setsize*(nS-3)),
+      so larger sets reduce WM use.
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_base, wm_success_bonus, wm_failure_penalty, kappa_setsize = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    def logit(p):
+        p = np.clip(p, eps, 1.0 - eps)
+        return np.log(p / (1.0 - p))
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # WM representation here will be constructed on-the-fly from last action/outcome memory
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        last_action = -1 * np.ones(nS, dtype=int)
+        last_reward = -1 * np.ones(nS, dtype=int)  # -1 = none yet, 0 or 1 afterward
+
+        # Set-size-gated WM usage
+        wm_logit = logit(wm_base) - kappa_setsize * max(0.0, float(nS) - 3.0)
+        wm_weight = sigmoid(wm_logit)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Build WM logits from last outcome for this state
+            wm_logits = np.zeros(nA)
+            if last_action[s] >= 0:
+                if last_reward[s] == 1:
+                    wm_logits[last_action[s]] += wm_success_bonus
+                elif last_reward[s] == 0:
+                    wm_logits[last_action[s]] -= wm_failure_penalty
+
+            # Convert logits to a probability-like vector w[s,:] for record-keeping
+            wm_logits_centered = wm_logits - np.max(wm_logits)
+            probs = np.exp(wm_logits_centered)
+            probs = probs / np.sum(probs)
+            w[s, :] = probs  # store for completeness
+
+            # WM policy via softmax on logits
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_logits - wm_logits[a])))
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update: store the most recent action and its outcome
+            last_action[s] = a
+            last_reward[s] = int(r)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL-WM with uncertainty-based arbitration and set-size-inflated WM decay.
+
+    Description:
+    - RL: standard Q-learning with single learning rate; softmax policy.
+    - WM: fast delta-rule toward one-hot for rewarded actions; decays toward uniform,
+      with decay increasing with set size.
+    - Arbitration: dynamic WM weight via a logistic function of (H_RL - H_WM),
+      where H_RL is the entropy of the RL softmax policy at the current state,
+      and H_WM is the entropy of the WM distribution. When WM is more certain (lower entropy),
+      arbitration favors WM; when RL is more certain, favors RL.
+
+    Parameters
+    - model_parameters[0] = lr (float, 0..1): RL learning rate.
+    - model_parameters[1] = softmax_beta (float, >0): Inverse temperature for RL; internally scaled x10.
+    - model_parameters[2] = wm_lr (float, 0..1): WM learning rate toward a one-hot target on reward.
+    - model_parameters[3] = wm_decay (float, 0..1): Base WM decay toward uniform; amplified by set size.
+    - model_parameters[4] = arb_gain (float, >=0): Gain for uncertainty-based arbitration.
+    - model_parameters[5] = arb_bias (float): Bias term for arbitration (positive favors WM).
+
+    Set-size effects
+    - WM decay is inflated by set size: wm_decay_eff = 1 - (1 - wm_decay)^(nS/3), increasing with nS.
+    - Arbitration depends indirectly on set size because WM entropy will be higher under larger nS (due to stronger decay).
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_lr, wm_decay, arb_gain, arb_bias = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    def entropy(p):
+        p = np.clip(p, eps, 1.0)
+        return -np.sum(p * np.log(p))
+
+    def softmax_from_logits(logits):
+        z = logits - np.max(logits)
+        p = np.exp(z)
+        return p / np.sum(p)
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # WM distribution per state, initialized uniform
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size inflated decay
+        wm_decay_eff = 1.0 - (1.0 - np.clip(wm_decay, 0.0, 1.0)) ** (float(nS) / 3.0)
+        wm_decay_eff = np.clip(wm_decay_eff, 0.0, 1.0)
+
+        log_p = 0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL softmax policy and its entropy as uncertainty
+            rl_logits = softmax_beta * Q_s
+            pi_rl = softmax_from_logits(rl_logits)
+            p_rl = pi_rl[a]
+            H_rl = entropy(pi_rl)
+
+            # WM policy: use W_s as logits for a near-deterministic softmax
+            W_logits = np.log(np.clip(W_s, eps, 1.0))
+            pi_wm = softmax_from_logits(softmax_beta_wm * W_logits)
+            p_wm = pi_wm[a]
+            H_wm = entropy(pi_wm)
+
+            # Arbitration weight based on relative uncertainty
+            wm_weight = 1.0 / (1.0 + np.exp(-(arb_bias + arb_gain * (H_rl - H_wm))))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            # Mixture likelihood
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - wm_decay_eff) * w[s, :] + wm_decay_eff * w_0[s, :]
+
+            # WM learning: if rewarded, move distribution toward one-hot on chosen action
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_lr) * w[s, :] + wm_lr * target
+                # keep normalization (already ensured)
+            else:
+                # no special negative update beyond decay; WM relies on positive evidence
+                pass
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

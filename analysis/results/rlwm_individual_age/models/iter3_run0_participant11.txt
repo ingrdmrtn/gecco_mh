@@ -1,0 +1,341 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Surprise-gated Working Memory + Asymmetric RL.
+
+    Idea:
+    - Model-free RL with asymmetric learning rates for positive vs. negative prediction errors.
+    - A WM policy store that is updated probabilistically (gated) as a function of surprise (|RPE|).
+    - Arbitration mixes WM and RL; WM influence is reduced for larger set sizes and for the older group.
+
+    Parameters (list of length 6):
+    - lr_pos: learning rate for positive prediction errors (0-1).
+    - lr_neg: learning rate for negative prediction errors (0-1).
+    - beta_base: base inverse temperature for RL policy; scaled by 10 internally.
+    - wm_weight_base: base mixture weight of WM in [0,1].
+    - wm_gate_sensitivity: sensitivity of WM write-gating to surprise (|RPE|); higher = more likely to store after surprising outcomes.
+    - age_gate_bias: additive bias (>=0) that reduces WM gating in the older group.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_pos, lr_neg, beta_base, wm_weight_base, wm_gate_sensitivity, age_gate_bias = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0  # WM near-deterministic when confident
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL values and WM policy store
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        beta_eff = max(1e-6, beta_base * 10.0)
+
+        # Arbitration weight: WM influence weakens with larger set size and in older adults
+        wm_weight_eff = wm_weight_base / (1.0 + max(0, nS - 3))
+        wm_weight_eff *= (1.0 - 0.30 * age_group)
+        wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            prefs = beta_eff * Q_s
+            prefs -= np.max(prefs)
+            exp_prefs = np.exp(prefs)
+            p_rl_vec = exp_prefs / np.sum(exp_prefs)
+            p_rl = np.clip(p_rl_vec[a], 1e-12, 1.0)
+
+            # WM policy
+            W_s = w[s, :]
+            wm_prefs = softmax_beta_wm * W_s
+            wm_prefs -= np.max(wm_prefs)
+            exp_wm = np.exp(wm_prefs)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = np.clip(p_wm_vec[a], 1e-12, 1.0)
+
+            # Mixture policy
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - Q_s[a]
+            alpha = lr_pos if pe >= 0.0 else lr_neg
+            q[s, a] += alpha * pe
+
+            # Surprise-gated WM write:
+            # Gate probability increases with |PE|, but is reduced for larger set size and for older group
+            size_penalty = max(0, nS - 3)
+            logit = wm_gate_sensitivity * abs(pe) - 0.5 * size_penalty - age_gate_bias * age_group
+            gate_prob = 1.0 / (1.0 + np.exp(-logit))
+            # Stochastic gating approximated by expected update (probabilistic write)
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - gate_prob) * w[s, :] + gate_prob * target
+
+            # Mild normalization to keep a proper distribution per state
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            w = w / np.clip(row_sums, 1e-12, None)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Uncertainty-sensitive temperature RL + Recency-weighted episodic WM + lapse.
+
+    Idea:
+    - Model-free RL with single learning rate.
+    - Inverse temperature decreases when action-values for a state are uncertain (fewer visits).
+    - WM stores the last rewarded action per state and expresses it with strength that decays with time since reward.
+    - Mixture policy between WM and RL, with a lapse that increases under higher load and age.
+
+    Parameters (list of length 6):
+    - lr: RL learning rate (0-1).
+    - beta_base: base inverse temperature for RL; scaled by 10 internally.
+    - tau_base: base WM time-decay rate (>0); higher = faster decay of episodic memory.
+    - wm_weight_base: base WM mixture weight in [0,1].
+    - epsilon_base: base lapse rate in [0,1] for random choice.
+    - age_temp_penalty: nonnegative factor increasing temperature softness (reducing beta) in the older group.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_base, tau_base, wm_weight_base, epsilon_base, age_temp_penalty = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # RL values and visit counts for uncertainty
+        q = (1.0 / nA) * np.ones((nS, nA))
+        visits = np.zeros((nS, nA))  # counts of updates to estimate uncertainty
+
+        # Episodic WM: last rewarded action index and last time it was rewarded
+        last_rewarded_action = -1 * np.ones(nS, dtype=int)
+        last_reward_time = -1 * np.ones(nS, dtype=int)
+
+        # Effective WM weight diminishes with set size and age
+        wm_weight_eff = wm_weight_base / (1.0 + max(0, nS - 3))
+        wm_weight_eff *= (1.0 - 0.25 * age_group)
+        wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+        # Lapse increases with load and age
+        eps = epsilon_base * (1.0 + 0.5 * age_group) * (1.0 + max(0, nS - 3) / 3.0)
+        eps = np.clip(eps, 0.0, 0.5)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Uncertainty proxy: fewer visits -> higher uncertainty
+            state_visits = np.sum(visits[s, :]) + 1e-6
+            uncert = 1.0 / np.sqrt(state_visits)  # decreases with experience
+
+            # RL policy with uncertainty-softened temperature and age penalty
+            beta_eff = beta_base * 10.0
+            beta_eff = beta_eff / (1.0 + uncert)
+            beta_eff = beta_eff / (1.0 + age_temp_penalty * age_group)
+            beta_eff = max(1e-6, beta_eff)
+
+            Q_s = q[s, :]
+            prefs = beta_eff * Q_s
+            prefs -= np.max(prefs)
+            exp_prefs = np.exp(prefs)
+            p_rl_vec = exp_prefs / np.sum(exp_prefs)
+            p_rl = np.clip(p_rl_vec[a], 1e-12, 1.0)
+
+            # Episodic WM: strength decays with time since last rewarded instance for this state
+            if last_reward_time[s] >= 0:
+                dt = max(0, t - last_reward_time[s])
+                tau_eff = tau_base * (1.0 + 0.5 * age_group) * (1.0 + max(0, nS - 3))
+                strength = np.exp(-tau_eff * dt)
+                W_s = np.ones(nA) / nA
+                la = int(last_rewarded_action[s])
+                if 0 <= la < nA:
+                    W_s = (1.0 - strength) * W_s
+                    W_s[la] += strength
+            else:
+                W_s = np.ones(nA) / nA
+
+            wm_prefs = softmax_beta_wm * W_s
+            wm_prefs -= np.max(wm_prefs)
+            exp_wm = np.exp(wm_prefs)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = np.clip(p_wm_vec[a], 1e-12, 1.0)
+
+            # Mixture with lapse
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = (1.0 - eps) * p_mix + eps * (1.0 / nA)
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+            visits[s, a] += 1.0
+
+            # Update episodic memory on reward
+            if r > 0.5:
+                last_rewarded_action[s] = a
+                last_reward_time[s] = t
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Bayesian (Dirichlet) RL with forgetting + Confidence-threshold arbitration + WM cache.
+
+    Idea:
+    - Maintain per-state, per-action Beta posterior over reward probability (success/failure counts).
+    - Compute RL Q as posterior mean and act via softmax.
+    - WM cache stores a one-shot perfect mapping after reward; cache decays toward uniform.
+    - Arbitration uses a confidence threshold based on entropy: when WM policy is sufficiently
+      more confident (lower entropy) than RL, rely more on WM; otherwise rely more on RL.
+    - Forgetting toward the prior increases with set size and age.
+
+    Parameters (list of length 6):
+    - prior_strength: symmetric Beta prior strength (>0); higher = stronger prior.
+    - beta_base: base inverse temperature for RL; scaled by 10 internally.
+    - forget_rate: base forgetting rate (0-1) pulling posteriors toward the prior each trial.
+    - wm_weight_base: base WM mixture weight in [0,1] when WM is more confident.
+    - conf_threshold: nonnegative threshold that WM must beat RL by (in entropy units) to dominate.
+    - age_forget_boost: nonnegative multiplier for forgetting in the older group.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    prior_strength, beta_base, forget_rate, wm_weight_base, conf_threshold, age_forget_boost = model_parameters
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Beta posterior parameters per (state, action): alpha=successes, beta=failures
+        alpha = prior_strength * np.ones((nS, nA))
+        beta = prior_strength * np.ones((nS, nA))
+
+        # WM policy store, decaying toward uniform
+        w = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective forgetting increases with set size and age
+        f_eff = forget_rate * (1.0 + max(0, nS - 3)) * (1.0 + age_forget_boost * age_group)
+        f_eff = np.clip(f_eff, 0.0, 1.0)
+
+        # Base WM weight when WM is confidently better
+        wm_weight_hi = wm_weight_base / (1.0 + max(0, nS - 3))
+        wm_weight_hi *= (1.0 - 0.25 * age_group)
+        wm_weight_hi = np.clip(wm_weight_hi, 0.0, 1.0)
+        wm_weight_lo = 0.3 * wm_weight_hi  # fallback WM influence when less confident
+
+        beta_eff_base = max(1e-6, beta_base * 10.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Apply forgetting toward prior each trial
+            alpha[s, :] = (1.0 - f_eff) * alpha[s, :] + f_eff * prior_strength
+            beta[s, :] = (1.0 - f_eff) * beta[s, :] + f_eff * prior_strength
+
+            # RL Q as posterior means
+            Q_s = alpha[s, :] / np.clip(alpha[s, :] + beta[s, :], 1e-12, None)
+
+            # RL policy
+            prefs = beta_eff_base * Q_s
+            prefs -= np.max(prefs)
+            exp_prefs = np.exp(prefs)
+            p_rl_vec = exp_prefs / np.sum(exp_prefs)
+            p_rl = np.clip(p_rl_vec[a], 1e-12, 1.0)
+
+            # WM policy
+            W_s = w[s, :]
+            wm_prefs = softmax_beta_wm * W_s
+            wm_prefs -= np.max(wm_prefs)
+            exp_wm = np.exp(wm_prefs)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = np.clip(p_wm_vec[a], 1e-12, 1.0)
+
+            # Confidence-threshold arbitration using entropy
+            def entropy(p):
+                p_safe = np.clip(p, 1e-12, 1.0)
+                return -np.sum(p_safe * np.log(p_safe))
+
+            H_wm = entropy(p_wm_vec)
+            H_rl = entropy(p_rl_vec)
+
+            if (H_rl - H_wm) > conf_threshold:
+                wm_weight_eff = wm_weight_hi
+            else:
+                wm_weight_eff = wm_weight_lo
+
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # Update posteriors
+            if r > 0.5:
+                alpha[s, a] += 1.0
+            else:
+                beta[s, a] += 1.0
+
+            # WM update: reward-locked cache with decay toward uniform
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = 0.5 * w[s, :] + 0.5 * target  # rapid overwrite on reward
+
+            # Decay WM toward uniform with same forgetting pressure
+            w = (1.0 - f_eff) * w + f_eff * (1.0 / nA)
+            w = w / np.clip(np.sum(w, axis=1, keepdims=True), 1e-12, None)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

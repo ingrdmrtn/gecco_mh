@@ -1,0 +1,305 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with adaptive arbitration by age and load; WM is a leaky-encoding store.
+
+    Parameters (model_parameters):
+    - lr: scalar (0-1), RL learning rate
+    - wm_bias: scalar, baseline bias of arbitration toward WM (logit space)
+    - wm_age_pen: scalar >=0, penalty on WM use for older adults (multiplies age_group)
+    - wm_load_pen: scalar >=0, penalty on WM use as set size increases (per item beyond 3)
+    - softmax_beta: scalar, RL inverse temperature before upscaling (template multiplies by 10)
+    - wm_beta: scalar >=0, scales WM inverse temperature in addition to template's wm beta
+
+    Model details:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: state-action utility table w[s,a] representing memory strength, chosen via softmax with high inverse temperature.
+    - Arbitration: dynamic WM weight = sigmoid(wm_bias - wm_age_pen*age_group - wm_load_pen*(nS-3)).
+      Older adults (age_group=1) and larger set size reduce WM contribution.
+    - WM update: successful outcomes are encoded strongly toward a one-hot trace; otherwise memory leaks toward uniform.
+      Encoding strength uses the same arbitration signal (stronger when WM is relied upon).
+    Returns negative log-likelihood of observed choices.
+    """
+    lr, wm_bias, wm_age_pen, wm_load_pen, softmax_beta, wm_beta = model_parameters
+    softmax_beta *= 10  # per template scaling
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50  # template constant for WM base determinism
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # Dynamic arbitration weight toward WM (sigmoid in logit space)
+            load_term = (nS - 3)
+            wm_logit = wm_bias - wm_age_pen * age_group - wm_load_pen * load_term
+            wm_weight_dyn = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_weight_dyn = np.clip(wm_weight_dyn, 0.0, 1.0)
+
+            # WM policy via softmax on w[s,:] with scaled WM temperature
+            W_s = w[s, :]
+            beta_wm_eff = softmax_beta_wm * max(wm_beta, 0.01)
+            denom_wm = np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight_dyn * p_wm + (1.0 - wm_weight_dyn) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: encode successes strongly; otherwise leak toward uniform
+            # Encoding strength tied to arbitration (higher when relying on WM)
+            enc = wm_weight_dyn
+            enc = np.clip(enc, 0.0, 1.0)
+            if r == 1:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1 - enc) * w[s, :] + enc * target
+            else:
+                # Leak toward uniform; leak a bit stronger with larger set size
+                leak = np.clip(1.0 - enc + 0.1 * (nS / 6.0), 0.0, 1.0)
+                w[s, :] = (1 - leak) * w[s, :] + leak * w_0[s, :]
+
+            # Normalize WM row for numerical stability
+            w_sum = np.sum(w[s, :])
+            if w_sum > 0:
+                w[s, :] /= w_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + episodic WM gated by state recency; WM contribution reduced by age and load.
+
+    Parameters (model_parameters):
+    - lr: scalar (0-1), RL learning rate
+    - wm_weight: scalar (0-1), baseline WM mixture weight
+    - softmax_beta: scalar, RL inverse temperature before upscaling (template multiplies by 10)
+    - recency_tau: scalar > 1, time constant for state activation (larger = slower decay)
+    - age_load_scaler: scalar >= 0, scales the reduction of WM use with age and set size
+
+    Model details:
+    - RL: tabular Q-learning with softmax choice.
+    - WM: stores last rewarded action per state (episodic). If present, WM policy is near-deterministic for that action.
+    - Arbitration: WM weight is boosted by recency activation of the state and reduced by age_group and set size:
+        wm_eff = wm_weight * activation / (1 + age_load_scaler * age_group * (nS/3))
+      so older adults and larger sets reduce WM's influence.
+    - Recency activation per state a_s in [0,1] increases when the state is visited, decays otherwise with time constant recency_tau.
+    Returns negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, recency_tau, age_load_scaler = model_parameters
+    softmax_beta *= 10  # per template scaling
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50  # near-deterministic WM policy when memory exists
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        episodic = -1 * np.ones(nS, dtype=int)  # last rewarded action per state, or -1 if none
+        activation = np.zeros(nS)  # recency activation in [0,1]
+
+        decay = max(0.0, 1.0 - 1.0 / max(recency_tau, 1.0001))  # per-trial decay factor
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # Update activation for this state (others implicitly decay when visited next time)
+            activation = activation * decay
+            activation[s] = np.clip(activation[s] + (1.0 - decay), 0.0, 1.0)
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy: if memory exists, choose that action almost deterministically; else uniform
+            if episodic[s] >= 0:
+                chosen_mem = episodic[s]
+                # Equivalent of softmax with large beta on a one-hot preference
+                p_wm = (1.0 - 1e-6) if a == chosen_mem else 1e-6 / (nA - 1)
+            else:
+                p_wm = 1.0 / nA
+
+            # Effective WM weight: baseline scaled by activation, penalized by age and load
+            penalty = 1.0 + age_load_scaler * age_group * (nS / 3.0)
+            wm_eff = wm_weight * activation[s] / penalty
+            wm_eff = np.clip(wm_eff, 0.0, 1.0)
+
+            p_total = wm_eff * p_wm + (1.0 - wm_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM episodic update
+            if r == 1:
+                episodic[s] = a
+                # Make WM row reflect this memory (for template consistency and future WM softmax variants)
+                w[s, :] = 1e-6
+                w[s, episodic[s]] = 1.0 - (nA - 1) * 1e-6
+            else:
+                # Mild decay of WM row toward uniform if no reward
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+            # Normalize WM row
+            w_sum = np.sum(w[s, :])
+            if w_sum > 0:
+                w[s, :] /= w_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with load- and age-adjusted WM temperature and WM-specific switch cost.
+
+    Parameters (model_parameters):
+    - lr: scalar (0-1), RL learning rate
+    - wm_weight: scalar (0-1), mixture weight between WM and RL
+    - softmax_beta: scalar, RL inverse temperature before upscaling (template multiplies by 10)
+    - wm_temp_base: scalar > 0, base multiplier for WM inverse temperature
+    - switch_cost: scalar >= 0, WM-specific cost for switching away from last chosen action in the state
+    - age_switch_gain: scalar >= 0, amplifies switch_cost in older adults
+
+    Model details:
+    - RL: tabular Q-learning with softmax.
+    - WM: leaky memory table w[s,a] chosen by softmax. WM inverse temperature decreases with set size and age:
+        beta_wm = 50 * wm_temp_base * (3/nS) * (1 - 0.3*age_group)
+      so larger sets and older age reduce WM precision.
+    - WM-specific switch cost: policies computed from WM values apply a penalty to actions
+      different from the last chosen action in that state. The penalty is larger for older adults:
+        cost_eff = switch_cost * (1 + age_switch_gain * age_group)
+    - WM update: encode toward observed outcome; successes move toward one-hot; failures decay toward uniform.
+    Returns negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, wm_temp_base, switch_cost, age_switch_gain = model_parameters
+    softmax_beta *= 10  # per template scaling
+
+    if age[0] <= 45:
+        age_group = 0
+    else:
+        age_group = 1
+
+    softmax_beta_wm = 50  # base WM determinism
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        last_choice = -1 * np.ones(nS, dtype=int)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy: softmax over WM values with load- and age-adjusted temperature,
+            # and with a WM-specific switch cost relative to last_choice in this state.
+            W_s = w[s, :].copy()
+            if last_choice[s] >= 0:
+                cost_eff = switch_cost * (1.0 + age_switch_gain * age_group)
+                for ai in range(nA):
+                    if ai != last_choice[s]:
+                        W_s[ai] -= cost_eff  # penalize switching within WM channel
+
+            beta_wm_eff = softmax_beta_wm * max(wm_temp_base, 1e-3) * (3.0 / max(nS, 1.0)) * (1.0 - 0.3 * age_group)
+            beta_wm_eff = max(beta_wm_eff, 1e-3)
+
+            denom_wm = np.sum(np.exp(beta_wm_eff * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: successes -> one-hot, failures -> decay toward uniform
+            enc = np.clip(0.5 * wm_temp_base, 0.0, 1.0)
+            if r == 1:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1 - enc) * w[s, :] + enc * target
+            else:
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+            # Normalize WM row
+            w_sum = np.sum(w[s, :])
+            if w_sum > 0:
+                w[s, :] /= w_sum
+
+            # Update last choice
+            last_choice[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

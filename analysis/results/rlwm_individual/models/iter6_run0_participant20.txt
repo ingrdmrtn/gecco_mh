@@ -1,0 +1,296 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-gated arbitration and load-sensitive WM decay.
+
+    Core ideas:
+    - Choices are a mixture of an RL policy (softmax over Q) and a WM policy (softmax over W).
+    - Arbitration favors WM when RL is uncertain (high entropy). A threshold controls this gating.
+    - WM learns one-shot toward the rewarded action, and leaks toward uniform otherwise.
+    - WM leakage increases with set size (3 vs 6), capturing load effects.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature; internally scaled by 10 for numerical range.
+    - wm_weight_base: baseline WM weight in [0,1] applied when RL is highly uncertain.
+    - wm_conf_threshold: entropy threshold (in nats) for gating WM; higher = stricter gate.
+    - wm_decay_rate: base WM plasticity/decay rate in [0,1]; higher = faster update and leak.
+    - setsize_entropy_boost: nonnegative scalar; extra WM leak per extra item beyond 3.
+
+    Set-size impact:
+    - WM leak is increased by setsize_entropy_boost * max(0, set_size - 3), reducing WM effectiveness in large sets.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, wm_conf_threshold, wm_decay_rate, setsize_entropy_boost = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM readout
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        load_extra = max(0, nS - 3)
+        # Effective leak toward uniform increases with set size
+        leak_extra = setsize_entropy_boost * load_extra
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration: entropy of RL softmax (uncertainty gate)
+            # compute RL softmax probs for entropy
+            rl_probs = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            rl_probs = rl_probs / np.sum(rl_probs)
+            entropy = -np.sum(rl_probs * (np.log(rl_probs + 1e-12)))
+
+            gate = 1.0 / (1.0 + np.exp(-(entropy - wm_conf_threshold)))
+            wm_w_eff = np.clip(wm_weight_base * gate, 0.0, 1.0)
+
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # WM update:
+            # If rewarded, move toward one-hot for chosen action with wm_decay_rate
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_decay_rate) * w[s, :] + wm_decay_rate * one_hot
+            else:
+                # Leak toward uniform with load-dependent leak
+                leak = 1.0 - (1.0 - wm_decay_rate) * np.exp(-leak_extra)
+                w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning + persistence-based WM and memory-strength–driven arbitration.
+
+    Core ideas:
+    - RL has separate learning rates for positive vs negative outcomes.
+    - WM stores the last rewarded action per state; its memory strength persists but
+      undergoes load-dependent interference toward uniform.
+    - Arbitration uses a logistic transform of WM memory strength (max weight in W_s).
+      Stronger, clearer WM traces yield higher WM contribution.
+
+    Parameters (model_parameters):
+    - alpha_pos: RL learning rate after reward=1, in [0,1].
+    - alpha_neg: RL learning rate after reward=0, in [0,1].
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_mix_slope: slope of the logistic mapping from WM strength to WM weight (>=0).
+    - memory_persist: WM write strength when rewarded in [0,1]; higher = crisper memory.
+    - load_interference: additional WM decay per extra item beyond 3 (>=0).
+
+    Set-size impact:
+    - WM interference grows with set size via load_interference * max(0, set_size - 3).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, softmax_beta, wm_mix_slope, memory_persist, load_interference = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        load_extra = max(0, nS - 3)
+        # Precompute a per-state drop/decay magnitude from load
+        base_drop = 1.0 - np.exp(-load_interference * load_extra)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Arbitration: WM weight increases with memory strength (max prob in W_s)
+            m_strength = np.max(W_s)  # in [1/3,1]
+            centered = m_strength - (1.0 / nA)  # 0 means uniform memory
+            wm_w_eff = 1.0 / (1.0 + np.exp(-wm_mix_slope * centered))
+            wm_w_eff = np.clip(wm_w_eff, 0.0, 1.0)
+
+            p_total = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            alpha = alpha_pos if r > 0.5 else alpha_neg
+            q[s, a] += alpha * (r - q[s, a])
+
+            # WM update:
+            if r > 0.5:
+                # Write toward one-hot with persistence strength
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - memory_persist) * w[s, :] + memory_persist * one_hot
+            else:
+                # Interference/leak toward uniform increases with set size
+                leak = base_drop
+                w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with surprise-driven arbitration and set-size–modulated perseveration.
+
+    Core ideas:
+    - Arbitration uses a running state-specific surprise signal (absolute RPE) to favor WM when
+      recent outcomes are surprising; higher surprise => more WM reliance (for rapid adaptation).
+    - A perseveration (choice-stickiness) component mixes in a policy that favors repeating the last action;
+      its impact decays with set size (less repetition benefit under higher load).
+    - WM learns toward the rewarded action and leaks otherwise, using the same surprise rate to control plasticity.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1].
+    - softmax_beta: RL inverse temperature; internally scaled by 10.
+    - wm_weight_base: baseline scale for WM reliance; multiplied by current surprise.
+    - surprise_rate: in (0,1]; updates surprise and sets WM plasticity rate.
+    - stickiness_weight: baseline weight for a perseveration policy in [0,1].
+    - setsize_stickiness_decay: nonnegative; reduces stickiness as set size increases beyond 3.
+
+    Set-size impact:
+    - Stickiness weight is dampened by exp(-setsize_stickiness_decay * max(0, set_size - 3)).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, wm_weight_base, surprise_rate, stickiness_weight, setsize_stickiness_decay = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # State-specific running surprise (init moderate)
+        surprise = 0.5 * np.ones(nS)
+
+        load_extra = max(0, nS - 3)
+        stickiness_scale = np.exp(-setsize_stickiness_decay * load_extra)
+
+        log_p = 0.0
+        prev_action = None
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Stickiness policy (favor repeating previous action, if exists)
+            if prev_action is None:
+                stickiness_probs = np.ones(nA) / nA
+            else:
+                pref = np.zeros(nA)
+                pref[prev_action] = 1.0
+                # Convert to a simple soft policy
+                tau = 5.0  # fixed sharpness for stickiness policy
+                stickiness_probs = np.exp(tau * (pref - np.max(pref)))
+                stickiness_probs /= np.sum(stickiness_probs)
+            p_stick = stickiness_probs[a]
+
+            # Arbitration: WM weight increases with current surprise
+            wm_w_eff = np.clip(wm_weight_base * np.clip(surprise[s], 0.0, 1.0), 0.0, 1.0)
+            # Stickiness weight reduced by set size
+            stick_w_eff = np.clip(stickiness_weight * stickiness_scale, 0.0, 1.0)
+            # Combine three policies (normalize weights)
+            # First combine RL and WM, then mix with stickiness
+            p_mix_rw = wm_w_eff * p_wm + (1.0 - wm_w_eff) * p_rl
+            p_total = (1.0 - stick_w_eff) * p_mix_rw + stick_w_eff * p_stick
+
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            q[s, a] += lr * (r - q[s, a])
+
+            # Update surprise (absolute RPE running average)
+            rpe = abs(r - Q_s[a])
+            surprise[s] = (1.0 - surprise_rate) * surprise[s] + surprise_rate * rpe
+            surprise[s] = np.clip(surprise[s], 0.0, 1.0)
+
+            # WM update: plasticity tied to surprise_rate
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - surprise_rate) * w[s, :] + surprise_rate * one_hot
+            else:
+                # Leak toward uniform when unrewarded
+                leak = surprise_rate * 0.5
+                w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+            prev_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,300 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Entropy-gated arbitration between RL and WM with load-biased gating and load-dependent WM decay.
+
+    Overview:
+    - RL: tabular Q-learning with a single learning rate and softmax action selection.
+    - WM: fast, reward-gated encoding updated via a delta rule and decays toward uniform.
+    - Arbitration: dynamic mixture weight determined by a logistic function of relative reliabilities.
+        Reliabilities are computed from WM entropy and RL value dispersion; a load-bias term shifts the
+        arbitration under higher set size.
+    - Set-size impact:
+        * WM decay increases with set size.
+        * Arbitration is biased away from WM as set size increases via 'load_bias'.
+
+    Parameters (model_parameters):
+    - lr: float in [0,1], RL learning rate.
+    - softmax_beta: float >= 0, RL inverse temperature; internally scaled by 10.
+    - alpha_wm: float in [0,1], WM learning rate used when reward is positive (one-shot-like).
+    - wm_decay_base: float in [0,1], base WM decay toward uniform per-trial. Effective decay increases with set size:
+        decay_eff = 1 - (1 - wm_decay_base) ** (nS/3).
+    - arb_beta: float >= 0, inverse temperature of the arbitration (sensitivity to reliability difference).
+    - load_bias: float (can be +/-), additive bias to arbitration in larger set sizes:
+        bias_term = load_bias * ((nS - 3) / 3). Positive values bias toward RL under high load.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, alpha_wm, wm_decay_base, arb_beta, load_bias = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Load-dependent WM decay
+        decay_eff = 1.0 - (1.0 - wm_decay_base) ** (float(nS) / 3.0)
+        # Load-dependent arbitration bias term
+        bias_term = load_bias * ((float(nS) - 3.0) / 3.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy (with softmax)
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax over WM row
+            W_s = w[s, :]
+            W_centered = W_s - np.max(W_s)
+            exp_W = np.exp(softmax_beta_wm * W_centered)
+            p_wm = exp_W[a] / np.sum(exp_W)
+
+            # Compute reliabilities
+            # WM reliability from entropy (lower entropy => higher reliability)
+            wm_probs = W_s / np.sum(W_s) if np.sum(W_s) > 0 else w_0[s, :]
+            H = -np.sum(wm_probs * np.log(np.maximum(wm_probs, 1e-12)))
+            H_max = np.log(nA)
+            rel_wm = 1.0 - (H / H_max)
+
+            # RL reliability from value dispersion (normalized)
+            # Use standard deviation normalized by its maximum possible range [0,1]
+            rel_rl = np.std(Q_s)
+
+            # Arbitration weight via logistic function with load bias
+            mix = 1.0 / (1.0 + np.exp(-arb_beta * (rel_wm - rel_rl + bias_term)))
+
+            p_total = mix * p_wm + (1.0 - mix) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform
+            w[s, :] = (1.0 - decay_eff) * w[s, :] + decay_eff * w_0[s, :]
+
+            # WM encoding on rewarded trials
+            if r > 0.0:
+                w[s, :] *= (1.0 - alpha_wm)
+                w[s, a] += alpha_wm
+                # Normalize row to prevent drift
+                row_sum = np.sum(w[s, :])
+                if row_sum > 0:
+                    w[s, :] /= row_sum
+                else:
+                    w[s, :] = w_0[s, :].copy()
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with load-amplified exploration bonus + WM with reward-triggered encoding.
+
+    Overview:
+    - RL: tabular Q-learning with softmax choice, augmented by an intrinsic exploration bonus
+      that prioritizes less-tried actions within a state; the bonus is stronger at larger set sizes.
+    - WM: deterministic retrieval policy; one-shot-like update on rewards; slow drift toward uniform.
+    - Arbitration: fixed mixture weight between WM and RL policies.
+    - Set-size impact:
+        * Exploration bonus increases with set size, promoting exploration under high load.
+
+    Parameters (model_parameters):
+    - lr: float in [0,1], RL learning rate.
+    - wm_weight: float in [0,1], fixed mixture weight for WM policy.
+    - softmax_beta: float >= 0, RL inverse temperature; internally scaled by 10.
+    - explore_bonus: float >= 0, base magnitude of intrinsic exploration bonus added to RL values.
+    - explore_load_gain: float >= 0, multiplicative gain on the exploration bonus with set size:
+        bonus_scale = 1 + explore_load_gain * ((nS - 3) / 3).
+    - wm_learn: float in [0,1], WM encoding strength on rewarded trials.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, explore_bonus, explore_load_gain, wm_learn = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Visit counts per state-action for exploration bonus
+        N = np.zeros((nS, nA))
+        bonus_scale = 1.0 + explore_load_gain * ((float(nS) - 3.0) / 3.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Intrinsic exploration bonus (decreases with visits within the state)
+            bonus_vec = explore_bonus * bonus_scale / np.sqrt(N[s, :] + 1.0)
+
+            # RL policy with exploration bonus
+            Q_s_eff = q[s, :] + bonus_vec
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s_eff - Q_s_eff[a])))
+
+            # WM policy from current WM weights
+            W_s = w[s, :]
+            W_centered = W_s - np.max(W_s)
+            exp_W = np.exp(softmax_beta_wm * W_centered)
+            p_wm = exp_W[a] / np.sum(exp_W)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM: mild decay toward uniform each trial
+            decay = 0.05  # small constant decay to prevent runaway; not a free parameter
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+            # WM encoding on reward
+            if r > 0.0:
+                w[s, :] *= (1.0 - wm_learn)
+                w[s, a] += wm_learn
+                row_sum = np.sum(w[s, :])
+                if row_sum > 0:
+                    w[s, :] /= row_sum
+                else:
+                    w[s, :] = w_0[s, :].copy()
+
+            # Update counts
+            N[s, a] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    Set-size-specific RL learning rates + WM retrieval noise that increases with load.
+
+    Overview:
+    - RL: tabular Q-learning with separate learning rates for small vs. large set size blocks.
+    - WM: near-deterministic retrieval, but subject to load-dependent retrieval noise implemented
+      as mixing the WM map with a uniform distribution before choice.
+    - Arbitration: fixed WM mixture weight across loads.
+    - Set-size impact:
+        * RL learns with lr_small when nS=3 and lr_large when nS=6.
+        * WM retrieval noise increases with set size via noise_load_gain.
+
+    Parameters (model_parameters):
+    - lr_small: float in [0,1], RL learning rate for small set size blocks (nS=3).
+    - lr_large: float in [0,1], RL learning rate for large set size blocks (nS=6).
+    - wm_weight: float in [0,1], fixed mixture weight for WM policy.
+    - softmax_beta: float >= 0, RL inverse temperature; internally scaled by 10.
+    - wm_noise_base: float in [0,1], baseline WM retrieval noise mixing with uniform at nS=3.
+    - noise_load_gain: float >= 0, multiplicative gain on WM noise with set size:
+        eta = clip(wm_noise_base * (1 + noise_load_gain * ((nS - 3) / 3)), 0, 0.99).
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr_small, lr_large, wm_weight, softmax_beta, wm_noise_base, noise_load_gain = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Choose RL learning rate by set size
+        lr = lr_small if nS <= 3 else lr_large
+
+        # Load-dependent WM retrieval noise
+        eta = wm_noise_base * (1.0 + noise_load_gain * ((float(nS) - 3.0) / 3.0))
+        eta = float(np.clip(eta, 0.0, 0.99))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy with retrieval noise: smooth toward uniform before softmax
+            W_s = w[s, :]
+            W_noisy = (1.0 - eta) * W_s + eta * w_0[s, :]
+            W_centered = W_noisy - np.max(W_noisy)
+            exp_W = np.exp(softmax_beta_wm * W_centered)
+            p_wm = exp_W[a] / np.sum(exp_W)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM simple encode on rewarded trials and mild decay
+            decay = 0.05
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+            if r > 0.0:
+                # Use encoding strength tied to noise complement so that noisier WM encodes less strongly
+                enc = max(1e-6, 1.0 - wm_noise_base)
+                w[s, :] *= (1.0 - enc)
+                w[s, a] += enc
+                row_sum = np.sum(w[s, :])
+                if row_sum > 0:
+                    w[s, :] /= row_sum
+                else:
+                    w[s, :] = w_0[s, :].copy()
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

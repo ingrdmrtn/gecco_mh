@@ -1,0 +1,304 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-weighted arbitration and load-driven cross-talk decay.
+
+    Idea
+    - RL learns Q-values with a single learning rate and softmax.
+    - WM stores a categorical distribution over actions per state.
+    - The WM contribution to choice is adapted by the WM state's entropy: more confident WM
+      (low entropy) gets higher weight. This arbitration is scaled by a baseline wm_weight.
+    - Load (set size) imposes cross-talk that pulls WM toward the uniform distribution,
+      stronger at larger set sizes (nS=6 vs 3).
+    - WM updates are graded: rewards push toward the chosen action (one-hot); non-rewards
+      push slightly away (toward a uniform "anti-one-hot").
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, cross_talk, wm_step)
+        - lr: RL learning rate in [0,1]
+        - wm_weight: baseline WM contribution in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled x10
+        - cross_talk: strength of load-induced WM decay toward uniform (>=0)
+        - wm_step: WM update step size (0..1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, cross_talk, wm_step = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Cross-talk decay per step increases with set size above 3
+        load_scale = max(0, nS - 3)
+        decay_rate = np.clip(cross_talk * load_scale, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy (softmax in "ratio" form)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            # Entropy-weighted arbitration: lower entropy => higher WM contribution
+            p_safe = np.clip(W_s, 1e-12, 1.0)
+            ent = -np.sum(p_safe * np.log(p_safe)) / np.log(nA)  # normalized 0..1
+            wm_weight_t = np.clip(wm_weight * (1.0 - ent), 0.0, 1.0)
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # Load-driven cross-talk decay toward uniform for current state's WM
+            w[s, :] = (1.0 - decay_rate) * w[s, :] + decay_rate * (1.0 / nA)
+
+            # WM update: reward => move toward one-hot; no-reward => mild push to "anti"
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            if r > 0.0:
+                w[s, :] = (1.0 - wm_step) * w[s, :] + wm_step * onehot
+            else:
+                anti = (1.0 - onehot) / (nA - 1)
+                w[s, :] = (1.0 - 0.5 * wm_step) * w[s, :] + 0.5 * wm_step * anti
+
+            # Normalize and floor
+            w[s, :] = np.clip(w[s, :], 1e-9, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning and WM with reward-gated encoding and load-scaled forgetting.
+
+    Idea
+    - RL uses separate learning rates for rewards vs non-rewards.
+    - WM encodes only after rewards (win-encoding), while non-rewards cause decay toward
+      uniform. Forgetting gets stronger as set size increases.
+    - Arbitration is fixed by wm_weight, but WM becomes less informative under load due
+      to stronger forgetting.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    model_parameters : tuple
+        (alpha_pos, alpha_neg, softmax_beta, wm_weight, forget_slope, wm_refresh)
+        - alpha_pos: RL learning rate for rewards in [0,1]
+        - alpha_neg: RL learning rate for non-rewards in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled x10
+        - wm_weight: mixture weight of WM in [0,1]
+        - forget_slope: scales WM decay with load (>=0). Effective decay = forget_slope*(nS-3)
+        - wm_refresh: WM strengthening step on rewards (0..1)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    alpha_pos, alpha_neg, softmax_beta, wm_weight, forget_slope, wm_refresh = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-scaled forgetting toward uniform
+        decay = np.clip(forget_slope * max(0, nS - 3), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            if r > 0.0:
+                q[s][a] += alpha_pos * (1.0 - Q_s[a])
+            else:
+                q[s][a] += alpha_neg * (0.0 - Q_s[a])
+
+            # WM forgetting toward uniform (load-scaled)
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * (1.0 / nA)
+
+            # WM reward-gated encoding
+            if r > 0.0:
+                onehot = np.zeros(nA)
+                onehot[a] = 1.0
+                w[s, :] = (1.0 - wm_refresh) * w[s, :] + wm_refresh * onehot
+
+            # Normalize and floor
+            w[s, :] = np.clip(w[s, :], 1e-9, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with leak and WM with load-biased prior on action 0.
+
+    Idea
+    - RL learns Q-values but suffers a small leak (toward 0) that grows with load, capturing
+      difficulty maintaining value estimates under high set size.
+    - WM stores action distributions per state and is updated with its own learning rate.
+    - WM policy is computed after mixing WM state with a load-biased prior that favors a
+      default action (here action 0) under high load, simulating a heuristic bias.
+    - Arbitration uses a baseline wm_weight.
+
+    Parameters
+    ----------
+    states : array-like of int
+    actions : array-like of int
+    rewards : array-like of {0,1}
+    blocks : array-like of int
+    set_sizes : array-like of int
+    model_parameters : tuple
+        (lr, wm_weight, softmax_beta, load_bias_strength, wm_alpha, rl_leak)
+        - lr: RL learning rate in [0,1]
+        - wm_weight: mixture weight for WM in [0,1]
+        - softmax_beta: RL inverse temperature (>0); internally scaled x10
+        - load_bias_strength: scales bias toward action 0 as set size increases (>=0)
+        - wm_alpha: WM learning rate (0..1)
+        - rl_leak: RL leak toward zero value, amplified by load (>=0)
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices.
+    """
+    lr, wm_weight, softmax_beta, load_bias_strength, wm_alpha, rl_leak = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Construct load-biased prior over actions (favor action 0 under higher load)
+        load_level = max(0, nS - 3)
+        bias_strength = np.clip(load_bias_strength * load_level, 0.0, 1.0)
+        prior = np.ones(nA) * ((1.0 - bias_strength) / (nA - 1))
+        prior[0] = bias_strength  # mass on action 0
+        prior = np.clip(prior, 1e-9, None)
+        prior /= np.sum(prior)
+
+        # RL leak factor per trial
+        leak_factor = np.clip(rl_leak * load_level, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # Apply RL leak toward zero
+            q[s, :] = (1.0 - leak_factor) * q[s, :]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Bias WM policy by mixing with prior (load-dependent heuristic)
+            W_biased = 0.5 * W_s + 0.5 * prior
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_biased - W_biased[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update with its own learning rate
+            onehot = np.zeros(nA)
+            onehot[a] = 1.0
+            target = r * onehot + (1.0 - r) * (1.0 / nA)
+            w[s, :] = (1.0 - wm_alpha) * w[s, :] + wm_alpha * target
+
+            # Normalize WM
+            w[s, :] = np.clip(w[s, :], 1e-9, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

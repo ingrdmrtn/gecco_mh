@@ -1,0 +1,306 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with surprise-gated WM writing and age- and load-dependent gating threshold.
+
+    Mechanism:
+    - RL: single learning rate with softmax choice.
+    - WM: near-deterministic softmax over a fast trace (w). WM writing is gated by signed surprise:
+      if reward occurs and the absolute RL prediction error exceeds a threshold, the chosen action
+      is written strongly into WM; otherwise WM gently decays toward uniform.
+    - Arbitration: fixed base WM weight scaled down by set size; total policy is a mixture of WM and RL.
+    - Age: older adults have a higher effective gating threshold (harder to write into WM).
+
+    Parameters (6):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_weight_base: baseline WM mixture weight at set size 3 (0..1).
+    - gate_threshold: base PE magnitude threshold to write into WM when rewarded (>=0).
+    - gate_gain: additional threshold per unit load beyond 3 (>=0), i.e., increases with set size.
+    - age_gate_shift: additive increase of threshold for older adults (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, softmax_beta, wm_weight_base, gate_threshold, gate_gain, age_gate_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic WM readout
+    age_group = 0 if age[0] <= 45 else 1
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM mixture weight diminishes with load
+        wm_weight_eff = wm_weight_base * (3.0 / nS)
+        wm_weight_eff = float(np.clip(wm_weight_eff, 0.0, 1.0))
+
+        # Effective gating threshold includes load and age
+        gate_thr_eff = gate_threshold + gate_gain * max(nS - 3, 0) + age_gate_shift * age_group
+        gate_thr_eff = float(max(gate_thr_eff, 0.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            # RL policy
+            logits_rl = softmax_beta * (Q_s - np.max(Q_s))
+            exp_rl = np.exp(logits_rl)
+            pi_rl = exp_rl / np.sum(exp_rl)
+            p_rl = float(np.clip(pi_rl[a], eps, 1.0))
+
+            # WM policy
+            W_s = w[s, :]
+            logits_wm = softmax_beta_wm * (W_s - np.max(W_s))
+            exp_wm = np.exp(logits_wm)
+            pi_wm = exp_wm / np.sum(exp_wm)
+            p_wm = float(np.clip(pi_wm[a], eps, 1.0))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: surprise-gated write on reward; otherwise gentle decay
+            if r > 0.5 and abs(pe) >= gate_thr_eff:
+                # Write chosen action strongly
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+                # Small stabilization toward uniform to avoid numerical lock
+                w[s, :] = 0.98 * w[s, :] + 0.02 * w_0[s, :]
+            else:
+                # Gentle decay toward uniform; faster decay under higher load
+                decay = 0.05 + 0.05 * max(nS - 3, 0)
+                decay = float(np.clip(decay, 0.0, 0.5))
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with choice stickiness (state-based) and WM volatility rising with load and age.
+
+    Mechanism:
+    - RL: single learning rate; softmax includes a stickiness bias favoring repeating the last action
+      taken in the same state. The strength of stickiness is modulated by age.
+    - WM: fast, decodable trace with load- and age-dependent volatility (leak toward uniform).
+    - Arbitration: baseline WM weight scaled down by load.
+
+    Parameters (6):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_weight_base: baseline WM mixture weight at set size 3 (0..1).
+    - stickiness: base stickiness coefficient added to RL logits for repeating last action (>=0).
+    - wm_volatility: base WM leak rate per trial at set size 3 (0..1).
+    - age_stick_mult: multiplicative factor on stickiness for older adults (>=0; 0 means no age effect).
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr, softmax_beta, wm_weight_base, stickiness, wm_volatility, age_stick_mult = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Track last action per state for stickiness (initialize as -1 = none)
+        last_action = -1 * np.ones(nS, dtype=int)
+
+        # Effective parameters by load/age
+        wm_weight_eff = wm_weight_base * (3.0 / nS)
+        wm_weight_eff = float(np.clip(wm_weight_eff, 0.0, 1.0))
+
+        stick_eff = stickiness * (1.0 + age_stick_mult * age_group)
+
+        # WM volatility increases with load and age
+        wm_vol_eff = wm_volatility * (nS / 3.0) * (1.0 + 0.5 * age_group)
+        wm_vol_eff = float(np.clip(wm_vol_eff, 0.0, 0.9))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy with stickiness bias for repeating last state-specific action
+            Q_s = q[s, :].copy()
+            logits_rl = softmax_beta * (Q_s - np.max(Q_s))
+
+            if last_action[s] >= 0:
+                logits_rl[last_action[s]] += stick_eff
+
+            exp_rl = np.exp(logits_rl)
+            pi_rl = exp_rl / np.sum(exp_rl)
+            p_rl = float(np.clip(pi_rl[a], eps, 1.0))
+
+            # WM policy
+            W_s = w[s, :]
+            logits_wm = softmax_beta_wm * (W_s - np.max(W_s))
+            exp_wm = np.exp(logits_wm)
+            pi_wm = exp_wm / np.sum(exp_wm)
+            p_wm = float(np.clip(pi_wm[a], eps, 1.0))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update: partial write on reward; continual volatility/leak each trial
+            if r > 0.5:
+                # Move toward one-hot on chosen action
+                write_strength = 0.8  # strong write
+                w[s, :] = (1.0 - write_strength) * w[s, :]  # shrink others
+                w[s, a] += write_strength
+                # Renormalize to a distribution
+                w[s, :] = np.clip(w[s, :], 0.0, None)
+                w[s, :] = w[s, :] / np.sum(w[s, :])
+            # Leak toward uniform every trial, scaled by volatility
+            w[s, :] = (1.0 - wm_vol_eff) * w[s, :] + wm_vol_eff * w_0[s, :]
+
+            # Update last action for stickiness
+            last_action[s] = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RLWM with load- and age-modulated learning rate and capacity-limited WM arbitration.
+
+    Mechanism:
+    - RL: learning rate decreases with set size and with age (meta-learning of caution under load).
+    - WM: capacity-limited contribution; effective WM mixture weight scales with K/nS where K is a
+      capacity parameter penalized by age. WM trace writes on reward and decays slightly otherwise.
+    - Arbitration: mixture of WM and RL policies weighted by effective WM capacity.
+
+    Parameters (6):
+    - lr_base: base RL learning rate at set size 3 for young (0..1).
+    - lr_load_penalty: multiplicative penalty on RL learning per extra item beyond 3 (>=0).
+    - softmax_beta: RL inverse temperature (scaled by 10 internally).
+    - wm_weight_base: baseline WM weight scaling factor (0..1).
+    - wm_capacity_K: nominal WM capacity K in items (0..6).
+    - age_K_shift: reduction of effective K for older adults (>=0).
+
+    Returns:
+    - Negative log-likelihood of observed choices under the model.
+    """
+    lr_base, lr_load_penalty, softmax_beta, wm_weight_base, wm_capacity_K, age_K_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    age_group = 0 if age[0] <= 45 else 1
+
+    eps = 1e-12
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask].astype(int)
+        block_rewards = rewards[block_mask].astype(float)
+        block_states = states[block_mask].astype(int)
+        block_set_sizes = set_sizes[block_mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective RL learning rate decreases with load and age
+        lr_eff = lr_base / (1.0 + lr_load_penalty * max(nS - 3, 0))
+        lr_eff *= (1.0 - 0.2 * age_group)  # older -> smaller lr
+        lr_eff = float(np.clip(lr_eff, 0.0, 1.0))
+
+        # Capacity-limited WM weight
+        K_eff = wm_capacity_K - age_K_shift * age_group
+        K_eff = float(np.clip(K_eff, 0.0, 6.0))
+        if nS > 0:
+            wm_weight_eff = wm_weight_base * min(1.0, K_eff / nS)
+        else:
+            wm_weight_eff = 0.0
+        wm_weight_eff = float(np.clip(wm_weight_eff, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            logits_rl = softmax_beta * (Q_s - np.max(Q_s))
+            exp_rl = np.exp(logits_rl)
+            pi_rl = exp_rl / np.sum(exp_rl)
+            p_rl = float(np.clip(pi_rl[a], eps, 1.0))
+
+            # WM policy
+            W_s = w[s, :]
+            logits_wm = softmax_beta_wm * (W_s - np.max(W_s))
+            exp_wm = np.exp(logits_wm)
+            pi_wm = exp_wm / np.sum(exp_wm)
+            p_wm = float(np.clip(pi_wm[a], eps, 1.0))
+
+            # Mixture
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            log_p += np.log(max(p_total, eps))
+
+            # RL update with effective lr
+            pe = r - q[s, a]
+            q[s, a] += lr_eff * pe
+
+            # WM update: write on reward, light decay otherwise; slightly more decay under higher load
+            if r > 0.5:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+                # small smoothing to avoid singularities
+                w[s, :] = 0.99 * w[s, :] + 0.01 * w_0[s, :]
+            else:
+                decay = 0.05 + 0.02 * max(nS - 3, 0)
+                w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,308 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with uncertainty-gated WM and capacity pressure.
+    
+    Idea:
+    - Choices are a mixture of model-free RL and a WM map over state-action values.
+    - WM engagement is higher when RL is uncertain for a state (estimated by PE variance),
+      and lower when set size is large (capacity pressure).
+    - WM rapidly encodes rewarded action preferences and globally decays toward uniform.
+    - Younger adults rely more on WM than older adults (age-dependent scaling).
+    
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1]
+    - wm_base: base WM mixture weight in [0,1]
+    - softmax_beta: RL inverse temperature (>0); internally scaled by 10
+    - wm_learn: WM learning rate toward one-hot following reward in [0,1]
+    - wm_forget: global WM decay toward uniform baseline in [0,1]
+    - gate_unc_slope: slope of sigmoid gating based on RL uncertainty (positive increases sensitivity)
+    
+    Returns:
+    - Negative log-likelihood of observed actions under the model.
+    """
+    lr, wm_base, softmax_beta, wm_learn, wm_forget, gate_unc_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # near-deterministic WM policy
+    
+    age_group = 0 if age[0] <= 45 else 1
+    # Age factor: older adults reduced WM reliance
+    age_factor = 1.0 if age_group == 0 else 0.75
+    
+    eps = 1e-12
+    blocks_log_p = 0.0
+    
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+        
+        nA = 3
+        nS = int(block_set_sizes[0])
+        
+        # RL and WM value tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        
+        # RL uncertainty proxy per state: exponential moving avg of squared PEs
+        u = 0.25 * np.ones(nS)  # initialize moderate uncertainty
+        # Set-size pressure: reduce WM base weight when nS is large
+        size_pressure = min(1.0, 3.5 / float(nS))  # = ~1 for nS=3, <1 for nS=6
+        wm_weight_block = np.clip(wm_base * size_pressure * age_factor, 0.0, 1.0)
+        
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            
+            Q_s = q[s, :]
+            # RL choice probability of action a via softmax trick
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            
+            # WM state policy
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            
+            # Uncertainty-gated WM engagement for this state (higher uncertainty -> more WM)
+            # Gate = sigmoid(gate_unc_slope * (u_thresh - u[s]))
+            u_thresh = 0.20
+            gate = 1.0 / (1.0 + np.exp(-gate_unc_slope * (u_thresh - u[s])))
+            wm_weight_eff = np.clip(wm_weight_block * gate, 0.0, 1.0)
+            
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+            
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] = q[s, a] + lr * delta
+            # Update uncertainty with PE^2
+            u[s] = (1.0 - wm_learn) * u[s] + wm_learn * (delta ** 2)
+            
+            # WM global decay toward baseline
+            w = (1.0 - wm_forget) * w + wm_forget * w_0
+            # WM learning: reward-driven sharpening toward chosen action
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * one_hot
+            else:
+                # On negative feedback, softly flatten toward baseline for chosen action
+                w[s, a] = (1.0 - 0.5 * wm_learn) * w[s, a] + 0.5 * wm_learn * (1.0 / nA)
+        
+        blocks_log_p += log_p
+    
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with perseveration + episodic WM recall with recency decay.
+    
+    Idea:
+    - RL drives value learning and exploration; add within-state perseveration toward most recent choice.
+    - An episodic WM store encodes the last rewarded action for each state (one-shot).
+    - WM recall probability decays with time since last reward for that state, drops with set size, and is reduced for older adults.
+    - Choices are a mixture of RL policy and WM recall policy, weighted by recall probability.
+    
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1]
+    - beta_base: RL inverse temperature base (>0); internally scaled by 10
+    - persev_tau: perseveration bonus added to the most recent action in a state (>=0)
+    - recall_base: base probability to recall episodic WM (0..1)
+    - decay_rate: rate of recall decay per trial since last rewarded memory (>=0)
+    - setsize_slope: slope controlling how recall drops with larger set sizes (>=0)
+    
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, beta_base, persev_tau, recall_base, decay_rate, setsize_slope = model_parameters
+    softmax_beta = beta_base * 10.0
+    softmax_beta_wm = 50.0
+    
+    age_group = 0 if age[0] <= 45 else 1
+    # Age factor on recall decay and base recall: older decay faster and have lower base recall
+    decay_age_mult = 1.0 if age_group == 0 else 1.3
+    base_age_mult = 1.0 if age_group == 0 else 0.8
+    
+    eps = 1e-12
+    blocks_log_p = 0.0
+    
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+        
+        nA = 3
+        nS = int(block_set_sizes[0])
+        
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # episodic store as a probability vector per state
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        
+        # Track last chosen action per state for perseveration (+1 indices; -1 means none)
+        last_act = -1 * np.ones(nS, dtype=int)
+        # Track time since last rewarded memory per state
+        since_store = 1.0 * np.ones(nS)  # start at 1 so recall not maximal at first
+        
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            
+            # RL with perseveration bias on last chosen action in this state
+            Q_s = q[s, :].copy()
+            if last_act[s] >= 0:
+                Q_s[last_act[s]] = Q_s[last_act[s]] + persev_tau
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            
+            # WM policy from episodic store (near-deterministic)
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            
+            # Recall probability: base * recency decay * set-size drop, with age modulation
+            # Recency decay
+            recency = np.exp(-decay_rate * decay_age_mult * since_store[s])
+            # Set-size impact: larger sets reduce recall via logistic transform
+            size_mod = 1.0 / (1.0 + np.exp(setsize_slope * (nS - 3.0)))
+            recall_prob = np.clip(recall_base * base_age_mult * recency * size_mod, 0.0, 1.0)
+            
+            p_total = recall_prob * p_wm + (1.0 - recall_prob) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+            
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] = q[s, a] + lr * delta
+            
+            # Update last action for perseveration
+            last_act[s] = a
+            
+            # Episodic WM update and decay
+            # Global soft decay toward uniform
+            w = 0.995 * w + 0.005 * w_0  # small background drift to avoid saturation
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = one_hot  # one-shot store of last rewarded action
+                since_store[s] = 0.0
+            else:
+                # No new store; increase time since last store for this state
+                since_store[s] += 1.0
+        
+        blocks_log_p += log_p
+    
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    Arbitration between RL and state-wise win-stay/lose-shift WM with recency.
+    
+    Idea:
+    - Two controllers:
+      1) Model-free RL with softmax choice.
+      2) A WM controller implementing a within-state win-stay/lose-shift rule encoded as an action preference vector.
+    - Arbitration weight favors WM when recent reward rate is low (need for flexible control),
+      but decreases with larger set sizes. Younger adults place more weight on WM than older adults.
+    
+    Parameters (model_parameters):
+    - lr: RL learning rate in [0,1]
+    - wm_weight0: base arbitration weight for WM (0..1)
+    - softmax_beta: RL inverse temperature (>0); internally scaled by 10
+    - arb_slope: slope mapping recent reward rate to WM weight (>=0)
+    - recency_lambda: WM recency parameter controlling how strongly outcomes update WM (0..1)
+    - age_bias: multiplicative bias for WM weight: young = (1+age_bias), old = (1-age_bias), clipped to [0,1]
+    
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, wm_weight0, softmax_beta, arb_slope, recency_lambda, age_bias = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    
+    age_group = 0 if age[0] <= 45 else 1
+    # Age modulation of WM weight
+    if age_group == 0:
+        age_mult = 1.0 + max(0.0, age_bias)
+    else:
+        age_mult = max(0.0, 1.0 - max(0.0, age_bias))
+    
+    eps = 1e-12
+    blocks_log_p = 0.0
+    
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+        
+        nA = 3
+        nS = int(block_set_sizes[0])
+        
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM preferences for win-stay/lose-shift
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        
+        # Running recent reward rate for arbitration (per block)
+        v = 0.5  # initialize mid reward rate
+        
+        # Set-size down-weighting of WM
+        size_mult = min(1.0, 3.0 / float(nS))
+        base_wm_weight = np.clip(wm_weight0 * age_mult * size_mult, 0.0, 1.0)
+        
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+            
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            
+            # WM policy: win-stay/lose-shift encoded as action probabilities
+            # If reward, push toward chosen action; else, push away from chosen toward others.
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            
+            # Arbitration based on recent reward rate: lower v -> more WM
+            # wm_weight = base * sigmoid(arb_slope * (0.5 - v))
+            wm_gate = 1.0 / (1.0 + np.exp(-arb_slope * (0.5 - v)))
+            wm_weight_eff = np.clip(base_wm_weight * wm_gate, 0.0, 1.0)
+            
+            p_total = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+            
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] = q[s, a] + lr * delta
+            
+            # Update recent reward rate with RL learning rate as smoothing factor
+            v = (1.0 - lr) * v + lr * r
+            
+            # WM recency update implementing win-stay/lose-shift
+            target = np.ones(nA) * (1.0 / nA)
+            if r > 0.5:
+                target = np.zeros(nA)
+                target[a] = 1.0  # win-stay: prefer chosen action
+            else:
+                # lose-shift: reduce chosen, distribute to others
+                target = np.ones(nA) * (1.0 / (nA - 1))
+                target[a] = 0.0
+            w[s, :] = (1.0 - recency_lambda) * w[s, :] + recency_lambda * target
+            
+            # Light global drift toward uniform to avoid overconfidence when not visited
+            w = 0.999 * w + 0.001 * w_0
+        
+        blocks_log_p += log_p
+    
+    return -blocks_log_p

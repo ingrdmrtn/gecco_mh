@@ -1,0 +1,295 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + episodic-recall WM with capacity-limited gating by set size.
+
+    Idea:
+    - RL: standard delta rule with softmax policy.
+    - WM: stores rewarded state-action associations as a high-precision template.
+      WM policy is computed from W, but its effective precision is controlled by wm_precision_base
+      via mixing with a uniform template (to avoid fully deterministic WM when precision is low).
+    - Mixture: The WM weight is not a fixed parameter. Instead, it's computed as an episodic
+      recall probability based on the ratio of WM slots to the set size (nS). More slots and
+      smaller set sizes increase WM reliance.
+
+    Parameters:
+    - lr: float in [0,1]. RL learning rate for Q-values.
+    - beta_rl: float >= 0. RL inverse temperature; internally scaled by 10.
+    - wm_precision_base: float in [0,1]. Relative precision of WM values; 0 = uniform, 1 = full W.
+    - M_slots: positive float. Effective number of WM slots available for this task.
+    - recall_slope: float >= 0. Controls how sharply WM reliance increases with M_slots/nS.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, wm_precision_base, M_slots, recall_slope = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0  # high precision WM softmax; precision further shaped by wm_precision_base
+    eps = 1e-12
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Initialize RL and WM tables
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Compute block-level WM mixture weight from episodic recall probability
+        # p_recall = sigmoid(recall_slope * (M_slots/nS - 1))
+        p_recall = 1.0 / (1.0 + np.exp(-recall_slope * (M_slots / max(nS, 1e-6) - 1.0)))
+        wm_weight_block = np.clip(p_recall, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            # Blend WM template with uniform to implement wm_precision_base
+            W_s_raw = w[s, :]
+            W_s = (1.0 - wm_precision_base) * w_0[s, :] + wm_precision_base * W_s_raw
+
+            # RL softmax probability of chosen action
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM softmax probability of chosen action
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            wm_weight = wm_weight_block
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            # Tiny stabilization toward uniform (prevents runaway values)
+            q[s, :] = 0.995 * q[s, :] + 0.005 * (1.0 / nA)
+
+            # WM decay toward uniform each trial
+            w = 0.98 * w + 0.02 * w_0
+            # If rewarded, store a strong one-shot memory for the state-action
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Overwrite toward the rewarded action
+                w[s, :] = 0.2 * w[s, :] + 0.8 * one_hot
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + performance-gated WM with load penalty.
+
+    Idea:
+    - RL: standard delta-rule softmax policy.
+    - WM: maintains short-term templates of state-action preferences that are reinforced by reward.
+      WM policy comes from w, and its precision is high (via softmax_beta_wm) but the mixture weight
+      is adapted online.
+    - Mixture: WM weight is dynamically modulated by a running performance estimate (poorer recent
+      performance increases WM reliance) and penalized by set size (larger nS -> less WM).
+
+    Parameters:
+    - lr: float in [0,1]. RL learning rate.
+    - beta_rl: float >= 0. RL inverse temperature; internally scaled by 10.
+    - wm_weight_base: float in (0,1). Baseline WM weight at small set size with neutral performance.
+    - perf_sensitivity: float (real). Controls the EMA rate for recent performance; larger -> faster tracking.
+      Mapped to EMA alpha via sigmoid.
+    - load_slope: float >= 0. Linear penalty on WM weight with larger set sizes.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, wm_weight_base, perf_sensitivity, load_slope = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    # Map sensitivity to EMA alpha in (0,1)
+    ema_alpha = 1.0 / (1.0 + np.exp(-perf_sensitivity))
+    ema_alpha = np.clip(ema_alpha, 1e-3, 0.999)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Initialize running performance estimate at chance (1/nA)
+        perf_est = 1.0 / nA
+        # Precompute base WM weight with load penalty
+        base_logit = np.log(wm_weight_base + 1e-12) - np.log(1.0 - wm_weight_base + 1e-12)
+        load_penalty = load_slope * max(0, nS - 3)
+        base_logit -= load_penalty
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL probability
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM probability
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Performance-adaptive WM gating: worse performance -> higher WM weight
+            # wm_weight = sigmoid(base_logit + k*(0.5 - perf_est))
+            k = 5.0  # fixed gain translating performance gap into logits
+            wm_weight = 1.0 / (1.0 + np.exp(-(base_logit + k * (0.5 - perf_est))))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            q[s, :] = 0.995 * q[s, :] + 0.005 * (1.0 / nA)
+
+            # WM decay and reward-driven refresh
+            w = 0.985 * w + 0.015 * w_0
+            if r > 0:
+                oh = np.zeros(nA)
+                oh[a] = 1.0
+                w[s, :] = 0.3 * w[s, :] + 0.7 * oh
+
+            # Update running performance estimate
+            perf_est = (1.0 - ema_alpha) * perf_est + ema_alpha * r
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with forgetting + error-avoidance WM that is damped by load.
+
+    Idea:
+    - RL: delta rule with softmax and global forgetting toward uniform.
+    - WM: a "lose-avoid" short-term system. After non-reward, WM sets a strong aversive tag
+      on the chosen action for that state, biasing away from repeating it; after reward, WM gently
+      decays toward neutral. Mixture weight is higher after errors but reduced under higher set size.
+
+    Parameters:
+    - lr: float in [0,1]. RL learning rate.
+    - beta_rl: float >= 0. RL inverse temperature; internally scaled by 10.
+    - wm_weight_base: float in (0,1). Baseline WM mixture weight at small set size without error.
+    - avoidance_gain: float >= 0. Magnitude of WM avoidance tag imposed after non-reward.
+    - q_forget: float in [0,1]. Per-trial forgetting toward uniform for Q-values (all states).
+    - load_slope: float >= 0. Reduces WM reliance linearly with set size above 3.
+
+    Returns:
+    - Negative log-likelihood of observed choices.
+    """
+    lr, beta_rl, wm_weight_base, avoidance_gain, q_forget, load_slope = model_parameters
+    softmax_beta = beta_rl * 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    # Helper to get logits and sigmoid
+    def logit(p):
+        p = np.clip(p, 1e-8, 1 - 1e-8)
+        return np.log(p) - np.log(1 - p)
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM starts neutral
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Base WM weight with load penalty
+        base_logit = logit(wm_weight_base) - load_slope * max(0, nS - 3)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(denom_rl, eps)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(denom_wm, eps)
+
+            # Error-contingent WM boost: transiently increase WM after errors
+            error_bonus = (1.0 - r) * 0.25 * np.tanh(avoidance_gain)  # bounded in [0, 0.25)
+            wm_weight = 1.0 / (1.0 + np.exp(-(base_logit))) + error_bonus
+            wm_weight = float(np.clip(wm_weight, 0.0, 1.0))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, eps)
+            log_p += np.log(p_total)
+
+            # RL update with global forgetting toward uniform
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+            q = (1.0 - q_forget) * q + q_forget * (1.0 / nA)
+
+            # WM update: decay toward neutral each trial
+            w = 0.99 * w + 0.01 * w_0
+
+            if r <= 0:
+                # Impose avoidance tag on chosen action for this state
+                # Push probability mass away from the chosen action
+                repel = np.ones(nA) / nA
+                repel[a] = 0.0  # discourage chosen action
+                repel = repel / max(repel.sum(), eps)
+                w[s, :] = (1.0 - np.tanh(avoidance_gain)) * w[s, :] + np.tanh(avoidance_gain) * repel
+            else:
+                # After reward, gently move toward neutral (already handled by decay)
+                pass
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,289 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with load-dependent WM noise and decay.
+
+    Idea:
+    - RL learns Q-values with a single learning rate.
+    - WM stores a (near-deterministic) mapping when rewarded, but both its sharpness and its decay toward uniform worsen
+      as set size (load) increases.
+    - Load transforms WM: larger nS -> lower WM beta (noisier WM policy) and stronger decay toward uniform.
+    - Mixture between RL and WM is fixed (wm_weight0), but WM itself becomes less informative at higher load.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0..1).
+    - wm_weight0: Mixture weight for WM vs RL (0..1).
+    - softmax_beta: Inverse temperature for RL choice (scaled internally by 10).
+    - wm_beta0: Base inverse temperature for WM policy at lowest load; reduced under higher load.
+    - epsilon0: Base WM decay/noise toward uniform at lowest load (0..1).
+    - eta_load: Sensitivity of WM degradation to set size (>=0). Higher -> stronger degradation at larger nS.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight0, softmax_beta, wm_beta0, epsilon0, eta_load = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # not used directly; wm_beta0 determines WM sharpness here
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load transform for WM: compute degradation factor phi in [0,1)
+        # Higher nS -> higher phi -> more decay/noise, lower beta_wm
+        phi = 1.0 - np.exp(-eta_load * max(0.0, float(nS) - 1.0))
+
+        # Effective WM softmax inverse temperature decreases with phi
+        eff_beta_wm = max(1.0, wm_beta0 * (1.0 - 0.8 * phi))
+
+        # Effective WM decay toward uniform increases with phi
+        base_decay = np.clip(epsilon0 + 0.5 * phi, 0.0, 0.99)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(1e-12, denom_rl)
+
+            # WM policy (softmax over WM weights with load-dependent beta)
+            denom_wm = np.sum(np.exp(eff_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight0 * p_wm + (1.0 - wm_weight0) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM decay toward uniform (stronger under higher load)
+            w[s, :] = (1.0 - base_decay) * w[s, :] + base_decay * w_0[s, :]
+
+            # WM imprint on positive feedback: sharpen mapping to chosen action.
+            # Imprint strength reduces with load (via base_decay)
+            imprint = np.clip(1.0 - base_decay, 0.0, 1.0)
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - imprint) * w[s, :] + imprint * one_hot
+
+            # Normalize and stabilize WM row
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with entropy-gated arbitration and WM leak.
+
+    Idea:
+    - RL updates Q-values with a single learning rate.
+    - WM forms a sharp mapping upon reward and otherwise leaks toward uniform with rate wm_leak.
+    - Arbitration weight for WM depends on RL uncertainty at the current state:
+      higher entropy of RL's policy -> rely more on WM (if available).
+    - WM policy temperature is a parameter (wm_temp) to allow non-deterministic WM control.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature (scaled internally by 10).
+    - wm_weight0: Base WM weight (bias term before gating; can be negative/positive).
+    - ent_slope: Sensitivity of WM weight to RL policy entropy (>=0).
+    - wm_leak: Per-visit WM leak toward uniform (0..1).
+    - wm_temp: Inverse temperature for WM policy (>=1 recommended).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, wm_weight0, ent_slope, wm_leak, wm_temp = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # not directly used; wm_temp determines WM sharpness here
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+
+            # RL full policy over actions (for entropy)
+            logits_rl = softmax_beta * (Q_s - np.max(Q_s))
+            exp_rl = np.exp(logits_rl)
+            p_rl_vec = exp_rl / np.sum(exp_rl)
+            p_rl = p_rl_vec[a]
+
+            # RL entropy at state s
+            H_rl = -np.sum(p_rl_vec * np.log(np.maximum(p_rl_vec, 1e-12)))
+            H_max = np.log(nA)
+            H_norm = H_rl / max(1e-12, H_max)  # normalize to [0,1]
+
+            # Entropy-gated WM weight (sigmoid of bias + slope*entropy)
+            wm_weight = 1.0 / (1.0 + np.exp(-(wm_weight0 + ent_slope * (H_norm - 0.5))))
+
+            # WM policy
+            W_s = w[s, :]
+            logits_wm = wm_temp * (W_s - np.max(W_s))
+            exp_wm = np.exp(logits_wm)
+            p_wm_vec = exp_wm / np.sum(exp_wm)
+            p_wm = p_wm_vec[a]
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM leak toward uniform
+            w[s, :] = (1.0 - wm_leak) * w[s, :] + wm_leak * w_0[s, :]
+
+            # WM imprint on positive feedback
+            if r > 0.5:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.0 * w[s, :] + one_hot
+
+            # Normalize/stabilize
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with cross-state interference under load.
+
+    Idea:
+    - RL learns Q-values with a single learning rate.
+    - WM encodes rewarded mappings as one-hot rows, but two kinds of degradation occur:
+        (a) Per-visit leak toward uniform with rate 'leak'.
+        (b) Cross-state interference that blends each state's WM row toward the across-state average, scaled by
+            both an interference parameter 'xi' and set size (more states -> more interference).
+    - WM policy uses its own inverse temperature.
+    - Mixture weight between WM and RL is a fixed parameter.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Mixture weight for WM vs RL (0..1).
+    - softmax_beta: RL inverse temperature (scaled internally by 10).
+    - xi: Strength of cross-state WM interference due to load (>=0).
+    - wm_beta: WM inverse temperature (>=1 recommended).
+    - leak: Per-visit WM leak toward uniform (0..1).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, xi, wm_beta, leak = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # wm_beta is used directly
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Interference strength grows with set size
+        rho = 1.0 - np.exp(-xi * max(0.0, float(nS) - 1.0))  # in [0,1)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            denom_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(1e-12, denom_rl)
+
+            # WM policy
+            denom_wm = np.sum(np.exp(wm_beta * (W_s - W_s[a])))
+            p_wm = 1.0 / max(1e-12, denom_wm)
+
+            # Mixture
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = max(1e-12, min(1.0, p_total))
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM local leak toward uniform at visited state
+            w[s, :] = (1.0 - leak) * w[s, :] + leak * w_0[s, :]
+
+            # WM imprint on reward
+            if r > 0.5:
+                w[s, :] = 0.0
+                w[s, a] = 1.0
+
+            # Cross-state interference: all states blend toward across-state average
+            mean_row = np.mean(w, axis=0)
+            w = (1.0 - rho) * w + rho * mean_row[None, :]
+
+            # Normalize/stabilize each row
+            w = np.maximum(w, 1e-12)
+            w /= np.sum(w, axis=1, keepdims=True)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

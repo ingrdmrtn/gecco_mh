@@ -1,0 +1,287 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + fast-binding WM with interference- and entropy-gated arbitration.
+
+    Overview:
+    - RL system: delta-rule Q-learning with softmax policy.
+    - WM system: a fast-binding associative store W(s,a) that moves toward a one-hot
+      code for the last rewarded action in that state. It decays/interferes with load.
+    - Arbitration: the WM mixture weight is a sigmoid function of WM confidence
+      (lower entropy -> more WM) and is reduced by load-dependent interference.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0..1).
+    - wm_alpha: WM binding strength on rewarded trials; moves W_s toward the chosen action (>=0).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - interference: Load-driven WM interference factor; higher values reduce WM precision as set size increases (>=0).
+    - gate_k: Slope of the entropy-based gating sigmoid (>=0).
+    - gate_tau: Entropy threshold controlling when WM dominates (in nats; between 0 and ln(3)).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_alpha, softmax_beta, interference, gate_k, gate_tau = model_parameters
+    softmax_beta *= 10.0  # beta has a higher upper bound
+    softmax_beta_wm = 50.0  # very deterministic
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM store initialized as uniform preferences
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # baseline prior (used as decay anchor)
+
+        # Precompute load-dependent interference mixing toward the baseline prior
+        # Higher nS -> stronger pull toward w_0, reducing WM distinctiveness
+        inter_eff = 1.0 - np.exp(-interference * max(0, nS - 1))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy from current WM preferences
+            wm_probs = np.maximum(W_s, 1e-12)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            pseudo_W = wm_probs
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (pseudo_W - pseudo_W[a])))
+
+            # Entropy of WM for gating (lower entropy => more confident WM)
+            H = -np.sum(wm_probs * np.log(np.maximum(wm_probs, 1e-12)))
+            # Convert entropy to confidence signal and sigmoid-gate it
+            # gate_tau is the entropy threshold where WM has ~50% weight before interference
+            wm_conf = 1.0 / (1.0 + np.exp(-gate_k * (gate_tau - H)))
+            # Reduce WM weight by load-driven interference
+            wm_weight_t = wm_conf * (1.0 - inter_eff)
+            wm_weight_t = np.clip(wm_weight_t, 0.0, 1.0)
+
+            # Mixture policy and log-likelihood
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update:
+            # 1) Interference decay toward uniform prior w_0 (load-dependent)
+            w[s, :] = (1.0 - inter_eff) * w[s, :] + inter_eff * w_0[s, :]
+
+            # 2) Fast binding toward one-hot for rewarded action
+            if r > 0.0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_alpha) * w[s, :] + wm_alpha * target
+            # Normalize to keep as a probability-like vector
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + recency-gated WM buffer with load-scaled availability.
+
+    Overview:
+    - RL system: delta-rule Q-learning with softmax policy.
+    - WM system: a transient buffer that stores the most recently rewarded action
+      for each state and decays with time since last reinforcement.
+    - Arbitration: mixture weight increases with recency (shorter age -> more WM)
+      and decreases with set size (load). WM policy is near-deterministic over
+      the buffered action.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0..1).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - mix0: Base WM mixture coefficient (0..1) at zero age and minimal load.
+    - decay: Per-trial exponential decay rate of WM availability with age (>=0).
+    - buffer_span: Age scaling factor; larger values prolong WM availability (>=0).
+      Effective WM weight uses exp(-decay * age / max(buffer_span,1e-6)).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, mix0, decay, buffer_span = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        # WM: store a one-hot preference vector and an age per state
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        age = np.full(nS, np.inf)  # age since last rewarded binding
+
+        # Load scaling: larger sets reduce achievable WM weighting
+        load_scale = 3.0 / max(3.0, float(nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy from buffer
+            wm_probs = np.maximum(W_s, 1e-12)
+            wm_probs = wm_probs / np.sum(wm_probs)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_probs - wm_probs[a])))
+
+            # Time-based WM availability
+            effective_span = max(buffer_span, 1e-6)
+            recency = np.exp(-decay * (age[s] if np.isfinite(age[s]) else 1e9) / effective_span)
+            wm_weight_t = np.clip(mix0 * recency * load_scale, 0.0, 1.0)
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update:
+            # Passive drift toward uniform when not recently reinforced
+            w[s, :] = 0.95 * w[s, :] + 0.05 * w_0[s, :]
+            # Age increases each visit unless reset by reward
+            age[:] = age + 1.0
+            if r > 0.0:
+                # Bind: set a sharp one-hot code to the rewarded action and reset age
+                new_pref = np.zeros(nA)
+                new_pref[a] = 1.0
+                w[s, :] = new_pref
+                age[s] = 0.0
+
+            # Keep numerical stability
+            w[s, :] = np.maximum(w[s, :], 1e-12)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Bayesian WM with load-dependent reliability and forgetting.
+
+    Overview:
+    - RL system: delta-rule Q-learning with softmax policy.
+    - WM system: Dirichlet counts per state over actions, updated by reward with
+      a forgetting factor. WM policy uses the posterior mean over actions.
+    - Arbitration: WM mixture weight proportional to its relative precision,
+      reducing with set size (load) and boosted by total concentration.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate for Q-values (0..1).
+    - softmax_beta: Inverse temperature for RL softmax (scaled by 10 internally).
+    - conc0: Initial Dirichlet concentration per action (>0), sets prior strength.
+    - wm_gain: Increment to the chosen action's concentration on each trial weighted by reward (>=0).
+    - forget: Per-trial forgetting/leak of WM concentrations toward the prior (0..1).
+    - load_kappa: Load-induced imprecision scale; larger values reduce WM influence more as nS grows (>=0).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, softmax_beta, conc0, wm_gain, forget, load_kappa = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM Dirichlet concentrations initialized to conc0
+        w = conc0 * np.ones((nS, nA))
+        w_0 = conc0 * np.ones((nS, nA))
+
+        # Load-imposed kappa term
+        kappa = load_kappa * max(0.0, float(nS) - 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+
+            # RL policy
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM posterior mean policy
+            conc = np.maximum(w[s, :], 1e-12)
+            wm_probs = conc / np.sum(conc)
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (wm_probs - wm_probs[a])))
+
+            # Precision-based arbitration:
+            # total concentration as reliability; relative weight vs. kappa + total
+            total_conc = np.sum(conc)
+            wm_weight_t = total_conc / (total_conc + kappa + 1e-12)
+            wm_weight_t = np.clip(wm_weight_t, 0.0, 1.0)
+
+            p_total = wm_weight_t * p_wm + (1.0 - wm_weight_t) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s][a] += lr * delta
+
+            # WM update with forgetting toward prior and reward-weighted increment
+            # Forget: convex combination with prior concentrations
+            w[s, :] = (1.0 - forget) * w[s, :] + forget * w_0[s, :]
+            # Learn: increase chosen concentration by reward-weighted gain
+            if r > 0.0:
+                w[s, a] += wm_gain
+            else:
+                # Weak non-reinforced exposure: tiny diffuse increment to keep counts positive-stable
+                w[s, :] += (wm_gain * 0.01) / nA
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

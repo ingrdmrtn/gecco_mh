@@ -1,0 +1,319 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility traces and WM with set-size-dependent binding noise.
+
+    Policy:
+    - RL: softmax over Q with inverse temperature softmax_beta (scaled by 10).
+    - WM: softmax over W with high determinism (fixed 50).
+    - Arbitration: fixed wm_weight blending WM and RL.
+
+    RL mechanisms:
+    - Standard delta-rule update with learning rate lr.
+    - Eligibility traces within the current state-action: an eligibility matrix e is decayed by
+      lambda_elig each trial and the current (s,a) trace is set to 1. Q is updated by lr * PE * e,
+      allowing fast re-learning when a state repeats soon.
+
+    WM mechanisms:
+    - Reward-dependent strengthening of W toward a one-hot code for the correct action, but with
+      set-size-dependent binding noise: with probability bind_eff the stored action is mistakenly
+      bound to a random alternative action.
+    - No explicit WM decay parameter (kept simple and stable); weights are clipped to [0,1].
+
+    Parameters:
+    - lr: RL learning rate (0..1).
+    - wm_weight: Fixed arbitration weight on WM (0..1).
+    - softmax_beta: RL inverse temperature (rescaled by 10 internally).
+    - lambda_elig: Eligibility trace decay (0..1); higher means longer-lasting traces.
+    - bind_base: Baseline WM binding noise (0..1).
+    - bind_slope: Increase in binding noise from set size 3 to 6.
+
+    Set-size effect:
+    - WM binding noise bind_eff = bind_base + bind_slope * (nS - 3) / 3 increases with set size,
+      making WM less reliable under higher load (6 vs 3).
+    """
+    lr, wm_weight, softmax_beta, lambda_elig, bind_base, bind_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_weight = np.clip(wm_weight, 0.0, 1.0)
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility traces
+
+        bind_eff = np.clip(float(bind_base) + float(bind_slope) * (nS - 3) / 3.0, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            pe = r - Q_s[a]
+            e *= lambda_elig
+            e[s, a] = 1.0
+            q += lr * pe * e
+
+            # WM updating with binding noise on encoding
+            if r > 0.0:
+                # Decide which action is encoded due to binding noise
+                if np.random.rand() < bind_eff:
+                    # bind to a random incorrect action
+                    other_actions = [aa for aa in range(nA) if aa != a]
+                    a_star = np.random.choice(other_actions)
+                else:
+                    a_star = a
+                # Strengthen toward one-hot at a_star
+                w[s, :] = 0.9 * w[s, :]  # mild competition
+                w[s, a_star] += lr * (1.0 - w[s, a_star])
+            else:
+                # On negative feedback, mildly suppress chosen action
+                w[s, a] -= 0.25 * lr * w[s, a]
+
+            w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with asymmetric learning rates and confidence-weighted arbitration; WM decay increases with load.
+
+    Policy:
+    - RL: softmax over Q with inverse temperature softmax_beta_base (scaled by 10).
+    - WM: softmax over W with high determinism (fixed 50).
+    - Arbitration: wm_weight is dynamic via confidence comparison between WM and RL.
+
+    RL mechanisms:
+    - Asymmetric learning rates lr_pos (for rewards) and lr_neg (for non-rewards).
+
+    WM mechanisms:
+    - Decay toward uniform increases with set size (decay_slope term).
+    - Rewarded strengthening for chosen action; mild suppression on negative feedback.
+
+    Arbitration:
+    - Compute confidence as spread = max(value) - mean(value) for each system at state s.
+    - wm_weight_dyn = sigmoid(wm_weight_base + conf_gain * (spread_wm - spread_rl)),
+      blending policies accordingly.
+
+    Parameters:
+    - lr_pos: RL learning rate for positive outcomes (0..1).
+    - lr_neg: RL learning rate for negative outcomes (0..1).
+    - softmax_beta_base: RL inverse temperature base (rescaled by 10 internally).
+    - wm_weight_base: Baseline arbitration bias toward WM (real-valued; passed through sigmoid).
+    - conf_gain: Gain scaling the effect of confidence difference on arbitration.
+    - decay_slope: Increase in WM decay from set size 3 to 6.
+
+    Set-size effect:
+    - WM decay wm_decay = decay0 + decay_slope * (nS - 3) / 3, where decay0 is a small base (0.05).
+      Thus WM becomes leakier under higher load, reducing its influence.
+    """
+    lr_pos, lr_neg, softmax_beta_base, wm_weight_base, conf_gain, decay_slope = model_parameters
+    softmax_beta = softmax_beta_base * 10.0
+    softmax_beta_wm = 50.0
+    blocks_log_p = 0.0
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        decay0 = 0.05
+        wm_decay = np.clip(decay0 + float(decay_slope) * (nS - 3) / 3.0, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # Confidence spreads
+            spread_rl = np.max(Q_s) - np.mean(Q_s)
+            spread_wm = np.max(W_s) - np.mean(W_s)
+
+            wm_weight_dyn = sigmoid(wm_weight_base + conf_gain * (spread_wm - spread_rl))
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight_dyn * p_wm + (1.0 - wm_weight_dyn) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            pe = r - Q_s[a]
+            lr = lr_pos if pe >= 0 else lr_neg
+            q[s, a] += lr * pe
+
+            # WM decay and update
+            w = (1.0 - wm_decay) * w + wm_decay * w_0
+            if r > 0.0:
+                w[s, a] += lr_pos * (1.0 - w[s, a])
+            else:
+                w[s, a] -= 0.25 * lr_neg * w[s, a]
+            w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with load-modulated perseveration and capacity-limited WM cache.
+
+    Policy:
+    - RL: softmax over Q with inverse temperature softmax_beta (scaled by 10), plus an action
+      perseveration bias added to Q when repeating the last action.
+    - WM: softmax over W with high determinism (fixed 50).
+    - Arbitration: wm_weight depends on WM cache hit (if state is stored, higher WM weight).
+
+    RL mechanisms:
+    - Standard delta-rule with learning rate lr.
+    - Perseveration (stickiness) increases with set size: bias(a == last_action) scaled
+      by stickiness_eff = stickiness_slope * (nS - 3) / 3.
+
+    WM mechanisms (capacity-limited cache):
+    - Up to k_cache states can be cached in WM. If s is cached, WM is reliable (higher weight).
+    - On rewarded trials, we encode s into the cache and strengthen its mapping. If cache is full
+      and s is not cached, a new encoding replaces an existing entry with probability wm_replace,
+      otherwise we keep the current cache.
+    - On non-rewarded trials, mild suppression of chosen action.
+
+    Arbitration:
+    - wm_weight_hit = wm_weight_base when s is in cache.
+    - wm_weight_miss = 0.1 * wm_weight_base when s is not in cache.
+
+    Parameters:
+    - lr: RL learning rate (0..1).
+    - softmax_beta: RL inverse temperature (rescaled by 10 internally).
+    - wm_weight_base: Base WM weight used on cache hits (0..1).
+    - k_cache: WM capacity in number of states (positive integer, e.g., 2..4).
+    - wm_replace: Probability to replace an existing cached state when capacity is full (0..1).
+    - stickiness_slope: Increase in perseveration from set size 3 to 6.
+
+    Set-size effect:
+    - Perseveration bias increases with set size via stickiness_slope, making action repetition
+      more likely in the 6-item condition.
+    - WM effectiveness depends on whether the state is within the limited cache; under larger set
+      sizes, cache misses are more likely, reducing WM contribution.
+    """
+    lr, softmax_beta, wm_weight_base, k_cache, wm_replace, stickiness_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    wm_weight_base = np.clip(wm_weight_base, 0.0, 1.0)
+    wm_replace = np.clip(wm_replace, 0.0, 1.0)
+    k_cache = int(np.round(k_cache))
+    blocks_log_p = 0.0
+
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask].astype(int)
+        block_rewards = rewards[mask].astype(float)
+        block_states = states[mask].astype(int)
+        block_set_sizes = set_sizes[mask].astype(int)
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        cache = set()  # states stored in WM
+        last_action = None
+        stickiness_eff = max(0.0, float(stickiness_slope) * (nS - 3) / 3.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = block_actions[t]
+            s = block_states[t]
+            r = block_rewards[t]
+
+            Q_s = q[s, :].copy()
+            # Add perseveration bias to the RL values
+            if last_action is not None and 0 <= last_action < nA:
+                Q_s[last_action] += stickiness_eff
+
+            # Determine arbitration weight based on WM cache membership
+            hit = (s in cache)
+            wm_weight = wm_weight_base if hit else 0.1 * wm_weight_base
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            W_s = w[s, :]
+            p_wm = 1.0 / np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - q[s, a]
+            q[s, a] += lr * pe
+
+            # WM update and caching
+            if r > 0.0:
+                # Ensure s is cached if capacity allows or replacement triggers
+                if s not in cache:
+                    if len(cache) < max(0, k_cache):
+                        cache.add(s)
+                    else:
+                        if np.random.rand() < wm_replace and len(cache) > 0:
+                            # Replace a random cached state
+                            victim = np.random.choice(list(cache))
+                            cache.remove(victim)
+                            cache.add(s)
+                # Strengthen WM mapping
+                w[s, :] = 0.9 * w[s, :]
+                w[s, a] += lr * (1.0 - w[s, a])
+            else:
+                # On negative feedback, mild suppression
+                w[s, a] -= 0.25 * lr * w[s, a]
+
+            w[s, :] = np.clip(w[s, :], 0.0, 1.0)
+
+            last_action = a
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,360 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with surprise-gated arbitration and set-size-dependent WM leak.
+
+    Mechanism
+    - RL: delta-rule with separate learning rates for positive/negative prediction errors.
+    - WM: state-specific cached distribution over actions that sharpens on rewarded actions
+      and leaks toward uniform with a leak that grows with set size.
+    - Arbitration: mixture weight of WM is down-regulated by surprise (|PE|) and by set size.
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr_pos: float in [0,1]
+            Learning rate for positive RL prediction errors (rewarded outcomes).
+        - lr_neg: float in [0,1]
+            Learning rate for negative RL prediction errors (non-rewarded outcomes).
+        - wm_weight0: float in [0,1]
+            Baseline weight of the WM policy in the mixture before gating.
+        - softmax_beta: float
+            Inverse temperature for the RL softmax (scaled by 10 internally).
+        - pe_slope: float >= 0
+            Slope controlling how strongly surprise (|PE|) suppresses WM weight.
+        - wm_leak: float in [0,1]
+            Baseline WM leak toward uniform per trial; scaled up with set size.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of observed choices under the model.
+    """
+    lr_pos, lr_neg, wm_weight0, softmax_beta, pe_slope, wm_leak = model_parameters
+    softmax_beta *= 10  # beta has a higher upper bound
+    softmax_beta_wm = 50  # very deterministic
+    blocks_log_p = 0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        w = (1 / nA) * np.ones((nS, nA))
+        w_0 = (1 / nA) * np.ones((nS, nA))
+
+        # Set-size dependent leak amplification: larger sets -> more leak
+        leak_eff = np.clip(wm_leak * (nS / 3.0), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL policy: direct prob of chosen action via logit trick
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: softmax over WM distribution (very sharp)
+            prefs_wm = W_s - np.mean(W_s)
+            p_wm_vec = np.exp(np.clip(softmax_beta_wm * prefs_wm, -50, 50))
+            p_wm_vec /= max(np.sum(p_wm_vec), eps)
+            p_wm = p_wm_vec[a]
+
+            # Compute PE and surprise gating for arbitration
+            pe = r - Q_s[a]
+            surprise = abs(pe)
+            # Down-weight WM with surprise and with set size
+            set_penalty = 1.0 / (1.0 + (nS - 3) if nS > 3 else 1.0)
+            wm_weight = wm_weight0 * set_penalty * (1.0 / (1.0 + pe_slope * surprise))
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with asymmetric learning rates
+            lr = lr_pos if pe >= 0 else lr_neg
+            q[s, a] += lr * pe
+
+            # WM leak toward uniform (interference increases with set size)
+            w[s, :] = (1.0 - leak_eff) * w[s, :] + leak_eff * w_0[s, :]
+
+            # WM strengthening on rewarded action; slight weakening on non-reward
+            if r > 0:
+                # Move distribution toward one-hot on chosen action
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = 0.5 * w[s, :] + 0.5 * target
+            else:
+                # Nudge away from chosen action toward uniform
+                w[s, a] = 0.5 * w[s, a] + 0.5 * (1.0 / nA)
+                others = [i for i in range(nA) if i != a]
+                mass_rest = 1.0 - w[s, a]
+                w_rest = np.array([w[s, i] for i in others])
+                if w_rest.sum() > 0:
+                    w_rest = w_rest / w_rest.sum() * mass_rest
+                    for idx, i in enumerate(others):
+                        w[s, i] = w_rest[idx]
+
+            # Normalize WM row
+            w[s, :] = np.clip(w[s, :], eps, None)
+            w[s, :] /= np.sum(w[s, :])
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with eligibility trace + Capacity-limited WM (slots) and size-dependent exploration.
+
+    Mechanism
+    - RL: delta-rule with eligibility trace lambda to carry PE to last chosen action in state.
+    - WM: capacity-limited cache stores up to K states; inside cache, deterministic policy from last rewarded action.
+          Outside cache, WM is effectively uniform. Cache updated on rewards; interference when cache is full.
+    - Exploration: an epsilon that grows with set size dilutes both RL and WM policies toward uniform.
+    - Mixture: WM and RL are mixed by wm_weight.
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr: float in [0,1]
+            RL learning rate.
+        - wm_weight: float in [0,1]
+            Mixture weight of WM policy.
+        - softmax_beta: float
+            Inverse temperature for RL softmax (scaled internally by 10).
+        - trace_lambda: float in [0,1]
+            Eligibility trace parameter controlling stickiness of recent RL updates within state.
+        - K_slots: float >= 0
+            Effective WM capacity (number of states that can be cached). Fractional allowed, rounded internally.
+        - epsilon_slope: float >= 0
+            Slope controlling how exploration to uniform increases with set size.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta, trace_lambda, K_slots, epsilon_slope = model_parameters
+    softmax_beta *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+        # Eligibility traces per state-action
+        e = np.zeros((nS, nA))
+
+        # WM cache: for each state, store "known action" index or -1 if unknown
+        cached_action = -np.ones(nS, dtype=int)
+        cache_order = []  # recency list for eviction
+        K = int(np.clip(np.round(K_slots), 0, nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy: if state cached, choose cached action deterministically; else uniform
+            if cached_action[s] >= 0:
+                wm_pref = np.zeros(nA)
+                wm_pref[cached_action[s]] = 1.0
+                prefs_centered = wm_pref - np.mean(wm_pref)
+                p_wm_vec = np.exp(np.clip(softmax_beta_wm * prefs_centered, -50, 50))
+                p_wm_vec /= max(np.sum(p_wm_vec), eps)
+            else:
+                p_wm_vec = np.ones(nA) / nA
+            p_wm = p_wm_vec[a]
+
+            # Size-dependent exploration epsilon (dilute both policies)
+            epsilon = np.clip(epsilon_slope * (nS - 3) / max(1, 3), 0.0, 1.0)
+
+            # Mix WM and RL, then add epsilon-uniform
+            p_mix = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = (1.0 - epsilon) * p_mix + epsilon * (1.0 / nA)
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces within the same state
+            pe = r - Q_s[a]
+
+            # Decay traces
+            e *= trace_lambda
+            # Assign trace 1 to the chosen (s,a)
+            e[s, :] *= 0.0
+            e[s, a] = 1.0
+
+            # Update Q for current state using traces (here traces only within state row)
+            q[s, :] += lr * pe * e[s, :]
+
+            # WM cache update: on reward, store mapping; manage capacity by LRU
+            if r > 0:
+                if cached_action[s] != a:
+                    cached_action[s] = a
+                    # Update recency
+                    if s in cache_order:
+                        cache_order.remove(s)
+                    cache_order.append(s)
+                    # Evict if over capacity
+                    if K < len(cache_order):
+                        # Evict least-recently updated state
+                        s_evict = cache_order.pop(0)
+                        cached_action[s_evict] = -1
+                else:
+                    # Refresh recency
+                    if s in cache_order:
+                        cache_order.remove(s)
+                    cache_order.append(s)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL with uncertainty-adaptive temperature + WM associative counts with set-size misbinding.
+
+    Mechanism
+    - RL: delta-rule; inverse temperature is adapted by state-wise uncertainty (variance proxy).
+      Higher uncertainty -> lower beta; certainty -> higher beta. Starts from softmax_beta0 and increases with certainty.
+    - WM: per-state Dirichlet-like counts over actions (associative memory).
+      Positive outcomes increment the chosen action's count; non-rewards increment all actions slightly.
+      Misbinding noise proportional to set size spreads a fraction of counts to other states.
+    - Mixture: WM and RL are mixed via wm_weight.
+
+    Parameters
+    ----------
+    model_parameters: tuple
+        - lr: float in [0,1]
+            RL learning rate.
+        - wm_weight: float in [0,1]
+            Mixture weight of WM policy.
+        - softmax_beta0: float
+            Baseline inverse temperature for RL softmax (scaled internally by 10).
+        - beta_gain: float >= 0
+            Gain controlling how much certainty increases RL inverse temperature.
+        - misbind_rate: float in [0,1]
+            Fraction of WM update that is misbound (leaked) to other states, scaled by set size.
+        - wm_lr: float in [0,1]
+            Step size for WM count updates toward observed outcomes.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood of the observed choices under the model.
+    """
+    lr, wm_weight, softmax_beta0, beta_gain, misbind_rate, wm_lr = model_parameters
+    softmax_beta0 *= 10
+    softmax_beta_wm = 50
+    blocks_log_p = 0.0
+    eps = 1e-12
+
+    for b in np.unique(blocks):
+        block_mask = (blocks == b)
+        block_actions = actions[block_mask]
+        block_rewards = rewards[block_mask]
+        block_states = states[block_mask]
+        block_set_sizes = set_sizes[block_mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1 / nA) * np.ones((nS, nA))
+
+        # WM associative counts; initialize with symmetric prior (1)
+        counts = np.ones((nS, nA))
+
+        # RL uncertainty proxy: running variance of Q-values per state (simple scalar)
+        # Start moderately uncertain
+        uncert = np.ones(nS)  # higher -> more uncertain
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+
+            # Adapt RL inverse temperature by certainty = 1/(1+uncert)
+            certainty = 1.0 / (1.0 + uncert[s])
+            softmax_beta = softmax_beta0 * (1.0 + beta_gain * certainty)
+
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy from associative counts (Dirichlet mean)
+            wm_probs = counts[s, :] / max(np.sum(counts[s, :]), eps)
+            prefs_wm = wm_probs - np.mean(wm_probs)
+            p_wm_vec = np.exp(np.clip(softmax_beta_wm * prefs_wm, -50, 50))
+            p_wm_vec /= max(np.sum(p_wm_vec), eps)
+            p_wm = p_wm_vec[a]
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, eps, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # Update uncertainty proxy: decrease with PE-consistent learning
+            uncert[s] = np.clip(0.9 * uncert[s] + 0.1 * (pe ** 2), 0.0, 10.0)
+
+            # WM update with misbinding proportional to set size
+            # Effective misbinding fraction increases with nS
+            leak = np.clip(misbind_rate * ((nS - 1) / max(1, nS)), 0.0, 1.0)
+            on_target = 1.0 - leak
+
+            # Construct target increment for the current state
+            incr = np.zeros(nA)
+            if r > 0:
+                incr[a] = 1.0
+            else:
+                incr += 0.2  # weak increment for all after non-reward
+
+            # Apply to current state
+            counts[s, :] = (1.0 - wm_lr) * counts[s, :] + wm_lr * ((counts[s, :] + on_target * incr))
+
+            # Misbind a fraction to other states (spread uniformly)
+            if leak > 0 and nS > 1:
+                spread = (wm_lr * leak) * incr
+                if spread.sum() > 0:
+                    per_state = spread / (nS - 1)
+                    for s2 in range(nS):
+                        if s2 == s:
+                            continue
+                        counts[s2, :] += per_state
+
+            # Keep counts positive and bounded
+            counts = np.clip(counts, 1e-6, 1e6)
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

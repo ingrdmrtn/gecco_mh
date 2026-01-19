@@ -1,0 +1,293 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with eligibility traces + WM certainty arbitration with age- and load-dependent gate.
+
+    Idea
+    - RL: Q-learning with eligibility traces so that recent choices receive a share of credit.
+    - WM: near-deterministic lookup that stores rewarded mappings; subject to decay.
+    - Arbitration: weight on WM grows with WM certainty (spread of W_s), but is penalized by set size load
+      and shifted by age. Older adults assumed to rely less on WM (negative age shift).
+
+    Parameters
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature (internally scaled by 10)
+    - lambda_et: eligibility trace decay (0..1), higher = longer credit assignment
+    - wm_decay: decay toward uniform for the active state’s WM row per trial (0..1)
+    - wm_conf_base: baseline logit for WM reliance
+    - age_conf_shift: additive logit shift applied if age_group=1 (older); typically negative
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, lambda_et, wm_decay, wm_conf_base, age_conf_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        e = np.zeros((nS, nA))  # eligibility trace
+
+        load_penalty = (nS - 3) / 3.0  # 0 for set size 3, 1 for set size 6
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            Z_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(Z_rl, 1e-12)
+
+            # WM policy
+            W_s = w[s, :]
+            Z_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(Z_wm, 1e-12)
+
+            # Arbitration: certainty of WM = max minus mean (0..~1)
+            wm_certainty = float(np.max(W_s) - np.mean(W_s))
+            wm_logit = wm_conf_base + 3.0 * (wm_certainty - 1.0 / 3.0) - 1.0 * load_penalty + (age_conf_shift if age_group == 1 else 0.0)
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update with eligibility traces
+            pe = r - Q_s[a]
+            e *= lambda_et
+            e[s, a] = 1.0
+            q += lr * pe * e
+
+            # WM decay for the active state
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+            # WM encoding: rewarded associations are written strongly; non-reward yields weak regression to uniform
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Move W_s toward one-hot
+                w[s, :] = 0.5 * w[s, :] + 0.5 * one_hot
+            else:
+                # Mild uncertainty increase if wrong
+                w[s, :] = 0.9 * w[s, :] + 0.1 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM recall and load-dependent lapse.
+
+    Idea
+    - RL: standard Q-learning.
+    - WM: stores last rewarded mapping per state in a near-deterministic table.
+      Arbitration is based on a capacity-limited recall probability p_recall = min(1, K_eff / set_size).
+      K_eff depends on age (older adults have smaller effective capacity).
+    - Lapse: a load-dependent lapse diverts some probability mass to uniform random choice.
+
+    Parameters
+    - lr: RL learning rate (0..1)
+    - softmax_beta: RL inverse temperature (scaled by 10)
+    - K_base: base capacity logit; transformed to K_eff via sigmoid and linear scaling
+    - age_K_shift: additive shift on K_base for older adults (negative reduces capacity)
+    - lapse_base: base lapse logit
+    - ss_lapse_slope: increase in lapse with set size (positive increases lapse for size=6)
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr, softmax_beta, K_base, age_K_shift, lapse_base, ss_lapse_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Effective WM capacity in slots in [1, 6], age-modulated
+        cap_logit = K_base + (age_K_shift if age_group == 1 else 0.0)
+        cap_frac = 1.0 / (1.0 + np.exp(-cap_logit))  # 0..1
+        K_eff = 1.0 + 5.0 * cap_frac  # map to [1,6]
+
+        # Load-dependent lapse (probability of uniform random)
+        load = (nS - 3) / 3.0  # 0 or 1
+        lapse_logit = lapse_base + ss_lapse_slope * load
+        lapse = 1.0 / (1.0 + np.exp(-lapse_logit))
+        lapse = np.clip(lapse, 0.0, 0.5)  # keep reasonable
+
+        # Recall probability from capacity
+        p_recall = min(1.0, K_eff / float(nS))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            Z_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(Z_rl, 1e-12)
+
+            # WM near-deterministic policy from table
+            W_s = w[s, :]
+            Z_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(Z_wm, 1e-12)
+
+            # Mixture with lapse
+            p_mix = p_recall * p_wm + (1.0 - p_recall) * p_rl
+            p_total = (1.0 - lapse) * p_mix + lapse * (1.0 / nA)
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: write on reward, overwrite current state
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.7 * w[s, :] + 0.3 * one_hot
+            else:
+                # Slight drift to uncertainty if not rewarded
+                w[s, :] = 0.95 * w[s, :] + 0.05 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with age-modulated learning rate and meta-learned temperature + WM gate by familiarity and load.
+
+    Idea
+    - RL: Q-learning with learning rate adjusted by age; choice temperature adapts to recent reward rate
+      (more reward -> higher beta/exploitation).
+    - WM: stores successful associations; WM weight increases with state familiarity (visit count),
+      but decreases with load (set size). Base gate parameter controls bias toward WM.
+    - Arbitration: convex combination of WM and RL policies.
+
+    Parameters
+    - lr_base: base RL learning-rate logit
+    - age_lr_mod: additive shift on lr_base if older (negative -> older learn more slowly)
+    - beta_base: base inverse-temperature (applied via exp to keep positive)
+    - beta_meta_rate: how strongly running reward average scales beta
+    - wm_weight_base: base WM gate logit
+    - ss_gate_slope: penalty on WM gate per unit load (0 for 3, 1 for 6)
+
+    Returns
+    - Negative log-likelihood of observed choices.
+    """
+    lr_base, age_lr_mod, beta_base, beta_meta_rate, wm_weight_base, ss_gate_slope = model_parameters
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        idx = (blocks == b)
+        block_actions = actions[idx]
+        block_rewards = rewards[idx]
+        block_states = states[idx]
+        block_set_sizes = set_sizes[idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        # Age-modulated learning rate (sigmoid to 0..1)
+        lr_logit = lr_base + (age_lr_mod if age_group == 1 else 0.0)
+        lr = 1.0 / (1.0 + np.exp(-lr_logit))
+
+        # Running reward average for meta-temperature
+        rr = 0.5  # initialize mid
+        rr_alpha = 0.2  # fixed smoothing inside model (not a free parameter)
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        visits = np.zeros(nS)
+
+        load = (nS - 3) / 3.0
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL temperature adapts with reward rate
+            softmax_beta = np.exp(beta_base + beta_meta_rate * (rr - 0.5)) * 10.0
+
+            # RL policy
+            Q_s = q[s, :]
+            Z_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / max(Z_rl, 1e-12)
+
+            # WM policy
+            W_s = w[s, :]
+            Z_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / max(Z_wm, 1e-12)
+
+            # WM gate by familiarity (more visits -> heavier WM)
+            fam = visits[s] / max(1.0, np.max(visits) + 1.0)  # normalized familiarity 0..~1
+            wm_logit = wm_weight_base + 2.0 * (fam - 0.5) - ss_gate_slope * load
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+
+            # Mixture policy
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: write on reward; otherwise small drift to uncertainty
+            if r > 0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = 0.6 * w[s, :] + 0.4 * one_hot
+            else:
+                w[s, :] = 0.97 * w[s, :] + 0.03 * w_0[s, :]
+
+            # Update reward rate and familiarity
+            rr = (1.0 - rr_alpha) * rr + rr_alpha * r
+            visits[s] += 1.0
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,309 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with error-gated WM encoding and load-dependent WM decay.
+
+    Idea:
+    - RL: standard Q-learning.
+    - WM: decaying action table that is selectively updated (encoded) when recent prediction errors are large
+      and reward is positive (error-gated encoding). Encoding propensity is modulated by age and set size.
+    - Arbitration: on each trial, the mixture weight for WM equals the WM "confidence" for that state
+      (the maximum entry of the WM row), so that WM dominates when it is sharp.
+
+    Parameters
+    - lr: RL learning rate in [0,1]
+    - softmax_beta: inverse temperature for RL (scaled internally by 10 for a wide range)
+    - wm_encode_base: base bias for WM encoding probability (logit space)
+    - encode_pe_slope: slope on unsigned prediction error to gate WM encoding (larger PE => more encoding)
+    - wm_decay: base WM decay rate toward uniform per trial in [0,1]
+    - age_encode_shift: age modulation of encoding bias; positive => boosts WM encoding in young, reduces in old
+
+    Age use:
+    - Encoding logit is shifted by +age_encode_shift for young and -age_encode_shift for old.
+
+    Set-size use:
+    - WM decay increases with set size: effective_decay = 1 - (1 - wm_decay) / (1 + (nS - 3)).
+      Thus larger sets decay faster.
+    """
+    lr, softmax_beta, wm_encode_base, encode_pe_slope, wm_decay, age_encode_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    age_term = age_encode_shift if age_group == 0 else -age_encode_shift
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+        # store a running unsigned PE per state to gate encoding
+        upe = np.zeros(nS)
+
+        # load-dependent decay: more decay when set size is larger
+        eff_decay = 1.0 - (1.0 - wm_decay) / (1.0 + max(0, nS - 3))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL policy
+            Q_s = q[s, :]
+            Z_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / Z_rl
+
+            # WM policy (deterministic softmax on w)
+            W_s = w[s, :]
+            Z_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / Z_wm
+
+            # Arbitration by WM confidence (how peaked WM is for this state)
+            wm_conf = np.max(W_s)
+            wm_weight = np.clip(wm_conf, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # Update unsigned PE trace for this state (re-using lr as a smoothing rate)
+            upe[s] = (1.0 - lr) * upe[s] + lr * abs(delta)
+
+            # WM decay toward uniform (load-dependent)
+            w[s, :] = (1.0 - eff_decay) * w[s, :] + eff_decay * w_0[s, :]
+
+            # WM encoding: probability increases with unsigned PE and is modulated by age
+            enc_logit = wm_encode_base + encode_pe_slope * upe[s] + age_term
+            p_encode = 1.0 / (1.0 + np.exp(-enc_logit))
+
+            if r > 0:
+                if np.random.uniform() < p_encode:
+                    # strong encoding of the rewarded action
+                    w[s, :] = w_0[s, :]
+                    w[s, a] = 1.0
+                else:
+                    # partial update even if not fully encoded
+                    w[s, a] = 0.5 * w[s, a] + 0.5
+                    # renormalize softly
+                    w[s, :] = w[s, :] / np.sum(w[s, :])
+            else:
+                # with negative outcome, gently drift toward uniform with a small extra push on chosen action
+                w[s, a] = 0.5 * w[s, a] + 0.5 * w_0[s, a]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with entropy-based arbitration and age- and load-sensitive WM usage.
+
+    Idea:
+    - RL: standard Q-learning, softmax policy.
+    - WM: fast, high-temperature table with decay toward uniform and perfect encoding on reward.
+    - Arbitration: compute policy entropies for RL and WM. If WM is more certain (lower entropy) than RL,
+      increase WM weight. WM usage is further down-weighted by larger set sizes and for older adults.
+
+    Parameters
+    - lr: RL learning rate in [0,1]
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - wm_decay: WM decay rate toward uniform per trial in [0,1]
+    - wm_weight_base: base logit for WM usage (sigmoid-transformed)
+    - entropy_slope: positive slope on (H_rl - H_wm); higher => more WM when WM is sharper than RL
+      Also used (with negative sign) to penalize WM usage with larger set sizes.
+    - age_entropy_shift: additive shift in WM usage logit by age (positive => boosts WM for young, reduces for old)
+
+    Age use:
+    - WM usage logit shifted by +age_entropy_shift for young, -age_entropy_shift for old.
+
+    Set-size use:
+    - WM usage logit penalized by abs(entropy_slope)*(nS - 3), reducing WM reliance for larger sets.
+    """
+    lr, softmax_beta, wm_decay, wm_weight_base, entropy_slope, age_entropy_shift = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+    age_term = age_entropy_shift if age_group == 0 else -age_entropy_shift
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # RL softmax policy vector and chosen prob
+            Q_s = q[s, :]
+            pref_rl = np.exp(softmax_beta * (Q_s - np.max(Q_s)))
+            pi_rl = pref_rl / np.sum(pref_rl)
+            p_rl = pi_rl[a]
+
+            # WM softmax policy vector and chosen prob
+            W_s = w[s, :]
+            pref_wm = np.exp(softmax_beta_wm * (W_s - np.max(W_s)))
+            pi_wm = pref_wm / np.sum(pref_wm)
+            p_wm = pi_wm[a]
+
+            # Entropies
+            H_rl = -np.sum(pi_rl * np.log(np.clip(pi_rl, 1e-12, 1.0)))
+            H_wm = -np.sum(pi_wm * np.log(np.clip(pi_wm, 1e-12, 1.0)))
+
+            # WM usage logit: base + entropy advantage - load penalty + age shift
+            load_penalty = np.abs(entropy_slope) * (nS - 3)
+            wm_logit = wm_weight_base + entropy_slope * (H_rl - H_wm) - load_penalty + age_term
+            wm_weight = 1.0 / (1.0 + np.exp(-wm_logit))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM decay and encoding
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+            if r > 0:
+                # perfect encoding on rewarded outcomes
+                w[s, :] = w_0[s, :]
+                w[s, a] = 1.0
+            else:
+                # mild push toward uniform for the chosen action
+                w[s, a] = 0.5 * w[s, a] + 0.5 * w_0[s, a]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM with confidence-based arbitration and RL forgetting that scales with set size and age.
+
+    Idea:
+    - RL: Q-learning with forgetting (drift toward uniform), where the forgetting rate increases with larger set sizes
+      and for older adults.
+    - WM: fast-learning memory with its own learning rate.
+    - Arbitration: WM weight is a sigmoid of WM confidence (max probability in WM for that state).
+
+    Parameters
+    - lr: RL learning rate in [0,1]
+    - softmax_beta: RL inverse temperature (scaled by 10 internally)
+    - wm_lr: WM learning rate controlling how strongly WM moves toward its target on each update
+    - k_conf: slope controlling how strongly WM confidence controls mixture (higher => more WM when confident)
+    - forget_base: base logit controlling RL forgetting (sigmoid-transformed)
+    - forget_set_age_slope: slope on (set size - 3 + age_group) in the forgetting logit
+
+    Age use:
+    - RL forgetting increases with age_group via the forgetting logit.
+
+    Set-size use:
+    - RL forgetting increases with (nS - 3) via the forgetting logit, making RL less stable in larger sets.
+    """
+    lr, softmax_beta, wm_lr, k_conf, forget_base, forget_set_age_slope = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        block_idx = (blocks == b)
+        block_actions = actions[block_idx]
+        block_rewards = rewards[block_idx]
+        block_states = states[block_idx]
+        block_set_sizes = set_sizes[block_idx]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # RL forgetting parameter for this block
+        forget_logit = forget_base + forget_set_age_slope * ((nS - 3) + age_group)
+        rl_forget = 1.0 / (1.0 + np.exp(-forget_logit))
+        rl_forget = np.clip(rl_forget, 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+
+            # Apply RL forgetting toward uniform before choosing
+            q[s, :] = (1.0 - rl_forget) * q[s, :] + rl_forget * (1.0 / nA)
+
+            # RL policy
+            Q_s = q[s, :]
+            Z_rl = np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+            p_rl = 1.0 / Z_rl
+
+            # WM policy
+            W_s = w[s, :]
+            Z_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / Z_wm
+
+            # Arbitration by WM confidence
+            wm_conf = np.max(W_s) - (1.0 / nA)
+            wm_weight = 1.0 / (1.0 + np.exp(-k_conf * wm_conf))
+            wm_weight = np.clip(wm_weight, 0.0, 1.0)
+
+            p_total = wm_weight * p_wm + (1.0 - wm_weight) * p_rl
+            p_total = np.clip(p_total, 1e-12, 1.0)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - q[s, a]
+            q[s, a] += lr * delta
+
+            # WM update (gradient step toward target distribution)
+            # Target: if rewarded, one-hot on chosen action; else, halfway to uniform on chosen action
+            target = w[s, :].copy()
+            if r > 0:
+                target[:] = w_0[s, :]
+                target[a] = 1.0
+            else:
+                target[:] = w[s, :]
+                target[a] = 0.5 * target[a] + 0.5 * w_0[s, a]
+            w[s, :] = (1.0 - wm_lr) * w[s, :] + wm_lr * target
+
+            # Normalize WM row to keep it a proper distribution
+            row_sum = np.sum(w[s, :])
+            if row_sum > 0:
+                w[s, :] = w[s, :] / row_sum
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

@@ -1,0 +1,333 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with uncertainty-gated arbitration and power-law load effect.
+
+    Idea:
+    - RL updates state-action values via delta rule.
+    - WM stores one-shot associations and drives a near-deterministic policy.
+    - Arbitration weight on WM increases with RL uncertainty (entropy of RL policy),
+      but decreases with set size via a power-law availability term.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight_base: Baseline WM mixture weight (0..1) before gating.
+    - softmax_beta: Inverse temperature for RL policy (scaled internally by 10).
+    - wm_load_exponent: Power-law exponent controlling the decline of WM availability with set size (>0).
+                        Availability ~ nS^(-wm_load_exponent).
+    - rl_unc_temp: Slope of the sigmoid mapping RL policy entropy (uncertainty) to WM gating (>0).
+    - wm_write_gain: Controls how strongly rewarded outcomes write into WM rows (>0).
+                     Higher -> faster convergence to one-hot on rewarded action.
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight_base, softmax_beta, wm_load_exponent, rl_unc_temp, wm_write_gain = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic WM policy
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Power-law WM availability with set size (bounded to [0,1])
+        wm_avail = (nS ** (-wm_load_exponent)) if wm_load_exponent > 0 else 1.0
+        wm_avail = float(np.clip(wm_avail, 0.0, 1.0))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL choice prob for chosen action (given by template form)
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # Compute RL policy entropy to gate WM: higher entropy -> more WM
+            logits = softmax_beta * (Q_s - np.max(Q_s))
+            pi_rl = np.exp(logits)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            entropy = -np.sum(pi_rl * (np.log(pi_rl + 1e-12)))
+            entropy_norm = entropy / np.log(nA)  # in [0,1]
+
+            # Uncertainty-to-WM gating via sigmoid centered at 0.5
+            wm_unc_gate = 1.0 / (1.0 + np.exp(-rl_unc_temp * (entropy_norm - 0.5)))
+
+            # WM policy for chosen action
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm if denom_wm > 0 else 1.0 / nA
+
+            # Effective WM weight combines baseline, availability, and uncertainty gate
+            wm_weight_eff = wm_weight_base * wm_avail * wm_unc_gate
+
+            p_total = p_wm * wm_weight_eff + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update:
+            # - On reward: strong write toward one-hot with gain depending on current confidence gap
+            # - On no reward: mild decay back to uniform, stronger when WM availability is low
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                # Write rate gates by how far current policy is from one-hot on chosen action
+                write_gap = 1.0 - W_s[a]
+                write_rate = 1.0 / (1.0 + np.exp(-wm_write_gain * (write_gap - 0.5)))
+                w[s, :] = (1.0 - write_rate) * w[s, :] + write_rate * one_hot
+            else:
+                decay_rate = (1.0 - wm_avail) * 0.5
+                w[s, :] = (1.0 - decay_rate) * w[s, :] + decay_rate * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + WM with limited slots (buffer) and LRU-biased eviction.
+
+    Idea:
+    - RL learns via delta rule as usual.
+    - WM is a discrete buffer that can store up to K state-action mappings.
+      If a state is stored, WM contributes strongly; if not, RL dominates.
+    - Storage is triggered by reward with a threshold; when full, the model
+      evicts an item using a mix of LRU and random eviction.
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Mixture weight when the current state is stored in WM (0..1).
+    - softmax_beta: Inverse temperature for RL policy (scaled internally by 10).
+    - slots_k: Effective WM slots (can be non-integer; fractional part gives a chance to hold an extra item).
+    - store_thresh: Storage threshold (0..1). On reward, store if W_s[a] < store_thresh (more likely when low).
+                    Used via a probabilistic logistic gate around this threshold.
+    - evict_randomness: Mix between LRU and random for eviction (0: pure LRU, 1: pure random).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, slots_k, store_thresh, evict_randomness = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # deterministic when stored
+
+    blocks_log_p = 0.0
+    rng = np.random.RandomState(0)  # deterministic pseudo-randomness for eviction tie-breaks
+
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # WM buffer bookkeeping
+        stored = np.zeros(nS, dtype=bool)
+        last_used_time = -1 * np.ones(nS, dtype=int)  # for LRU
+        time_counter = 0
+
+        # Determine effective capacity: floor plus possible extra slot with probability = fractional part
+        K_floor = int(np.floor(max(0.0, slots_k)))
+        frac = float(np.clip(slots_k - K_floor, 0.0, 1.0))
+        extra_slot_active = (frac > 0.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+            time_counter += 1
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL choice prob for chosen action
+            p_rl = 1.0 / np.sum(np.exp(softmax_beta * (Q_s - Q_s[a])))
+
+            # WM policy and effective weight only if state is stored
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm if denom_wm > 0 else 1.0 / nA
+
+            wm_weight_eff = wm_weight if stored[s] else 0.0
+
+            p_total = p_wm * wm_weight_eff + (1.0 - wm_weight_eff) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: encode on reward based on threshold gate; decay lightly otherwise
+            if r > 0.0:
+                # Probabilistic gate around the threshold: lower W_s[a] -> more likely to (re)store
+                gate = 1.0 / (1.0 + np.exp(10.0 * (W_s[a] - store_thresh)))  # steep around threshold
+                # We cannot sample in likelihood; instead, use the expectation as a write-rate
+                write_rate = gate
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - write_rate) * w[s, :] + write_rate * one_hot
+
+                # Manage buffer membership deterministically using gate as strength
+                # If not stored, attempt to store; if stored, refresh usage
+                if not stored[s]:
+                    # Check current capacity usage
+                    cap = K_floor
+                    if extra_slot_active:
+                        # expected extra slot usage proportional to fractional part
+                        cap += frac
+                    # Determine expected occupancy (sum of stored booleans)
+                    occupancy = np.sum(stored).astype(float)
+                    need_slot = 1.0 if occupancy + write_rate > cap else 0.0
+
+                    if occupancy < cap or need_slot == 0.0:
+                        stored[s] = True
+                        last_used_time[s] = time_counter
+                    else:
+                        # Evict one: mix LRU and random
+                        candidates = np.where(stored)[0]
+                        if candidates.size > 0:
+                            if evict_randomness <= 0.0:
+                                # Pure LRU
+                                evict_idx = candidates[np.argmin(last_used_time[candidates])]
+                            elif evict_randomness >= 1.0:
+                                evict_idx = candidates[rng.randint(0, candidates.size)]
+                            else:
+                                # Mix: with prob p random, else LRU; use expectation by weighted argmin index
+                                # We approximate by choosing LRU but slightly biasing by recency scores
+                                ages = time_counter - last_used_time[candidates]
+                                # Combine ages with small random-like tie-break using indices
+                                scores = (1.0 - evict_randomness) * ages + evict_randomness * (1.0 + candidates - np.min(candidates))
+                                evict_idx = candidates[np.argmax(scores)]  # largest score -> evict
+                            stored[evict_idx] = False
+                            stored[s] = True
+                            last_used_time[s] = time_counter
+                else:
+                    last_used_time[s] = time_counter
+            else:
+                # Light decay toward uniform for the active state
+                w[s, :] = 0.95 * w[s, :] + 0.05 * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, model_parameters):
+    """
+    RL + Surprise-driven WM encoding and load-sensitive decision noise.
+
+    Idea:
+    - RL uses delta rule to learn Q.
+    - WM stores associations more when surprise (absolute prediction error) is high.
+    - WM traces decay over time, with stronger decay under higher load (larger set size).
+    - RL choice temperature becomes noisier with increasing set size (load-sensitive beta scaling).
+
+    Parameters (model_parameters):
+    - lr: RL learning rate (0..1).
+    - wm_weight: Mixture weight for WM contribution (0..1).
+    - softmax_beta: Baseline inverse temperature for RL (scaled internally by 10, then adjusted by load).
+    - surprise_sensitivity: Slope of sigmoid mapping |PE| to WM write rate (>0).
+    - wm_decay_rate: Base WM decay rate per update (0..1), scaled up with set size.
+    - beta_load_slope: Degree to which RL inverse temperature declines with set size (>0 reduces beta as load increases).
+
+    Returns:
+    - Negative log-likelihood of the observed choices.
+    """
+    lr, wm_weight, softmax_beta, surprise_sensitivity, wm_decay_rate, beta_load_slope = model_parameters
+
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0  # very deterministic WM
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+
+        block_actions = actions[blocks == b]
+        block_rewards = rewards[blocks == b]
+        block_states = states[blocks == b]
+        block_set_sizes = set_sizes[blocks == b]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        # Load-dependent scaling
+        load_factor = max(0.0, (nS - 3.0) / 3.0)  # 0 at nS=3, 1 at nS=6
+        beta_eff = softmax_beta / (1.0 + beta_load_slope * load_factor)
+        wm_decay_eff = np.clip(wm_decay_rate * (1.0 + load_factor), 0.0, 1.0)
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = float(block_rewards[t])
+
+            Q_s = q[s, :]
+            W_s = w[s, :]
+
+            # RL choice prob for chosen action using load-adjusted beta
+            p_rl = 1.0 / np.sum(np.exp(beta_eff * (Q_s - Q_s[a])))
+
+            # WM policy for chosen action
+            denom_wm = np.sum(np.exp(softmax_beta_wm * (W_s - W_s[a])))
+            p_wm = 1.0 / denom_wm if denom_wm > 0 else 1.0 / nA
+
+            p_total = p_wm * wm_weight + (1.0 - wm_weight) * p_rl
+            p_total = max(p_total, 1e-12)
+            log_p += np.log(p_total)
+
+            # RL update
+            pe = r - Q_s[a]
+            q[s, a] += lr * pe
+
+            # WM update: surprise-driven write + load-dependent decay
+            # Write rate increases with |PE|
+            write_rate = 1.0 / (1.0 + np.exp(-surprise_sensitivity * (abs(pe) - 0.5)))
+            if r > 0.0:
+                one_hot = np.zeros(nA)
+                one_hot[a] = 1.0
+                w[s, :] = (1.0 - write_rate) * w[s, :] + write_rate * one_hot
+            else:
+                # Even without reward, allow small adjustments based on surprise to discourage repeated errors
+                anti_hot = np.ones(nA) / nA
+                anti_hot[a] = 0.0  # reduce weight on the chosen wrong action
+                anti_hot = anti_hot / np.sum(anti_hot)
+                w[s, :] = (1.0 - 0.5 * write_rate) * w[s, :] + 0.5 * write_rate * anti_hot
+
+            # Global decay toward uniform for the current state, stronger under load
+            w[s, :] = (1.0 - wm_decay_eff) * w[s, :] + wm_decay_eff * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

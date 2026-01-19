@@ -1,0 +1,299 @@
+def cognitive_model1(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + capacity-limited WM mixture with age- and load-dependent lapse.
+
+    Mechanism:
+    - Choices are a mixture of RL softmax policy and a WM softmax policy.
+    - WM reliability is capacity-limited: effective WM influence scales with K / set_size.
+    - WM stores rewarded associations as one-hot; when not rewarded, WM decays toward uniform with a rate tied to (1 - K/set_size).
+    - An age- and load-dependent lapse mixes in uniform random choice.
+
+    Parameters (list; all in [0,1] except capacities which are in [1,6]):
+    - lr: RL learning rate.
+    - softmax_beta: RL inverse temperature baseline; multiplied by 10 internally.
+    - wm_weight_base: baseline WM mixture weight.
+    - wm_capacity: capacity parameter K (interpreted in number of items; effective factor is min(1, K/set_size)).
+    - lapse_young: baseline lapse probability for young participants.
+    - lapse_age_bonus: added lapse probability for older group (0 for this participant but retained for generality).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes: arrays of equal length.
+    - age: array with a single repeated value; age_group = 0 if <=45, else 1.
+    - model_parameters: list as specified.
+
+    Returns:
+    - Negative log-likelihood of observed actions under the model.
+    """
+    lr, softmax_beta, wm_weight_base, wm_capacity, lapse_young, lapse_age_bonus = model_parameters
+    softmax_beta *= 10.0  # higher upper bound
+    softmax_beta_wm = 50.0  # WM is near-deterministic when it has an entry
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))  # RL Q-values
+        w = (1.0 / nA) * np.ones((nS, nA))  # WM store (policy-like weights)
+        w_0 = (1.0 / nA) * np.ones((nS, nA))  # uniform prior
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(softmax_beta * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(softmax_beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # Capacity-limited WM weight
+            cap_factor = min(1.0, max(0.0, wm_capacity) / max(1.0, set_size))
+            wm_weight_eff = np.clip(wm_weight_base * cap_factor, 0.0, 1.0)
+
+            # Lapse with age and load
+            # Slightly higher lapse under higher load; older group has added lapse
+            load_term = 0.02 * max(0, set_size - 3)
+            lapse = np.clip(lapse_young + age_group * lapse_age_bonus + load_term, 0.0, 0.5)
+
+            # Mixture and lapse
+            p_mix = wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl
+            p_total = np.clip((1.0 - lapse) * p_mix + lapse * (1.0 / nA), eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward strengthens one-hot; no-reward decays toward uniform more under high load
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = target
+            decay = np.clip(1.0 - cap_factor, 0.0, 1.0)
+            w[s, :] = (1.0 - decay) * w[s, :] + decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model2(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL + WM mixture with entropy-based arbitration and load/age-dependent WM decay.
+
+    Mechanism:
+    - Choices are a mixture of RL and WM policies.
+    - Arbitration depends on RL uncertainty: WM gets more weight when RL is confident (low entropy).
+    - WM updates toward rewarded one-hot with a confidence-dependent learning rate; when not rewarded,
+      WM decays toward uniform with a rate that increases with set size and age.
+
+    Parameters (list):
+    - lr: RL learning rate.
+    - softmax_beta: RL inverse temperature baseline; multiplied by 10 internally.
+    - wm_weight_base: baseline WM weight.
+    - entropy_sensitivity: scales the reduction of WM weight by RL entropy (>=0).
+    - wm_decay_base: base WM decay rate toward uniform (0..1).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age, model_parameters.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, wm_weight_base, entropy_sensitivity, wm_decay_base = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # RL policy
+            Q_s = q[s, :]
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(softmax_beta * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # RL entropy (normalized to [0,1])
+            H = -np.sum(pi_rl * (np.log(pi_rl + eps))) / np.log(nA)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(softmax_beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # Arbitration: WM weight reduced by RL entropy, and by load/age
+            size_factor = 3.0 / set_size
+            age_factor = 1.0 - 0.2 * age_group
+            wm_weight_eff = wm_weight_base * size_factor * age_factor * (1.0 - entropy_sensitivity * H)
+            wm_weight_eff = np.clip(wm_weight_eff, 0.0, 1.0)
+
+            # No explicit lapse here; uncertainty is handled via arbitration
+            p_total = np.clip(wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl, eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update
+            if r > 0:
+                # Confidence-dependent WM learning: larger when RL is confident (low H)
+                eta_wm = np.clip(1.0 - H, 0.0, 1.0)
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - eta_wm) * w[s, :] + eta_wm * target
+            # Decay with load and age
+            wm_decay = np.clip(wm_decay_base * (set_size / 3.0) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            w[s, :] = (1.0 - wm_decay) * w[s, :] + wm_decay * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p
+
+
+def cognitive_model3(states, actions, rewards, blocks, set_sizes, age, model_parameters):
+    """
+    RL with reward-rate-driven temperature and leaky WM, mixed by load and reward context.
+
+    Mechanism:
+    - RL inverse temperature adapts with a running estimate of recent reward rate m (meta-learning of exploration).
+      When rewards are high, policy is more exploitative; age attenuates this gain.
+    - WM stores rewarded one-hot associations and leaks toward uniform otherwise.
+    - Mixture weight favors WM under low load and when recent rewards are high (WM presumed reliable).
+
+    Parameters (list):
+    - lr: RL learning rate.
+    - softmax_beta: RL base inverse temperature; multiplied by 10 internally before applying gain.
+    - beta_gain: scales how much the recent reward rate modulates RL temperature (can be 0..1+).
+    - wm_weight_base: baseline WM mixture weight.
+    - tau_meta: learning rate for running reward-rate estimate m (0..1).
+    - wm_leak: baseline WM leak/decay rate toward uniform (0..1).
+
+    Inputs:
+    - states, actions, rewards, blocks, set_sizes, age, model_parameters.
+
+    Returns:
+    - Negative log-likelihood of observed actions.
+    """
+    lr, softmax_beta, beta_gain, wm_weight_base, tau_meta, wm_leak = model_parameters
+    softmax_beta *= 10.0
+    softmax_beta_wm = 50.0
+    eps = 1e-12
+
+    age_group = 0 if age[0] <= 45 else 1
+
+    blocks_log_p = 0.0
+    for b in np.unique(blocks):
+        mask = (blocks == b)
+        block_actions = actions[mask]
+        block_rewards = rewards[mask]
+        block_states = states[mask]
+        block_set_sizes = set_sizes[mask]
+
+        nA = 3
+        nS = int(block_set_sizes[0])
+
+        q = (1.0 / nA) * np.ones((nS, nA))
+        w = (1.0 / nA) * np.ones((nS, nA))
+        w_0 = (1.0 / nA) * np.ones((nS, nA))
+
+        m = 0.5  # running reward-rate estimate
+
+        log_p = 0.0
+        for t in range(len(block_states)):
+            a = int(block_actions[t])
+            s = int(block_states[t])
+            r = block_rewards[t]
+            set_size = int(block_set_sizes[t])
+
+            # Update meta reward-rate estimate (using previous reward)
+            m = (1.0 - tau_meta) * m + tau_meta * r
+
+            # RL policy with reward-rate-driven temperature
+            beta_gain_eff = beta_gain * (1.0 - 0.3 * age_group)
+            beta_rl_eff = softmax_beta * (1.0 + beta_gain_eff * (m - 0.5))
+            beta_rl_eff = max(0.0, beta_rl_eff)
+
+            Q_s = q[s, :]
+            q_shift = Q_s - np.max(Q_s)
+            pi_rl = np.exp(beta_rl_eff * q_shift)
+            pi_rl = pi_rl / np.sum(pi_rl)
+            p_rl = max(pi_rl[a], eps)
+
+            # WM policy
+            W_s = w[s, :]
+            w_shift = W_s - np.max(W_s)
+            pi_wm = np.exp(softmax_beta_wm * w_shift)
+            pi_wm = pi_wm / np.sum(pi_wm)
+            p_wm = max(pi_wm[a], eps)
+
+            # Mixture weight: higher with low load and high recent rewards
+            load_factor = 3.0 / set_size
+            reward_factor = 0.8 + 0.4 * m  # in [0.6, 1.2] approximately
+            wm_weight_eff = np.clip(wm_weight_base * load_factor * reward_factor, 0.0, 1.0)
+
+            p_total = np.clip(wm_weight_eff * p_wm + (1.0 - wm_weight_eff) * p_rl, eps, 1.0 - eps)
+            log_p += np.log(p_total)
+
+            # RL update
+            delta = r - Q_s[a]
+            q[s, a] += lr * delta
+
+            # WM update: reward strengthens one-hot; otherwise leak toward uniform with age/load scaling
+            wm_learn = np.clip(1.0 - wm_leak, 0.0, 1.0)
+            if r > 0:
+                target = np.zeros(nA)
+                target[a] = 1.0
+                w[s, :] = (1.0 - wm_learn) * w[s, :] + wm_learn * target
+            leak_eff = np.clip(wm_leak * (set_size / 3.0) * (1.0 + 0.5 * age_group), 0.0, 1.0)
+            w[s, :] = (1.0 - leak_eff) * w[s, :] + leak_eff * w_0[s, :]
+
+        blocks_log_p += log_p
+
+    return -blocks_log_p

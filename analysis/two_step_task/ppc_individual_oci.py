@@ -19,11 +19,15 @@ import matplotlib.pyplot as plt
 
 
 rng = np.random.default_rng()
+import argparse
+
+args = argparse.ArgumentParser()
+args.add_argument('--config', type=str, required=True, help='Configuration YAML file for the experiment.')
+args = args.parse_args()
 
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]
-cfg = load_config(project_root / "config" /
-                  "two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml")
+cfg = load_config(project_root / "config" / args.config)
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()

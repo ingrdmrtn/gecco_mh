@@ -79,14 +79,17 @@ best_params_list = {'participant': [], 'fitted_parameters': [],
                     'shared': [], 'model_type': [], 'baseline_params': [],
                     'baseline_bic': [], 'best_model_bic': []}
 baseline_params = ['learning_rate', 'learning_rate_2', 'beta', 'beta_2', 'w', 'lambd', 'perseveration']
-for p in participants[14:]:
-
-    if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
+if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
         existing_df = pd.read_csv(
             f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
-        if p in existing_df['participant'].values:
-            print(f'Participant {p} already processed. Skipping.')
-            continue
+        processed_participants = existing_df['participant'].values
+else:
+    processed_participants = []
+for p in participants[14:]:
+
+    if p in processed_participants:
+        print(f'Participant {p} already processed, skipping.')
+        continue
 
     print(f'Processing participant {p}')
     df_participant = df[df.participant == p].reset_index()
@@ -159,16 +162,13 @@ for p in participants[14:]:
     best_params_list['baseline_params'].append(baseline_params)
     best_params_list['baseline_bic'].append(baseline_bic)
     best_params_list['best_model_bic'].append(best_model_bic)
-
+    best_params_df = pd.DataFrame(best_params_list)
+    
     # check if dataframe ecists append to existing else create new
     if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
-        existing_df = pd.read_csv(
-            f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
-        new_df = pd.DataFrame(best_params_list)
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        combined_df = pd.concat([existing_df, best_params_df], ignore_index=True)
         combined_df.to_csv(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv', index=False)
         print(f'Appended comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
     else:
-        best_params_df = pd.DataFrame(best_params_list)
         best_params_df.to_csv(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv', index=False)
         print(f'Saved comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')

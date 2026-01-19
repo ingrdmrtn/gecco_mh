@@ -15,7 +15,13 @@ module purge
 module load anaconda3/2025.12 
 module load proxy/default
 conda activate gecco
+
+# model generation
 python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd_maxsetting.yaml
 python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml
 # python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_ocd.yaml
 # python scripts/two_step_psychiatry_group.py --config two_step_psychiatry_group_metadata_ocd.yaml
+
+# ppc generation
+python analysis/two_step_task/ppc_group_oci.py --config two_step_psychiatry_group_ocd_maxsetting.yaml
+python analysis/two_step_task/ppc_group_oci.py --config two_step_psychiatry_group_metadata_ocd_maxsetting.yaml

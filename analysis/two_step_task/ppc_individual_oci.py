@@ -23,7 +23,7 @@ rng = np.random.default_rng()
 # project_root = Path(__file__).resolve().parents[1]
 project_root = Path(__file__).resolve().parents[2]
 cfg = load_config(project_root / "config" /
-                  "two_step_psychiatry_individual_function_gemini-3-pro_ocd.yaml")
+                  "two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -108,9 +108,12 @@ for p in participants[14:]:
     participant_simulation_model = participant_simulation_model.read()
     participant_simulation_model = extract_full_function(
         participant_simulation_model, 'simulate_model')
-
-    exec(participant_simulation_model, globals())
-    model_func = globals()['simulate_model']
+    try:
+        exec(participant_simulation_model, globals())
+        model_func = globals()['simulate_model']
+    except Exception as e:
+        print(f'Error loading model for participant {p}: {e}')
+        continue
 
     parameter_names = extract_parameter_names(participant_simulation_model)
 

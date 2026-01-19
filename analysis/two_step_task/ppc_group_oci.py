@@ -13,7 +13,7 @@ rng = np.random.default_rng()
 
 project_root = Path(__file__).resolve().parents[2]
 # project_root = Path('/home/aj9225/gecco-1')
-cfg = load_config(project_root / "config" / "two_step_psychiatry_group_ocd.yaml")
+cfg = load_config(project_root / "config" / "two_step_psychiatry_group_ocd_maxsetting.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = parse_split(cfg.data.splits.test, df.participant.unique().tolist()) #df.participant.unique()
@@ -118,7 +118,7 @@ for r in range(num_runs):
 
 
     ppcs = pd.DataFrame(p_stay)
-    ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_group{"_oci" if cfg.metadata.flag else ""}.csv')
+    ppcs.to_csv(f'{project_root}/analysis/two_step_task/ppcs_{cfg.task.name}_{cfg.evaluation.fit_type}_oci.csv')
 
 
 
@@ -131,6 +131,5 @@ axis.set_title(f'GeCCo Group {"w/ oci as metadata" if cfg.metadata.flag else ""}
 axis.set_ylabel('Stay Probability')
 axis.set_xticks(np.arange(4))
 axis.set_xticklabels(['common/r','rare/r','common/nr','rare/nr'])
-figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_group{"_oci" if cfg.metadata.flag else ""}.png')
-
+figure.savefig(f'{project_root}/analysis/two_step_task/ppcs_{cfg.task.name}_{cfg.evaluation.fit_type}_oci.png')
 print('stop')

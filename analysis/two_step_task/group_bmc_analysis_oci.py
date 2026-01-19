@@ -227,6 +227,18 @@ def load_gecco_bics(bics_dir: str, participants: List[int]) -> dict:
             gecco_bics[pid] = best_bic
     return gecco_bics
 
+def load_gecco_bics_group(bics_dir: str, participants: List[int]) -> dict:
+    """Load GECCO group model BICs for each participant."""
+    gecco_bics = {}
+    pattern = os.path.join(bics_dir, f'best_bic_on_test_run0.json')
+    with open(pattern) as fp:
+        data = json.load(fp)
+        individual_bics = data.get('individual_BIC', [])
+        for i, pid in enumerate(participants):
+            if i < len(individual_bics):
+                gecco_bics[pid] = individual_bics[i]
+    return gecco_bics
+
 
 def load_oci_scores(data_path: str, participants: List[int]) -> dict:
     """Load oci scores for each participant."""
@@ -465,16 +477,19 @@ def main():
         os.path.dirname(os.path.abspath(__file__))))
     data_path = os.path.join(base_dir, 'data', 'two_step_gillan_2016_ocibalanced.csv')
     bics_dir = os.path.join(
-        base_dir, 'results', f'{cfg.task.name}_individual', 'bics')
+        base_dir, 'results', f'{cfg.task.name}{'_individual' if cfg.evaluation.fit_type == 'individual' else ''}', 'bics')
     output_dir = os.path.join(
-        base_dir, 'results', f'{cfg.task.name}_individual')
+        base_dir, 'results', f'{cfg.task.name}{'_individual' if cfg.evaluation.fit_type == 'individual' else ''}')
 
     participants = list(range(14, 45))  # Participants 14-44
 
     # Load data
     print("Loading data...")
     baseline_bics = load_baseline_bics(data_path, participants)
-    gecco_bics = load_gecco_bics(bics_dir, participants)
+    if 'individual' in cfg.task.name:
+        gecco_bics = load_gecco_bics(bics_dir, participants)
+    else:
+        gecco_bics = load_gecco_bics_group(bics_dir, participants)
     oci_scores = load_oci_scores(data_path, participants)
 
     # Participant-level comparison

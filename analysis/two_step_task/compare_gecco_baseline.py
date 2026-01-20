@@ -54,9 +54,9 @@ rng = np.random.default_rng()
 project_root = Path(__file__).resolve().parents[2]
 run = 0
 cfg = load_config(project_root / "config" /
-                  "two_step_psychiatry_individual_function_gemini-3-pro_ocd_maxsetting.yaml")
+                  "two_step_psychiatry_individual_ocd_function_gemini-3-pro_ocd_maxsetting.yaml")
 compare_config = load_config(project_root / "analysis" /
-                             "two_step_task" / "compare_gecco_baseline_twostep_individual_ocd.yaml")
+                             "two_step_task" / "compare_gecco_baseline_twostep_individual_metadata_ocd.yaml")
 data_cfg = cfg.data
 df = load_data(data_cfg.path)
 participants = df.participant.unique()
@@ -76,14 +76,17 @@ best_params_list = {'participant': [], 'fitted_parameters': [],
                     'parsed_params': [], 'num_params': [], 'extraction_mismatch': [],
                     'shared_params': [], 'unique_params': [],
                     'shared_mechanisms': [], 'unique_mechanisms': [],
+                    'psychiatry_mediated_mechanisms': [], 'psychiatry_mediated_parameters': [],
                     'shared': [], 'model_type': [], 'baseline_params': [],
-                    'baseline_bic': [], 'best_model_bic': []}
+                    'baseline_bic': [], 'best_model_bic': [], 'oci': []}
 baseline_params = ['learning_rate', 'learning_rate_2', 'beta', 'beta_2', 'w', 'lambd', 'perseveration']
 if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
         existing_df = pd.read_csv(
             f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')
         processed_participants = existing_df['participant'].values
+        append_to_existing = True
 else:
+    append_to_existing = False
     processed_participants = []
 for p in participants[14:]:
 
@@ -97,8 +100,16 @@ for p in participants[14:]:
     model_path = f'{best_models}best_model_{run}_participant{p}.txt'
     with open(model_path, 'r') as f:
         best_model = f.read()
-    vals = {'base_code': compare_config.compare.base_model, 'model_code': best_model,
-            'psychiatry': "- OCD: obsesstive compulsive disorder score (0-1) modulates behavior" if compare_config.compare.psychiatry else ""}
+    # load best model parameters
+    try:
+        best_model_parameters = pd.read_csv(
+            f'{param_dir}/best_params_run{run}_participant{p}.csv')
+        fitted_parameters = [best_model_parameters[n][0] for n in best_model_parameters.columns]
+    except: 
+        print(f'No parameters for participant {p}')
+        continue
+    
+    vals = {'base_code': compare_config.compare.base_model, 'model_code': best_model}
     prompt = compare_config.compare.comparison_prompt.format(**vals)
     model, tokenizer = load_llm(cfg.llm.provider, cfg.llm.base_model)
     search = GeCCoModelSearch(model, tokenizer, cfg, df_participant, None)
@@ -110,8 +121,8 @@ for p in participants[14:]:
         # if baseline_params and participant_model_parms match with regex'ed output, break
         llm_extracted_model_parameter_names = model_outputs["participant_model_parameter_names"]
         llm_extracted_base_model_parameter_names = model_outputs["base_model_parameter_names"]
-        # retry if baseline_params do not match
-        if set(baseline_params) == set(llm_extracted_base_model_parameter_names):
+        # retry if baseline_params and participant_model_parameters do not match true ones
+        if set(baseline_params) == set(llm_extracted_base_model_parameter_names) and set(best_model_parameters.columns.values) == set(llm_extracted_model_parameter_names):
             print('Baseline model parameters match expected parameters.')
             best_params_list['extraction_mismatch'].append(False)
             break
@@ -125,15 +136,6 @@ for p in participants[14:]:
             print(
                 f'Retrying LLM output for participant {p} due to mismatch in baseline parameters.') 
             retry_count += 1
-    try:
-        # print(param_dir)
-        best_model_parameters = pd.read_csv(
-            f'{param_dir}/best_params_run{run}_participant{p}.csv')
-        fitted_parameters = [best_model_parameters[n][0] for n in best_model_parameters.columns]
-    except:  # noqa: E722
-        print(f'No parameters for participant {p}')
-        continue
-    
     # load bics 
     bic_path = f'{bics}best_bic_{run}_participant{p}.json'
     # load json from bic_path
@@ -162,10 +164,13 @@ for p in participants[14:]:
     best_params_list['baseline_params'].append(baseline_params)
     best_params_list['baseline_bic'].append(baseline_bic)
     best_params_list['best_model_bic'].append(best_model_bic)
+    best_params_list['psychiatry_mediated_mechanisms'].append(model_outputs.get('psychiatry_mediated_mechanisms', []))
+    best_params_list['psychiatry_mediated_parameters'].append(model_outputs.get('psychiatry_mediated_parameters', []))
+    best_params_list['oci'].append(df_participant['oci'].iloc[0])
     best_params_df = pd.DataFrame(best_params_list)
     
     # check if dataframe ecists append to existing else create new
-    if os.path.exists(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv'):
+    if append_to_existing:
         combined_df = pd.concat([existing_df, best_params_df], ignore_index=True)
         combined_df.to_csv(f'{project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv', index=False)
         print(f'Appended comparison results to {project_root}/results/{cfg.task.name}_{cfg.evaluation.fit_type}/gecco_baseline_comparison.csv')

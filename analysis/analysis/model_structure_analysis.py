@@ -30,13 +30,15 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import numpy as np
 
 # ============================================================
 # Paths / utilities
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
+
+which_group = "young"
 
 def read_text(rel_path: str) -> str:
     with open(ROOT / rel_path, "r", encoding="utf-8") as f:
@@ -379,9 +381,9 @@ def plot_arbitration_shift(fp: pd.DataFrame, outdir: Path):
     plt.colorbar(label="Number of models")
     plt.xlabel("Age-dependent control regime")
     plt.ylabel("Baseline control regime")
-    plt.title("Control regime transitions with age")
+    plt.title(f"Control regime transitions with age:{which_group}")
     plt.tight_layout()
-    plt.savefig(outdir / "arbitration_shift_matrix.png")
+    plt.savefig(outdir /f"arbitration_shift_matrix_{which_group}.png")
     plt.close()
 
 
@@ -403,10 +405,10 @@ def plot_control_vs_representation(delta: pd.DataFrame, outdir: Path):
     plt.yticks([0,1], ["No representation change", "Representation change"])
     plt.xlabel("Control-level age effects")
     plt.ylabel("Representation-level age effects")
-    plt.title("Where age enters the architecture (model counts)")
+    plt.title(f"{which_group} group: Where age enters the architecture (model counts)")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(outdir / "control_vs_representation.png")
+    plt.savefig(outdir / f"control_vs_representation_{which_group}.png")
     plt.close()
 
 
@@ -422,18 +424,42 @@ def plot_mechanism_reallocation(delta: pd.DataFrame, outdir: Path):
     ]:
         rows.append({
             "mechanism": label,
-            "added": (delta[mech] > 0).sum(),
-            "removed": (delta[mech] < 0).sum()
+            "added": int((delta[mech] > 0).sum()),
+            "removed": int((delta[mech] < 0).sum())
         })
 
     df = pd.DataFrame(rows).set_index("mechanism")
-    df.plot(kind="bar", figsize=(8,4))
-    plt.ylabel("Number of models")
-    plt.title("Mechanism reallocation with age")
+
+    # 🔑 DROP EMPTY CATEGORIES
+    drop_empty = True
+    if drop_empty:
+        df = df[(df["added"] > 0) | (df["removed"] > 0)]
+
+    # If *everything* is empty (edge case), avoid empty plot
+    if df.empty:
+        print(f"⚠ No mechanism changes to plot{which_group}")
+        return
+
+    # df.plot(kind="bar", figsize=(8, 4))
+
+    net = df["added"] - df["removed"]
+
+    plt.figure(figsize=(7, 4))
+    plt.bar(df.index, net)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.ylabel("Net change (age − baseline)")
+    plt.title(f"Net mechanism reallocation with age:{which_group}")
     plt.xticks(rotation=30)
     plt.tight_layout()
-    plt.savefig(outdir / "mechanism_reallocation.png")
+    plt.savefig(outdir / f"net_mechanism_reallocation{which_group}.png")
     plt.close()
+
+    # plt.ylabel("Number of models")
+    # plt.title(f"Mechanism reallocation with age:{which_group}")
+    # plt.xticks(rotation=30)
+    # plt.tight_layout()
+    # plt.savefig(outdir / f"mechanism_reallocation{which_group}.png")
+    # plt.close()
 
 
 # ============================================================
@@ -457,6 +483,21 @@ def main():
     base = parse_models(read_text(args.baseline), "baseline")
     age  = parse_models(read_text(args.age), "age")
 
+
+    ids = np.array(pd.read_csv(f"{project_root}/best_age_id_{which_group}.csv")['ids'])
+
+    base = {
+        k: v
+        for k, v in base.items()
+        if int(k.split('_')[0][1:]) in ids
+    }
+
+    age = {
+        k: v
+        for k, v in age.items()
+        if int(k.split('_')[0][1:]) in ids
+    }
+
     names = sorted(set(base) & set(age))
 
     fps, deltas, summaries = [], [], []
@@ -471,10 +512,10 @@ def main():
     fp_df = pd.DataFrame(fps)
     delta_df = pd.DataFrame(deltas)
 
-    fp_df.to_csv(outdir / "model_mechanism_fingerprints.csv", index=False)
-    delta_df.to_csv(outdir / "age_delta_by_model.csv", index=False)
+    fp_df.to_csv(outdir / f"model_mechanism_fingerprints_{which_group}.csv", index=False)
+    delta_df.to_csv(outdir / f"age_delta_by_model_{which_group}.csv", index=False)
 
-    with open(outdir / "model_delta_summaries.txt", "w") as f:
+    with open(outdir / f"model_delta_summaries_{which_group}.txt", "w") as f:
         f.write("\n\n".join(summaries))
 
     plot_arbitration_shift(fp_df, plotdir)

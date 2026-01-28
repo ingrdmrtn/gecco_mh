@@ -32,7 +32,7 @@ def main():
         # --- Convert data to narrative text for the LLM ---
         data2text = get_data2text_function(data_cfg.data2text_function)
 
-        for participant in df.participant.unique()[14:]:
+        for participant in df.participant.unique()[:14]:
 
             # best_hybrid_bic =
             df_participant = df[df.participant == participant].reset_index()

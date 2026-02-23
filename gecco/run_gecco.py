@@ -139,12 +139,31 @@ class GeCCoModelSearch:
         # Hugging Face-style generation
         # -----------------------------
         else:
+            from transformers import TextStreamer
+
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
+            n_input = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
 
             _log(
                 f"[GeCCo] Generating with HF model '{self.cfg.llm.base_model}' "
-                f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
+                f"(input_tokens={n_input}, max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
             )
+
+            class _ProgressStreamer(TextStreamer):
+                """Log generation progress every N tokens."""
+                def __init__(self, tokenizer, log_every=50):
+                    super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    self.token_count = 0
+                    self.log_every = log_every
+                    self.t0 = time.time()
+
+                def on_finalized_text(self, text, stream_end=False):
+                    self.token_count += len(text.split()) if text.strip() else 1
+                    if self.token_count % self.log_every < 5 or stream_end:
+                        elapsed = time.time() - self.t0
+                        _log(f"[GeCCo] ... generated ~{self.token_count} tokens ({elapsed:.0f}s elapsed)")
+
+            streamer = _ProgressStreamer(tokenizer, log_every=50)
 
             t0 = time.time()
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -153,6 +172,7 @@ class GeCCoModelSearch:
                 max_new_tokens=max_new,
                 temperature=self.cfg.llm.temperature,
                 do_sample=True,
+                streamer=streamer,
             )
             elapsed = time.time() - t0
             n_tokens = output.shape[1] - inputs["input_ids"].shape[1]

@@ -1,8 +1,14 @@
 # engine/run_fit.py
+import time
 import numpy as np
+from datetime import datetime
 from scipy.optimize import minimize
 from gecco.offline_evaluation.utils import build_model_spec
 from gecco.offline_evaluation.evaluation_functions import aic as _aic, bic as _bic
+
+def _log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
     """
@@ -55,8 +61,12 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
 
     eval_metrics = []
     parameter_estimates = []
+    n_participants = len(participants)
+    t0_fit = time.time()
+    _log(f"[GeCCo] Fitting {expected_func_name} to {n_participants} participants ({n_starts} starts each)")
+
     # --- Fit per participant ---
-    for p in participants:
+    for pi, p in enumerate(participants):
         df_p = df[df[data_cfg.id_column] == p].reset_index(drop=True)
 
         # Extract task-relevant input columns dynamically
@@ -77,12 +87,17 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
                 min_ll = res.fun
                 best_parameter_values = res.x
 
-
         eval_metrics.append(metric_func(min_ll, len(parameter_bounds), len(df_p)))
         parameter_estimates.append(best_parameter_values)
+
+        if (pi + 1) % 10 == 0 or (pi + 1) == n_participants:
+            elapsed = time.time() - t0_fit
+            _log(f"[GeCCo] Fitted {pi+1}/{n_participants} participants ({elapsed:.0f}s elapsed)")
+
     # --- Aggregate results ---
     mean_metric = float(np.mean(eval_metrics))
-    print(f"[GeCCo] Mean {metric_name} = {mean_metric:.2f}")
+    total_fit_time = time.time() - t0_fit
+    _log(f"[GeCCo] Mean {metric_name} = {mean_metric:.2f} (fitting took {total_fit_time:.1f}s)")
 
     return {
         "metric_name": metric_name,

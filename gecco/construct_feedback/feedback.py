@@ -31,7 +31,7 @@ class FeedbackGenerator:
             "and explore alternative parameter configurations or mechanisms.\n"
         )
 
-        if self.cfg.feedback.prompt:
+        if getattr(self.cfg.feedback, "prompt", None):
             # Allow user to use {best_model} and {previous_parameters} in their custom prompt
             feedback = self.cfg.feedback.prompt.format(
                 best_model=best_model,
@@ -68,7 +68,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             "that differ conceptually but might still perform well."
         )
 
-        if self.cfg.feedback.prompt is not None:
+        if getattr(self.cfg.feedback, "prompt", None) is not None:
             prompt = self.cfg.feedback.prompt.format(
                 best_model=best_model,
                 previous_parameters=previous_parameters

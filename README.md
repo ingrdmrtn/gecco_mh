@@ -114,6 +114,32 @@ Optional (for local LLMs): vllm, accelerate
 export OPENAI_API_KEY=your_openai_api_key_here
 ```
 
+### Using local LLMs
+
+GeCCo supports running open-weight models locally via HuggingFace Transformers. The supported providers are:
+
+| Provider value | Models | Example `base_model` |
+|----------------|--------|----------------------|
+| `llama` | Meta LLaMA family | `meta-llama/Meta-Llama-3.1-70B-Instruct` |
+| `qwen` | Alibaba Qwen family | `Qwen/Qwen2-72B-Instruct` |
+| `r1` | DeepSeek R1-Distilled | `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` |
+
+To use a local model, set `provider` and `base_model` in your YAML config:
+
+```yaml
+llm:
+  provider: "llama"
+  base_model: "meta-llama/Meta-Llama-3.1-70B-Instruct"
+  temperature: 0.2
+  max_output_tokens: 2048
+```
+
+Models are downloaded from the HuggingFace Hub on first use and loaded with `device_map="auto"` (automatically distributed across available GPUs). bfloat16 precision is used when CUDA is available. You will need:
+
+- A GPU with sufficient VRAM for your chosen model (e.g. ~140 GB for a 70B model in bfloat16, or less with quantisation)
+- `torch`, `transformers`, and `accelerate` installed (included in `requirements.txt`)
+- For gated models (e.g. LLaMA), log in with `huggingface-cli login` and accept the model license on HuggingFace
+
 ## ⚙️ Configuration
 
 All experiment parameters are specified in YAML files under `config/`.

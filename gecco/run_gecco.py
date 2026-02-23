@@ -228,6 +228,8 @@ class GeCCoModelSearch:
                         self.best_model = func_code
                         self.best_iter = it
                         self.best_params = params
+                        self.best_param_names = fit_res["param_names"]
+                        self.best_param_values = fit_res["parameter_values"]
                         self.best_id_results = id_results
                         _log(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 

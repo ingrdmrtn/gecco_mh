@@ -72,7 +72,15 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
 
     # Get the join key for each participant (one value per participant)
     if join_id_col != fitting_id_col:
-        join_ids = [str(df[df[fitting_id_col] == p][join_id_col].iloc[0]) for p in participants]
+        # The join column may not be in the eval DataFrame (dropped by load_data),
+        # so load the mapping directly from the original data file
+        data_path = Path(cfg.data.path)
+        if not data_path.is_absolute():
+            project_root = Path(__file__).resolve().parents[2]
+            data_path = project_root / data_path
+        full_df = pd.read_csv(data_path, usecols=[fitting_id_col, join_id_col]).drop_duplicates()
+        id_map = dict(zip(full_df[fitting_id_col], full_df[join_id_col].astype(str)))
+        join_ids = [id_map[p] for p in participants]
     else:
         join_ids = [str(p) for p in participants]
     param_df["_participant_id"] = join_ids

@@ -95,7 +95,7 @@ def main():
         print(f"Best mean BIC: {best_bic:.2f}")
         print(f"Best params: {', '.join(best_params)}")
 
-        if cfg.llm.do_simulation == "True":
+        if getattr(cfg.llm, "do_simulation", "False") == "True":
             from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
             simulation_prompt_text = simulation_prompt(

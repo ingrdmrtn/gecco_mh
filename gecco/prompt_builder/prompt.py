@@ -9,10 +9,10 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     4. Guardrails
     5. Template model
     """
-    task, llm, evaluation, metadata = cfg.task, cfg.llm, cfg.evaluation, cfg.metadata
+    task, llm, evaluation, metadata = cfg.task, cfg.llm, cfg.evaluation, getattr(cfg, "metadata", None)
     guardrails = getattr(llm, "guardrails", [])
     include_feedback = getattr(llm, "include_feedback", False)
-    fit_type = getattr(evaluation, "fit_type")
+    fit_type = getattr(evaluation, "fit_type", "group")
     metadata = getattr(metadata, "flag", False)
     abstract_base_model = getattr(llm, "abstract_base_model", None)
     diversity_requirement = getattr(llm, "diversity_requirement", None)

@@ -1,4 +1,11 @@
-from google.genai import types
+from datetime import datetime
+
+
+def _log(msg):
+    """Print a timestamped log message."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
 
 class FeedbackGenerator:
     """
@@ -33,7 +40,7 @@ class FeedbackGenerator:
             "and explore alternative parameter configurations or mechanisms.\n"
         )
 
-        if hasattr(self.cfg, "feedback") and hasattr(self.cfg.feedback, "prompt"): #self.cfg.feedback.prompt:
+        if getattr(self.cfg.feedback, "prompt", None):
             # Allow user to use {best_model} and {previous_parameters} in their custom prompt
             feedback = self.cfg.feedback.prompt.format(
                 best_model=best_model,
@@ -70,7 +77,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             "that differ conceptually but might still perform well."
         )
 
-        if self.cfg.feedback.prompt is not None:
+        if getattr(self.cfg.feedback, "prompt", None) is not None:
             prompt = self.cfg.feedback.prompt.format(
                 best_model=best_model,
                 previous_parameters=previous_parameters
@@ -98,7 +105,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
             text_verbosity = getattr(self.cfg.llm, "text_verbosity", "low")
 
-            print(
+            _log(
                 f"[GeCCo] Using GPT model '{self.cfg.llm.base_model}' "
                 f"(reasoning={reasoning_effort}, verbosity={text_verbosity}, max_output_tokens={max_out})"
             )
@@ -140,17 +147,9 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         else:
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
 
-            print(
+            _log(
                 f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "
                 f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
-            )
-
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new,
-                temperature=self.cfg.llm.temperature,
-                do_sample=True,
             )
 
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)

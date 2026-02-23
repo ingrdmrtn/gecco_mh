@@ -133,11 +133,27 @@ A HuggingFace token can be created at huggingface.co/settings/tokens. For gated 
 
 GeCCo supports running open-weight models locally via HuggingFace Transformers. The supported providers are:
 
-| Provider value | Models | Example `base_model` |
-|----------------|--------|----------------------|
-| `llama` | Meta LLaMA family | `meta-llama/Meta-Llama-3.1-70B-Instruct` |
-| `qwen` | Alibaba Qwen family | `Qwen/Qwen2-72B-Instruct` |
-| `r1` | DeepSeek R1-Distilled | `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` |
+| Provider value | Models | Gated? |
+|----------------|--------|--------|
+| `llama` | Meta LLaMA family | Yes (requires HF login + licence) |
+| `qwen` | Alibaba Qwen family | No |
+| `r1` | DeepSeek R1-Distilled | No |
+
+**Recommended models by size:**
+
+| `base_model` | Provider | Params | VRAM (bfloat16) | Min GPUs (40 GB A100) |
+|--------------|----------|--------|-----------------|----------------------|
+| `Qwen/Qwen2.5-1.5B-Instruct` | `qwen` | 1.5B | ~3 GB | 1 |
+| `meta-llama/Llama-3.2-3B-Instruct` | `llama` | 3B | ~6 GB | 1 |
+| `Qwen/Qwen2.5-7B-Instruct` | `qwen` | 7B | ~14 GB | 1 |
+| `meta-llama/Meta-Llama-3.1-8B-Instruct` | `llama` | 8B | ~16 GB | 1 |
+| `Qwen/Qwen2.5-14B-Instruct` | `qwen` | 14B | ~28 GB | 1 |
+| `Qwen/Qwen2.5-32B-Instruct` | `qwen` | 32B | ~64 GB | 2 |
+| `meta-llama/Meta-Llama-3.1-70B-Instruct` | `llama` | 70B | ~140 GB | 4 |
+| `Qwen/Qwen2.5-72B-Instruct` | `qwen` | 72B | ~144 GB | 4 |
+| `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` | `r1` | 70B | ~140 GB | 4 |
+
+Larger models produce better code but require more VRAM. If your model exceeds a single GPU's memory, `device_map="auto"` will split it across multiple GPUs automatically — ensure your job requests enough GPUs (e.g. `--gres=gpu:4` in SLURM).
 
 To use a local model, set `provider` and `base_model` in your YAML config:
 

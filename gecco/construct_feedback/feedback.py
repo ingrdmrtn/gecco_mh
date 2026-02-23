@@ -142,6 +142,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             return decoded
 
         elif "gemini" in provider:
+            from google.genai import types
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
             print(

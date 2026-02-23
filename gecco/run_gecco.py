@@ -1,6 +1,8 @@
 # engine/model_search.py
 import os
 import json
+import time
+from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -9,6 +11,12 @@ from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 from google.genai import types
+
+def _log(msg):
+    """Print a timestamped log message."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
 
 class GeCCoModelSearch:
     def __init__(self, model, tokenizer, cfg, df, prompt_builder):
@@ -63,7 +71,7 @@ class GeCCoModelSearch:
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
             text_verbosity = getattr(self.cfg.llm, "text_verbosity", "low")
 
-            print(
+            _log(
                 f"[GeCCo] Using GPT model '{self.cfg.llm.base_model}' "
                 f"(reasoning={reasoning_effort}, verbosity={text_verbosity}, max_output_tokens={max_out})"
             )
@@ -125,11 +133,12 @@ class GeCCoModelSearch:
         else:
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
 
-            print(
-                f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "
+            _log(
+                f"[GeCCo] Generating with HF model '{self.cfg.llm.base_model}' "
                 f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
             )
 
+            t0 = time.time()
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             output = model.generate(
                 **inputs,
@@ -137,11 +146,14 @@ class GeCCoModelSearch:
                 temperature=self.cfg.llm.temperature,
                 do_sample=True,
             )
+            elapsed = time.time() - t0
+            n_tokens = output.shape[1] - inputs["input_ids"].shape[1]
+            _log(f"[GeCCo] Generation complete: {n_tokens} tokens in {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)")
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
     def run_n_shots(self, run_idx, baseline_bic):
         for it in range(self.cfg.loop.max_iterations):
-            print(f"\n[GeCCo] --- Iteration {it} ---")
+            _log(f"\n[GeCCo] --- Iteration {it} ---")
 
             stop_iterations = False  # ✅ reset each iteration
 
@@ -178,7 +190,7 @@ class GeCCoModelSearch:
                     params = fit_res["param_names"]
                     self.tried_param_sets.append(params)
 
-                    print(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
+                    _log(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
 
                     iteration_results.append({
                         "function_name": func_name,
@@ -193,9 +205,7 @@ class GeCCoModelSearch:
                         self.best_model = func_code
                         self.best_iter = it
                         self.best_params = params
-                        self.best_param_names = fit_res["param_names"]  # ✅ store names
-                        self.best_param_values = fit_res["parameter_values"]
-                        print(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
+                        _log(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
                             self.results_dir / "models" / f"best_model_{run_idx}.txt"
@@ -221,7 +231,7 @@ class GeCCoModelSearch:
                         break
 
                 except Exception as e:
-                    print(f"[⚠️ GeCCo] Error fitting {func_name}: {e}")
+                    _log(f"[⚠️ GeCCo] Error fitting {func_name}: {e}")
 
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (
@@ -234,10 +244,7 @@ class GeCCoModelSearch:
 
             self.feedback.record_iteration(it, iteration_results)
 
-            if stop_iterations:
-                break  # ✅ breaks iterations loop only (run loop unaffected)
-
-        print(
+        _log(
             f"\n[🏁 GeCCo] Finished search. "
             f"Best model (iteration {self.best_iter}) "
             f"{self.cfg.evaluation.metric.upper()}={self.best_metric:.2f}"

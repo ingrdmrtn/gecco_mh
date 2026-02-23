@@ -108,11 +108,79 @@ See `requirements.txt` for full list. Core packages include:
 
 Optional (for local LLMs): vllm, accelerate
 
-### API keys (if using OpenAI)
+### API keys
+
+GeCCo reads API keys from environment variables or a `.env` file in the project root (`.env` is gitignored). Create a `.env` file and add whichever keys you need:
+
+```bash
+# OpenAI (required if using provider: "openai")
+OPENAI_API_KEY=your_openai_api_key_here
+
+# HuggingFace (optional — increases rate limits and is required for gated models such as LLaMA)
+HF_TOKEN=your_hf_token_here
+```
+
+Alternatively, export them in your shell before running:
 
 ```bash
 export OPENAI_API_KEY=your_openai_api_key_here
+export HF_TOKEN=your_hf_token_here
 ```
+
+A HuggingFace token can be created at huggingface.co/settings/tokens. For gated models (e.g. LLaMA), you must also accept the model licence on the model's HuggingFace page.
+
+### Using local LLMs
+
+GeCCo supports running open-weight models locally via HuggingFace Transformers. The supported providers are:
+
+| Provider value | Models | Gated? |
+|----------------|--------|--------|
+| `llama` | Meta LLaMA family | Yes (requires HF login + licence) |
+| `qwen` | Alibaba Qwen family | No |
+| `r1` | DeepSeek R1-Distilled | No |
+
+**Recommended models by size:**
+
+| `base_model` | Provider | Params | VRAM (bfloat16) | Min GPUs (40 GB A100) |
+|--------------|----------|--------|-----------------|----------------------|
+| `Qwen/Qwen2.5-1.5B-Instruct` | `qwen` | 1.5B | ~3 GB | 1 |
+| `meta-llama/Llama-3.2-3B-Instruct` | `llama` | 3B | ~6 GB | 1 |
+| `Qwen/Qwen2.5-7B-Instruct` | `qwen` | 7B | ~14 GB | 1 |
+| `meta-llama/Meta-Llama-3.1-8B-Instruct` | `llama` | 8B | ~16 GB | 1 |
+| `Qwen/Qwen2.5-14B-Instruct` | `qwen` | 14B | ~28 GB | 1 |
+| `Qwen/Qwen2.5-32B-Instruct` | `qwen` | 32B | ~64 GB | 2 |
+| `meta-llama/Meta-Llama-3.1-70B-Instruct` | `llama` | 70B | ~140 GB | 4 |
+| `Qwen/Qwen2.5-72B-Instruct` | `qwen` | 72B | ~144 GB | 4 |
+| `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` | `r1` | 70B | ~140 GB | 4 |
+
+Larger models produce better code but require more VRAM. If your model exceeds a single GPU's memory, `device_map="auto"` will split it across multiple GPUs automatically — ensure your job requests enough GPUs (e.g. `--gres=gpu:4` in SLURM).
+
+To use a local model, set `provider` and `base_model` in your YAML config:
+
+```yaml
+llm:
+  provider: "llama"
+  base_model: "meta-llama/Meta-Llama-3.1-70B-Instruct"
+  temperature: 0.2
+  max_output_tokens: 2048
+```
+
+Models are downloaded from the HuggingFace Hub on first use and loaded with `device_map="auto"` (automatically distributed across available GPUs). bfloat16 precision is used when CUDA is available. You will need:
+
+- A GPU with sufficient VRAM for your chosen model (e.g. ~140 GB for a 70B model in bfloat16, or less with quantisation)
+- `torch`, `transformers`, and `accelerate` installed (included in `requirements.txt`)
+- For gated models (e.g. LLaMA), log in with `huggingface-cli login` and accept the model license on HuggingFace
+
+**HPC users:** Models are cached in `~/.cache/huggingface/` by default, which may exceed home directory quotas. To use a different location (e.g. a scratch filesystem), set the `HF_HOME` environment variable in your shell or job script before running:
+
+```bash
+export HF_HOME=/scratch/$USER/huggingface
+python scripts/two_step_demo.py --config config/two_step_local.yaml
+```
+
+Note: `HF_HOME` must be set as a shell environment variable — putting it in the `.env` file will not work, as HuggingFace reads it at import time before `python-dotenv` loads.
+
+**Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
 ## ⚙️ Configuration
 

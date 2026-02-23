@@ -27,9 +27,22 @@ def main():
 
     df = load_data(data_cfg.path, data_cfg.input_columns)
     splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-    df_prompt, df_eval, df_test, = splits["prompt"], splits["eval"], splits["test"]
+    df_prompt = splits["prompt"]
 
-    if cfg.loop.early_stopping == "True":
+    # --- Split eval/test by proportion of remaining participants ---
+    eval_test_proportion = getattr(cfg.evaluation, "eval_test_split", 0.7)
+    non_prompt_ids = sorted(set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique()))
+    np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
+    np.random.shuffle(non_prompt_ids)
+    split_idx = int(len(non_prompt_ids) * eval_test_proportion)
+    eval_ids = non_prompt_ids[:split_idx]
+    test_ids = non_prompt_ids[split_idx:]
+    df_eval = df[df[data_cfg.id_column].isin(eval_ids)]
+    df_test = df[df[data_cfg.id_column].isin(test_ids)]
+    print(f"[GeCCo] Eval/test split: {len(eval_ids)} eval, {len(test_ids)} test "
+          f"({eval_test_proportion:.0%}/{1-eval_test_proportion:.0%})")
+
+    if getattr(cfg.loop, "early_stopping", "False") == "True":
         df_baselines = load_data(data_cfg.path)
         splits_baselines = split_by_participant(df_baselines, data_cfg.id_column, data_cfg.splits)
         df_prompt_splits, df_eval_splits = splits_baselines["prompt"], splits_baselines["eval"]

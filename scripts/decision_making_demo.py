@@ -1,6 +1,6 @@
 # examples/two_step_demo.py
 
-import os, sys, numpy as np
+import os, sys, argparse, numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from pathlib import Path
 
@@ -13,8 +13,14 @@ from gecco.prompt_builder.prompt import PromptBuilderWrapper
 
 def main():
     # --- Load configuration & data ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file (default: config/decision_making.yaml)")
+    args = parser.parse_args()
+
     project_root = Path(__file__).resolve().parents[1]
-    cfg = load_config(project_root / "config" / "decision_making.yaml")
+    config_path = Path(args.config) if args.config else project_root / "config" / "decision_making.yaml"
+    cfg = load_config(config_path)
     data_cfg = cfg.data
     max_independent_runs  = cfg.loop.max_independent_runs
 

@@ -140,6 +140,8 @@ Models are downloaded from the HuggingFace Hub on first use and loaded with `dev
 - `torch`, `transformers`, and `accelerate` installed (included in `requirements.txt`)
 - For gated models (e.g. LLaMA), log in with `huggingface-cli login` and accept the model license on HuggingFace
 
+**Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models.
+
 ## ⚙️ Configuration
 
 All experiment parameters are specified in YAML files under `config/`.

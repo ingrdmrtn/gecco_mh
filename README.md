@@ -108,11 +108,26 @@ See `requirements.txt` for full list. Core packages include:
 
 Optional (for local LLMs): vllm, accelerate
 
-### API keys (if using OpenAI)
+### API keys
+
+GeCCo reads API keys from environment variables or a `.env` file in the project root (`.env` is gitignored). Create a `.env` file and add whichever keys you need:
+
+```bash
+# OpenAI (required if using provider: "openai")
+OPENAI_API_KEY=your_openai_api_key_here
+
+# HuggingFace (optional — increases rate limits and is required for gated models such as LLaMA)
+HF_TOKEN=your_hf_token_here
+```
+
+Alternatively, export them in your shell before running:
 
 ```bash
 export OPENAI_API_KEY=your_openai_api_key_here
+export HF_TOKEN=your_hf_token_here
 ```
+
+A HuggingFace token can be created at huggingface.co/settings/tokens. For gated models (e.g. LLaMA), you must also accept the model licence on the model's HuggingFace page.
 
 ### Using local LLMs
 
@@ -140,7 +155,13 @@ Models are downloaded from the HuggingFace Hub on first use and loaded with `dev
 - `torch`, `transformers`, and `accelerate` installed (included in `requirements.txt`)
 - For gated models (e.g. LLaMA), log in with `huggingface-cli login` and accept the model license on HuggingFace
 
-**Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models.
+**HPC users:** Models are cached in `~/.cache/huggingface/` by default, which may exceed home directory quotas. To use a different location (e.g. a scratch filesystem), set the `HF_HOME` environment variable before running:
+
+```bash
+export HF_HOME=/scratch/$USER/huggingface
+```
+
+**Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
 ## ⚙️ Configuration
 

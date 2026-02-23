@@ -35,11 +35,12 @@ class GeCCoModelSearch:
         self.project_root = Path(__file__).resolve().parents[1]
 
         # --- Results directory (absolute path) ---
-        # self.results_dir = self.project_root / "results" / self.cfg.task.name if self.cfg.evaluation.fit_type != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
+        # self.results_dir = self.project_root / "results" / self.cfg.task.name if getattr(self.cfg.evaluation, "fit_type", "group") != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
 
+        fit_type = getattr(self.cfg.evaluation, "fit_type", "group")
         self.results_dir = (
             self.project_root / "results" / self.cfg.task.name
-            if self.cfg.evaluation.fit_type != "individual"
+            if fit_type != "individual"
             else self.project_root / "results" / f"{self.cfg.task.name}_individual"
         )
 
@@ -176,7 +177,7 @@ class GeCCoModelSearch:
 
             model_file = (
                 self.results_dir / "models" / f"iter{it}_run{run_idx}.txt"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else self.results_dir / "models" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
             )
 
@@ -232,7 +233,7 @@ class GeCCoModelSearch:
 
                         best_model_file = (
                             self.results_dir / "models" / f"best_model_{run_idx}.txt"
-                            if self.cfg.evaluation.fit_type != "individual"
+                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                             else self.results_dir / "models" / f"best_model_{run_idx}_participant{self.df.participant[0]}.txt"
                         )
                         with open(best_model_file, "w") as f:
@@ -241,7 +242,7 @@ class GeCCoModelSearch:
                         # save best model bic
                         best_bic_file = (
                             self.results_dir / "bics" / f"best_bic_{run_idx}.json"
-                            if self.cfg.evaluation.fit_type != "individual"
+                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                             else self.results_dir / "bics" / f"best_bic_{run_idx}_participant{self.df.participant[0]}.json"
                         )
                         with open(best_bic_file, "w") as f:
@@ -259,7 +260,7 @@ class GeCCoModelSearch:
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (
                 self.results_dir / "bics" / f"iter{it}_run{run_idx}.json"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else self.results_dir / "bics" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.json"
             )
             with open(bic_file, "w") as f:
@@ -276,7 +277,7 @@ class GeCCoModelSearch:
         # --- save best parameters ---
         if self.best_model is not None and self.best_params:
 
-            # if self.cfg.evaluation.fit_type == "individual":
+            # if getattr(self.cfg.evaluation, "fit_type", "group") == "individual":
             param_df = pd.DataFrame(
                 self.best_param_values,
                 columns=self.best_param_names
@@ -287,7 +288,7 @@ class GeCCoModelSearch:
 
             param_file = (
                 param_dir / f"best_params_run{run_idx}.csv"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else param_dir / f"best_params_run{run_idx}_participant{self.df.participant[0]}.csv"
             )
 

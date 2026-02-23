@@ -17,10 +17,21 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='', help='*REQUIRED* config.yaml')
+    parser.add_argument('--test', action='store_true',
+                        help='Test mode: use a small local model (Qwen 1.5B) with 1 run and 1 iteration')
     args = parser.parse_args()
     # --- Load configuration & data ---
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_config(project_root / "config" / args.config)
+
+    # --- Test mode: override LLM and loop settings ---
+    if args.test:
+        cfg.llm.provider = "qwen"
+        cfg.llm.base_model = "Qwen/Qwen2.5-1.5B-Instruct"
+        cfg.loop.max_independent_runs = 1
+        cfg.loop.max_iterations = 1
+        print("[GeCCo] TEST MODE: using Qwen 1.5B, 1 run, 1 iteration")
+
     data_cfg = cfg.data
     metadata = getattr(getattr(cfg, "metadata", None), "flag", False)
     max_independent_runs  = cfg.loop.max_independent_runs

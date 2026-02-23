@@ -47,12 +47,19 @@ class GeCCoModelSearch:
         (self.results_dir / "models").mkdir(parents=True, exist_ok=True)
         (self.results_dir / "bics").mkdir(parents=True, exist_ok=True)
 
+        # --- Individual differences evaluation (optional) ---
+        self.id_eval_data = None
+        if hasattr(cfg, 'individual_differences_eval'):
+            from gecco.offline_evaluation.individual_differences import load_id_data
+            self.id_eval_data = load_id_data(cfg)
+
         # --- Tracking ---
         self.best_model = None
         self.best_metric = np.inf
         self.best_params = []
         self.best_iter = -1
         self.tried_param_sets = []
+        self.best_id_results = None
 
     def generate(self, model, tokenizer=None, prompt=None):
         """
@@ -159,7 +166,10 @@ class GeCCoModelSearch:
 
             feedback = ""
             if self.best_model is not None:
-                feedback = self.feedback.get_feedback(self.best_model, self.tried_param_sets)
+                feedback = self.feedback.get_feedback(
+                    self.best_model, self.tried_param_sets,
+                    id_results=self.best_id_results
+                )
 
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
             code_text = self.generate(self.model, self.tokenizer, prompt)
@@ -192,12 +202,24 @@ class GeCCoModelSearch:
 
                     _log(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
 
+                    # --- Individual differences evaluation (optional) ---
+                    id_results = None
+                    if self.id_eval_data is not None:
+                        try:
+                            from gecco.offline_evaluation.individual_differences import evaluate_individual_differences
+                            id_results = evaluate_individual_differences(
+                                fit_res, self.df, self.cfg, id_data=self.id_eval_data
+                            )
+                        except Exception as e:
+                            _log(f"[GeCCo] Individual differences eval failed for {func_name}: {e}")
+
                     iteration_results.append({
                         "function_name": func_name,
                         "metric_name": metric_name,
                         "metric_value": mean_metric,
                         "param_names": params,
                         "code_file": str(model_file),
+                        "individual_differences": id_results,
                     })
 
                     if mean_metric < self.best_metric:
@@ -205,6 +227,7 @@ class GeCCoModelSearch:
                         self.best_model = func_code
                         self.best_iter = it
                         self.best_params = params
+                        self.best_id_results = id_results
                         _log(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (

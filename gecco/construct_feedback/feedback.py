@@ -25,7 +25,7 @@ class FeedbackGenerator:
             "results": results,
         })
 
-    def get_feedback(self, best_model, tried_param_sets):
+    def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback string for the next prompt.
         Default: discourage reuse of past parameter combinations.
@@ -49,6 +49,16 @@ class FeedbackGenerator:
         else:
             feedback = default_prompt
 
+        if id_results is not None:
+            feedback += (
+                "\n\nIndividual Differences Analysis:\n"
+                f"{id_results['summary_text']}\n\n"
+                "When proposing new models, consider whether parameters could better capture "
+                "individual variation in these questionnaire measures. The primary objective "
+                "remains minimising BIC (model fit), but higher R² for individual differences "
+                "is also desirable.\n"
+            )
+
         return feedback
 
 
@@ -62,7 +72,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         self.model = model
         self.tokenizer = tokenizer
 
-    def get_feedback(self, best_model, tried_param_sets):
+    def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback string for the next prompt using an LLM.
         """
@@ -85,7 +95,16 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         else:
             prompt = default_prompt
 
-        # from llm.generator import generate
+        if id_results is not None:
+            prompt += (
+                "\n\nIndividual Differences Analysis:\n"
+                f"{id_results['summary_text']}\n\n"
+                "Consider whether model parameters could better capture "
+                "individual variation in these questionnaire measures. "
+                "The primary objective remains minimising BIC, but higher R² "
+                "for individual differences is also desirable."
+            )
+
         feedback_text = self.generate(prompt)
         return feedback_text.strip()
 

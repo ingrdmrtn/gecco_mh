@@ -1,3 +1,12 @@
+from datetime import datetime
+
+
+def _log(msg):
+    """Print a timestamped log message."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
 class FeedbackGenerator:
     """
     Base feedback handler for guiding the LLM between iterations.
@@ -96,7 +105,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
             text_verbosity = getattr(self.cfg.llm, "text_verbosity", "low")
 
-            print(
+            _log(
                 f"[GeCCo] Using GPT model '{self.cfg.llm.base_model}' "
                 f"(reasoning={reasoning_effort}, verbosity={text_verbosity}, max_output_tokens={max_out})"
             )
@@ -118,7 +127,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         else:
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
 
-            print(
+            _log(
                 f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "
                 f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
             )

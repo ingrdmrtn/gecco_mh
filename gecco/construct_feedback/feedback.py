@@ -130,12 +130,4 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 temperature=self.cfg.llm.temperature,
                 do_sample=True,
             )
-
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new,
-                temperature=self.cfg.llm.temperature,
-                do_sample=True,
-            )
             return self.tokenizer.decode(output[0], skip_special_tokens=True)

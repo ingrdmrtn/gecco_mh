@@ -10,7 +10,6 @@ from gecco.offline_evaluation.fit_generated_models import run_fit
 from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
-from google.genai import types
 
 def _log(msg):
     """Print a timestamped log message."""
@@ -89,6 +88,7 @@ class GeCCoModelSearch:
             return decoded
 
         elif "gemini" in provider:
+            from google.genai import types
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
             print(

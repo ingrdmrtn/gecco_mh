@@ -155,11 +155,14 @@ Models are downloaded from the HuggingFace Hub on first use and loaded with `dev
 - `torch`, `transformers`, and `accelerate` installed (included in `requirements.txt`)
 - For gated models (e.g. LLaMA), log in with `huggingface-cli login` and accept the model license on HuggingFace
 
-**HPC users:** Models are cached in `~/.cache/huggingface/` by default, which may exceed home directory quotas. To use a different location (e.g. a scratch filesystem), set the `HF_HOME` environment variable before running:
+**HPC users:** Models are cached in `~/.cache/huggingface/` by default, which may exceed home directory quotas. To use a different location (e.g. a scratch filesystem), set the `HF_HOME` environment variable in your shell or job script before running:
 
 ```bash
 export HF_HOME=/scratch/$USER/huggingface
+python scripts/two_step_demo.py --config config/two_step_local.yaml
 ```
+
+Note: `HF_HOME` must be set as a shell environment variable — putting it in the `.env` file will not work, as HuggingFace reads it at import time before `python-dotenv` loads.
 
 **Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 

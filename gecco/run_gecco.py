@@ -1,6 +1,7 @@
 # engine/model_search.py
 import os
 import json
+import time
 import numpy as np
 
 from gecco.offline_evaluation.fit_generated_models import run_fit
@@ -79,10 +80,11 @@ class GeCCoModelSearch:
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
 
             print(
-                f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "
+                f"[GeCCo] Generating with HF model '{self.cfg.llm.base_model}' "
                 f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
             )
 
+            t0 = time.time()
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             output = model.generate(
                 **inputs,
@@ -90,6 +92,9 @@ class GeCCoModelSearch:
                 temperature=self.cfg.llm.temperature,
                 do_sample=True,
             )
+            elapsed = time.time() - t0
+            n_tokens = output.shape[1] - inputs["input_ids"].shape[1]
+            print(f"[GeCCo] Generation complete: {n_tokens} tokens in {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)")
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
     def run_n_shots(self, run_idx):

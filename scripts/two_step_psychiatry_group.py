@@ -22,7 +22,7 @@ def main():
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_config(project_root / "config" / args.config)
     data_cfg = cfg.data
-    metadata = cfg.metadata.flag
+    metadata = getattr(getattr(cfg, "metadata", None), "flag", False)
     max_independent_runs  = cfg.loop.max_independent_runs
 
     df = load_data(data_cfg.path, data_cfg.input_columns)
@@ -58,7 +58,7 @@ def main():
         id_col=data_cfg.id_column,
         template=data_cfg.narrative_template,
         fit_type=getattr(cfg.evaluation, "fit_type", "group"),
-        metadata =cfg.metadata.narrative_template if metadata else None,
+        metadata=getattr(cfg.metadata, "narrative_template", None) if metadata else None,
         max_trials=getattr(data_cfg, "max_prompt_trials", None),
         value_mappings=getattr(data_cfg, "value_mappings", None)  # 👈 add this
     )

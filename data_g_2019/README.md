@@ -1,8 +1,37 @@
 # data_g_2019
 
-Self-report questionnaire data from Gillan et al. (2016, 2019). No behavioral task data is included here — see `../data/` for two-step task data.
+Self-report questionnaire data and two-step task behavioral data from Gillan et al. (2016, 2019).
 
 ## Files
+
+### `twostep_data_study1_individual_csv/`
+- **649 files**, one CSV per participant, named by subject ID
+- Raw two-step task data from Study 1 (Gillan et al., 2016)
+- *Notes from Claire Gillan (November 2019):*
+  - Task data starts the row after the one that lists `twostep_instruct_9` in column C
+  - Subjects can have a varying number of rows before the task starts due to repeated instructions (multiple `instructionLoop` instances)
+
+**Column reference (lettered columns in raw files):**
+
+| Column | Name | Description |
+|---|---|---|
+| A | `trial_num` | Trial number |
+| B | `drift_1` | Reward probability after stage 2, option 1 |
+| C | `drift_2` | Reward probability after stage 2, option 2 |
+| D | `drift_3` | Reward probability after stage 2, option 3 |
+| E | `drift_4` | Reward probability after stage 2, option 4 |
+| F | `stage_1_response` | Left or right |
+| G | `stage_1_selected_stimulus` | 1 or 2 (redundant with response — stage 1 options do not switch locations) |
+| H | `stage_1_rt` | Stage 1 reaction time |
+| I | `transition` | Common = TRUE; rare = FALSE |
+| J | `stage_2_response` | Left or right |
+| K | `stage_2_selected_stimulus` | 1 or 2 (redundant with response — stage 2 options also do not switch locations) |
+| L | `stage_2_state` | Identity of second stage reached (2 or 3) |
+| M | `stage_2_rt` | Stage 2 reaction time |
+| N | `reward` | 1 = rewarded; 0 = not rewarded |
+| O | `redundant` | Always 1; redundant task variable |
+
+
 
 ### `self_report_study1.csv`
 - **N = 548 participants**

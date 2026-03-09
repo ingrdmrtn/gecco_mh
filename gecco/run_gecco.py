@@ -241,6 +241,7 @@ class GeCCoModelSearch:
                         "param_names": params,
                         "code_file": str(model_file),
                         "individual_differences": id_results,
+                        "code": func_code,
                     })
 
                     if mean_metric < self.best_metric:

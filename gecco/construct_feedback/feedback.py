@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 
 
@@ -190,20 +191,144 @@ class FeedbackGenerator:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Level 3: Stagnation detection, factor extraction, top-N code
+    # ------------------------------------------------------------------
+
+    def _detect_stagnation(self, threshold=2.0, window=3):
+        """
+        Check whether the search has stagnated.
+        Returns "exploring" if best BIC hasn't improved by more than
+        *threshold* over the last *window* iterations, "exploiting" otherwise.
+        """
+        if len(self.history) < window:
+            return "exploiting"
+
+        recent = self.history[-window:]
+        best_bics = []
+        for entry in recent:
+            if entry["results"]:
+                best_bics.append(min(r["metric_value"] for r in entry["results"]))
+
+        if len(best_bics) < 2:
+            return "exploiting"
+
+        improvement = best_bics[0] - best_bics[-1]
+        return "exploring" if improvement < threshold else "exploiting"
+
+    def _extract_factor_usage(self, code):
+        """
+        Parse model code to identify which psychiatric factors are used.
+        Returns a list of factor names found (e.g. ["ad", "cit"] or ["stai"]).
+        """
+        factors = {
+            "ad": r"\bself\.ad\b",
+            "cit": r"\bself\.cit\b",
+            "sw": r"\bself\.sw\b",
+            "stai": r"\bstai\b",
+            "oci": r"\boci\b",
+        }
+        found = []
+        for name, pattern in factors.items():
+            if re.search(pattern, code):
+                found.append(name)
+        return found
+
+    def _get_top_n_code(self, n=3):
+        """
+        Return the code of the top *n* models (by BIC) from history.
+        Returns list of (name, bic, code, factors_used) tuples.
+        """
+        all_models = []
+        for entry in self.history:
+            for r in entry["results"]:
+                code = r.get("code", "")
+                if code:
+                    all_models.append({
+                        "name": r["function_name"],
+                        "bic": r["metric_value"],
+                        "code": code,
+                        "iter": entry["iteration"],
+                    })
+
+        if not all_models:
+            return []
+
+        all_models.sort(key=lambda x: x["bic"])
+        results = []
+        for m in all_models[:n]:
+            factors = self._extract_factor_usage(m["code"])
+            results.append((m["name"], m["bic"], m["code"], factors))
+        return results
+
+    def _build_factor_coverage(self):
+        """
+        Build a summary of which psychiatric factor-mechanism pairings
+        have been tried across all models. Only produces output if
+        factor usage is detected.
+        """
+        all_factor_usage = []
+        for entry in self.history:
+            for r in entry["results"]:
+                code = r.get("code", "")
+                if code:
+                    factors = self._extract_factor_usage(code)
+                    if factors:
+                        all_factor_usage.append({
+                            "name": r["function_name"],
+                            "bic": r["metric_value"],
+                            "factors": factors,
+                            "iter": entry["iteration"],
+                        })
+
+        if not all_factor_usage:
+            return ""
+
+        lines = ["Psychiatric factor usage across models:"]
+        # Count how often each factor appears and its average BIC
+        factor_stats = {}
+        for m in all_factor_usage:
+            for f in m["factors"]:
+                if f not in factor_stats:
+                    factor_stats[f] = {"count": 0, "bics": []}
+                factor_stats[f]["count"] += 1
+                factor_stats[f]["bics"].append(m["bic"])
+
+        for f, stats in sorted(factor_stats.items()):
+            avg_bic = sum(stats["bics"]) / len(stats["bics"])
+            best_bic = min(stats["bics"])
+            lines.append(
+                f"  - '{f}': used in {stats['count']} model(s), "
+                f"avg BIC = {avg_bic:.1f}, best BIC = {best_bic:.1f}"
+            )
+
+        # Flag factors never used
+        used = set(factor_stats.keys())
+        # Only flag missing factors from the set that appears at least once
+        # (e.g. if stai is used, don't flag missing ad/cit/sw since it's a different config)
+        if used & {"ad", "cit", "sw"}:
+            missing = {"ad", "cit", "sw"} - used
+            if missing:
+                lines.append(
+                    f"  - Untried factors: {sorted(missing)} — consider models using these."
+                )
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback string for the next prompt.
-        Includes Level 1 (BIC trajectory) and Level 2 (landscape summary)
-        context before the core model-and-parameter feedback.
+        Includes Level 1 (BIC trajectory), Level 2 (landscape summary),
+        and Level 3 (stagnation signal, factor coverage) context.
         """
         previous_parameters = "\n".join(
             [", ".join(s) for s in tried_param_sets]
         )
 
-        # --- Level 1 + 2 context (always prepended) ---
+        # --- Level 1 + 2 context ---
         context_parts = []
         trajectory = self._build_trajectory_summary()
         if trajectory:
@@ -211,6 +336,25 @@ class FeedbackGenerator:
         landscape = self._build_landscape_summary()
         if landscape:
             context_parts.append(landscape)
+
+        # --- Level 3: factor coverage + stagnation ---
+        factor_coverage = self._build_factor_coverage()
+        if factor_coverage:
+            context_parts.append(factor_coverage)
+
+        mode = self._detect_stagnation()
+        if mode == "exploring":
+            context_parts.append(
+                "Search status: STAGNATING. BIC has not improved meaningfully "
+                "in recent iterations. Try structurally different mechanisms "
+                "rather than refining the current approach."
+            )
+        elif len(self.history) >= 3:
+            context_parts.append(
+                "Search status: IMPROVING. Current direction is productive — "
+                "refine and build on the best model's mechanisms."
+            )
+
         search_context = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
 
         # --- Core feedback (custom prompt or default) ---
@@ -254,43 +398,47 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
     def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
-        Construct feedback string for the next prompt using an LLM.
-        Level 1 + 2 context is prepended to the LLM prompt so the LLM
-        can reason over the full search history.
+        Construct feedback using an LLM judge that analyses the full
+        search landscape and provides data-driven guidance.
         """
-        previous_parameters = "\n".join(
-            [", ".join(s) for s in tried_param_sets]
-        )
-
-        # --- Level 1 + 2 context ---
+        # --- Build landscape context (Levels 1-3) ---
         context_parts = []
+
         trajectory = self._build_trajectory_summary()
         if trajectory:
-            context_parts.append(trajectory)
+            context_parts.append(f"## Search Trajectory\n{trajectory}")
+
         landscape = self._build_landscape_summary()
         if landscape:
-            context_parts.append(landscape)
-        search_context = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
+            context_parts.append(f"## Model Landscape\n{landscape}")
 
-        if getattr(self.cfg.feedback, "prompt", None) is not None:
-            core_prompt = self.cfg.feedback.prompt.format(
-                best_model=best_model,
-                previous_parameters=previous_parameters,
+        factor_coverage = self._build_factor_coverage()
+        if factor_coverage:
+            context_parts.append(f"## Psychiatric Factor Usage\n{factor_coverage}")
+
+        mode = self._detect_stagnation()
+        context_parts.append(f"## Search Status\nMode: {mode.upper()}")
+
+        # --- Top N model code ---
+        top_models = self._get_top_n_code(n=3)
+        if top_models:
+            code_sections = []
+            for name, bic, code, factors in top_models:
+                factor_str = f" (factors used: {', '.join(factors)})" if factors else ""
+                code_sections.append(
+                    f"### {name} (BIC = {bic:.1f}){factor_str}\n```python\n{code}\n```"
+                )
+            context_parts.append(
+                "## Top Model Implementations\n" + "\n\n".join(code_sections)
             )
-        else:
-            core_prompt = (
-                f"The best model so far was:\n  {best_model}.\n"
-                f"The following parameter combinations have already been explored:\n"
-                f"{previous_parameters}\n\n"
-                "Please suggest high-level guidance for generating new model variants "
-                "that differ conceptually but might still perform well."
-            )
 
-        prompt = search_context + core_prompt
+        # --- Best model ---
+        context_parts.append(f"## Current Best Model\n```python\n{best_model}\n```")
 
+        # --- Individual differences (from Marko's eval) ---
         if id_results is not None:
-            prompt += (
-                "\n\nIndividual Differences Analysis:\n"
+            context_parts.append(
+                f"## Individual Differences Analysis\n"
                 f"{id_results['summary_text']}\n\n"
                 "Consider whether model parameters could better capture "
                 "individual variation in these questionnaire measures. "
@@ -298,7 +446,26 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 "for individual differences is also desirable."
             )
 
-        feedback_text = self.generate(prompt)
+        search_context = "\n\n".join(context_parts)
+
+        # --- Judge prompt ---
+        judge_prompt = (
+            "You are analysing a computational model search. Be purely data-driven — "
+            "report what the BIC values show. Do NOT interpret mechanisms based on "
+            "literature or prior knowledge. The goal is novel discovery.\n\n"
+            f"{search_context}\n\n"
+            "Based on the data above:\n"
+            "1. Which parameters or mechanisms consistently appear in well-fitting models?\n"
+            "2. Which parameters add complexity without meaningfully improving BIC?\n"
+            "3. What parameter or mechanism combinations have not been tried yet?\n"
+            "4. Is improvement stagnating? If so, suggest structurally different directions "
+            "to explore.\n"
+            "5. Provide specific, actionable guidance for generating the next set of models.\n\n"
+            "Keep your response concise and focused on actionable next steps."
+        )
+
+        _log("[GeCCo] Sending landscape data to judge LLM for feedback")
+        feedback_text = self.generate(judge_prompt)
         return feedback_text.strip()
 
     def generate(self, prompt):

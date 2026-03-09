@@ -82,6 +82,15 @@ class FeedbackGenerator:
     # Level 2: BIC landscape — ranked table + parameter importance
     # ------------------------------------------------------------------
 
+    def _count_clients(self):
+        """Count the number of distinct clients contributing to history."""
+        client_ids = set()
+        for entry in self.history:
+            cid = entry.get("client_id")
+            if cid is not None:
+                client_ids.add(cid)
+        return len(client_ids)
+
     def _build_landscape_summary(self):
         """
         Build a ranked table of all models across all iterations, flag
@@ -100,6 +109,7 @@ class FeedbackGenerator:
                     "bic": r["metric_value"],
                     "params": r["param_names"],
                     "iter": entry["iteration"],
+                    "client_id": entry.get("client_id"),
                 })
 
         if not all_models:
@@ -108,7 +118,9 @@ class FeedbackGenerator:
         all_models.sort(key=lambda x: x["bic"])
 
         # --- Ranked table (top 10) ---
-        lines = ["Model landscape (all iterations, ranked by BIC):"]
+        n_clients = self._count_clients()
+        client_note = f" from {n_clients} parallel search clients" if n_clients > 1 else ""
+        lines = [f"Model landscape (all iterations{client_note}, ranked by BIC):"]
         lines.append(f"{'Model':<22} {'BIC':>8}  {'Params':<45}  Iter")
         lines.append("-" * 82)
         for m in all_models[:10]:
@@ -398,7 +410,9 @@ class FeedbackGenerator:
         mode = self._detect_stagnation()
         trend = "improving" if mode == "exploiting" else "stagnating"
 
-        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}). Trend: {trend}."]
+        n_clients = self._count_clients()
+        client_note = f" across {n_clients} clients" if n_clients > 1 else ""
+        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}{client_note}). Trend: {trend}."]
 
         # ID summary
         if id_results is not None:
@@ -582,6 +596,16 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 "individual variation in these questionnaire measures. "
                 "The primary objective remains minimising BIC, but higher R² "
                 "for individual differences is also desirable."
+            )
+
+        # --- Multi-client context ---
+        n_clients = self._count_clients()
+        if n_clients > 1:
+            context_parts.insert(0,
+                f"## Distributed Search\n"
+                f"This search is running across {n_clients} parallel clients, "
+                f"each exploring different model architectures. The data below "
+                f"aggregates results from all clients."
             )
 
         search_context = "\n\n".join(context_parts)

@@ -290,6 +290,7 @@ class GeCCoModelSearch:
                         "code_file": str(model_file),
                         "individual_differences": id_results,
                         "code": func_code,
+                        "eval_metrics": fit_res.get("eval_metrics", []),
                     })
 
                     if mean_metric < self.best_metric:

@@ -129,6 +129,7 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
 
     # Run regression for each parameter
     per_param_r2 = {}
+    per_param_detail = {}
     summary_lines = ["Individual Differences Analysis (R² from param ~ questionnaire regressions):"]
 
     for pname in param_names:
@@ -137,6 +138,7 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
         # Skip if no variance
         if np.std(y) < 1e-10:
             per_param_r2[pname] = 0.0
+            per_param_detail[pname] = {"r2": 0.0, "coefficients": {f: 0.0 for f in all_features}}
             summary_lines.append(f"  - {pname}: R² = 0.00 (no variance in parameter)")
             continue
 
@@ -144,7 +146,14 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
         r2 = reg.score(X, y)
         r2 = max(0.0, r2)  # Clip negative R² (possible with few samples)
         per_param_r2[pname] = r2
-        summary_lines.append(f"  - {pname}: R² = {r2:.3f}")
+
+        # Store per-predictor coefficients
+        coefficients = {f: float(c) for f, c in zip(all_features, reg.coef_)}
+        per_param_detail[pname] = {"r2": r2, "coefficients": coefficients}
+
+        # Build summary line with predictor coefficients
+        predictor_strs = [f"{f}: β={coefficients[f]:.3f}" for f in predictors]
+        summary_lines.append(f"  - {pname}: R² = {r2:.3f} ({', '.join(predictor_strs)})")
 
     mean_r2 = float(np.mean(list(per_param_r2.values()))) if per_param_r2 else 0.0
     summary_lines.append(f"  Mean R² across parameters: {mean_r2:.3f}")
@@ -155,5 +164,6 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
     return {
         "mean_r2": mean_r2,
         "per_param_r2": per_param_r2,
+        "per_param_detail": per_param_detail,
         "summary_text": summary_text,
     }

@@ -1,4 +1,5 @@
 import re
+import numpy as np
 from datetime import datetime
 
 
@@ -315,47 +316,191 @@ class FeedbackGenerator:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Level 4: Per-participant fit quality
+    # ------------------------------------------------------------------
+
+    def _build_fit_quality_summary(self):
+        """
+        Analyse per-participant fit metrics for the best model in the most
+        recent iteration. Flags outliers and reports distribution stats.
+        """
+        # Find the best model's eval_metrics from the most recent iteration
+        if not self.history:
+            return ""
+
+        # Get eval_metrics from the best model across all history
+        best_metrics = None
+        best_bic = float("inf")
+        best_name = ""
+        for entry in self.history:
+            for r in entry["results"]:
+                metrics = r.get("eval_metrics", [])
+                if metrics and r["metric_value"] < best_bic:
+                    best_bic = r["metric_value"]
+                    best_metrics = metrics
+                    best_name = r["function_name"]
+
+        if not best_metrics or len(best_metrics) < 2:
+            return ""
+
+        metrics = np.array(best_metrics)
+        mean_val = np.mean(metrics)
+        std_val = np.std(metrics)
+        min_val = np.min(metrics)
+        max_val = np.max(metrics)
+        n_total = len(metrics)
+
+        # Outliers: participants with BIC > mean + 2*std
+        outlier_threshold = mean_val + 2 * std_val
+        n_outliers = int(np.sum(metrics > outlier_threshold))
+        pct_outliers = 100 * n_outliers / n_total
+
+        # Well-fit: participants with BIC below median
+        median_val = np.median(metrics)
+
+        lines = [
+            f"Participant fit quality for best model ({best_name}):",
+            f"  Mean BIC: {mean_val:.1f} (std: {std_val:.1f}, min: {min_val:.1f}, max: {max_val:.1f})",
+            f"  Median BIC: {median_val:.1f}",
+            f"  Poorly-fit participants (BIC > mean + 2σ): {n_outliers}/{n_total} ({pct_outliers:.1f}%)",
+        ]
+
+        # Report the spread — large std relative to mean indicates heterogeneity
+        if std_val > 0.5 * mean_val:
+            lines.append(
+                "  High variability in fit quality across participants — "
+                "the model may not capture an important source of individual differences."
+            )
+
+        return "\n".join(lines)
+
+    def _build_high_level_summary(self, id_results=None):
+        """
+        Build a concise 2-3 line summary of the search state.
+        """
+        if not self.history:
+            return ""
+
+        # Best model info
+        best_bic = float("inf")
+        best_name = ""
+        best_iter = -1
+        for entry in self.history:
+            for r in entry["results"]:
+                if r["metric_value"] < best_bic:
+                    best_bic = r["metric_value"]
+                    best_name = r["function_name"]
+                    best_iter = entry["iteration"]
+
+        if best_bic == float("inf"):
+            return ""
+
+        mode = self._detect_stagnation()
+        trend = "improving" if mode == "exploiting" else "stagnating"
+
+        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}). Trend: {trend}."]
+
+        # ID summary
+        if id_results is not None:
+            mean_r2 = id_results.get("mean_r2", 0.0)
+            detail = id_results.get("per_param_detail", {})
+            # Find the strongest predictor across all params
+            best_pred = ""
+            best_beta = 0.0
+            best_param = ""
+            for pname, info in detail.items():
+                for pred, coef in info.get("coefficients", {}).items():
+                    if abs(coef) > abs(best_beta):
+                        best_beta = coef
+                        best_pred = pred
+                        best_param = pname
+            if best_pred:
+                lines.append(
+                    f"Individual differences: mean R² = {mean_r2:.3f} "
+                    f"(strongest predictor: {best_pred} → {best_param}, β={best_beta:.3f})."
+                )
+            else:
+                lines.append(f"Individual differences: mean R² = {mean_r2:.3f}.")
+
+        # Fit quality summary
+        fit_quality = self._build_fit_quality_summary()
+        if fit_quality:
+            # Extract just the outlier line
+            for line in fit_quality.split("\n"):
+                if "Poorly-fit" in line:
+                    lines.append(line.strip())
+                    break
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback string for the next prompt.
-        Includes Level 1 (BIC trajectory), Level 2 (landscape summary),
-        and Level 3 (stagnation signal, factor coverage) context.
+        Includes high-level summary, BIC trajectory, landscape, fit quality,
+        individual differences detail, and stagnation signal.
         """
         previous_parameters = "\n".join(
             [", ".join(s) for s in tried_param_sets]
         )
 
-        # --- Level 1 + 2 context ---
-        context_parts = []
+        # --- High-level summary ---
+        parts = []
+        summary = self._build_high_level_summary(id_results=id_results)
+        if summary:
+            parts.append(f"## Summary\n{summary}")
+
+        # --- Detailed breakdown ---
+
+        # BIC trajectory
         trajectory = self._build_trajectory_summary()
         if trajectory:
-            context_parts.append(trajectory)
+            parts.append(trajectory)
+
+        # Model landscape
         landscape = self._build_landscape_summary()
         if landscape:
-            context_parts.append(landscape)
+            parts.append(landscape)
 
-        # --- Level 3: factor coverage + stagnation ---
+        # Participant fit quality
+        fit_quality = self._build_fit_quality_summary()
+        if fit_quality:
+            parts.append(fit_quality)
+
+        # Individual differences
+        if id_results is not None:
+            parts.append(
+                f"Individual Differences Analysis:\n"
+                f"{id_results['summary_text']}\n\n"
+                "When proposing new models, consider whether parameters could better capture "
+                "individual variation in these questionnaire measures. The primary objective "
+                "remains minimising BIC (model fit), but higher R² for individual differences "
+                "is also desirable."
+            )
+
+        # Factor coverage
         factor_coverage = self._build_factor_coverage()
         if factor_coverage:
-            context_parts.append(factor_coverage)
+            parts.append(factor_coverage)
 
+        # Stagnation signal
         mode = self._detect_stagnation()
         if mode == "exploring":
-            context_parts.append(
+            parts.append(
                 "Search status: STAGNATING. BIC has not improved meaningfully "
                 "in recent iterations. Try structurally different mechanisms "
                 "rather than refining the current approach."
             )
         elif len(self.history) >= 3:
-            context_parts.append(
+            parts.append(
                 "Search status: IMPROVING. Current direction is productive — "
                 "refine and build on the best model's mechanisms."
             )
 
-        search_context = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
+        search_context = ("\n\n".join(parts) + "\n\n") if parts else ""
 
         # --- Core feedback (custom prompt or default) ---
         if getattr(self.cfg.feedback, "prompt", None):
@@ -365,25 +510,13 @@ class FeedbackGenerator:
             )
         else:
             core = (
-                f"Your best model so far:\n  {best_model}.\n"
-                f"The parameter combinations tried so far:\n{previous_parameters}\n\n"
+                f"## Best Model So Far\n```python\n{best_model}\n```\n\n"
+                f"## Parameter Combinations Tested\n{previous_parameters}\n\n"
                 "Avoid repeating these exact combinations, "
                 "and explore alternative parameter configurations or mechanisms.\n"
             )
 
-        feedback = search_context + core
-
-        if id_results is not None:
-            feedback += (
-                "\n\nIndividual Differences Analysis:\n"
-                f"{id_results['summary_text']}\n\n"
-                "When proposing new models, consider whether parameters could better capture "
-                "individual variation in these questionnaire measures. The primary objective "
-                "remains minimising BIC (model fit), but higher R² for individual differences "
-                "is also desirable.\n"
-            )
-
-        return feedback
+        return search_context + core
 
 
 class LLMFeedbackGenerator(FeedbackGenerator):
@@ -412,6 +545,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         if landscape:
             context_parts.append(f"## Model Landscape\n{landscape}")
 
+        # --- Participant fit quality ---
+        fit_quality = self._build_fit_quality_summary()
+        if fit_quality:
+            context_parts.append(f"## Participant Fit Quality\n{fit_quality}")
+
         factor_coverage = self._build_factor_coverage()
         if factor_coverage:
             context_parts.append(f"## Psychiatric Factor Usage\n{factor_coverage}")
@@ -435,7 +573,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # --- Best model ---
         context_parts.append(f"## Current Best Model\n```python\n{best_model}\n```")
 
-        # --- Individual differences (from Marko's eval) ---
+        # --- Individual differences (with per-predictor detail) ---
         if id_results is not None:
             context_parts.append(
                 f"## Individual Differences Analysis\n"
@@ -458,10 +596,15 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             "1. Which parameters or mechanisms consistently appear in well-fitting models?\n"
             "2. Which parameters add complexity without meaningfully improving BIC?\n"
             "3. What parameter or mechanism combinations have not been tried yet?\n"
-            "4. Is improvement stagnating? If so, suggest structurally different directions "
+            "4. Are there patterns in which participants fit poorly? Does the model "
+            "struggle with a specific subset of participants?\n"
+            "5. Which symptom dimensions (questionnaire factors) most strongly predict "
+            "model parameters, and what does this suggest about individual differences?\n"
+            "6. Is improvement stagnating? If so, suggest structurally different directions "
             "to explore.\n"
-            "5. Provide specific, actionable guidance for generating the next set of models.\n\n"
-            "Keep your response concise and focused on actionable next steps."
+            "7. Provide specific, actionable guidance for generating the next set of models.\n\n"
+            "Keep your response concise and focused on actionable next steps. "
+            "Do NOT include Python code or pseudocode — describe mechanisms conceptually only."
         )
 
         _log("[GeCCo] Sending landscape data to judge LLM for feedback")

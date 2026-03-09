@@ -9,6 +9,7 @@ Works with arbitrary callable model functions (e.g., LLM-generated models)
 that follow the ModelSpec interface.
 """
 
+import os
 import numpy as np
 import logging
 from copy import deepcopy
@@ -16,6 +17,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional, Callable
 from scipy.optimize import minimize
 from scipy.special import psi, gammaln
+from concurrent.futures import as_completed
+from loky import get_reusable_executor
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
@@ -135,6 +138,9 @@ def optimize_subject_map(
     prior_precision: np.ndarray,
     bounds_list: List[Tuple[float, float]],
     theta_init: np.ndarray,
+    maxiter: int = 200,
+    ftol: float = 1e-10,
+    compute_hessian: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
     Find MAP estimate for a single subject under a single model.
@@ -146,6 +152,9 @@ def optimize_subject_map(
         prior_precision: Diagonal prior precision in unbounded space, shape (D,)
         bounds_list: [(lb, ub), ...] for each parameter
         theta_init: Starting point in unbounded space, shape (D,)
+        maxiter: Maximum optimizer iterations (lower for warm-start EM steps)
+        ftol: Function tolerance for optimizer convergence
+        compute_hessian: Whether to compute the numerical Hessian (can skip for speed)
 
     Returns:
         theta_map: MAP estimate in unbounded space
@@ -185,28 +194,65 @@ def optimize_subject_map(
         neg_log_posterior,
         theta_init,
         method="L-BFGS-B",
-        options={"maxiter": 200, "ftol": 1e-10},
+        options={"maxiter": maxiter, "ftol": ftol},
     )
     theta_map = result.x
 
-    # Compute Hessian at MAP
-    H = numerical_hessian(neg_log_posterior, theta_map)
+    if compute_hessian:
+        # Compute Hessian at MAP
+        H = numerical_hessian(neg_log_posterior, theta_map)
 
-    # Regularize and invert
-    H_reg = H + np.eye(D) * 1e-6
-    try:
-        H_inv = np.linalg.inv(H_reg)
-        sign, logdet = np.linalg.slogdet(H_reg)
-        if sign <= 0:
+        # Regularize and invert
+        H_reg = H + np.eye(D) * 1e-6
+        try:
+            H_inv = np.linalg.inv(H_reg)
+            sign, logdet = np.linalg.slogdet(H_reg)
+            if sign <= 0:
+                logdet = D * np.log(1e-6)
+        except np.linalg.LinAlgError:
+            H_inv = np.eye(D) * 1e6
             logdet = D * np.log(1e-6)
-    except np.linalg.LinAlgError:
-        H_inv = np.eye(D) * 1e6
-        logdet = D * np.log(1e-6)
 
-    hessian_inv_diag = np.diag(H_inv)
+        hessian_inv_diag = np.diag(H_inv)
+    else:
+        hessian_inv_diag = None
+        logdet = None
+
     log_posterior = -neg_log_posterior(theta_map)
 
     return theta_map, hessian_inv_diag, logdet, log_posterior
+
+
+# --- Parallel Helpers ---
+
+
+def _fit_subject_init(nll_func, data_cols, prior_mean, prior_prec, bounds_list, n_starts, Dk):
+    """Fit a single subject during initialization (multi-start)."""
+    best_log_post = -np.inf
+    best_stats = (np.zeros(Dk), np.zeros(Dk), 0.0, -np.inf)
+
+    start_points = [prior_mean.copy()]
+    for _ in range(n_starts - 1):
+        start_points.append(np.random.randn(Dk) * 0.5)
+
+    for start_val in start_points:
+        th_map, h_inv_diag, logdet, log_post = optimize_subject_map(
+            nll_func, data_cols, prior_mean, prior_prec, bounds_list, start_val,
+        )
+        if log_post > best_log_post:
+            best_log_post = log_post
+            best_stats = (th_map, h_inv_diag, logdet, log_post)
+
+    return best_stats
+
+
+def _fit_subject_em(nll_func, data_cols, prior_mean, prior_precision, bounds_list,
+                    th_init, maxiter=50, ftol=1e-6, compute_hessian=True):
+    """Fit a single subject during an EM iteration."""
+    return optimize_subject_map(
+        nll_func, data_cols, prior_mean, prior_precision, bounds_list, th_init,
+        maxiter=maxiter, ftol=ftol, compute_hessian=compute_hessian,
+    )
 
 
 # --- HBI Update Functions ---
@@ -352,6 +398,8 @@ def run_hbi_scipy(
     max_iter: int = 50,
     tol: float = 1e-5,
     n_starts: int = 3,
+    n_jobs: int = -1,
+    model_comparison: bool = False,
     hyperprior_beta: float = 1.0,
     hyperprior_nu: float = 0.5,
     hyperprior_sigma: float = 0.01,
@@ -359,12 +407,25 @@ def run_hbi_scipy(
     """
     Run Hierarchical Bayesian Inference using scipy optimization.
 
+    When model_comparison=False (default), runs in parameter estimation mode:
+    fits a single model with empirical Bayes shrinkage. This is faster because
+    it skips Hessian computation, responsibility updates, and model frequency
+    tracking. If multiple model_specs are provided, model_comparison is
+    automatically enabled.
+
+    When model_comparison=True, runs full CBM: computes Hessians for Laplace
+    approximation, updates model responsibilities, and tracks model frequencies
+    and exceedance probabilities.
+
     Args:
         participant_data: List of N participants, each a list of input column arrays.
         model_specs: List of K ModelSpec objects, each with .func, .param_names, .bounds
         max_iter: Maximum EM iterations
-        tol: Convergence tolerance on effective counts
+        tol: Convergence tolerance
         n_starts: Number of random restarts for initial fitting
+        n_jobs: Number of parallel jobs (-1 = all cores, 1 = sequential)
+        model_comparison: Enable full model comparison (Hessians, responsibilities,
+            exceedance probabilities). Auto-enabled when len(model_specs) > 1.
         hyperprior_beta: Prior pseudo-count for mean precision
         hyperprior_nu: Prior shape for precision Gamma
         hyperprior_sigma: Prior scale for precision Gamma
@@ -372,11 +433,30 @@ def run_hbi_scipy(
     Returns:
         HBIResult with fitted parameters, responsibilities, model frequencies, etc.
     """
+    # Respect SLURM allocation if available
+    if n_jobs == -1:
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK") or os.environ.get("SLURM_CPUS_ON_NODE")
+        if slurm_cpus is not None:
+            n_jobs = int(slurm_cpus)
+
     N = len(participant_data)
     K = len(model_specs)
 
-    console.rule("[bold blue]HBI: Hierarchical Bayesian Inference")
-    console.print(f"  Models: [cyan]{K}[/]  Subjects: [cyan]{N}[/]  Max iterations: [cyan]{max_iter}[/]")
+    # Auto-enable model comparison when multiple models are provided
+    if K > 1:
+        model_comparison = True
+
+    # Resolve n_jobs
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+    n_jobs = min(n_jobs, N)  # no point having more workers than subjects
+
+    mode_str = "Model Comparison" if model_comparison else "Parameter Estimation"
+    console.rule(f"[bold blue]HBI: {mode_str}")
+    console.print(
+        f"  Models: [cyan]{K}[/]  Subjects: [cyan]{N}[/]  "
+        f"Max iterations: [cyan]{max_iter}[/]  Workers: [cyan]{n_jobs}[/]"
+    )
 
     # Extract bounds as list of tuples for each model
     bounds_per_model = []
@@ -422,6 +502,9 @@ def run_hbi_scipy(
     subject_params_unbounded = []
     hessian_inv_diag_per_model = []
 
+    # Create reusable process pool (uses cloudpickle, handles exec'd functions)
+    executor = get_reusable_executor(max_workers=n_jobs)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -429,44 +512,40 @@ def run_hbi_scipy(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         console=console,
-    ) as progress:
+        transient=True,
+    ) as init_progress:
         for k in range(K):
             Dk = param_counts[k]
             prior_mean_init = np.zeros(Dk)
             prior_prec_init = np.ones(Dk) * 5.0
 
+            init_task = init_progress.add_task(
+                f"[cyan]Init {model_specs[k].name} ({Dk} params, {n_starts} starts)",
+                total=N,
+            )
+
             theta_k = np.zeros((Dk, N))
             hess_k = np.zeros((Dk, N))
 
-            task = progress.add_task(
-                f"[green]Init {model_specs[k].name} ({Dk} params)", total=N
-            )
-
-            for n in range(N):
-                best_log_post = -np.inf
-                best_stats = (np.zeros(Dk), np.zeros(Dk), 0.0, -np.inf)
-
-                # Multi-start: prior mean + random starts
-                start_points = [prior_mean_init.copy()]
-                for _ in range(n_starts - 1):
-                    start_points.append(np.random.randn(Dk) * 0.5)
-
-                for start_val in start_points:
-                    th_map, h_inv_diag, logdet, log_post = optimize_subject_map(
-                        model_specs[k].func,
-                        participant_data[n],
-                        prior_mean_init,
-                        prior_prec_init,
-                        bounds_per_model[k],
-                        start_val,
-                    )
-                    if log_post > best_log_post:
-                        best_log_post = log_post
-                        best_stats = (th_map, h_inv_diag, logdet, log_post)
-
-                theta_k[:, n] = best_stats[0]
-                hess_k[:, n] = best_stats[1]
-                progress.advance(task)
+            futures = {
+                executor.submit(
+                    _fit_subject_init,
+                    model_specs[k].func,
+                    participant_data[n],
+                    prior_mean_init,
+                    prior_prec_init,
+                    bounds_per_model[k],
+                    n_starts,
+                    Dk,
+                ): n
+                for n in range(N)
+            }
+            for future in as_completed(futures):
+                n = futures[future]
+                th, h, _, _ = future.result()
+                theta_k[:, n] = th
+                hess_k[:, n] = h
+                init_progress.advance(init_task)
 
             subject_params_unbounded.append(theta_k)
             hessian_inv_diag_per_model.append(hess_k)
@@ -474,8 +553,47 @@ def run_hbi_scipy(
     # --- Main EM Loop ---
     log_posterior_matrix = np.zeros((K, N))
     log_det_hessian_matrix = np.zeros((K, N))
-    old_effective_counts = np.zeros(K)
     converged = False
+
+    # Hessian only needed for model comparison (Laplace approximation)
+    hessian_freq = 3  # recompute every N iterations when needed
+
+    # Track convergence: group mean change for param estimation,
+    # effective count change for model comparison
+    old_group_means = [np.zeros_like(prior_mu_tau[k].a) for k in range(K)]
+    old_effective_counts = np.zeros(K)
+
+    # Early stopping: stop if mean log-posterior doesn't improve for `patience` iterations
+    best_mean_log_post = -np.inf
+    patience = 5
+    no_improve_count = 0
+
+    def _parallel_em_step(k, do_hessian):
+        """Run parallelized E-step for model k."""
+        prior_mean = post_mu_tau[k].a
+        prior_precision = post_mu_tau[k].Etau
+
+        futures = {
+            executor.submit(
+                _fit_subject_em,
+                model_specs[k].func,
+                participant_data[n],
+                prior_mean,
+                prior_precision,
+                bounds_per_model[k],
+                subject_params_unbounded[k][:, n],
+                50,     # maxiter (warm start)
+                1e-6,   # ftol (looser than init)
+                do_hessian,
+            ): n
+            for n in range(N)
+        }
+
+        results = {}
+        for future in as_completed(futures):
+            n = futures[future]
+            results[n] = future.result()
+        return results
 
     with Progress(
         SpinnerColumn(),
@@ -498,62 +616,92 @@ def run_hbi_scipy(
 
             # Step 2: Update group hyperparameters
             post_mu_tau = hbi_qmutau(prior_mu_tau, effective_counts, weighted_means, weighted_variances)
-            post_model_freq = hbi_qm(prior_model_freq, effective_counts)
+            if model_comparison:
+                post_model_freq = hbi_qm(prior_model_freq, effective_counts)
 
-            # Step 3: Re-fit each subject with updated priors
-            new_subject_params = deepcopy(subject_params_unbounded)
-            new_hessian_inv_diag = deepcopy(hessian_inv_diag_per_model)
+            # Step 3: Re-fit each subject with updated priors (parallelized)
+            is_last = (it == max_iter - 1)
+            do_hessian = model_comparison and ((it % hessian_freq == 0) or is_last)
+
+            new_subject_params = [p.copy() for p in subject_params_unbounded]
+            new_hessian_inv_diag = [h.copy() for h in hessian_inv_diag_per_model]
 
             for k in range(K):
-                prior_mean = post_mu_tau[k].a
-                prior_precision = post_mu_tau[k].Etau
-
-                for n in range(N):
-                    th_init = subject_params_unbounded[k][:, n]
-                    th_map, h_inv_diag, logdet, log_post = optimize_subject_map(
-                        model_specs[k].func,
-                        participant_data[n],
-                        prior_mean,
-                        prior_precision,
-                        bounds_per_model[k],
-                        th_init,
-                    )
+                results = _parallel_em_step(k, do_hessian)
+                for n, (th_map, h_inv_diag, logdet, log_post) in results.items():
                     new_subject_params[k][:, n] = th_map
-                    new_hessian_inv_diag[k][:, n] = h_inv_diag
-                    log_det_hessian_matrix[k, n] = logdet
+                    if do_hessian:
+                        new_hessian_inv_diag[k][:, n] = h_inv_diag
+                        log_det_hessian_matrix[k, n] = logdet
                     log_posterior_matrix[k, n] = log_post
 
             subject_params_unbounded = new_subject_params
             hessian_inv_diag_per_model = new_hessian_inv_diag
 
-            # Step 4: Update responsibilities
-            responsibilities = hbi_qHZ(
-                post_mu_tau,
-                post_model_freq,
-                log_posterior_matrix,
-                log_det_hessian_matrix,
-                subject_params_unbounded,
-                hessian_inv_diag_per_model,
-            )
+            # Early stopping: check if mean log-posterior is improving
+            mean_log_post = float(np.mean(log_posterior_matrix))
+            if mean_log_post > best_mean_log_post + 1e-6:
+                best_mean_log_post = mean_log_post
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= patience:
+                progress.update(
+                    em_task, completed=max_iter,
+                    status=f"[bold yellow]Early stop[/] (no improvement for {patience} iters)",
+                )
+                converged = True
+                break
+
+            # Step 4: Update responsibilities (only for model comparison)
+            if model_comparison:
+                responsibilities = hbi_qHZ(
+                    post_mu_tau,
+                    post_model_freq,
+                    log_posterior_matrix,
+                    log_det_hessian_matrix,
+                    subject_params_unbounded,
+                    hessian_inv_diag_per_model,
+                )
 
             # Check convergence
-            freq_str = ", ".join(f"{c:.1f}" for c in effective_counts)
-            if it > 0:
-                count_change = np.sum(np.abs(effective_counts - old_effective_counts))
-                progress.update(
-                    em_task, advance=1,
-                    status=f"delta={count_change:.2e}  counts=[{freq_str}]",
+            if model_comparison:
+                # Converge on effective counts (model assignment)
+                delta = np.sum(np.abs(effective_counts - old_effective_counts))
+                freq_str = ", ".join(f"{c:.1f}" for c in effective_counts)
+                hess_str = " [H]" if do_hessian else ""
+                status_str = f"delta={delta:.2e}  counts=[{freq_str}]{hess_str}" if it > 0 else f"counts=[{freq_str}]{hess_str}"
+            else:
+                # Converge on group mean (parameter estimates)
+                delta = sum(
+                    float(np.max(np.abs(post_mu_tau[k].a - old_group_means[k])))
+                    for k in range(K)
                 )
-                if count_change < tol:
+                status_str = f"delta={delta:.2e}" if it > 0 else ""
+
+            if it > 0:
+                progress.update(em_task, advance=1, status=status_str)
+                if delta < tol:
+                    # For model comparison, recompute Hessians at convergence
+                    if model_comparison and not do_hessian:
+                        for k in range(K):
+                            results = _parallel_em_step(k, True)
+                            for n, (_, h_inv_diag, logdet, _) in results.items():
+                                hessian_inv_diag_per_model[k][:, n] = h_inv_diag
+                                log_det_hessian_matrix[k, n] = logdet
+
                     progress.update(
                         em_task, completed=max_iter,
-                        status=f"[bold green]Converged[/]  counts=[{freq_str}]",
+                        status=f"[bold green]Converged[/] (iter {it + 1})",
                     )
                     converged = True
                     break
             else:
-                progress.update(em_task, advance=1, status=f"counts=[{freq_str}]")
+                progress.update(em_task, advance=1, status=status_str)
+
             old_effective_counts = effective_counts.copy()
+            old_group_means = [post_mu_tau[k].a.copy() for k in range(K)]
 
     if not converged:
         console.print(
@@ -583,22 +731,31 @@ def run_hbi_scipy(
             )
         params_bounded.append(theta_bounded_k)
 
-    # Exceedance probabilities
-    xp = compute_exceedance_probabilities(post_model_freq.alpha)
+    # Model comparison outputs
+    if model_comparison:
+        xp = compute_exceedance_probabilities(post_model_freq.alpha)
+        model_freq = post_model_freq.alpha / np.sum(post_model_freq.alpha)
+    else:
+        xp = np.ones(K)
+        model_freq = np.ones(K) / K
 
     # Summary table
     table = Table(title="HBI Results", show_header=True, header_style="bold cyan")
     table.add_column("Model", style="bold")
-    table.add_column("Frequency", justify="right")
-    table.add_column("Exceedance Prob", justify="right")
     table.add_column("Params", justify="right")
+    if model_comparison:
+        table.add_column("Frequency", justify="right")
+        table.add_column("Exceedance Prob", justify="right")
+    table.add_column("Mean NLL", justify="right")
     for k in range(K):
-        table.add_row(
-            model_specs[k].name,
-            f"{effective_counts[k]/N:.3f}",
-            f"{xp[k]:.3f}",
-            str(param_counts[k]),
-        )
+        row = [model_specs[k].name, str(param_counts[k])]
+        if model_comparison:
+            row.extend([
+                f"{model_freq[k]:.3f}",
+                f"{xp[k]:.3f}",
+            ])
+        row.append(f"{np.mean(per_subject_nll[k]):.2f}")
+        table.add_row(*row)
     console.print(table)
     console.rule("[bold blue]HBI Complete")
 
@@ -608,7 +765,7 @@ def run_hbi_scipy(
         responsibilities=responsibilities,
         group_mean=[q.a for q in post_mu_tau],
         group_precision=[q.Etau for q in post_mu_tau],
-        model_frequency=post_model_freq.alpha / np.sum(post_model_freq.alpha),
+        model_frequency=model_freq,
         exceedance_prob=xp,
         per_subject_nll=per_subject_nll,
         converged=converged,

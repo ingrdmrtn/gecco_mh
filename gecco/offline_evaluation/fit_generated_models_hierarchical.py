@@ -23,6 +23,7 @@ def run_fit_hierarchical(
     max_iter=50,
     tol=1e-5,
     n_starts=3,
+    n_jobs=-1,
 ):
     """
     Fit an LLM-generated model hierarchically using HBI.
@@ -90,6 +91,7 @@ def run_fit_hierarchical(
         max_iter=max_iter,
         tol=tol,
         n_starts=n_starts,
+        n_jobs=n_jobs,
     )
 
     elapsed = time.time() - t0

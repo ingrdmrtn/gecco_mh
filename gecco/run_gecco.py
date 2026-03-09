@@ -196,7 +196,7 @@ class GeCCoModelSearch:
                 # Save feedback for inspection
                 feedback_file = (
                     self.results_dir / "feedback" / f"iter{it}_run{run_idx}.txt"
-                    if self.cfg.evaluation.fit_type != "individual"
+                    if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                     else self.results_dir / "feedback" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
                 )
                 with open(feedback_file, "w") as f:

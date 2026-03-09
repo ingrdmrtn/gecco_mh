@@ -255,6 +255,31 @@ def _fit_subject_em(nll_func, data_cols, prior_mean, prior_precision, bounds_lis
     )
 
 
+def _fit_subjects_batch_init(nll_func, batch_data, batch_indices, prior_mean,
+                             prior_prec, bounds_list, n_starts, Dk):
+    """Fit a batch of subjects during initialization (multi-start)."""
+    results = {}
+    for i, n in enumerate(batch_indices):
+        results[n] = _fit_subject_init(
+            nll_func, batch_data[i], prior_mean, prior_prec, bounds_list, n_starts, Dk,
+        )
+    return results
+
+
+def _fit_subjects_batch_em(nll_func, batch_data, batch_indices, prior_mean,
+                           prior_precision, bounds_list, batch_theta_inits,
+                           maxiter=50, ftol=1e-6, compute_hessian=True):
+    """Fit a batch of subjects during an EM iteration."""
+    results = {}
+    for i, n in enumerate(batch_indices):
+        results[n] = optimize_subject_map(
+            nll_func, batch_data[i], prior_mean, prior_precision, bounds_list,
+            batch_theta_inits[i], maxiter=maxiter, ftol=ftol,
+            compute_hessian=compute_hessian,
+        )
+    return results
+
+
 # --- HBI Update Functions ---
 
 
@@ -527,25 +552,33 @@ def run_hbi_scipy(
             theta_k = np.zeros((Dk, N))
             hess_k = np.zeros((Dk, N))
 
-            futures = {
-                executor.submit(
-                    _fit_subject_init,
+            # Batch subjects into n_jobs chunks to reduce process pool overhead
+            all_indices = list(range(N))
+            chunks = [all_indices[i::n_jobs] for i in range(n_jobs)]
+            chunks = [c for c in chunks if c]  # remove empty
+
+            futures = {}
+            for chunk in chunks:
+                batch_data = [participant_data[n] for n in chunk]
+                f = executor.submit(
+                    _fit_subjects_batch_init,
                     model_specs[k].func,
-                    participant_data[n],
+                    batch_data,
+                    chunk,
                     prior_mean_init,
                     prior_prec_init,
                     bounds_per_model[k],
                     n_starts,
                     Dk,
-                ): n
-                for n in range(N)
-            }
+                )
+                futures[f] = chunk
+
             for future in as_completed(futures):
-                n = futures[future]
-                th, h, _, _ = future.result()
-                theta_k[:, n] = th
-                hess_k[:, n] = h
-                init_progress.advance(init_task)
+                batch_results = future.result()
+                for n, (th, h, _, _) in batch_results.items():
+                    theta_k[:, n] = th
+                    hess_k[:, n] = h
+                    init_progress.advance(init_task)
 
             subject_params_unbounded.append(theta_k)
             hessian_inv_diag_per_model.append(hess_k)
@@ -568,32 +601,53 @@ def run_hbi_scipy(
     patience = 5
     no_improve_count = 0
 
-    def _parallel_em_step(k, do_hessian):
-        """Run parallelized E-step for model k."""
+    # Skip-stable-subjects: track per-subject parameter change
+    skip_threshold = 1e-4
+    min_iters_before_skip = 3
+    subject_skip_mask = [np.zeros(N, dtype=bool) for _ in range(K)]
+
+    def _parallel_em_step(k, do_hessian, em_maxiter, em_ftol, skip_mask=None):
+        """Run parallelized E-step for model k with batching."""
         prior_mean = post_mu_tau[k].a
         prior_precision = post_mu_tau[k].Etau
 
-        futures = {
-            executor.submit(
-                _fit_subject_em,
+        # Determine which subjects to optimize
+        if skip_mask is not None and not do_hessian:
+            active = [n for n in range(N) if not skip_mask[n]]
+        else:
+            active = list(range(N))
+
+        if not active:
+            return {}
+
+        # Batch active subjects into n_jobs chunks
+        n_batches = min(n_jobs, len(active))
+        chunks = [active[i::n_batches] for i in range(n_batches)]
+        chunks = [c for c in chunks if c]
+
+        futures = {}
+        for chunk in chunks:
+            batch_data = [participant_data[n] for n in chunk]
+            batch_thetas = [subject_params_unbounded[k][:, n] for n in chunk]
+            f = executor.submit(
+                _fit_subjects_batch_em,
                 model_specs[k].func,
-                participant_data[n],
+                batch_data,
+                chunk,
                 prior_mean,
                 prior_precision,
                 bounds_per_model[k],
-                subject_params_unbounded[k][:, n],
-                50,     # maxiter (warm start)
-                1e-6,   # ftol (looser than init)
+                batch_thetas,
+                em_maxiter,
+                em_ftol,
                 do_hessian,
-            ): n
-            for n in range(N)
-        }
+            )
+            futures[f] = chunk
 
-        results = {}
+        all_results = {}
         for future in as_completed(futures):
-            n = futures[future]
-            results[n] = future.result()
-        return results
+            all_results.update(future.result())
+        return all_results
 
     with Progress(
         SpinnerColumn(),
@@ -623,17 +677,40 @@ def run_hbi_scipy(
             is_last = (it == max_iter - 1)
             do_hessian = model_comparison and ((it % hessian_freq == 0) or is_last)
 
+            # Adaptive optimizer tolerance: loose early, tight later
+            if it < 3:
+                em_maxiter, em_ftol = 20, 1e-4
+            elif it < 10:
+                em_maxiter, em_ftol = 35, 1e-5
+            else:
+                em_maxiter, em_ftol = 50, 1e-6
+
             new_subject_params = [p.copy() for p in subject_params_unbounded]
             new_hessian_inv_diag = [h.copy() for h in hessian_inv_diag_per_model]
 
+            # Use skip mask for subjects that have stabilized
+            use_skip = it >= min_iters_before_skip
+            n_skipped = 0
+
             for k in range(K):
-                results = _parallel_em_step(k, do_hessian)
+                skip = subject_skip_mask[k] if use_skip else None
+                results = _parallel_em_step(k, do_hessian, em_maxiter, em_ftol, skip)
+                if use_skip and skip is not None:
+                    n_skipped += int(skip.sum())
                 for n, (th_map, h_inv_diag, logdet, log_post) in results.items():
                     new_subject_params[k][:, n] = th_map
                     if do_hessian:
                         new_hessian_inv_diag[k][:, n] = h_inv_diag
                         log_det_hessian_matrix[k, n] = logdet
                     log_posterior_matrix[k, n] = log_post
+
+            # Update skip mask: track per-subject parameter change
+            for k in range(K):
+                for n in range(N):
+                    delta_n = np.max(np.abs(
+                        new_subject_params[k][:, n] - subject_params_unbounded[k][:, n]
+                    ))
+                    subject_skip_mask[k][n] = delta_n < skip_threshold
 
             subject_params_unbounded = new_subject_params
             hessian_inv_diag_per_model = new_hessian_inv_diag
@@ -678,7 +755,8 @@ def run_hbi_scipy(
                     float(np.max(np.abs(post_mu_tau[k].a - old_group_means[k])))
                     for k in range(K)
                 )
-                status_str = f"delta={delta:.2e}" if it > 0 else ""
+                skip_str = f"  skipped={n_skipped}/{N*K}" if n_skipped > 0 else ""
+                status_str = f"delta={delta:.2e}{skip_str}" if it > 0 else ""
 
             if it > 0:
                 progress.update(em_task, advance=1, status=status_str)

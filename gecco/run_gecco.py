@@ -138,6 +138,29 @@ class GeCCoModelSearch:
             return decoded
 
         # -----------------------------
+        # vLLM (OpenAI-compatible API)
+        # -----------------------------
+        elif "vllm" in provider:
+            max_out = getattr(self.cfg.llm, "max_output_tokens",
+                              getattr(self.cfg.llm, "max_tokens", 2048))
+
+            console.print(
+                f"[dim]Generating with vLLM [cyan]{self.cfg.llm.base_model}[/] "
+                f"(max_tokens={max_out}, temp={self.cfg.llm.temperature})[/]"
+            )
+
+            resp = model.chat.completions.create(
+                model=self.cfg.llm.base_model,
+                messages=[
+                    {"role": "system", "content": self.cfg.llm.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.cfg.llm.temperature,
+                max_tokens=max_out,
+            )
+            return resp.choices[0].message.content.strip()
+
+        # -----------------------------
         # Hugging Face-style generation
         # -----------------------------
         else:

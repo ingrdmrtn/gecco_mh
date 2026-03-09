@@ -196,21 +196,29 @@ class FeedbackGenerator:
     def get_feedback(self, best_model, tried_param_sets):
         """
         Construct feedback string for the next prompt.
-        Includes Level 1 (BIC trajectory) and Level 2 (landscape summary)
-        context before the core model-and-parameter feedback.
+        Prepends Level 1 (BIC trajectory) and/or Level 2 (landscape summary)
+        context depending on cfg.feedback.level (default: 2).
+
+        level=0 — no search-history context
+        level=1 — BIC trajectory only
+        level=2 — BIC trajectory + ranked model landscape
         """
+        level = int(getattr(self.cfg.feedback, "level", 2))
+
         previous_parameters = "\n".join(
             [", ".join(s) for s in tried_param_sets]
         )
 
-        # --- Level 1 + 2 context (always prepended) ---
+        # --- Search-history context block ---
         context_parts = []
-        trajectory = self._build_trajectory_summary()
-        if trajectory:
-            context_parts.append(trajectory)
-        landscape = self._build_landscape_summary()
-        if landscape:
-            context_parts.append(landscape)
+        if level >= 1:
+            trajectory = self._build_trajectory_summary()
+            if trajectory:
+                context_parts.append(trajectory)
+        if level >= 2:
+            landscape = self._build_landscape_summary()
+            if landscape:
+                context_parts.append(landscape)
         search_context = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
 
         # --- Core feedback (custom prompt or default) ---
@@ -245,19 +253,27 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         Construct feedback string for the next prompt using an LLM.
         Level 1 + 2 context is prepended to the LLM prompt so the LLM
         can reason over the full search history.
+
+        level=0 — no search-history context
+        level=1 — BIC trajectory only
+        level=2 — BIC trajectory + ranked model landscape
         """
+        level = int(getattr(self.cfg.feedback, "level", 2))
+
         previous_parameters = "\n".join(
             [", ".join(s) for s in tried_param_sets]
         )
 
-        # --- Level 1 + 2 context ---
+        # --- Search-history context block ---
         context_parts = []
-        trajectory = self._build_trajectory_summary()
-        if trajectory:
-            context_parts.append(trajectory)
-        landscape = self._build_landscape_summary()
-        if landscape:
-            context_parts.append(landscape)
+        if level >= 1:
+            trajectory = self._build_trajectory_summary()
+            if trajectory:
+                context_parts.append(trajectory)
+        if level >= 2:
+            landscape = self._build_landscape_summary()
+            if landscape:
+                context_parts.append(landscape)
         search_context = ("\n\n".join(context_parts) + "\n\n") if context_parts else ""
 
         if getattr(self.cfg.feedback, "prompt", None) is not None:

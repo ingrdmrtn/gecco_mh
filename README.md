@@ -265,6 +265,119 @@ GeCCo will connect to the running vLLM server instead of loading a model locally
 
 **Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
+### Distributed parallel search (multiple clients)
+
+When model fitting is the bottleneck (e.g. fitting ~1000 subjects per model), you can run multiple GeCCo clients in parallel. Each client queries the same vLLM server for model generation but fits models independently. Clients share results via a JSON registry file on the shared filesystem, so each client's LLM feedback incorporates discoveries from all other clients.
+
+```text
+            vLLM Server (GPU node)
+                   |  HTTP
+        +----------+----------+
+        |          |          |
+    Client 0   Client 1   Client 2
+    (CPU job)  (CPU job)  (CPU job)
+        |          |          |
+        +----+-----+-----+---+
+             |
+      Shared filesystem
+      (shared_registry.json)
+```
+
+#### Step 1: Define client profiles in your config
+
+Add a `clients:` section to your YAML config. Each profile can override LLM settings such as temperature and append extra instructions to the system prompt:
+
+```yaml
+clients:
+  exploit:
+    llm:
+      temperature: 0.3
+      system_prompt_suffix: |
+        Focus on refining and improving the best-performing model.
+        Make small, targeted changes to parameters and mechanisms.
+  explore:
+    llm:
+      temperature: 0.9
+      system_prompt_suffix: |
+        Be creative and try fundamentally different model architectures.
+        Consider cognitive mechanisms not yet explored.
+      extra_guardrails:
+        - "Each model must use at least one mechanism not present in any previous model."
+  diverse:
+    llm:
+      temperature: 0.7
+      models_per_iteration: 5
+      system_prompt_suffix: |
+        Ensure each proposed model uses a substantially different
+        combination of cognitive mechanisms from any previous model.
+  minimal:
+    llm:
+      temperature: 0.5
+      system_prompt_suffix: |
+        Propose simple models with few parameters. Prioritise parsimony.
+      extra_guardrails:
+        - "Each model should have at most 3 free parameters."
+```
+
+Available override fields per profile:
+
+| Field | Effect |
+| ------- | -------- |
+| `temperature` | Direct override of `llm.temperature` |
+| `models_per_iteration` | Direct override of `llm.models_per_iteration` |
+| `system_prompt_suffix` | Appended to the base `llm.system_prompt` |
+| `extra_guardrails` | Appended to the `llm.guardrails` list |
+| Any other `llm.*` field | Direct override |
+
+The `clients:` section is ignored by existing non-distributed scripts.
+
+#### Step 2: Launch with the launcher script
+
+`scripts/launch_distributed.py` reads profiles from your config, launches the vLLM server and client array, and wires up SLURM dependencies automatically:
+
+```bash
+# Launch vLLM + all profiles from config
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --launch-vllm
+
+# vLLM already running — just launch clients, specifying the server URL
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml \
+    --vllm-url http://gpu-node:8000/v1
+
+# Run only a subset of profiles
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --profiles exploit,minimal
+
+# Add extra clients running the base config (no profile overrides)
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --extra-clients 2
+
+# Preview commands without submitting
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --dry-run
+```
+
+For local testing without SLURM, run clients directly:
+
+```bash
+python scripts/run_gecco_distributed.py --config two_step_factors_distributed.yaml \
+    --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
+```
+
+#### Step 3: Monitor progress
+
+```bash
+# One-shot status
+python scripts/monitor_distributed.py --task two_step_factors
+
+# Live dashboard (refreshes every 10s, Ctrl+C to exit)
+python scripts/monitor_distributed.py --task two_step_factors --watch 10
+```
+
+#### How coordination works
+
+- Clients share results via `results/<task_name>/shared_registry.json` on the shared filesystem
+- Before each iteration, clients merge cross-client history into their feedback — the LLM judge automatically sees the full model landscape from all clients
+- The global best model is tracked across all clients
+- File locking and atomic writes prevent corruption from concurrent access
+- Output files include the client ID in their names (e.g. `iter0_client2_run0.txt`)
+
 ## ⚙️ Configuration
 
 All experiment parameters are specified in YAML files under `config/`.

@@ -46,6 +46,7 @@ class GeCCoModelSearch:
 
         (self.results_dir / "models").mkdir(parents=True, exist_ok=True)
         (self.results_dir / "bics").mkdir(parents=True, exist_ok=True)
+        (self.results_dir / "feedback").mkdir(parents=True, exist_ok=True)
 
         # --- Tracking ---
         self.best_model = None
@@ -160,6 +161,15 @@ class GeCCoModelSearch:
             feedback = ""
             if self.best_model is not None:
                 feedback = self.feedback.get_feedback(self.best_model, self.tried_param_sets)
+
+                # Save feedback for inspection
+                feedback_file = (
+                    self.results_dir / "feedback" / f"iter{it}_run{run_idx}.txt"
+                    if self.cfg.evaluation.fit_type != "individual"
+                    else self.results_dir / "feedback" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                )
+                with open(feedback_file, "w") as f:
+                    f.write(feedback)
 
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
             code_text = self.generate(self.model, self.tokenizer, prompt)

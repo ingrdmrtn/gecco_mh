@@ -77,6 +77,8 @@ def main():
     parser.add_argument("--vllm-url", type=str, default=None,
                         help="vLLM server URL (e.g. http://gpu-node:8000/v1). "
                              "Passed to all clients. If omitted, clients read $VLLM_BASE_URL or $HOME/.vllm_env")
+    parser.add_argument("--conda-env", type=str, default=None,
+                        help="Conda environment to activate in each client job")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without submitting")
     args = parser.parse_args()
@@ -139,9 +141,10 @@ def main():
     print("Launching client array...")
     dep_flag = f"--dependency=afterok:{vllm_job_id}" if vllm_job_id else ""
     vllm_url_arg = f'"{args.vllm_url}"' if args.vllm_url else '""'
+    conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
     cmd = (
         f"sbatch --array={array_spec} {dep_flag} "
-        f'bash/run_gecco_distributed.sh "{args.config}" "{profiles_csv}" {vllm_url_arg}'
+        f'bash/run_gecco_distributed.sh "{args.config}" "{profiles_csv}" {vllm_url_arg} {conda_arg}'
     )
     client_job_id = run_cmd(cmd, dry_run=args.dry_run)
     if client_job_id:

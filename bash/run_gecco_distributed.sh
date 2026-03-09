@@ -18,6 +18,7 @@
 CONFIG=${1:-"two_step_factors_distributed.yaml"}
 PROFILES_CSV=${2:-""}
 VLLM_URL_ARG=${3:-""}
+CONDA_ENV=${4:-""}
 
 # Resolve profile for this array task from the comma-separated list
 if [ -n "$PROFILES_CSV" ]; then
@@ -36,8 +37,15 @@ fi
 
 mkdir -p logs
 
+# Activate conda environment if specified
+if [ -n "$CONDA_ENV" ]; then
+    echo "[GeCCo] Activating conda env: $CONDA_ENV"
+    conda activate "$CONDA_ENV"
+fi
+
 echo "[GeCCo] Client $SLURM_ARRAY_TASK_ID starting (profile: ${PROFILE:-default})"
 echo "[GeCCo] Config: $CONFIG"
+echo "[GeCCo] Python: $(which python)"
 
 # Resolve vLLM server URL: explicit arg > .vllm_env > environment
 if [ -n "$VLLM_URL_ARG" ]; then

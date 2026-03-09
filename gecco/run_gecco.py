@@ -19,12 +19,15 @@ console = Console()
 
 
 class GeCCoModelSearch:
-    def __init__(self, model, tokenizer, cfg, df, prompt_builder):
+    def __init__(self, model, tokenizer, cfg, df, prompt_builder,
+                 client_id=None, shared_registry=None):
         self.model = model
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.df = df
         self.prompt_builder = prompt_builder
+        self.client_id = client_id
+        self.shared_registry = shared_registry
 
         # --- Choose feedback generator based on config ---
         if hasattr(cfg, "feedback") and getattr(cfg.feedback, "type", "manual") == "llm":
@@ -36,8 +39,6 @@ class GeCCoModelSearch:
         self.project_root = Path(__file__).resolve().parents[1]
 
         # --- Results directory (absolute path) ---
-        # self.results_dir = self.project_root / "results" / self.cfg.task.name if getattr(self.cfg.evaluation, "fit_type", "group") != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
-
         fit_type = getattr(self.cfg.evaluation, "fit_type", "group")
         self.results_dir = (
             self.project_root / "results" / self.cfg.task.name
@@ -62,6 +63,9 @@ class GeCCoModelSearch:
         self.best_iter = -1
         self.tried_param_sets = []
         self.best_id_results = None
+
+        # --- Track which registry entries we've already merged ---
+        self._merged_history_count = 0
 
     def generate(self, model, tokenizer=None, prompt=None):
         """
@@ -218,11 +222,83 @@ class GeCCoModelSearch:
             )
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
+    def _file_tag(self):
+        """Return a client tag for filenames, or empty string if not distributed."""
+        if self.client_id is not None:
+            return f"_client{self.client_id}"
+        return ""
+
+    def _sync_from_registry(self):
+        """
+        Pull cross-client data from the shared registry into local state.
+        Updates best model, tried param sets, and merges history into
+        self.feedback.history so all feedback analysis methods see
+        cross-client data.
+        """
+        if self.shared_registry is None:
+            return
+
+        data = self.shared_registry.read()
+
+        # Update best model if global best is better
+        global_best = data.get("global_best")
+        if global_best and global_best["metric_value"] < self.best_metric:
+            self.best_metric = global_best["metric_value"]
+            self.best_model = global_best["model_code"]
+            self.best_params = global_best["param_names"]
+            console.print(
+                f"  [bold magenta]Synced global best from client {global_best['client_id']}:[/] "
+                f"BIC = {global_best['metric_value']:.2f}"
+            )
+
+        # Merge tried param sets (deduplicate)
+        existing = {tuple(s) for s in self.tried_param_sets}
+        for ps in data.get("tried_param_sets", []):
+            key = tuple(ps)
+            if key not in existing:
+                self.tried_param_sets.append(ps)
+                existing.add(key)
+
+        # Merge cross-client iteration history into feedback.history
+        all_history = data.get("iteration_history", [])
+        new_entries = all_history[self._merged_history_count:]
+
+        for entry in new_entries:
+            # Skip our own entries (already in feedback.history)
+            if entry.get("client_id") == self.client_id:
+                continue
+
+            self.feedback.history.append({
+                "iteration": entry["iteration"],
+                "results": entry["results"],
+                "client_id": entry.get("client_id"),
+            })
+
+        self._merged_history_count = len(all_history)
+
+    def _update_registry(self, iteration, results):
+        """Push this iteration's results to the shared registry."""
+        if self.shared_registry is None:
+            return
+
+        self.shared_registry.update(
+            client_id=self.client_id,
+            iteration=iteration,
+            results=results,
+            best_model=self.best_model,
+            best_metric=self.best_metric,
+            param_names=self.best_params,
+            tried_param_sets=self.tried_param_sets,
+        )
+
     def run_n_shots(self, run_idx, baseline_bic):
         for it in range(self.cfg.loop.max_iterations):
             console.rule(f"[bold]Iteration {it}")
 
             stop_iterations = False  # ✅ reset each iteration
+
+            # --- Sync from shared registry (distributed mode) ---
+            self._sync_from_registry()
 
             feedback = ""
             if self.best_model is not None:
@@ -232,10 +308,11 @@ class GeCCoModelSearch:
                 )
 
                 # Save feedback for inspection
+                tag = self._file_tag()
                 feedback_file = (
-                    self.results_dir / "feedback" / f"iter{it}_run{run_idx}.txt"
+                    self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}.txt"
                     if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                    else self.results_dir / "feedback" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                    else self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
                 )
                 with open(feedback_file, "w") as f:
                     f.write(feedback)
@@ -243,10 +320,11 @@ class GeCCoModelSearch:
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
             code_text = self.generate(self.model, self.tokenizer, prompt)
 
+            tag = self._file_tag()
             model_file = (
-                self.results_dir / "models" / f"iter{it}_run{run_idx}.txt"
+                self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir / "models" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                else self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
             )
 
             with open(model_file, "w") as f:
@@ -303,18 +381,18 @@ class GeCCoModelSearch:
                         console.print(f"  [bold green]New best model:[/] {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
-                            self.results_dir / "models" / f"best_model_{run_idx}.txt"
+                            self.results_dir / "models" / f"best_model{tag}_{run_idx}.txt"
                             if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                            else self.results_dir / "models" / f"best_model_{run_idx}_participant{self.df.participant[0]}.txt"
+                            else self.results_dir / "models" / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
                         )
                         with open(best_model_file, "w") as f:
                             f.write(func_code)
                         
                         # save best model bic
                         best_bic_file = (
-                            self.results_dir / "bics" / f"best_bic_{run_idx}.json"
+                            self.results_dir / "bics" / f"best_bic{tag}_{run_idx}.json"
                             if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                            else self.results_dir / "bics" / f"best_bic_{run_idx}_participant{self.df.participant[0]}.json"
+                            else self.results_dir / "bics" / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                         )
                         with open(best_bic_file, "w") as f:
                             json.dump({"bic": mean_metric}, f)
@@ -330,14 +408,17 @@ class GeCCoModelSearch:
 
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (
-                self.results_dir / "bics" / f"iter{it}_run{run_idx}.json"
+                self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}.json"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir / "bics" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.json"
+                else self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
             )
             with open(bic_file, "w") as f:
                 json.dump(iteration_results, f, indent=2)
 
             self.feedback.record_iteration(it, iteration_results)
+
+            # --- Push results to shared registry (distributed mode) ---
+            self._update_registry(it, iteration_results)
 
         console.print(
             f"\n[bold]Search complete.[/] "
@@ -357,14 +438,18 @@ class GeCCoModelSearch:
             param_dir = self.results_dir / "parameters"
             param_dir.mkdir(parents=True, exist_ok=True)
 
+            tag = self._file_tag()
             param_file = (
-                param_dir / f"best_params_run{run_idx}.csv"
+                param_dir / f"best_params{tag}_run{run_idx}.csv"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else param_dir / f"best_params_run{run_idx}_participant{self.df.participant[0]}.csv"
+                else param_dir / f"best_params{tag}_run{run_idx}_participant{self.df.participant[0]}.csv"
             )
 
             param_df.to_csv(param_file, index=False)
 
+        # --- Mark client complete in shared registry ---
+        if self.shared_registry is not None and self.client_id is not None:
+            self.shared_registry.mark_complete(self.client_id)
 
         return self.best_model, self.best_metric, self.best_params
 

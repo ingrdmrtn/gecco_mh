@@ -265,6 +265,120 @@ GeCCo will connect to the running vLLM server instead of loading a model locally
 
 **Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
+### Distributed parallel search (multiple clients)
+
+When model fitting is the bottleneck (e.g. fitting ~1000 subjects per model), you can run multiple GeCCo clients in parallel. Each client queries the same vLLM server for model generation but fits models independently. Clients share results via a JSON registry file on the shared filesystem, so each client's LLM feedback incorporates discoveries from all other clients.
+
+```text
+            vLLM Server (GPU node)
+                   |  HTTP
+        +----------+----------+
+        |          |          |
+    Client 0   Client 1   Client 2
+    (CPU job)  (CPU job)  (CPU job)
+        |          |          |
+        +----+-----+-----+---+
+             |
+      Shared filesystem
+      (shared_registry.json)
+```
+
+#### Step 1: Define client profiles in your config
+
+Add a `clients:` section to your YAML config. Each profile can override LLM settings such as temperature and append extra instructions to the system prompt:
+
+```yaml
+clients:
+  exploit:
+    llm:
+      temperature: 0.3
+      system_prompt_suffix: |
+        Focus on refining and improving the best-performing model.
+        Make small, targeted changes to parameters and mechanisms.
+  explore:
+    llm:
+      temperature: 0.9
+      system_prompt_suffix: |
+        Be creative and try fundamentally different model architectures.
+        Consider cognitive mechanisms not yet explored.
+      extra_guardrails:
+        - "Each model must use at least one mechanism not present in any previous model."
+  diverse:
+    llm:
+      temperature: 0.7
+      models_per_iteration: 5
+      system_prompt_suffix: |
+        Ensure each proposed model uses a substantially different
+        combination of cognitive mechanisms from any previous model.
+  minimal:
+    llm:
+      temperature: 0.5
+      system_prompt_suffix: |
+        Propose simple models with few parameters. Prioritise parsimony.
+      extra_guardrails:
+        - "Each model should have at most 3 free parameters."
+```
+
+Available override fields per profile:
+
+| Field | Effect |
+| ------- | -------- |
+| `temperature` | Direct override of `llm.temperature` |
+| `models_per_iteration` | Direct override of `llm.models_per_iteration` |
+| `system_prompt_suffix` | Appended to the base `llm.system_prompt` |
+| `extra_guardrails` | Appended to the `llm.guardrails` list |
+| Any other `llm.*` field | Direct override |
+
+The `clients:` section is ignored by existing non-distributed scripts.
+
+#### Step 2: Launch the vLLM server
+
+Follow the vLLM setup steps above, or launch via SLURM:
+
+```bash
+VLLM_JOB=$(sbatch --parsable bash/launch_vllm_server.sh Qwen/Qwen2.5-14B-Instruct 8000 1)
+```
+
+#### Step 3: Launch the distributed clients
+
+Use the provided SLURM job array script. It automatically maps array task IDs 0-3 to the profiles `exploit`, `explore`, `diverse`, and `minimal`:
+
+```bash
+sbatch --dependency=afterok:$VLLM_JOB bash/run_gecco_distributed.sh two_step_factors.yaml
+```
+
+The `--dependency=afterok:$VLLM_JOB` flag ensures clients only start once the vLLM server is running. Each client will also retry connecting to the server for up to 5 minutes before giving up.
+
+You can also run clients manually (e.g. for local testing):
+
+```bash
+# Terminal 1
+python scripts/run_gecco_distributed.py --config two_step_factors.yaml --client-id 0 --client-profile exploit
+
+# Terminal 2
+python scripts/run_gecco_distributed.py --config two_step_factors.yaml --client-id 1 --client-profile explore
+```
+
+#### How coordination works
+
+- Each client writes its iteration results (model code, BIC, parameters) to a shared registry file at `results/<task_name>/shared_registry.json`
+- Before each iteration, clients read the registry and merge cross-client results into their feedback history — this means the LLM judge (if using `feedback.type: "llm"`) automatically sees the full model landscape from all clients
+- The global best model is tracked across all clients, so each client benefits from any client's discoveries
+- File-level advisory locking (`fcntl.flock`) and atomic writes (`os.replace`) prevent corruption from concurrent access
+- Output files include the client ID in their names (e.g. `iter0_client2_run0.txt`) to avoid conflicts
+
+#### Customising the job array
+
+Edit `bash/run_gecco_distributed.sh` to change the number of clients or profile mapping:
+
+```bash
+#SBATCH --array=0-3          # number of clients (0-indexed)
+
+PROFILES=("exploit" "explore" "diverse" "minimal")  # one per array task
+```
+
+To run more clients than profiles, additional clients will use the base config without profile overrides.
+
 ## ⚙️ Configuration
 
 All experiment parameters are specified in YAML files under `config/`.

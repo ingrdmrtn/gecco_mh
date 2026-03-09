@@ -6,15 +6,16 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.table import Table
+
 from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
 from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 
-def _log(msg):
-    """Print a timestamped log message."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+console = Console()
 
 
 class GeCCoModelSearch:
@@ -78,9 +79,9 @@ class GeCCoModelSearch:
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
             text_verbosity = getattr(self.cfg.llm, "text_verbosity", "low")
 
-            _log(
-                f"[GeCCo] Using GPT model '{self.cfg.llm.base_model}' "
-                f"(reasoning={reasoning_effort}, verbosity={text_verbosity}, max_output_tokens={max_out})"
+            console.print(
+                f"[dim]Generating with GPT [cyan]{self.cfg.llm.base_model}[/] "
+                f"(reasoning={reasoning_effort}, max_tokens={max_out})[/]"
             )
 
             resp = model.responses.create(
@@ -99,9 +100,9 @@ class GeCCoModelSearch:
             from google.genai import types
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
-            print(
-                f"[GeCCo] Using Gemini model '{self.cfg.llm.base_model}' "
-                f"(reasoning={reasoning_effort})"
+            console.print(
+                f"[dim]Generating with Gemini [cyan]{self.cfg.llm.base_model}[/] "
+                f"(reasoning={reasoning_effort})[/]"
             )
 
             config_args = {
@@ -144,44 +145,58 @@ class GeCCoModelSearch:
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
             n_input = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
 
-            _log(
-                f"[GeCCo] Generating with HF model '{self.cfg.llm.base_model}' "
-                f"(input_tokens={n_input}, max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
+            console.print(
+                f"[dim]Generating with [cyan]{self.cfg.llm.base_model}[/] "
+                f"(input={n_input}, max_new={max_new}, temp={self.cfg.llm.temperature})[/]"
             )
 
+            # Progress bar streamer
+            gen_progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total} tokens"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            )
+            gen_task = gen_progress.add_task("[green]Generating", total=max_new)
+
             class _ProgressStreamer(TextStreamer):
-                """Log generation progress every N tokens."""
-                def __init__(self, tokenizer, log_every=50):
+                def __init__(self, tokenizer, progress, task_id):
                     super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
                     self.token_count = 0
-                    self.log_every = log_every
-                    self.t0 = time.time()
+                    self._progress = progress
+                    self._task_id = task_id
 
                 def on_finalized_text(self, text, stream_end=False):
-                    self.token_count += len(text.split()) if text.strip() else 1
-                    if self.token_count % self.log_every < 5 or stream_end:
-                        elapsed = time.time() - self.t0
-                        _log(f"[GeCCo] ... generated ~{self.token_count} tokens ({elapsed:.0f}s elapsed)")
+                    n = len(text.split()) if text.strip() else 1
+                    self.token_count += n
+                    self._progress.update(self._task_id, completed=self.token_count)
 
-            streamer = _ProgressStreamer(tokenizer, log_every=50)
+            streamer = _ProgressStreamer(tokenizer, gen_progress, gen_task)
 
             t0 = time.time()
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            output = model.generate(
-                **inputs,
-                max_new_tokens=max_new,
-                temperature=self.cfg.llm.temperature,
-                do_sample=True,
-                streamer=streamer,
-            )
+            with gen_progress:
+                output = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new,
+                    temperature=self.cfg.llm.temperature,
+                    do_sample=True,
+                    streamer=streamer,
+                )
             elapsed = time.time() - t0
             n_tokens = output.shape[1] - inputs["input_ids"].shape[1]
-            _log(f"[GeCCo] Generation complete: {n_tokens} tokens in {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)")
+            console.print(
+                f"[dim]Generated [cyan]{n_tokens}[/] tokens in {elapsed:.1f}s "
+                f"({n_tokens/elapsed:.1f} tok/s)[/]"
+            )
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
     def run_n_shots(self, run_idx, baseline_bic):
         for it in range(self.cfg.loop.max_iterations):
-            _log(f"\n[GeCCo] --- Iteration {it} ---")
+            console.rule(f"[bold]Iteration {it}")
 
             stop_iterations = False  # ✅ reset each iteration
 
@@ -221,7 +236,7 @@ class GeCCoModelSearch:
                     params = fit_res["param_names"]
                     self.tried_param_sets.append(params)
 
-                    _log(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
+                    console.print(f"  [bold]{func_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]")
 
                     # --- Individual differences evaluation (optional) ---
                     id_results = None
@@ -232,7 +247,7 @@ class GeCCoModelSearch:
                                 fit_res, self.df, self.cfg, id_data=self.id_eval_data
                             )
                         except Exception as e:
-                            _log(f"[GeCCo] Individual differences eval failed for {func_name}: {e}")
+                            console.print(f"  [yellow]Individual differences eval failed for {func_name}:[/] {e}")
 
                     iteration_results.append({
                         "function_name": func_name,
@@ -251,7 +266,7 @@ class GeCCoModelSearch:
                         self.best_param_names = fit_res["param_names"]
                         self.best_param_values = fit_res["parameter_values"]
                         self.best_id_results = id_results
-                        _log(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
+                        console.print(f"  [bold green]New best model:[/] {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
                             self.results_dir / "models" / f"best_model_{run_idx}.txt"
@@ -277,7 +292,7 @@ class GeCCoModelSearch:
                         break
 
                 except Exception as e:
-                    _log(f"[⚠️ GeCCo] Error fitting {func_name}: {e}")
+                    console.print(f"  [bold red]Error fitting {func_name}:[/] {e}")
 
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (
@@ -290,10 +305,10 @@ class GeCCoModelSearch:
 
             self.feedback.record_iteration(it, iteration_results)
 
-        _log(
-            f"\n[🏁 GeCCo] Finished search. "
-            f"Best model (iteration {self.best_iter}) "
-            f"{self.cfg.evaluation.metric.upper()}={self.best_metric:.2f}"
+        console.print(
+            f"\n[bold]Search complete.[/] "
+            f"Best model (iteration {self.best_iter}): "
+            f"{self.cfg.evaluation.metric.upper()} = [bold cyan]{self.best_metric:.2f}[/]"
         )
 
         # --- save best parameters ---

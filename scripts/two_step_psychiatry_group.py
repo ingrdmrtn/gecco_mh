@@ -18,7 +18,6 @@ import argparse
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 
 console = Console()
 
@@ -102,90 +101,77 @@ def main():
     global_best_bic = np.inf
     global_best_params = None
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        run_task = progress.add_task(
-            "[bold green]Independent runs", total=max_independent_runs
+    for r in range(max_independent_runs):
+        console.rule(f"[bold]Run {r+1}/{max_independent_runs}")
+
+        best_model, best_bic, best_params = search.run_n_shots(r, baseline_bic=baseline_bic)
+        best_iter = search.best_iter
+
+        console.print(
+            Panel(
+                f"[bold]Best BIC:[/] [cyan]{best_bic:.2f}[/]\n"
+                f"[bold]Parameters:[/] {', '.join(best_params)}",
+                title=f"Run {r} Complete",
+                style="green",
+            )
         )
 
-        for r in range(max_independent_runs):
-            best_model, best_bic, best_params = search.run_n_shots(r, baseline_bic=baseline_bic)
-            best_iter = search.best_iter
+        if getattr(cfg.llm, "do_simulation", "False") == "True":
+            from gecco.prompt_builder.simulation_prompt import simulation_prompt
 
-            # Run summary
-            progress.console.print(
-                Panel(
-                    f"[bold]Best BIC:[/] [cyan]{best_bic:.2f}[/]\n"
-                    f"[bold]Parameters:[/] {', '.join(best_params)}",
-                    title=f"Run {r} Complete",
-                    style="green",
-                )
+            simulation_prompt_text = simulation_prompt(
+                best_model,
+                cfg,
+            )
+            simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
+            simulation_dir = search.results_dir / "simulation"
+            simulation_dir.mkdir(parents=True, exist_ok=True)
+            simulation_file = simulation_dir / f"simulation_model_run{r}.txt"
+            with open(simulation_file, "w") as f:
+                f.write(simulation_text)
+
+        # fit the best model to test data
+        console.print("[dim]Fitting best model to test data...[/]")
+        try:
+            func_name = f"cognitive_model{best_iter}"
+            fit_res = run_fit(df_test, best_model, cfg=cfg, expected_func_name=func_name)
+            mean_metric = float(fit_res["metric_value"])
+            metric_name = fit_res["metric_name"]
+            params = fit_res["param_names"]
+
+            console.print(
+                f"  [bold]{func_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
             )
 
-            if getattr(cfg.llm, "do_simulation", "False") == "True":
-                from gecco.prompt_builder.simulation_prompt import simulation_prompt
+            # save best model bic
+            results_dir = search.results_dir
+            results_dir.mkdir(parents=True, exist_ok=True)
+            best_bic_file = (
+                results_dir / "bics" / f"best_bic_on_test_run{r}.json"
+            )
+            with open(best_bic_file, "w") as f:
+                json.dump({"mean_"+metric_name: mean_metric, "individual_"+metric_name: fit_res['eval_metrics']}, f)
 
-                simulation_prompt_text = simulation_prompt(
-                    best_model,
-                    cfg,
-                )
-                simulation_text = search.generate(model, tokenizer, simulation_prompt_text)
-                simulation_dir = search.results_dir / "simulation"
-                simulation_dir.mkdir(parents=True, exist_ok=True)
-                simulation_file = simulation_dir / f"simulation_model_run{r}.txt"
-                with open(simulation_file, "w") as f:
-                    f.write(simulation_text)
+            # save best model params
+            param_df = pd.DataFrame(
+                fit_res["parameter_values"],
+                columns=params
+            )
+            param_dir = results_dir / "parameters"
+            param_dir.mkdir(parents=True, exist_ok=True)
+            param_file = (
+                param_dir / f"best_params_on_test_run{r}.csv"
+            )
+            param_df.to_csv(param_file, index=False)
 
-            # fit the best model to test data
-            progress.console.print("[dim]Fitting best model to test data...[/]")
-            try:
-                func_name = f"cognitive_model{best_iter}"
-                fit_res = run_fit(df_test, best_model, cfg=cfg, expected_func_name=func_name)
-                mean_metric = float(fit_res["metric_value"])
-                metric_name = fit_res["metric_name"]
-                params = fit_res["param_names"]
+        except Exception as e:
+            console.print(f"[bold red]Error fitting {func_name}:[/] {e}")
 
-                progress.console.print(
-                    f"  [bold]{func_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
-                )
-
-                # save best model bic
-                results_dir = search.results_dir
-                results_dir.mkdir(parents=True, exist_ok=True)
-                best_bic_file = (
-                    results_dir / "bics" / f"best_bic_on_test_run{r}.json"
-                )
-                with open(best_bic_file, "w") as f:
-                    json.dump({"mean_"+metric_name: mean_metric, "individual_"+metric_name: fit_res['eval_metrics']}, f)
-
-                # save best model params
-                param_df = pd.DataFrame(
-                    fit_res["parameter_values"],
-                    columns=params
-                )
-                param_dir = results_dir / "parameters"
-                param_dir.mkdir(parents=True, exist_ok=True)
-                param_file = (
-                    param_dir / f"best_params_on_test_run{r}.csv"
-                )
-                param_df.to_csv(param_file, index=False)
-
-            except Exception as e:
-                progress.console.print(f"[bold red]Error fitting {func_name}:[/] {e}")
-
-            if best_bic < global_best_bic:
-                global_best_bic = best_bic
-                global_best_model = best_model
-                global_best_params = best_params
-                global_best_iter = best_iter
-
-            progress.advance(run_task)
+        if best_bic < global_best_bic:
+            global_best_bic = best_bic
+            global_best_model = best_model
+            global_best_params = best_params
+            global_best_iter = best_iter
 
     # --- Final results ---
     console.rule("[bold blue]GeCCo Search Complete")

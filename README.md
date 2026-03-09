@@ -178,6 +178,13 @@ export HF_HOME=/scratch/$USER/huggingface
 python scripts/two_step_demo.py --config config/two_step_local.yaml
 ```
 
+We also have models stored for lab use, in which case you can set `HF_HOME` to that path:
+
+```bash
+export HF_HOME=/scratch/prj/bcn_neudec/huggingface
+python scripts/two_step_demo.py --config config/two_step_local.yaml
+```
+
 Note: `HF_HOME` must be set as a shell environment variable — putting it in the `.env` file will not work, as HuggingFace reads it at import time before `python-dotenv` loads.
 
 **Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.

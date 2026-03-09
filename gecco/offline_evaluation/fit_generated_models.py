@@ -108,3 +108,11 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
         "eval_metrics": eval_metrics
 
     }
+
+
+def run_fit_hierarchical(df, code_text, cfg, **kwargs):
+    """Fit using hierarchical Bayesian inference. See fit_generated_models_hierarchical."""
+    from gecco.offline_evaluation.fit_generated_models_hierarchical import (
+        run_fit_hierarchical as _run,
+    )
+    return _run(df, code_text, cfg, **kwargs)

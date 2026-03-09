@@ -6,7 +6,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from gecco.offline_evaluation.fit_generated_models import run_fit
+from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
 from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path

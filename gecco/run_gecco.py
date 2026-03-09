@@ -6,11 +6,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from gecco.offline_evaluation.fit_generated_models import run_fit
+from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
 from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
-from google.genai import types
 
 def _log(msg):
     """Print a timestamped log message."""
@@ -36,11 +35,12 @@ class GeCCoModelSearch:
         self.project_root = Path(__file__).resolve().parents[1]
 
         # --- Results directory (absolute path) ---
-        # self.results_dir = self.project_root / "results" / self.cfg.task.name if self.cfg.evaluation.fit_type != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
+        # self.results_dir = self.project_root / "results" / self.cfg.task.name if getattr(self.cfg.evaluation, "fit_type", "group") != "individual" else self.project_root / "results" / self.cfg.task.name + "_individual"
 
+        fit_type = getattr(self.cfg.evaluation, "fit_type", "group")
         self.results_dir = (
             self.project_root / "results" / self.cfg.task.name
-            if self.cfg.evaluation.fit_type != "individual"
+            if fit_type != "individual"
             else self.project_root / "results" / f"{self.cfg.task.name}_individual"
         )
 
@@ -48,12 +48,19 @@ class GeCCoModelSearch:
         (self.results_dir / "bics").mkdir(parents=True, exist_ok=True)
         (self.results_dir / "feedback").mkdir(parents=True, exist_ok=True)
 
+        # --- Individual differences evaluation (optional) ---
+        self.id_eval_data = None
+        if hasattr(cfg, 'individual_differences_eval'):
+            from gecco.offline_evaluation.individual_differences import load_id_data
+            self.id_eval_data = load_id_data(cfg)
+
         # --- Tracking ---
         self.best_model = None
         self.best_metric = np.inf
         self.best_params = []
         self.best_iter = -1
         self.tried_param_sets = []
+        self.best_id_results = None
 
     def generate(self, model, tokenizer=None, prompt=None):
         """
@@ -90,6 +97,7 @@ class GeCCoModelSearch:
             return decoded
 
         elif "gemini" in provider:
+            from google.genai import types
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
             print(
@@ -132,12 +140,31 @@ class GeCCoModelSearch:
         # Hugging Face-style generation
         # -----------------------------
         else:
+            from transformers import TextStreamer
+
             max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
+            n_input = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
 
             _log(
                 f"[GeCCo] Generating with HF model '{self.cfg.llm.base_model}' "
-                f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
+                f"(input_tokens={n_input}, max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
             )
+
+            class _ProgressStreamer(TextStreamer):
+                """Log generation progress every N tokens."""
+                def __init__(self, tokenizer, log_every=50):
+                    super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    self.token_count = 0
+                    self.log_every = log_every
+                    self.t0 = time.time()
+
+                def on_finalized_text(self, text, stream_end=False):
+                    self.token_count += len(text.split()) if text.strip() else 1
+                    if self.token_count % self.log_every < 5 or stream_end:
+                        elapsed = time.time() - self.t0
+                        _log(f"[GeCCo] ... generated ~{self.token_count} tokens ({elapsed:.0f}s elapsed)")
+
+            streamer = _ProgressStreamer(tokenizer, log_every=50)
 
             t0 = time.time()
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -146,6 +173,7 @@ class GeCCoModelSearch:
                 max_new_tokens=max_new,
                 temperature=self.cfg.llm.temperature,
                 do_sample=True,
+                streamer=streamer,
             )
             elapsed = time.time() - t0
             n_tokens = output.shape[1] - inputs["input_ids"].shape[1]
@@ -160,7 +188,10 @@ class GeCCoModelSearch:
 
             feedback = ""
             if self.best_model is not None:
-                feedback = self.feedback.get_feedback(self.best_model, self.tried_param_sets)
+                feedback = self.feedback.get_feedback(
+                    self.best_model, self.tried_param_sets,
+                    id_results=self.best_id_results
+                )
 
                 # Save feedback for inspection
                 feedback_file = (
@@ -176,7 +207,7 @@ class GeCCoModelSearch:
 
             model_file = (
                 self.results_dir / "models" / f"iter{it}_run{run_idx}.txt"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else self.results_dir / "models" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.txt"
             )
 
@@ -202,12 +233,24 @@ class GeCCoModelSearch:
 
                     _log(f"[GeCCo] {func_name}: mean {metric_name} = {mean_metric:.2f}")
 
+                    # --- Individual differences evaluation (optional) ---
+                    id_results = None
+                    if self.id_eval_data is not None:
+                        try:
+                            from gecco.offline_evaluation.individual_differences import evaluate_individual_differences
+                            id_results = evaluate_individual_differences(
+                                fit_res, self.df, self.cfg, id_data=self.id_eval_data
+                            )
+                        except Exception as e:
+                            _log(f"[GeCCo] Individual differences eval failed for {func_name}: {e}")
+
                     iteration_results.append({
                         "function_name": func_name,
                         "metric_name": metric_name,
                         "metric_value": mean_metric,
                         "param_names": params,
                         "code_file": str(model_file),
+                        "individual_differences": id_results,
                         "code": func_code,
                     })
 
@@ -216,11 +259,14 @@ class GeCCoModelSearch:
                         self.best_model = func_code
                         self.best_iter = it
                         self.best_params = params
+                        self.best_param_names = fit_res["param_names"]
+                        self.best_param_values = fit_res["parameter_values"]
+                        self.best_id_results = id_results
                         _log(f"[⭐ GeCCo] New best model: {func_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
                             self.results_dir / "models" / f"best_model_{run_idx}.txt"
-                            if self.cfg.evaluation.fit_type != "individual"
+                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                             else self.results_dir / "models" / f"best_model_{run_idx}_participant{self.df.participant[0]}.txt"
                         )
                         with open(best_model_file, "w") as f:
@@ -229,7 +275,7 @@ class GeCCoModelSearch:
                         # save best model bic
                         best_bic_file = (
                             self.results_dir / "bics" / f"best_bic_{run_idx}.json"
-                            if self.cfg.evaluation.fit_type != "individual"
+                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                             else self.results_dir / "bics" / f"best_bic_{run_idx}_participant{self.df.participant[0]}.json"
                         )
                         with open(best_bic_file, "w") as f:
@@ -247,7 +293,7 @@ class GeCCoModelSearch:
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (
                 self.results_dir / "bics" / f"iter{it}_run{run_idx}.json"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else self.results_dir / "bics" / f"iter{it}_run{run_idx}_participant{self.df.participant[0]}.json"
             )
             with open(bic_file, "w") as f:
@@ -264,7 +310,7 @@ class GeCCoModelSearch:
         # --- save best parameters ---
         if self.best_model is not None and self.best_params:
 
-            # if self.cfg.evaluation.fit_type == "individual":
+            # if getattr(self.cfg.evaluation, "fit_type", "group") == "individual":
             param_df = pd.DataFrame(
                 self.best_param_values,
                 columns=self.best_param_names
@@ -275,7 +321,7 @@ class GeCCoModelSearch:
 
             param_file = (
                 param_dir / f"best_params_run{run_idx}.csv"
-                if self.cfg.evaluation.fit_type != "individual"
+                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
                 else param_dir / f"best_params_run{run_idx}_participant{self.df.participant[0]}.csv"
             )
 

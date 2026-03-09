@@ -9,10 +9,10 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
     4. Guardrails
     5. Template model
     """
-    task, llm, evaluation, metadata = cfg.task, cfg.llm, cfg.evaluation, cfg.metadata
+    task, llm, evaluation, metadata = cfg.task, cfg.llm, cfg.evaluation, getattr(cfg, "metadata", None)
     guardrails = getattr(llm, "guardrails", [])
     include_feedback = getattr(llm, "include_feedback", False)
-    fit_type = getattr(evaluation, "fit_type")
+    fit_type = getattr(evaluation, "fit_type", "group")
     metadata = getattr(metadata, "flag", False)
     abstract_base_model = getattr(llm, "abstract_base_model", None)
     diversity_requirement = getattr(llm, "diversity_requirement", None)
@@ -34,6 +34,25 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
             individual_variability_section = cfg.individual_difference.description.format(individual_feature = individual_variability_feature)
     else:
         individual_variability_section = ""
+
+    # Individual differences evaluation context (if configured)
+    id_eval_section = ""
+    if hasattr(cfg, "individual_differences_eval"):
+        id_cfg = cfg.individual_differences_eval
+        predictor_names = ", ".join(id_cfg.predictors)
+        id_eval_section = (
+            "### Individual Differences Evaluation\n"
+            "In addition to fitting the behavioural data well (minimising BIC), "
+            "your models will also be evaluated on how well their fitted parameters "
+            "explain individual differences in questionnaire measures.\n"
+            f"The questionnaire measures are: {predictor_names}.\n"
+            "Specifically, for each model parameter, we will run a regression predicting "
+            "the parameter values from these questionnaire scores across participants. "
+            "Models whose parameters show meaningful relationships with these measures "
+            "(higher R²) are preferred, alongside good BIC.\n"
+            "Design your model parameters to capture psychologically meaningful "
+            "individual variation that could relate to these measures."
+        )
 
     feedback_section = (
         f"\n\n### Feedback\n{feedback_text.strip()}"
@@ -77,6 +96,8 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 
 {f"### Diversity Requirement\n{chr(10).join(diversity_requirement)}" if diversity_requirement else ""}
 
+{"" if not id_eval_section else id_eval_section}
+
 ### Your Task
 {goal_text.strip()}
 
@@ -100,6 +121,8 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 
 ### Initial Model Template
 {llm.template_model.strip()}
+
+{"" if not id_eval_section else id_eval_section}
 
 Your function:
 

@@ -318,7 +318,7 @@ class FeedbackGenerator:
     # Public interface
     # ------------------------------------------------------------------
 
-    def get_feedback(self, best_model, tried_param_sets):
+    def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback string for the next prompt.
         Includes Level 1 (BIC trajectory), Level 2 (landscape summary),
@@ -371,7 +371,19 @@ class FeedbackGenerator:
                 "and explore alternative parameter configurations or mechanisms.\n"
             )
 
-        return search_context + core
+        feedback = search_context + core
+
+        if id_results is not None:
+            feedback += (
+                "\n\nIndividual Differences Analysis:\n"
+                f"{id_results['summary_text']}\n\n"
+                "When proposing new models, consider whether parameters could better capture "
+                "individual variation in these questionnaire measures. The primary objective "
+                "remains minimising BIC (model fit), but higher R² for individual differences "
+                "is also desirable.\n"
+            )
+
+        return feedback
 
 
 class LLMFeedbackGenerator(FeedbackGenerator):
@@ -384,7 +396,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         self.model = model
         self.tokenizer = tokenizer
 
-    def get_feedback(self, best_model, tried_param_sets):
+    def get_feedback(self, best_model, tried_param_sets, id_results=None):
         """
         Construct feedback using an LLM judge that analyses the full
         search landscape and provides data-driven guidance.
@@ -422,6 +434,17 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
         # --- Best model ---
         context_parts.append(f"## Current Best Model\n```python\n{best_model}\n```")
+
+        # --- Individual differences (from Marko's eval) ---
+        if id_results is not None:
+            context_parts.append(
+                f"## Individual Differences Analysis\n"
+                f"{id_results['summary_text']}\n\n"
+                "Consider whether model parameters could better capture "
+                "individual variation in these questionnaire measures. "
+                "The primary objective remains minimising BIC, but higher R² "
+                "for individual differences is also desirable."
+            )
 
         search_context = "\n\n".join(context_parts)
 
@@ -479,6 +502,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             return decoded
 
         elif "gemini" in provider:
+            from google.genai import types
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
             print(

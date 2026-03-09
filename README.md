@@ -331,53 +331,52 @@ Available override fields per profile:
 
 The `clients:` section is ignored by existing non-distributed scripts.
 
-#### Step 2: Launch the vLLM server
+#### Step 2: Launch with the launcher script
 
-Follow the vLLM setup steps above, or launch via SLURM:
+`scripts/launch_distributed.py` reads profiles from your config, launches the vLLM server and client array, and wires up SLURM dependencies automatically:
 
 ```bash
-VLLM_JOB=$(sbatch --parsable bash/launch_vllm_server.sh Qwen/Qwen2.5-14B-Instruct 8000 1)
+# Launch vLLM + all profiles from config
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --launch-vllm
+
+# vLLM already running — just launch clients, specifying the server URL
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml \
+    --vllm-url http://gpu-node:8000/v1
+
+# Run only a subset of profiles
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --profiles exploit,minimal
+
+# Add extra clients running the base config (no profile overrides)
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --extra-clients 2
+
+# Preview commands without submitting
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --dry-run
 ```
 
-#### Step 3: Launch the distributed clients
-
-Use the provided SLURM job array script. It automatically maps array task IDs 0-3 to the profiles `exploit`, `explore`, `diverse`, and `minimal`:
+For local testing without SLURM, run clients directly:
 
 ```bash
-sbatch --dependency=afterok:$VLLM_JOB bash/run_gecco_distributed.sh two_step_factors.yaml
+python scripts/run_gecco_distributed.py --config two_step_factors_distributed.yaml \
+    --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
 ```
 
-The `--dependency=afterok:$VLLM_JOB` flag ensures clients only start once the vLLM server is running. Each client will also retry connecting to the server for up to 5 minutes before giving up.
-
-You can also run clients manually (e.g. for local testing):
+#### Step 3: Monitor progress
 
 ```bash
-# Terminal 1
-python scripts/run_gecco_distributed.py --config two_step_factors.yaml --client-id 0 --client-profile exploit
+# One-shot status
+python scripts/monitor_distributed.py --task two_step_factors
 
-# Terminal 2
-python scripts/run_gecco_distributed.py --config two_step_factors.yaml --client-id 1 --client-profile explore
+# Live dashboard (refreshes every 10s, Ctrl+C to exit)
+python scripts/monitor_distributed.py --task two_step_factors --watch 10
 ```
 
 #### How coordination works
 
-- Each client writes its iteration results (model code, BIC, parameters) to a shared registry file at `results/<task_name>/shared_registry.json`
-- Before each iteration, clients read the registry and merge cross-client results into their feedback history — this means the LLM judge (if using `feedback.type: "llm"`) automatically sees the full model landscape from all clients
-- The global best model is tracked across all clients, so each client benefits from any client's discoveries
-- File-level advisory locking (`fcntl.flock`) and atomic writes (`os.replace`) prevent corruption from concurrent access
-- Output files include the client ID in their names (e.g. `iter0_client2_run0.txt`) to avoid conflicts
-
-#### Customising the job array
-
-Edit `bash/run_gecco_distributed.sh` to change the number of clients or profile mapping:
-
-```bash
-#SBATCH --array=0-3          # number of clients (0-indexed)
-
-PROFILES=("exploit" "explore" "diverse" "minimal")  # one per array task
-```
-
-To run more clients than profiles, additional clients will use the base config without profile overrides.
+- Clients share results via `results/<task_name>/shared_registry.json` on the shared filesystem
+- Before each iteration, clients merge cross-client history into their feedback — the LLM judge automatically sees the full model landscape from all clients
+- The global best model is tracked across all clients
+- File locking and atomic writes prevent corruption from concurrent access
+- Output files include the client ID in their names (e.g. `iter0_client2_run0.txt`)
 
 ## ⚙️ Configuration
 

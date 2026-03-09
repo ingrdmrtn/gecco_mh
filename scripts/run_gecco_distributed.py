@@ -33,9 +33,15 @@ def main():
                         help='Client ID (defaults to $SLURM_ARRAY_TASK_ID)')
     parser.add_argument('--client-profile', type=str, default=None,
                         help='Named client profile from config clients: section')
+    parser.add_argument('--vllm-url', type=str, default=None,
+                        help='vLLM server URL (overrides $VLLM_BASE_URL)')
     parser.add_argument('--test', action='store_true',
                         help='Test mode: use a small local model with 1 run and 1 iteration')
     args = parser.parse_args()
+
+    # --- Set vLLM URL if provided (before load_llm reads it) ---
+    if args.vllm_url:
+        os.environ["VLLM_BASE_URL"] = args.vllm_url
 
     # --- Resolve client ID ---
     client_id = args.client_id
@@ -44,7 +50,8 @@ def main():
 
     console.print(Panel(
         f"[bold]Client ID:[/] {client_id}\n"
-        f"[bold]Profile:[/] {args.client_profile or 'default'}",
+        f"[bold]Profile:[/] {args.client_profile or 'default'}\n"
+        f"[bold]vLLM URL:[/] {os.environ.get('VLLM_BASE_URL', '(not set)')}",
         title="Distributed GeCCo Client",
         style="blue",
     ))

@@ -4,34 +4,34 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=64G
 #SBATCH -t 8:00:00
-#SBATCH --array=0-4
 #SBATCH --output=logs/gecco-client-%A_%a.out
 #SBATCH --error=logs/gecco-client-%A_%a.err
-# Add dependency on vLLM server job:
-#   sbatch --dependency=afterok:<VLLM_JOB_ID> bash/run_gecco_distributed.sh
+# NOTE: --array is set dynamically by launch_distributed.py (or override with sbatch --array=...)
 
-# Usage:
-#   # 1. Launch vLLM server
-#   VLLM_JOB=$(sbatch --parsable bash/launch_vllm_server.sh)
+# Usage (preferred — reads profiles from config automatically):
+#   python scripts/launch_distributed.py --config two_step_factors_distributed.yaml
 #
-#   # 2. Launch distributed clients (waits for vLLM)
-#   sbatch --dependency=afterok:$VLLM_JOB bash/run_gecco_distributed.sh [CONFIG]
-#
-# Environment variables:
-#   CONFIG  — config YAML filename (default: two_step_factors.yaml)
+# Manual usage:
+#   sbatch --array=0-4 --dependency=afterok:$VLLM_JOB \
+#       bash/run_gecco_distributed.sh two_step_factors_distributed.yaml "exploit,explore,diverse,minimal,hybrid" "http://gpu-node:8000/v1"
 
 CONFIG=${1:-"two_step_factors_distributed.yaml"}
+PROFILES_CSV=${2:-""}
+VLLM_URL_ARG=${3:-""}
 
-# Map array task IDs to client profiles
-PROFILES=("exploit" "explore" "diverse" "minimal" "hybrid")
-PROFILE=${PROFILES[$SLURM_ARRAY_TASK_ID]}
-
-# Fall back to default if no matching profile
-if [ -z "$PROFILE" ]; then
-    PROFILE=""
-    PROFILE_ARG=""
+# Resolve profile for this array task from the comma-separated list
+if [ -n "$PROFILES_CSV" ]; then
+    IFS=',' read -ra PROFILES <<< "$PROFILES_CSV"
+    PROFILE=${PROFILES[$SLURM_ARRAY_TASK_ID]}
 else
+    PROFILE=""
+fi
+
+# Build profile argument
+if [ -n "$PROFILE" ]; then
     PROFILE_ARG="--client-profile $PROFILE"
+else
+    PROFILE_ARG=""
 fi
 
 mkdir -p logs
@@ -39,12 +39,17 @@ mkdir -p logs
 echo "[GeCCo] Client $SLURM_ARRAY_TASK_ID starting (profile: ${PROFILE:-default})"
 echo "[GeCCo] Config: $CONFIG"
 
-# Source vLLM connection info
-if [ -f "$HOME/.vllm_env" ]; then
+# Resolve vLLM server URL: explicit arg > .vllm_env > environment
+if [ -n "$VLLM_URL_ARG" ]; then
+    export VLLM_BASE_URL="$VLLM_URL_ARG"
+    echo "[GeCCo] vLLM server (from arg): $VLLM_BASE_URL"
+elif [ -f "$HOME/.vllm_env" ]; then
     source "$HOME/.vllm_env"
-    echo "[GeCCo] vLLM server: $VLLM_BASE_URL"
+    echo "[GeCCo] vLLM server (from .vllm_env): $VLLM_BASE_URL"
+elif [ -n "$VLLM_BASE_URL" ]; then
+    echo "[GeCCo] vLLM server (from env): $VLLM_BASE_URL"
 else
-    echo "[GeCCo] WARNING: $HOME/.vllm_env not found. vLLM may not be ready."
+    echo "[GeCCo] WARNING: No vLLM URL found. Set VLLM_BASE_URL, pass as 3rd arg, or create \$HOME/.vllm_env"
 fi
 
 # Wait for vLLM server to be ready (retry for up to 5 minutes)
@@ -63,8 +68,16 @@ for i in $(seq 1 $MAX_RETRIES); do
     sleep $RETRY_INTERVAL
 done
 
+# Build vLLM URL argument
+if [ -n "$VLLM_BASE_URL" ]; then
+    VLLM_ARG="--vllm-url $VLLM_BASE_URL"
+else
+    VLLM_ARG=""
+fi
+
 # Run the distributed client
 python scripts/run_gecco_distributed.py \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
-    $PROFILE_ARG
+    $PROFILE_ARG \
+    $VLLM_ARG

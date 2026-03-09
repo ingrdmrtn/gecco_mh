@@ -21,6 +21,10 @@ def load_llm(provider: str, model_name: str, **kwargs):
         from gecco.load_llms.gemini_backend import load_gemini
         model = load_gemini(model_name)
         tokenizer = None
+    elif "vllm" in provider:
+        from gecco.load_llms.vllm_backend import load_vllm
+        model = load_vllm(model_name)
+        tokenizer = None
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")
 

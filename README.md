@@ -187,6 +187,82 @@ python scripts/two_step_demo.py --config config/two_step_local.yaml
 
 Note: `HF_HOME` must be set as a shell environment variable — putting it in the `.env` file will not work, as HuggingFace reads it at import time before `python-dotenv` loads.
 
+### Using a vLLM server (recommended for HPC)
+
+Instead of loading a model in-process, you can serve it as a standalone API using [vLLM](https://docs.vllm.ai/) and have GeCCo query it over HTTP. This decouples model serving from model fitting, allowing you to:
+
+- Reuse one LLM server across multiple GeCCo runs
+- Run model fitting on CPU-only nodes while the LLM runs on GPU nodes
+- Avoid reloading the model for each experiment
+
+#### Step 0: Install vLLM
+
+vLLM is not included in the base `requirements.txt` since it is only needed for this serving mode. Install it with CUDA 12.8 support (required for Blackwell / SM 100 GPUs):
+
+```bash
+pip install -r requirements-vllm.txt
+```
+
+#### Step 1: Launch the vLLM server
+
+On a GPU node (e.g. via SLURM):
+
+```bash
+sbatch bash/launch_vllm_server.sh meta-llama/Meta-Llama-3.1-70B-Instruct 8000 4
+```
+
+This launches vLLM with tensor parallelism across 4 GPUs and writes the server address to `$HOME/.vllm_env`. You can also start the server manually:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --trust-remote-code
+```
+
+#### Step 2: Set the server URL
+
+If you used the SLURM script, source the connection file it wrote:
+
+```bash
+source $HOME/.vllm_env
+```
+
+Or set the environment variable directly:
+
+```bash
+export VLLM_BASE_URL=http://<hostname>:8000/v1
+```
+
+The URL must include the `/v1` suffix. If your vLLM server uses an API key (launched with `--api-key`), also set:
+
+```bash
+export VLLM_API_KEY=your_key_here
+```
+
+#### Step 3: Configure GeCCo to use vLLM
+
+Set `provider: "vllm"` in your YAML config. The `base_model` must match the model name that vLLM is serving (by default, this is the HuggingFace model ID):
+
+```yaml
+llm:
+  provider: "vllm"
+  base_model: "meta-llama/Meta-Llama-3.1-70B-Instruct"
+  temperature: 0.2
+  max_output_tokens: 2048
+```
+
+See `config/two_step_vllm_example.yaml` for a complete example.
+
+#### Step 4: Run GeCCo
+
+```bash
+python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
+```
+
+GeCCo will connect to the running vLLM server instead of loading a model locally. The server must be running and ready before the script starts — vLLM can take a few minutes to load large models.
+
 **Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
 ## ⚙️ Configuration

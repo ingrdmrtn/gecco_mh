@@ -129,12 +129,18 @@ class SharedRegistry:
                 # Append iteration history (strip non-serializable fields)
                 serializable_results = []
                 for r in results:
-                    serializable_results.append({
+                    entry = {
                         "function_name": r.get("function_name", ""),
                         "metric_value": r.get("metric_value", float("inf")),
                         "param_names": r.get("param_names", []),
                         "code": r.get("code", ""),
-                    })
+                    }
+                    # Include individual differences R² if available
+                    id_res = r.get("individual_differences")
+                    if id_res and isinstance(id_res, dict):
+                        entry["mean_r2"] = id_res.get("mean_r2")
+                        entry["per_param_r2"] = id_res.get("per_param_r2")
+                    serializable_results.append(entry)
 
                 data["iteration_history"].append({
                     "client_id": client_id,

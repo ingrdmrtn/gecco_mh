@@ -122,6 +122,7 @@ def build_landscape_table(data, top_n=15):
                     "params": r.get("param_names", []),
                     "client": client_id,
                     "iter": iteration,
+                    "mean_r2": r.get("mean_r2"),
                 })
 
     if not all_models:
@@ -129,11 +130,16 @@ def build_landscape_table(data, top_n=15):
 
     all_models.sort(key=lambda x: x["bic"])
 
+    # Check if any model has R² data
+    has_r2 = any(m.get("mean_r2") is not None for m in all_models)
+
     table = Table(title=f"Model Landscape (top {min(top_n, len(all_models))} of {len(all_models)})",
                   show_header=True, header_style="bold")
     table.add_column("Rank", justify="right", width=4)
     table.add_column("Model", width=20)
     table.add_column("BIC", justify="right", width=10)
+    if has_r2:
+        table.add_column("R²", justify="right", width=6)
     table.add_column("Params", width=40)
     table.add_column("Client", justify="center", width=6)
     table.add_column("Iter", justify="right", width=4)
@@ -141,15 +147,13 @@ def build_landscape_table(data, top_n=15):
     for i, m in enumerate(all_models[:top_n]):
         style = "bold green" if i == 0 else ""
         param_str = ", ".join(m["params"])
-        table.add_row(
-            str(i + 1),
-            m["name"],
-            f"{m['bic']:.2f}",
-            param_str,
-            str(m["client"]),
-            str(m["iter"]),
-            style=style,
-        )
+        r2 = m.get("mean_r2")
+        r2_str = f"{r2:.3f}" if r2 is not None else "-"
+        row = [str(i + 1), m["name"], f"{m['bic']:.2f}"]
+        if has_r2:
+            row.append(r2_str)
+        row.extend([param_str, str(m["client"]), str(m["iter"])])
+        table.add_row(*row, style=style)
 
     return table
 
@@ -223,6 +227,66 @@ def build_summary_stats(data):
     return Panel("\n".join(lines), title="Summary", style="blue")
 
 
+def build_r2_table(data):
+    """Build a table showing R² for the best models (by BIC)."""
+    history = data.get("iteration_history", [])
+
+    # Collect models that have per-param R²
+    models_with_r2 = []
+    for entry in history:
+        for r in entry.get("results", []):
+            per_param = r.get("per_param_r2")
+            if per_param and r.get("metric_value") is not None:
+                models_with_r2.append({
+                    "name": r.get("function_name", "?"),
+                    "bic": r["metric_value"],
+                    "mean_r2": r.get("mean_r2", 0.0),
+                    "per_param_r2": per_param,
+                    "client": entry.get("client_id", "?"),
+                })
+
+    if not models_with_r2:
+        return None  # Don't show panel if no R² data exists
+
+    # Show top 5 by BIC, plus the top 3 by R² if different
+    by_bic = sorted(models_with_r2, key=lambda x: x["bic"])[:5]
+    by_r2 = sorted(models_with_r2, key=lambda x: -x["mean_r2"])[:3]
+
+    # Merge, deduplicate, keep order
+    shown = []
+    seen = set()
+    for m in by_bic + by_r2:
+        key = (m["name"], m["client"])
+        if key not in seen:
+            shown.append(m)
+            seen.add(key)
+
+    # Collect all parameter names across shown models
+    all_params = []
+    for m in shown:
+        for p in m["per_param_r2"]:
+            if p not in all_params:
+                all_params.append(p)
+
+    table = Table(title="Individual Differences R²", show_header=True, header_style="bold")
+    table.add_column("Model", width=20)
+    table.add_column("BIC", justify="right", width=10)
+    table.add_column("Mean R²", justify="right", width=8)
+    for p in all_params:
+        table.add_column(p, justify="right", width=8)
+    table.add_column("Client", justify="center", width=6)
+
+    for m in shown:
+        row = [m["name"], f"{m['bic']:.2f}", f"{m['mean_r2']:.3f}"]
+        for p in all_params:
+            val = m["per_param_r2"].get(p)
+            row.append(f"{val:.3f}" if val is not None else "-")
+        row.append(str(m["client"]))
+        table.add_row(*row)
+
+    return table
+
+
 def render_dashboard(results_dir):
     """Render the full monitoring dashboard."""
     data = load_registry(results_dir)
@@ -244,6 +308,9 @@ def render_dashboard(results_dir):
         build_trajectory_table(data),
         build_landscape_table(data),
     ]
+    r2_table = build_r2_table(data)
+    if r2_table:
+        elements.append(r2_table)
     timestamp = datetime.now().strftime("%H:%M:%S")
     header = Text(f"GeCCo Distributed Monitor — {results_dir.name} — {timestamp}", style="bold blue")
 

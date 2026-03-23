@@ -154,56 +154,11 @@ GeCCo supports Google Gemini models via the `google-genai` Python SDK. To use Ge
 ```yaml
 llm:
   provider: "gemini"
-  base_model: "gemini-2.5-flash"
+  base_model: "gemini-3-flash-preview"
   temperature: 0.2
   max_output_tokens: 2048
   models_per_iteration: 3
   include_feedback: true
-```
-
-**Available models:**
-
-| `base_model` | Notes |
-| --- | --- |
-| `gemini-2.5-pro` | Most capable; supports extended thinking |
-| `gemini-2.5-flash` | Fast and cost-effective; supports extended thinking |
-| `gemini-2.0-flash` | Previous generation, fast |
-
-**Extended thinking:** Gemini 2.5+ models support a reasoning/thinking step before generating. Enable it by setting `reasoning_effort` in your config:
-
-```yaml
-llm:
-  provider: "gemini"
-  base_model: "gemini-2.5-flash"
-  reasoning_effort: "low"   # "low" or "high"
-```
-
-For Gemini 2.5 models, `low` allocates a small thinking budget (4096 tokens) while `high` uses the maximum (24576 tokens).
-
-### Using the KCL AI API
-
-KCL members can use the university's hosted LLM API, which serves open-source models behind an OpenAI-compatible endpoint.
-
-1. **Get an API key** from KCL's AI platform
-2. **Set the key** in your `.env` file or shell (see above)
-3. **Configure your YAML** with `provider: "kcl"`:
-
-```yaml
-llm:
-  provider: "kcl"
-  base_model: "arc:lite"
-  temperature: 0.2
-  max_output_tokens: 2048
-  models_per_iteration: 3
-  include_feedback: true
-```
-
-Set `base_model` to whichever model is available on the KCL API (e.g. `arc:lite`). Check the platform documentation for the current list of served models.
-
-The base URL defaults to `https://api.ai.create.kcl.ac.uk/v1`. To override it (e.g. for a different endpoint), set `KCL_BASE_URL` in your `.env` file or shell:
-
-```bash
-export KCL_BASE_URL=https://your-custom-endpoint/v1
 ```
 
 ### Using local LLMs
@@ -548,6 +503,34 @@ python scripts/monitor_distributed.py --task two_step_factors
 # Live dashboard (refreshes every 10s, Ctrl+C to exit)
 python scripts/monitor_distributed.py --task two_step_factors --watch 10
 ```
+
+#### Step 4 (optional): Streamlit dashboard (interactive, SSH tunnel)
+
+An interactive web dashboard is available in `gecco-mh-dashboard/`.
+
+Install dashboard dependencies:
+
+```bash
+pip install -r gecco-mh-dashboard/requirements.txt
+```
+
+On the remote machine (compute node), start Streamlit bound to all interfaces:
+
+```bash
+streamlit run gecco-mh-dashboard/app.py \
+  --server.address 0.0.0.0 \
+  --server.port 8501
+```
+
+From your local machine, create an SSH tunnel through the login node to the compute node:
+
+```bash
+ssh -N -L 8501:<compute-node>:8501 <user>@<hpc-login-node>
+```
+
+Example: `ssh -N -L 8501:node-42:8501 user@hpc.create.kcl.ac.uk`
+
+Then open <http://127.0.0.1:8501> locally.
 
 #### How coordination works
 

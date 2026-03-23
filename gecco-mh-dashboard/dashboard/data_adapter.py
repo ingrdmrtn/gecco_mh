@@ -100,6 +100,23 @@ def build_client_df(data: dict[str, Any]) -> pd.DataFrame:
 
 def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+
+    # Include baseline model if available
+    baseline = data.get("baseline") or {}
+    if baseline.get("metric_value") is not None:
+        rows.append(
+            {
+                "Model": baseline.get("function_name", "baseline_model"),
+                "BIC": baseline["metric_value"],
+                "Max R²": baseline.get("max_r2"),
+                "Best Param": baseline.get("best_param"),
+                "Mean R²": baseline.get("mean_r2"),
+                "Params": ", ".join(baseline.get("param_names", [])),
+                "Client": "baseline",
+                "Iteration": 0,
+            }
+        )
+
     for entry in data.get("iteration_history", []):
         cid = entry.get("client_id")
         it = entry.get("iteration")
@@ -146,6 +163,22 @@ def build_iteration_df(data: dict[str, Any]) -> pd.DataFrame:
 
 def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
     candidates: list[dict[str, Any]] = []
+
+    # Include baseline if it has per-param R² data
+    baseline = data.get("baseline") or {}
+    baseline_per_param = baseline.get("per_param_r2")
+    if baseline_per_param:
+        candidates.append(
+            {
+                "Model": baseline.get("function_name", "baseline_model"),
+                "Client": "baseline",
+                "BIC": baseline.get("metric_value"),
+                "Max R²": baseline.get("max_r2"),
+                "Mean R²": baseline.get("mean_r2"),
+                "per_param": baseline_per_param,
+            }
+        )
+
     for entry in data.get("iteration_history", []):
         for r in entry.get("results", []):
             per_param = r.get("per_param_r2")

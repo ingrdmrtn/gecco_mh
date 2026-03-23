@@ -149,11 +149,15 @@ class SharedRegistry:
                     if id_res and isinstance(id_res, dict):
                         entry["individual_differences"] = {
                             "mean_r2": id_res.get("mean_r2"),
+                            "max_r2": id_res.get("max_r2"),
+                            "best_param": id_res.get("best_param"),
                             "per_param_r2": id_res.get("per_param_r2"),
                             "summary_text": id_res.get("summary_text", ""),
                         }
                         # Also store at top level for monitor dashboard
                         entry["mean_r2"] = id_res.get("mean_r2")
+                        entry["max_r2"] = id_res.get("max_r2")
+                        entry["best_param"] = id_res.get("best_param")
                         entry["per_param_r2"] = id_res.get("per_param_r2")
                     serializable_results.append(entry)
 
@@ -233,6 +237,8 @@ class SharedRegistry:
                 id_res = baseline_result.get("individual_differences")
                 if id_res and isinstance(id_res, dict):
                     data["baseline"]["mean_r2"] = id_res.get("mean_r2")
+                    data["baseline"]["max_r2"] = id_res.get("max_r2")
+                    data["baseline"]["best_param"] = id_res.get("best_param")
                     data["baseline"]["per_param_r2"] = id_res.get("per_param_r2")
 
                 self._atomic_write(data)

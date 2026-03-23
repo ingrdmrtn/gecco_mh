@@ -110,6 +110,8 @@ def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
                 {
                     "Model": r.get("function_name", "?"),
                     "BIC": bic,
+                    "Max R²": r.get("max_r2"),
+                    "Best Param": r.get("best_param"),
                     "Mean R²": r.get("mean_r2"),
                     "Params": ", ".join(r.get("param_names", [])),
                     "Client": cid,
@@ -118,7 +120,7 @@ def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
             )
 
     if not rows:
-        return pd.DataFrame(columns=["Model", "BIC", "Mean R²", "Params", "Client", "Iteration"])
+        return pd.DataFrame(columns=["Model", "BIC", "Max R²", "Best Param", "Mean R²", "Params", "Client", "Iteration"])
 
     rows = _apply_bic_cap(rows)
     return pd.DataFrame(rows).sort_values("BIC", ascending=True).reset_index(drop=True)
@@ -153,6 +155,7 @@ def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
                     "Model": r.get("function_name", "?"),
                     "Client": entry.get("client_id", "?"),
                     "BIC": r.get("metric_value"),
+                    "Max R²": r.get("max_r2"),
                     "Mean R²": r.get("mean_r2"),
                     "per_param": per_param,
                 }
@@ -174,6 +177,7 @@ def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
             "Model": c["Model"],
             "Client": c["Client"],
             "BIC": c["BIC"],
+            "Max R²": c["Max R²"],
             "Mean R²": c["Mean R²"],
         }
         for p in all_params:

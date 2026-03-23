@@ -567,27 +567,31 @@ class FeedbackGenerator:
         if momentum:
             lines.append(momentum)
 
-        # ID summary
+        # ID summary — lead with best per-parameter link
         if id_results is not None:
             mean_r2 = id_results.get("mean_r2", 0.0)
+            max_r2 = id_results.get("max_r2", 0.0)
+            best_param_name = id_results.get("best_param", "")
             detail = id_results.get("per_param_detail", {})
-            # Find the strongest predictor across all params
+            # Find the strongest predictor for the best parameter
             best_pred = ""
             best_beta = 0.0
-            best_param = ""
-            for pname, info in detail.items():
-                for pred, coef in info.get("coefficients", {}).items():
+            if best_param_name and best_param_name in detail:
+                for pred, coef in detail[best_param_name].get("coefficients", {}).items():
                     if abs(coef) > abs(best_beta):
                         best_beta = coef
                         best_pred = pred
-                        best_param = pname
-            if best_pred:
+            if best_pred and max_r2 > 0:
                 lines.append(
-                    f"Individual differences: mean R² = {mean_r2:.3f} "
-                    f"(strongest predictor: {best_pred} → {best_param}, β={best_beta:.3f})."
+                    f"Individual differences: best param R² = {max_r2:.3f} "
+                    f"({best_param_name} ← {best_pred}, β={best_beta:.3f}), "
+                    f"mean R² = {mean_r2:.3f}."
                 )
             else:
-                lines.append(f"Individual differences: mean R² = {mean_r2:.3f}.")
+                lines.append(
+                    f"Individual differences: best param R² = {max_r2:.3f}, "
+                    f"mean R² = {mean_r2:.3f}."
+                )
 
         # Fit quality summary — extract key lines
         fit_quality = self._build_fit_quality_summary()
@@ -645,10 +649,11 @@ class FeedbackGenerator:
             parts.append(
                 f"Individual Differences Analysis:\n"
                 f"{id_results['summary_text']}\n\n"
-                "When proposing new models, consider whether parameters could better capture "
-                "individual variation in these questionnaire measures. The primary objective "
-                "remains minimising BIC (model fit), but higher R² for individual differences "
-                "is also desirable."
+                "Even a single strong link between a model parameter and a symptom measure is "
+                "valuable. You don't need high average R² across all parameters — focus on "
+                "designing parameters that could have clear, interpretable links to specific "
+                "symptom dimensions. One strong parameter-symptom relationship matters more "
+                "than many weak ones."
             )
 
         # Factor coverage
@@ -760,10 +765,10 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             context_parts.append(
                 f"## Individual Differences Analysis\n"
                 f"{id_results['summary_text']}\n\n"
-                "Consider whether model parameters could better capture "
-                "individual variation in these questionnaire measures. "
-                "The primary objective remains minimising BIC, but higher R² "
-                "for individual differences is also desirable."
+                "Even a single strong link between a model parameter and a symptom measure "
+                "is valuable — one clear relationship matters more than many weak ones. "
+                "Focus on designing parameters with interpretable links to specific "
+                "symptom dimensions."
             )
 
         # --- Multi-client context ---

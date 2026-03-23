@@ -240,9 +240,14 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                     st.markdown(f"**Parameters:** `{', '.join(params)}`")
 
                 # R² info
+                max_r2 = r.get("max_r2")
+                best_param_r2 = r.get("best_param")
                 mean_r2 = r.get("mean_r2")
                 per_param_r2 = r.get("per_param_r2")
-                if mean_r2 is not None:
+                if max_r2 is not None:
+                    bp_note = f" ({best_param_r2})" if best_param_r2 else ""
+                    st.markdown(f"**Best param R²:** {max_r2:.3f}{bp_note} · **Mean R²:** {mean_r2:.3f}" if mean_r2 is not None else f"**Best param R²:** {max_r2:.3f}{bp_note}")
+                elif mean_r2 is not None:
                     st.markdown(f"**Mean R²:** {mean_r2:.3f}")
                 if per_param_r2:
                     r2_parts = [f"{k}: {v:.3f}" for k, v in per_param_r2.items()]

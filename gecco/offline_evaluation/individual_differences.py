@@ -156,13 +156,18 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
         summary_lines.append(f"  - {pname}: R² = {r2:.3f} ({', '.join(predictor_strs)})")
 
     mean_r2 = float(np.mean(list(per_param_r2.values()))) if per_param_r2 else 0.0
+    max_r2 = float(max(per_param_r2.values())) if per_param_r2 else 0.0
+    best_param = max(per_param_r2, key=per_param_r2.get) if per_param_r2 else None
     summary_lines.append(f"  Mean R² across parameters: {mean_r2:.3f}")
+    summary_lines.append(f"  Best parameter R²: {max_r2:.3f} ({best_param})")
 
     summary_text = "\n".join(summary_lines)
-    _log(f"[GeCCo] Individual differences: mean R² = {mean_r2:.3f}")
+    _log(f"[GeCCo] Individual differences: mean R² = {mean_r2:.3f}, max R² = {max_r2:.3f} ({best_param})")
 
     return {
         "mean_r2": mean_r2,
+        "max_r2": max_r2,
+        "best_param": best_param,
         "per_param_r2": per_param_r2,
         "per_param_detail": per_param_detail,
         "summary_text": summary_text,

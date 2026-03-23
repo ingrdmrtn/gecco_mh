@@ -21,6 +21,7 @@ from dashboard.views import (
     render_models,
     render_overview,
     render_r2,
+    render_results_browser,
     render_trajectory,
 )
 
@@ -56,9 +57,11 @@ def main() -> None:
         st.stop()
 
     if refresh_now or auto_refresh:
-        append_snapshot(data, max_history_points=max_history_points)
+        append_snapshot(data, max_points=max_history_points)
 
-    tab_overview, tab_clients, tab_models, tab_advanced = st.tabs(["Overview", "Clients", "Models", "Advanced"])
+    tab_overview, tab_clients, tab_models, tab_results = st.tabs(
+        ["Overview", "Clients", "Models", "Results"]
+    )
 
     with tab_overview:
         render_overview(data)
@@ -72,9 +75,8 @@ def main() -> None:
         render_models(data, top_n=top_n)
         render_r2(data)
 
-    with tab_advanced:
-        with st.expander("Raw shared registry JSON"):
-            st.json(data)
+    with tab_results:
+        render_results_browser(data, results_dir)
 
     if auto_refresh:
         time.sleep(refresh_seconds)

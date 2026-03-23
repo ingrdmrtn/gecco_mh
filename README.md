@@ -510,19 +510,21 @@ Install dashboard dependencies:
 pip install -r gecco-mh-dashboard/requirements.txt
 ```
 
-On the remote machine, start Streamlit bound to localhost only:
+On the remote machine (compute node), start Streamlit bound to all interfaces:
 
 ```bash
 streamlit run gecco-mh-dashboard/app.py \
-  --server.address 127.0.0.1 \
+  --server.address 0.0.0.0 \
   --server.port 8501
 ```
 
-From your local machine, create an SSH tunnel:
+From your local machine, create an SSH tunnel through the login node to the compute node:
 
 ```bash
-ssh -N -L 8501:127.0.0.1:8501 <user>@<remote-host>
+ssh -N -L 8501:<compute-node>:8501 <user>@<hpc-login-node>
 ```
+
+Example: `ssh -N -L 8501:node-42:8501 user@hpc.create.kcl.ac.uk`
 
 Then open <http://127.0.0.1:8501> locally.
 

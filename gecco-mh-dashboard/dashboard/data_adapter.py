@@ -6,7 +6,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+# BIC filtering configuration for dashboard display
+BIC_PERCENTILE = 95  # Show up to 95th percentile
+BIC_ABSOLUTE_CAP = 1000  # Cap displayed BIC at this absolute value
+
+
+def _cap_bic_outliers(bic_values: list[float | None]) -> float | None:
+    """Calculate BIC cap based on 95th percentile or absolute limit."""
+    valid_bics = [b for b in bic_values if b is not None and b < float("inf")]
+    if not valid_bics:
+        return None
+    percentile_val = float(np.percentile(valid_bics, BIC_PERCENTILE))
+    return min(percentile_val, BIC_ABSOLUTE_CAP)
+
+
+def _apply_bic_cap(rows: list[dict[str, Any]], key: str = "BIC") -> list[dict[str, Any]]:
+    """Cap BIC values in rows for display. Does not modify the original data."""
+    if not rows:
+        return rows
+    bic_values = [r.get(key) for r in rows]
+    cap = _cap_bic_outliers(bic_values)
+    if cap is None:
+        return rows
+    for row in rows:
+        bic = row.get(key)
+        if bic is not None and bic > cap:
+            row[key] = cap
+    return rows
 
 
 def _read_json_locked(path: Path) -> dict[str, Any] | None:
@@ -91,6 +120,7 @@ def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["Model", "BIC", "Mean R²", "Params", "Client", "Iteration"])
 
+    rows = _apply_bic_cap(rows)
     return pd.DataFrame(rows).sort_values("BIC", ascending=True).reset_index(drop=True)
 
 
@@ -107,6 +137,7 @@ def build_iteration_df(data: dict[str, Any]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["Client", "Iteration", "Best BIC"])
 
+    rows = _apply_bic_cap(rows, key="Best BIC")
     return pd.DataFrame(rows).sort_values(["Client", "Iteration"])
 
 
@@ -149,6 +180,7 @@ def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
             row[p] = c["per_param"].get(p)
         rows.append(row)
 
+    rows = _apply_bic_cap(rows)
     return pd.DataFrame(rows)
 
 
@@ -164,3 +196,66 @@ def summary_stats(data: dict[str, Any]) -> dict[str, int]:
         "models": total_models,
         "param_combos": len(data.get("tried_param_sets", [])),
     }
+
+
+# ============================================================
+# Results browser helpers
+# ============================================================
+
+def list_iterations(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract unique (client, iteration) pairs from iteration_history, sorted."""
+    seen: list[dict[str, Any]] = []
+    for entry in data.get("iteration_history", []):
+        cid = entry.get("client_id")
+        it = entry.get("iteration")
+        n_models = len(entry.get("results", []))
+        bics = [r.get("metric_value") for r in entry.get("results", [])
+                if r.get("metric_value") is not None]
+        seen.append({
+            "client_id": cid,
+            "iteration": it,
+            "n_models": n_models,
+            "best_bic": min(bics) if bics else None,
+        })
+    return sorted(seen, key=lambda x: (x["client_id"] or 0, x["iteration"] or 0))
+
+
+def get_iteration_results(data: dict[str, Any], client_id: Any, iteration: int) -> list[dict[str, Any]]:
+    """Get model results for a specific (client, iteration)."""
+    for entry in data.get("iteration_history", []):
+        if entry.get("client_id") == client_id and entry.get("iteration") == iteration:
+            return entry.get("results", [])
+    return []
+
+
+def load_text_file(results_dir: Path, subdir: str, pattern: str) -> str | None:
+    """Try to read a text file matching pattern from results_dir/subdir/. Returns None if not found."""
+    target_dir = results_dir / subdir
+    if not target_dir.exists():
+        return None
+    # Try exact match first
+    exact = target_dir / pattern
+    if exact.exists():
+        try:
+            return exact.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    # Try glob
+    matches = sorted(target_dir.glob(pattern))
+    if matches:
+        try:
+            return matches[0].read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    return None
+
+
+def load_json_file(results_dir: Path, subdir: str, pattern: str) -> list | dict | None:
+    """Try to read a JSON file matching pattern from results_dir/subdir/."""
+    text = load_text_file(results_dir, subdir, pattern)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None

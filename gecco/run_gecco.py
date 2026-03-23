@@ -287,7 +287,7 @@ class GeCCoModelSearch:
 
         # --- Initial generation ---
         raw_text = self.generate(self.model, self.tokenizer, prompt)
-        models = parse_model_response(raw_text, n_models, structured_output=structured)
+        models, json_ok = parse_model_response(raw_text, n_models, structured_output=structured)
 
         if not models:
             console.print("[yellow]No models extracted from LLM response[/]")
@@ -302,23 +302,44 @@ class GeCCoModelSearch:
                 )
 
         # --- Reflection step (optional) ---
+        # When JSON parsing succeeded, use JSON-format reflection.
+        # When it fell back to regex, use plain-text reflection (code blocks only)
+        # to avoid re-embedding Python code into JSON strings.
         if getattr(self.cfg.llm, "reflection", True) and models:
-            console.print("[dim]Running self-critique reflection...[/]")
             guardrails = getattr(self.cfg.llm, "guardrails", [])
-            reflection_prompt = build_reflection_prompt(models, guardrails=guardrails)
-            reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
-            revised = parse_model_response(
-                reflection_text, n_models, structured_output=structured
-            )
-            if revised and len(revised) == len(models):
-                # Preserve original name and analysis — reflection only updates code/rationale
-                for orig, rev in zip(models, revised):
-                    orig["code"] = rev["code"]
-                    if rev.get("rationale"):
-                        orig["rationale"] = rev["rationale"]
-                console.print("[dim]Reflection complete — using revised models[/]")
+            if json_ok:
+                console.print("[dim]Running self-critique reflection (JSON)...[/]")
+                reflection_prompt = build_reflection_prompt(
+                    models, guardrails=guardrails, use_json=True
+                )
+                reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
+                revised, _ = parse_model_response(
+                    reflection_text, n_models, structured_output=structured
+                )
+                if revised and len(revised) == len(models):
+                    for orig, rev in zip(models, revised):
+                        orig["code"] = rev["code"]
+                        if rev.get("rationale"):
+                            orig["rationale"] = rev["rationale"]
+                    console.print("[dim]Reflection complete — using revised models[/]")
+                else:
+                    console.print("[dim]Reflection parsing failed — keeping original models[/]")
             else:
-                console.print("[dim]Reflection parsing failed — keeping original models[/]")
+                console.print("[dim]Running self-critique reflection (plain text)...[/]")
+                reflection_prompt = build_reflection_prompt(
+                    models, guardrails=guardrails, use_json=False
+                )
+                reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
+                # Extract revised code via regex; preserve names/analysis from originals
+                revised, _ = parse_model_response(
+                    reflection_text, n_models, structured_output=False
+                )
+                if revised and len(revised) == len(models):
+                    for orig, rev in zip(models, revised):
+                        orig["code"] = rev["code"]
+                    console.print("[dim]Reflection complete (plain text) — using revised code[/]")
+                else:
+                    console.print("[dim]Reflection parsing failed — keeping original models[/]")
 
         return raw_text, models
 

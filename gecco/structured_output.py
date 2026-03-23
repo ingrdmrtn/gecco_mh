@@ -147,7 +147,7 @@ def parse_model_response(
     text: str,
     n_models: int,
     structured_output: bool = True,
-) -> List[Dict]:
+) -> tuple:
     """
     Parse an LLM response into a list of model dicts.
 
@@ -165,19 +165,20 @@ def parse_model_response(
 
     Returns
     -------
-    list of dict
+    tuple of (list of dict, bool)
+        Models list and a flag indicating whether JSON parsing succeeded.
+        Falls back to regex extraction with generic names if JSON fails.
         Each dict has keys: name, rationale, code, analysis (optional).
-        Falls back to generic names if JSON parsing fails.
     """
     if structured_output:
         parsed = _try_parse_json(text)
         if parsed is not None:
-            return parsed
+            return parsed, True
 
         _log("[GeCCo] Structured output parsing failed — falling back to regex extraction")
 
     # Fallback: regex extraction
-    return _fallback_regex_extraction(text, n_models)
+    return _fallback_regex_extraction(text, n_models), False
 
 
 def _try_parse_json(text: str) -> Optional[List[Dict]]:
@@ -251,7 +252,8 @@ def _fallback_regex_extraction(text: str, n_models: int) -> List[Dict]:
 # Reflection / self-critique prompt
 # ============================================================
 
-def build_reflection_prompt(models: List[Dict], guardrails: list = None) -> str:
+def build_reflection_prompt(models: List[Dict], guardrails: list = None,
+                            use_json: bool = True) -> str:
     """
     Build a self-critique prompt for reviewing generated models.
 
@@ -261,6 +263,9 @@ def build_reflection_prompt(models: List[Dict], guardrails: list = None) -> str:
         Parsed model dicts from the initial generation.
     guardrails : list of str, optional
         Model guardrails from config.
+    use_json : bool
+        If True, ask for JSON output (for structured output providers).
+        If False, ask for plain Python code blocks (regex-friendly fallback).
 
     Returns
     -------
@@ -281,21 +286,32 @@ def build_reflection_prompt(models: List[Dict], guardrails: list = None) -> str:
             + "\n".join(f"- {g}" for g in guardrails)
         )
 
-    return f"""Review the following cognitive models that were just generated. For each model, check:
+    checks = """Review the following cognitive models. For each model, check:
 
-1. **Parameter usage**: Are all parameters meaningfully used? Flag any parameters that are defined but never influence the output.
-2. **Numerical stability**: Check for potential division by zero, log of zero or negative values, exp overflow, or NaN propagation.
+1. **Parameter usage**: Are all parameters meaningfully used? Flag any that are defined but never influence the output.
+2. **Numerical stability**: Check for division by zero, log of zero or negative values, exp overflow, NaN propagation.
 3. **Docstring accuracy**: Do the parameter bounds in the docstring match how parameters are actually used?
 4. **Logic errors**: Are Q-value updates, probability calculations, and learning rules implemented correctly?
-5. **Code quality**: Are there any obvious bugs, off-by-one errors, or incorrect array indexing?
-{guardrails_text}
+5. **Code quality**: Any obvious bugs, off-by-one errors, or incorrect array indexing?"""
 
-{models_text}
+    if use_json:
+        output_instructions = (
+            "\nFor each model, either confirm it is correct or provide a corrected version.\n"
+            "Respond with the same JSON format as before — a JSON object with a \"models\" array.\n"
+            "If a model is correct, return it unchanged. If it needs fixes, return the corrected "
+            "version with an updated rationale noting what was fixed.\n"
+            "Do NOT change model names."
+        )
+    else:
+        output_instructions = (
+            "\nFor each model, either confirm it is correct or provide a corrected version.\n"
+            "Return each (possibly corrected) function in a ```python ... ``` code block, "
+            "in the same order as above. Keep function names exactly as they are "
+            "(cognitive_model1, cognitive_model2, etc.).\n"
+            "If a model is correct, repeat it unchanged."
+        )
 
-For each model, either confirm it is correct or provide a corrected version.
-You MUST respond with the same JSON format as before — a JSON object with a "models" array.
-If a model is correct, return it unchanged. If it needs fixes, return the corrected version with an updated rationale noting what was fixed.
-Do NOT change model names unless fixing a duplicate."""
+    return f"{checks}\n{guardrails_text}\n{models_text}\n{output_instructions}"
 
 
 # ============================================================

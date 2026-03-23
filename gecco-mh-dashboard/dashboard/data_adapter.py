@@ -287,7 +287,16 @@ def get_iteration_results_by_idx(data: dict[str, Any], history_idx: int) -> list
     if 0 <= history_idx < len(history):
         return history[history_idx].get("results", [])
     return []
-    return []
+
+
+def get_model_code(data: dict[str, Any], model_name: str, client_id: Any, iteration: Any) -> str | None:
+    """Look up a model's code from iteration_history by name, client, and iteration."""
+    for entry in data.get("iteration_history", []):
+        if entry.get("client_id") == client_id and entry.get("iteration") == iteration:
+            for r in entry.get("results", []):
+                if r.get("function_name") == model_name:
+                    return r.get("code")
+    return None
 
 
 def load_text_file(results_dir: Path, subdir: str, pattern: str) -> str | None:

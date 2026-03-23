@@ -15,6 +15,7 @@ from dashboard.data_adapter import (
     build_landscape_df,
     build_r2_df,
     get_iteration_results_by_idx,
+    get_model_code,
     list_iterations,
     load_json_file,
     load_text_file,
@@ -111,9 +112,21 @@ def render_models(data: dict[str, Any], top_n: int) -> None:
         st.info("No models evaluated yet.")
         return
 
-    st.caption(f"Top {top_n} models (by BIC)")
+    st.caption(f"Top {top_n} models (by BIC) — click a row to view code")
     show = ldf.head(top_n).copy()
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    event = st.dataframe(
+        show, use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row",
+    )
+
+    if event.selection.rows:
+        row = show.iloc[event.selection.rows[0]]
+        code = get_model_code(data, row["Model"], row["Client"], row["Iteration"])
+        if code:
+            st.subheader(f"Code: {row['Model']}")
+            st.code(code, language="python")
+        else:
+            st.caption("Code not available for this model.")
 
 
 def render_r2(data: dict[str, Any]) -> None:

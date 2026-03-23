@@ -197,45 +197,115 @@ Instead of loading a model in-process, you can serve it as a standalone API usin
 
 #### Step 0: Install vLLM
 
-vLLM is not included in the base `requirements.txt` since it is only needed for this serving mode. Install it with CUDA 12.8 support (required for Blackwell / SM 100 GPUs):
+vLLM is not included in the base `requirements.txt` since it is only needed on the machine serving the model (not on nodes that just run GeCCo). Install it in its own environment to avoid dependency conflicts:
 
 ```bash
-pip install -r requirements-vllm.txt
+# Create a dedicated venv (recommended — vLLM pins specific torch/CUDA versions)
+python -m venv ~/.venvs/vllm
+source ~/.venvs/vllm/bin/activate
+
+# Install vLLM (includes torch with CUDA support)
+pip install vllm
+
+# For gated models (e.g. LLaMA), log in to HuggingFace:
+pip install huggingface-hub
+huggingface-cli login
+```
+
+On HPC systems with module-managed CUDA, make sure a compatible CUDA toolkit is loaded before installing (e.g. `module load cuda/12.4`). vLLM requires CUDA 12.1+ at runtime.
+
+**Quick check that it works:**
+
+```bash
+python -c "from vllm import LLM; print('vLLM installed successfully')"
 ```
 
 #### Step 1: Launch the vLLM server
 
-On a GPU node (e.g. via SLURM):
+vLLM exposes an OpenAI-compatible HTTP API. You need to start this server on a machine with GPUs, then point GeCCo at it.
+
+**Option A — Local / interactive (simplest):**
+
+Open a terminal on your GPU machine and run:
+
+**Important:** vLLM downloads models from the HuggingFace Hub. On HPC systems where home directories have limited quota, set `HF_HOME` to a scratch/shared location **before** launching the server:
 
 ```bash
-sbatch bash/launch_vllm_server.sh meta-llama/Meta-Llama-3.1-70B-Instruct 8000 4
+# Point at the lab's shared model cache (or any path with enough space)
+export HF_HOME=/scratch/prj/bcn_neudec/huggingface
 ```
 
-This launches vLLM with tensor parallelism across 4 GPUs and writes the server address to `$HOME/.vllm_env`. You can also start the server manually:
+If you already have models downloaded there, vLLM will use the cached copy. This must be set as a shell environment variable before the `python -m vllm...` command — it cannot be set in `.env`.
+
+**Choosing `--tensor-parallel-size`:** This controls how many GPUs the model is split across. Set it based on your GPU memory and model size — the model weights (in bfloat16) must fit in the combined VRAM:
+
+| GPU          | VRAM   | 14B model                  | 70B model                  |
+| ------------ | ------ | -------------------------- | -------------------------- |
+| A100         | 40 GB  | `--tensor-parallel-size 1` | `--tensor-parallel-size 4` |
+| A100 (80 GB) | 80 GB  | `--tensor-parallel-size 1` | `--tensor-parallel-size 2` |
+| H200         | 141 GB | `--tensor-parallel-size 1` | `--tensor-parallel-size 1` |
+| B200         | 192 GB | `--tensor-parallel-size 1` | `--tensor-parallel-size 1` |
+
+If omitted, vLLM defaults to 1 GPU. Using more GPUs than necessary still works but adds communication overhead.
 
 ```bash
+# Small model for testing (~3 GB VRAM, no HF login required)
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --port 8000
+
+# LLaMA 70B — adjust --tensor-parallel-size for your GPU (see table above)
 python -m vllm.entrypoints.openai.api_server \
     --model meta-llama/Meta-Llama-3.1-70B-Instruct \
     --port 8000 \
     --tensor-parallel-size 4 \
     --trust-remote-code
+
+# DeepSeek R1 distilled 70B
+python -m vllm.entrypoints.openai.api_server \
+    --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --trust-remote-code
 ```
+
+Wait for the log line `Uvicorn running on http://0.0.0.0:8000` before proceeding.
+
+**Option B — SLURM (HPC):**
+
+```bash
+# Usage: sbatch bash/launch_vllm_server.sh [MODEL] [PORT] [TP_SIZE]
+sbatch bash/launch_vllm_server.sh meta-llama/Meta-Llama-3.1-70B-Instruct 8000 4
+```
+
+This submits a GPU job that starts vLLM and writes the server address to `$HOME/.vllm_env`. Check `logs/vllm-server-<jobid>.out` for startup progress.
+
+**Verifying the server is ready:**
+
+```bash
+# Replace <hostname> with localhost (local) or the SLURM node hostname
+curl http://<hostname>:8000/v1/models
+```
+
+You should see a JSON response listing the served model. If the connection is refused, the server is still loading — large models can take 2-5 minutes.
 
 #### Step 2: Set the server URL
 
-If you used the SLURM script, source the connection file it wrote:
+GeCCo reads the vLLM server address from the `VLLM_BASE_URL` environment variable.
+
+If you used the SLURM script:
 
 ```bash
 source $HOME/.vllm_env
 ```
 
-Or set the environment variable directly:
+Or set it directly:
 
 ```bash
 export VLLM_BASE_URL=http://<hostname>:8000/v1
 ```
 
-The URL must include the `/v1` suffix. If your vLLM server uses an API key (launched with `--api-key`), also set:
+The URL **must** include the `/v1` suffix. If your vLLM server uses an API key (launched with `--api-key`), also set:
 
 ```bash
 export VLLM_API_KEY=your_key_here
@@ -261,9 +331,21 @@ See `config/two_step_vllm_example.yaml` for a complete example.
 python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
 ```
 
-GeCCo will connect to the running vLLM server instead of loading a model locally. The server must be running and ready before the script starts — vLLM can take a few minutes to load large models.
+GeCCo will connect to the running vLLM server instead of loading a model locally. The server must be running and ready before the script starts.
 
-**Lightweight models for testing:** For quick local testing without a large GPU, try a small model such as `Qwen/Qwen2.5-1.5B-Instruct` (~3 GB VRAM) or `meta-llama/Llama-3.2-3B-Instruct` (~6 GB VRAM). Note that model generation quality will be significantly lower than larger models. Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
+**Quick-start summary (local testing with a small model):**
+
+```bash
+# Terminal 1 — start vLLM server
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-1.5B-Instruct --port 8000
+
+# Terminal 2 — run GeCCo
+export VLLM_BASE_URL=http://localhost:8000/v1
+python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
+```
+
+Note that model generation quality with small models (1.5B–3B) will be significantly lower than with larger models (14B+). Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
 ### Distributed parallel search (multiple clients)
 

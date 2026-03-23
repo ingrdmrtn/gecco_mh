@@ -360,6 +360,11 @@ class GeCCoModelSearch:
                             spec = build_model_spec(
                                 func_code, expected_func_name=func_name, cfg=self.cfg
                             )
+                            console.print(
+                                f"  [dim]Running parameter recovery check for {func_name} "
+                                f"({self.recovery_checker.n_subjects} subjects, "
+                                f"{self.recovery_checker.n_trials} trials)...[/]"
+                            )
                             recovery = self.recovery_checker.check(spec)
                             if not recovery["passed"]:
                                 console.print(

@@ -361,13 +361,18 @@ class ParameterRecoveryChecker:
         passed = mean_r >= self.threshold
 
         elapsed = time.time() - t0
+        status_color = "green" if passed else "yellow"
+        status_text = "PASSED" if passed else "FAILED"
         console.print(
-            f"    Recovery check: mean r={mean_r:.2f} "
-            f"({n_successful}/{self.n_subjects} subjects) "
-            f"[{'green' if passed else 'yellow'}]"
-            f"{'PASSED' if passed else 'FAILED'}[/] "
-            f"({elapsed:.1f}s)"
+            f"    [{status_color}]Recovery {status_text}[/] "
+            f"(mean r={mean_r:.2f}, {n_successful}/{self.n_subjects} subjects, "
+            f"{elapsed:.1f}s)"
         )
+        # Per-parameter breakdown
+        param_strs = [
+            f"{name}: r={r_val:.2f}" for name, r_val in per_param_r.items()
+        ]
+        console.print(f"    [dim]Per-parameter: {', '.join(param_strs)}[/]")
 
         return {
             "passed": passed,

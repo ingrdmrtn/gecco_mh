@@ -431,7 +431,16 @@ class GeCCoModelSearch:
         )
 
     def run_n_shots(self, run_idx, baseline_bic):
-        for it in range(self.cfg.loop.max_iterations):
+        # Resume from the next iteration after what's already in the registry
+        start_iter = 0
+        if self.shared_registry is not None:
+            max_existing = self.shared_registry.get_max_iteration()
+            if max_existing >= 0:
+                start_iter = max_existing + 1
+                console.print(f"[dim]Resuming from iteration {start_iter} (registry has up to {max_existing})[/]")
+
+        end_iter = start_iter + self.cfg.loop.max_iterations
+        for it in range(start_iter, end_iter):
             console.rule(f"[bold]Iteration {it}")
 
             stop_iterations = False  # ✅ reset each iteration

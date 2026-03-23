@@ -201,6 +201,16 @@ class SharedRegistry:
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+    def get_max_iteration(self):
+        """Return the highest iteration number across all clients, or -1 if none."""
+        data = self.read()
+        max_iter = -1
+        for entry in data.get("iteration_history", []):
+            it = entry.get("iteration")
+            if it is not None and it > max_iter:
+                max_iter = it
+        return max_iter
+
     def set_activity(self, client_id, activity):
         """Update a client's current activity without pushing results."""
         with open(self.registry_path, "a+") as f:

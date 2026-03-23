@@ -159,14 +159,14 @@ class GeCCoModelSearch:
 
             # Structured output via response schema
             if getattr(self.cfg.llm, "structured_output", True):
-                from gecco.structured_output import get_model_schema
+                from gecco.structured_output import get_model_schema, get_gemini_schema
                 include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
                 schema = get_model_schema(
                     self.cfg.llm.models_per_iteration,
                     include_analysis=include_analysis,
                 )
                 config_args["response_mime_type"] = "application/json"
-                config_args["response_schema"] = schema
+                config_args["response_schema"] = get_gemini_schema(schema)
 
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,

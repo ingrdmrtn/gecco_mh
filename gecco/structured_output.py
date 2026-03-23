@@ -318,6 +318,20 @@ def build_reflection_prompt(models: List[Dict], guardrails: list = None,
 # Provider-specific response format helpers
 # ============================================================
 
+def get_gemini_schema(schema: dict) -> dict:
+    """Strip fields unsupported by Gemini (additionalProperties, minItems, maxItems)."""
+    def _clean(obj):
+        if isinstance(obj, dict):
+            return {
+                k: _clean(v) for k, v in obj.items()
+                if k not in ("additionalProperties", "minItems", "maxItems")
+            }
+        if isinstance(obj, list):
+            return [_clean(item) for item in obj]
+        return obj
+    return _clean(schema)
+
+
 def get_openai_response_format(schema: dict) -> dict:
     """Build OpenAI Responses API text format spec."""
     return {

@@ -9,8 +9,9 @@ and reject models where recovery (Pearson r) is below a threshold.
 Uses the "incremental NLL trick" to extract per-trial choice probabilities
 from model functions that only return total NLL.
 
-Simulation and fitting are parallelised across subjects using loky
-(the same process pool backend used by the HBI fitter).
+Simulation is parallelised across subjects. Fitting uses HBI (the same
+hierarchical Bayesian inference used for the real data), which has its
+own internal parallelisation across subjects and cores.
 """
 
 import os
@@ -18,27 +19,12 @@ import time
 from abc import ABC, abstractmethod
 
 import numpy as np
-from scipy.optimize import minimize
 from scipy.stats import pearsonr
 from rich.console import Console
 
 from gecco.offline_evaluation.utils import ModelSpec
 
 console = Console()
-
-
-def _resolve_n_jobs(n_jobs, n_subjects):
-    """Resolve n_jobs respecting SLURM allocation, like hbi_scipy."""
-    if n_jobs == -1:
-        slurm_cpus = (
-            os.environ.get("SLURM_CPUS_PER_TASK")
-            or os.environ.get("SLURM_CPUS_ON_NODE")
-        )
-        if slurm_cpus is not None:
-            n_jobs = int(slurm_cpus)
-        else:
-            n_jobs = os.cpu_count() or 1
-    return min(n_jobs, n_subjects)
 
 
 # ============================================================
@@ -49,7 +35,7 @@ class TaskSimulator(ABC):
     """Abstract base class for task-specific data simulation."""
 
     @abstractmethod
-    def simulate_subject(self, model_func, true_params, n_trials):
+    def simulate_subject(self, model_func, true_params, n_trials, rng=None):
         """Simulate one subject's behavioral data.
 
         Uses the model function to generate choice probabilities
@@ -64,6 +50,8 @@ class TaskSimulator(ABC):
             True parameter values for simulation.
         n_trials : int
             Number of trials to simulate.
+        rng : np.random.Generator, optional
+            Random number generator for reproducibility.
 
         Returns
         -------
@@ -265,16 +253,15 @@ def get_simulator(recovery_cfg):
 
 
 # ============================================================
-# Worker function for parallel execution
+# Worker function for parallel simulation
 # ============================================================
 
-def _recover_one_subject(model_func, simulator, n_trials, bounds_list,
-                         n_fitting_starts, seed):
-    """Simulate and fit a single subject. Runs in a worker process.
+def _simulate_one_subject(model_func, simulator, n_trials, bounds_list, seed):
+    """Simulate a single subject in a worker process.
 
     Returns
     -------
-    tuple (true_params, recovered_params) or None on failure.
+    tuple (true_params, sim_data) or None on failure.
     """
     rng = np.random.default_rng(seed)
 
@@ -284,32 +271,11 @@ def _recover_one_subject(model_func, simulator, n_trials, bounds_list,
     ])
 
     # Simulate data
-    sim_data = simulator.simulate_subject(model_func, true_params, n_trials, rng=rng)
+    sim_data = simulator.simulate_subject(
+        model_func, true_params, n_trials, rng=rng
+    )
 
-    # Fit model with multiple random starts
-    best_nll = np.inf
-    best_params = None
-
-    for _ in range(n_fitting_starts):
-        x0 = np.array([rng.uniform(lb, ub) for lb, ub in bounds_list])
-        try:
-            result = minimize(
-                lambda params: model_func(*sim_data, params),
-                x0=x0,
-                method="L-BFGS-B",
-                bounds=bounds_list,
-                options={"maxiter": 200, "ftol": 1e-8},
-            )
-            if result.fun < best_nll and np.isfinite(result.fun):
-                best_nll = result.fun
-                best_params = result.x.copy()
-        except Exception:
-            continue
-
-    if best_params is None:
-        return None
-
-    return (true_params, best_params)
+    return (true_params, sim_data)
 
 
 # ============================================================
@@ -323,14 +289,14 @@ class ParameterRecoveryChecker:
     For each simulated subject:
     1. Sample true parameters from uniform(bounds)
     2. Simulate behavioral data using the TaskSimulator
-    3. Fit the model to simulated data using L-BFGS-B
-    4. Compare recovered vs true parameters
+
+    Then fit ALL simulated subjects as a group using HBI (the same
+    hierarchical Bayesian inference used for real data evaluation).
+    This tests recovery under the actual fitting procedure and
+    leverages HBI's built-in parallelisation across subjects.
 
     The model passes if the mean Pearson r across parameters
     exceeds the threshold.
-
-    Subjects are processed in parallel using loky (respects SLURM
-    CPU allocation via $SLURM_CPUS_PER_TASK).
     """
 
     def __init__(self, simulator, n_subjects=50, n_trials=100,
@@ -378,54 +344,74 @@ class ParameterRecoveryChecker:
         # Build ordered bounds list
         bounds_list = [bounds_dict[p] for p in param_names]
 
-        # Generate independent seeds for each subject
+        # --- Step 1: Simulate all subjects (parallelised) ---
         seed_seq = np.random.SeedSequence()
         seeds = seed_seq.spawn(self.n_subjects)
 
-        n_workers = _resolve_n_jobs(self.n_jobs, self.n_subjects)
         console.print(
-            f"    [dim]Simulating & fitting {self.n_subjects} subjects "
-            f"across {n_workers} workers...[/]"
+            f"    [dim]Simulating {self.n_subjects} subjects "
+            f"({self.n_trials} trials each)...[/]"
         )
+        t_sim = time.time()
 
-        if n_workers > 1:
-            results = self._run_parallel(
-                spec.func, bounds_list, seeds, n_workers
-            )
-        else:
-            results = self._run_sequential(
-                spec.func, bounds_list, seeds
-            )
+        sim_results = self._simulate_all(spec.func, bounds_list, seeds)
 
-        # Collect successful results
+        # Collect successful simulations
         true_params_all = []
-        recovered_params_all = []
-        for res in results:
+        participant_data = []
+        for res in sim_results:
             if res is not None:
                 true_params_all.append(res[0])
-                recovered_params_all.append(res[1])
+                participant_data.append(res[1])
 
-        n_successful = len(true_params_all)
+        n_simulated = len(true_params_all)
+        console.print(
+            f"    [dim]Simulation complete: {n_simulated}/{self.n_subjects} "
+            f"subjects ({time.time() - t_sim:.1f}s)[/]"
+        )
 
-        # Need at least 5 successful subjects for meaningful correlation
-        if n_successful < 5:
+        if n_simulated < 5:
             return {
                 "passed": False,
                 "mean_r": 0.0,
                 "per_param_r": {p: 0.0 for p in param_names},
-                "n_successful": n_successful,
+                "n_successful": n_simulated,
                 "elapsed_seconds": time.time() - t0,
             }
 
-        true_arr = np.array(true_params_all)       # (n_successful, n_params)
-        rec_arr = np.array(recovered_params_all)    # (n_successful, n_params)
+        # --- Step 2: Fit all subjects as a group using HBI ---
+        console.print(
+            f"    [dim]Fitting {n_simulated} simulated subjects with HBI...[/]"
+        )
+        t_fit = time.time()
+
+        try:
+            recovered_params = self._fit_group_hbi(
+                spec, participant_data
+            )
+        except Exception as e:
+            console.print(f"    [yellow]HBI fitting failed: {e}[/]")
+            return {
+                "passed": False,
+                "mean_r": 0.0,
+                "per_param_r": {p: 0.0 for p in param_names},
+                "n_successful": 0,
+                "elapsed_seconds": time.time() - t0,
+            }
+
+        console.print(
+            f"    [dim]HBI fitting complete ({time.time() - t_fit:.1f}s)[/]"
+        )
+
+        # --- Step 3: Compute Pearson r per parameter ---
+        true_arr = np.array(true_params_all)   # (N, n_params)
+        rec_arr = recovered_params              # (N, n_params)
 
         per_param_r = {}
         for p_idx, p_name in enumerate(param_names):
             true_col = true_arr[:, p_idx]
             rec_col = rec_arr[:, p_idx]
 
-            # Check for zero variance (all same value after recovery)
             if np.std(true_col) < 1e-10 or np.std(rec_col) < 1e-10:
                 per_param_r[p_name] = 0.0
             else:
@@ -440,10 +426,9 @@ class ParameterRecoveryChecker:
         status_text = "PASSED" if passed else "FAILED"
         console.print(
             f"    [{status_color}]Recovery {status_text}[/] "
-            f"(mean r={mean_r:.2f}, {n_successful}/{self.n_subjects} subjects, "
+            f"(mean r={mean_r:.2f}, {n_simulated}/{self.n_subjects} subjects, "
             f"{elapsed:.1f}s)"
         )
-        # Per-parameter breakdown
         param_strs = [
             f"{name}: r={r_val:.2f}" for name, r_val in per_param_r.items()
         ]
@@ -453,30 +438,39 @@ class ParameterRecoveryChecker:
             "passed": passed,
             "mean_r": mean_r,
             "per_param_r": per_param_r,
-            "n_successful": n_successful,
+            "n_successful": n_simulated,
             "elapsed_seconds": elapsed,
         }
 
-    def _run_sequential(self, model_func, bounds_list, seeds):
-        """Run recovery for all subjects sequentially."""
+    def _simulate_all(self, model_func, bounds_list, seeds):
+        """Simulate all subjects, parallelised across cores."""
+        n_workers = self._resolve_n_jobs()
+
+        if n_workers > 1:
+            return self._simulate_parallel(
+                model_func, bounds_list, seeds, n_workers
+            )
+        else:
+            return self._simulate_sequential(
+                model_func, bounds_list, seeds
+            )
+
+    def _simulate_sequential(self, model_func, bounds_list, seeds):
+        """Simulate all subjects sequentially."""
         results = []
         for seed in seeds:
             try:
-                res = _recover_one_subject(
+                res = _simulate_one_subject(
                     model_func, self.simulator, self.n_trials,
-                    bounds_list, self.n_fitting_starts, seed,
+                    bounds_list, seed,
                 )
                 results.append(res)
             except Exception:
                 results.append(None)
         return results
 
-    def _run_parallel(self, model_func, bounds_list, seeds, n_workers):
-        """Run recovery for all subjects in parallel using loky.
-
-        Falls back to concurrent.futures.ProcessPoolExecutor if loky
-        is not installed.
-        """
+    def _simulate_parallel(self, model_func, bounds_list, seeds, n_workers):
+        """Simulate all subjects in parallel."""
         from concurrent.futures import as_completed
 
         try:
@@ -485,12 +479,13 @@ class ParameterRecoveryChecker:
         except ImportError:
             from concurrent.futures import ProcessPoolExecutor
             executor = ProcessPoolExecutor(max_workers=n_workers)
+
         futures = {}
         for idx, seed in enumerate(seeds):
             fut = executor.submit(
-                _recover_one_subject,
+                _simulate_one_subject,
                 model_func, self.simulator, self.n_trials,
-                bounds_list, self.n_fitting_starts, seed,
+                bounds_list, seed,
             )
             futures[fut] = idx
 
@@ -503,3 +498,40 @@ class ParameterRecoveryChecker:
                 results[idx] = None
 
         return results
+
+    def _fit_group_hbi(self, spec, participant_data):
+        """Fit all simulated subjects as a group using HBI.
+
+        Returns
+        -------
+        np.array of shape (N, n_params)
+            Recovered parameters for each subject (bounded space).
+        """
+        from gecco.model_fitting.hbi_scipy import run_hbi_scipy
+
+        hbi_result = run_hbi_scipy(
+            participant_data=participant_data,
+            model_specs=[spec],
+            max_iter=50,
+            tol=1e-5,
+            n_starts=self.n_fitting_starts,
+            n_jobs=self.n_jobs,
+        )
+
+        # hbi_result.parameters[0] is (D, N) for model 0
+        # Transpose to (N, D) to match true_params_all layout
+        return hbi_result.parameters[0].T
+
+    def _resolve_n_jobs(self):
+        """Resolve n_jobs respecting SLURM allocation."""
+        n_jobs = self.n_jobs
+        if n_jobs == -1:
+            slurm_cpus = (
+                os.environ.get("SLURM_CPUS_PER_TASK")
+                or os.environ.get("SLURM_CPUS_ON_NODE")
+            )
+            if slurm_cpus is not None:
+                n_jobs = int(slurm_cpus)
+            else:
+                n_jobs = os.cpu_count() or 1
+        return min(n_jobs, self.n_subjects)

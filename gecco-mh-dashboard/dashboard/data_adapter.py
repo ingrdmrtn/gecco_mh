@@ -101,16 +101,29 @@ def build_client_df(data: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _fill_r2_from_per_param(entry: dict[str, Any]) -> tuple[Any, Any]:
+    """Compute max_r2 and best_param from per_param_r2 if not already present."""
+    max_r2 = entry.get("max_r2")
+    best_param = entry.get("best_param")
+    if max_r2 is None:
+        per_param = entry.get("per_param_r2") or {}
+        if per_param:
+            best_param = max(per_param, key=per_param.get)
+            max_r2 = per_param[best_param]
+    return max_r2, best_param
+
+
 def build_baseline_row(data: dict[str, Any]) -> pd.DataFrame | None:
     """Build a single-row DataFrame for the baseline model, or None if unavailable."""
     baseline = data.get("baseline") or {}
     if baseline.get("metric_value") is None:
         return None
+    max_r2, best_param = _fill_r2_from_per_param(baseline)
     row = {
         "Model": baseline.get("function_name", "baseline_model"),
         "BIC": baseline["metric_value"],
-        "Max R²": baseline.get("max_r2"),
-        "Best Param": baseline.get("best_param"),
+        "Max R²": max_r2,
+        "Best Param": best_param,
         "Mean R²": baseline.get("mean_r2"),
         "Params": ", ".join(baseline.get("param_names", [])),
         "Client": "baseline",
@@ -129,12 +142,13 @@ def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
             bic = r.get("metric_value")
             if bic is None:
                 continue
+            max_r2, best_param = _fill_r2_from_per_param(r)
             rows.append(
                 {
                     "Model": r.get("function_name", "?"),
                     "BIC": bic,
-                    "Max R²": r.get("max_r2"),
-                    "Best Param": r.get("best_param"),
+                    "Max R²": max_r2,
+                    "Best Param": best_param,
                     "Mean R²": r.get("mean_r2"),
                     "Params": ", ".join(r.get("param_names", [])),
                     "Client": cid,

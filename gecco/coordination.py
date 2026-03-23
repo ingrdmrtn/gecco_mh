@@ -132,10 +132,19 @@ class SharedRegistry:
                 for r in results:
                     entry = {
                         "function_name": r.get("function_name", ""),
+                        "metric_name": r.get("metric_name", "BIC"),
                         "metric_value": r.get("metric_value", float("inf")),
                         "param_names": r.get("param_names", []),
                         "code": r.get("code", ""),
                     }
+                    # Include error message for failed models
+                    if r.get("error"):
+                        entry["error"] = r["error"]
+                    # Include recovery stats for failed recovery checks
+                    if r.get("recovery_r") is not None:
+                        entry["recovery_r"] = r["recovery_r"]
+                    if r.get("recovery_per_param"):
+                        entry["recovery_per_param"] = r["recovery_per_param"]
                     # Include per-participant eval metrics for fit quality analysis
                     eval_metrics = r.get("eval_metrics")
                     if eval_metrics:
@@ -187,6 +196,27 @@ class SharedRegistry:
                             "client_id": client_id,
                             "iteration": iteration,
                         }
+
+                self._atomic_write(data)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def set_activity(self, client_id, activity):
+        """Update a client's current activity without pushing results."""
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                entry = data["client_entries"].get(str(client_id), {})
+                entry["activity"] = activity
+                entry["updated_at"] = datetime.now().isoformat()
+                data["client_entries"][str(client_id)] = entry
 
                 self._atomic_write(data)
             finally:

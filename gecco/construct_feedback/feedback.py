@@ -44,7 +44,7 @@ class FeedbackGenerator:
         for entry in self.history:
             valid_results = [
                 r for r in entry["results"]
-                if r.get("metric_name") != "RECOVERY_FAILED"
+                if r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR")
             ]
             if valid_results:
                 best_bic = min(r["metric_value"] for r in valid_results)
@@ -255,7 +255,7 @@ class FeedbackGenerator:
         recent = self.history[-window:]
         best_bics = []
         for entry in recent:
-            valid = [r for r in entry["results"] if r.get("metric_name") != "RECOVERY_FAILED"]
+            valid = [r for r in entry["results"] if r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR")]
             if valid:
                 best_bics.append(min(r["metric_value"] for r in valid))
 

@@ -409,6 +409,12 @@ class GeCCoModelSearch:
 
         self._merged_history_count = len(all_history)
 
+    def _set_activity(self, activity):
+        """Update current activity in the shared registry."""
+        if self.shared_registry is None:
+            return
+        self.shared_registry.set_activity(self.client_id, activity)
+
     def _update_registry(self, iteration, results):
         """Push this iteration's results to the shared registry."""
         if self.shared_registry is None:
@@ -450,6 +456,7 @@ class GeCCoModelSearch:
                 with open(feedback_file, "w") as f:
                     f.write(feedback)
 
+            self._set_activity(f"generating models (iter {it})")
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
             code_text, parsed_models = self.generate_models(prompt)
 
@@ -475,6 +482,7 @@ class GeCCoModelSearch:
 
             iteration_results = []
 
+            n_models = len(parsed_models)
             for i, model_dict in enumerate(parsed_models):
                 func_name = f"cognitive_model{i + 1}"
                 display_name = model_dict.get("name", func_name)
@@ -486,6 +494,7 @@ class GeCCoModelSearch:
                 try:
                     # --- Parameter recovery check (optional) ---
                     if self.recovery_checker is not None:
+                        self._set_activity(f"parameter recovery {i+1}/{n_models}: {display_name} (iter {it})")
                         from gecco.offline_evaluation.utils import build_model_spec
                         try:
                             spec = build_model_spec(
@@ -528,6 +537,7 @@ class GeCCoModelSearch:
                             })
                             continue
 
+                    self._set_activity(f"fitting model {i+1}/{n_models}: {display_name} (iter {it})")
                     fit_res = run_fit(self.df, func_code, cfg=self.cfg, expected_func_name=func_name)
 
                     mean_metric = float(fit_res["metric_value"])
@@ -595,6 +605,16 @@ class GeCCoModelSearch:
 
                 except Exception as e:
                     console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
+                    iteration_results.append({
+                        "function_name": display_name,
+                        "metric_name": "FIT_ERROR",
+                        "metric_value": float("inf"),
+                        "param_names": [],
+                        "code": func_code,
+                        "error": str(e),
+                    })
+
+            self._set_activity(f"saving results (iter {it})")
 
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (

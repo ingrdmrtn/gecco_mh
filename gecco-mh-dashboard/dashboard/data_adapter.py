@@ -88,6 +88,7 @@ def build_client_df(data: dict[str, Any]) -> pd.DataFrame:
             {
                 "Client": cid,
                 "Status": e.get("status", "unknown"),
+                "Activity": e.get("activity", "-"),
                 "Last Iter": e.get("last_iteration"),
                 "Best BIC": e.get("best_metric"),
                 "Updated": _age_from_iso(e.get("updated_at")),
@@ -191,13 +192,21 @@ def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
 def summary_stats(data: dict[str, Any]) -> dict[str, int]:
     entries = data.get("client_entries", {})
     history = data.get("iteration_history", [])
-    total_models = sum(len(h.get("results", [])) for h in history)
+    total_models = 0
+    failed_models = 0
+    for h in history:
+        for r in h.get("results", []):
+            total_models += 1
+            mn = r.get("metric_name", "BIC")
+            if mn in ("RECOVERY_FAILED", "FIT_ERROR"):
+                failed_models += 1
     return {
         "n_clients": len(entries),
         "running": sum(1 for e in entries.values() if e.get("status") == "running"),
         "complete": sum(1 for e in entries.values() if e.get("status") == "complete"),
         "iterations": len(history),
         "models": total_models,
+        "failed": failed_models,
         "param_combos": len(data.get("tried_param_sets", [])),
     }
 

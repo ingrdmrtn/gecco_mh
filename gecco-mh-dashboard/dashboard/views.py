@@ -40,13 +40,16 @@ def render_overview(data: dict[str, Any]) -> None:
     baseline = data.get("baseline") or {}
     best = data.get("global_best") or {}
 
-    cols = st.columns(6)
+    failed = stats.get("failed", 0)
+    succeeded = stats["models"] - failed
+    cols = st.columns(7)
     cols[0].metric("Clients", f"{stats['n_clients']}", f"{stats['running']} running")
     cols[1].metric("Completed", f"{stats['complete']}")
     cols[2].metric("Iterations", f"{stats['iterations']}")
-    cols[3].metric("Models", f"{stats['models']}")
-    cols[4].metric("Param sets", f"{stats['param_combos']}")
-    cols[5].metric("Best BIC", _fmt_float(best.get("metric_value")))
+    cols[3].metric("Models", f"{succeeded}")
+    cols[4].metric("Failed", f"{failed}")
+    cols[5].metric("Param sets", f"{stats['param_combos']}")
+    cols[6].metric("Best BIC", _fmt_float(best.get("metric_value")))
 
     with st.container(border=True):
         c1, c2 = st.columns(2)
@@ -218,7 +221,12 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
             # Status indicator
             if metric_name == "RECOVERY_FAILED":
                 icon = "🔴"
-                status_note = " — recovery failed"
+                recovery_r = r.get("recovery_r")
+                r_note = f" (r={recovery_r:.2f})" if recovery_r is not None else ""
+                status_note = f" — recovery failed{r_note}"
+            elif metric_name == "FIT_ERROR":
+                icon = "🔴"
+                status_note = " — fitting error"
             elif bic is not None and bic < float("inf"):
                 icon = "🟢"
                 status_note = ""
@@ -228,6 +236,15 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
 
             with st.expander(f"{icon} **{name}** — {metric_name}: {bic_str}{status_note}"):
                 meta = meta_by_idx.get(i, {})
+
+                # Error details for failed models
+                error_msg = r.get("error")
+                if error_msg:
+                    st.error(f"**Error:** {error_msg}")
+                recovery_per_param = r.get("recovery_per_param")
+                if metric_name == "RECOVERY_FAILED" and recovery_per_param:
+                    parts = [f"{k}: r={v:.2f}" for k, v in recovery_per_param.items()]
+                    st.warning(f"**Recovery per param:** {', '.join(parts)}")
 
                 # Rationale
                 rationale = meta.get("rationale") or ""

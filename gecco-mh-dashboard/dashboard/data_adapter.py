@@ -79,8 +79,11 @@ def build_client_df(data: dict[str, Any]) -> pd.DataFrame:
     entries = data.get("client_entries", {})
     rows: list[dict[str, Any]] = []
 
-    def _sort_key(k: str) -> int:
-        return int(k) if str(k).isdigit() else 9999
+    def _sort_key(k: str) -> tuple:
+        # Numeric IDs first (sorted numerically), then names (alphabetically)
+        if str(k).isdigit():
+            return (0, int(k), "")
+        return (1, 0, str(k))
 
     for cid in sorted(entries.keys(), key=_sort_key):
         e = entries[cid]

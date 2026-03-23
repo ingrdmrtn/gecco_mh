@@ -44,9 +44,12 @@ def main():
         os.environ["VLLM_BASE_URL"] = args.vllm_url
 
     # --- Resolve client ID ---
-    client_id = args.client_id
-    if client_id is None:
-        client_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+    # Use profile name as client ID when available (more readable in dashboard),
+    # fall back to numeric SLURM task ID or explicit --client-id.
+    numeric_id = args.client_id
+    if numeric_id is None:
+        numeric_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+    client_id = args.client_profile if args.client_profile else numeric_id
 
     console.print(Panel(
         f"[bold]Client ID:[/] {client_id}\n"

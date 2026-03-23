@@ -458,6 +458,7 @@ class ParameterRecoveryChecker:
     def _simulate_sequential(self, model_func, bounds_list, seeds):
         """Simulate all subjects sequentially."""
         results = []
+        first_error_logged = False
         for seed in seeds:
             try:
                 res = _simulate_one_subject(
@@ -465,12 +466,19 @@ class ParameterRecoveryChecker:
                     bounds_list, seed,
                 )
                 results.append(res)
-            except Exception:
+            except Exception as e:
+                if not first_error_logged:
+                    console.print(f"    [yellow]Simulation error: {e}[/]")
+                    first_error_logged = True
                 results.append(None)
         return results
 
     def _simulate_parallel(self, model_func, bounds_list, seeds, n_workers):
-        """Simulate all subjects in parallel."""
+        """Simulate all subjects in parallel.
+
+        Uses loky (which handles exec'd functions via cloudpickle).
+        Falls back to sequential if parallelisation fails.
+        """
         from concurrent.futures import as_completed
 
         try:
@@ -480,8 +488,28 @@ class ParameterRecoveryChecker:
             from concurrent.futures import ProcessPoolExecutor
             executor = ProcessPoolExecutor(max_workers=n_workers)
 
+        # Submit first job as a test — if pickling fails, fall back
+        # to sequential rather than failing all 50 silently
+        test_fut = executor.submit(
+            _simulate_one_subject,
+            model_func, self.simulator, self.n_trials,
+            bounds_list, seeds[0],
+        )
+        try:
+            test_result = test_fut.result(timeout=120)
+        except Exception as e:
+            console.print(
+                f"    [yellow]Parallel simulation failed ({type(e).__name__}: {e}), "
+                f"falling back to sequential...[/]"
+            )
+            return self._simulate_sequential(model_func, bounds_list, seeds)
+
+        # First subject succeeded — submit the rest
         futures = {}
-        for idx, seed in enumerate(seeds):
+        results = [None] * len(seeds)
+        results[0] = test_result
+
+        for idx, seed in enumerate(seeds[1:], start=1):
             fut = executor.submit(
                 _simulate_one_subject,
                 model_func, self.simulator, self.n_trials,
@@ -489,12 +517,15 @@ class ParameterRecoveryChecker:
             )
             futures[fut] = idx
 
-        results = [None] * len(seeds)
+        first_error_logged = False
         for fut in as_completed(futures):
             idx = futures[fut]
             try:
                 results[idx] = fut.result()
-            except Exception:
+            except Exception as e:
+                if not first_error_logged:
+                    console.print(f"    [yellow]Simulation error (subject {idx}): {e}[/]")
+                    first_error_logged = True
                 results[idx] = None
 
         return results

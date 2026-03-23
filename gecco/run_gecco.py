@@ -78,6 +78,7 @@ class GeCCoModelSearch:
                 n_trials=getattr(cfg.parameter_recovery, 'n_trials', 100),
                 threshold=getattr(cfg.parameter_recovery, 'threshold', 0.5),
                 n_fitting_starts=getattr(cfg.parameter_recovery, 'n_fitting_starts', 3),
+                n_jobs=getattr(cfg.parameter_recovery, 'n_jobs', -1),
             )
 
     def generate(self, model, tokenizer=None, prompt=None):

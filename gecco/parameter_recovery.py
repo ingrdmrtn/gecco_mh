@@ -8,8 +8,12 @@ and reject models where recovery (Pearson r) is below a threshold.
 
 Uses the "incremental NLL trick" to extract per-trial choice probabilities
 from model functions that only return total NLL.
+
+Simulation and fitting are parallelised across subjects using loky
+(the same process pool backend used by the HBI fitter).
 """
 
+import os
 import time
 from abc import ABC, abstractmethod
 
@@ -21,6 +25,20 @@ from rich.console import Console
 from gecco.offline_evaluation.utils import ModelSpec
 
 console = Console()
+
+
+def _resolve_n_jobs(n_jobs, n_subjects):
+    """Resolve n_jobs respecting SLURM allocation, like hbi_scipy."""
+    if n_jobs == -1:
+        slurm_cpus = (
+            os.environ.get("SLURM_CPUS_PER_TASK")
+            or os.environ.get("SLURM_CPUS_ON_NODE")
+        )
+        if slurm_cpus is not None:
+            n_jobs = int(slurm_cpus)
+        else:
+            n_jobs = os.cpu_count() or 1
+    return min(n_jobs, n_subjects)
 
 
 # ============================================================
@@ -86,9 +104,10 @@ def _extract_choice_probs(model_func, data_arrays, trial_idx,
         Normalised choice probabilities of shape (n_options,).
     """
     log_likes = np.zeros(n_options)
+    end = trial_idx + 1
 
     for opt in range(n_options):
-        data_copy = [col[:trial_idx + 1].copy() for col in data_arrays]
+        data_copy = [col[:end].copy() for col in data_arrays]
         data_copy[choice_col_idx][trial_idx] = opt
         nll = model_func(*data_copy, params)
         log_likes[opt] = -nll  # convert NLL to log-likelihood
@@ -133,7 +152,7 @@ class TwoStepSimulator(TaskSimulator):
     def get_input_columns(self):
         return ["choice_1", "state", "choice_2", "reward"]
 
-    def _generate_reward_walks(self, n_trials):
+    def _generate_reward_walks(self, n_trials, rng):
         """Generate drifting reward probabilities (Gaussian random walk).
 
         Returns
@@ -145,16 +164,16 @@ class TwoStepSimulator(TaskSimulator):
         reward_probs = np.zeros((2, 2, n_trials))
         for s in range(2):
             for a in range(2):
-                reward_probs[s, a, 0] = np.random.uniform(lb, ub)
+                reward_probs[s, a, 0] = rng.uniform(lb, ub)
                 for t in range(1, n_trials):
                     reward_probs[s, a, t] = np.clip(
                         reward_probs[s, a, t - 1]
-                        + np.random.normal(0, self.reward_drift_sd),
+                        + rng.normal(0, self.reward_drift_sd),
                         lb, ub,
                     )
         return reward_probs
 
-    def simulate_subject(self, model_func, true_params, n_trials):
+    def simulate_subject(self, model_func, true_params, n_trials, rng=None):
         """Simulate one subject using the incremental NLL trick.
 
         Per trial:
@@ -163,6 +182,9 @@ class TwoStepSimulator(TaskSimulator):
         3. Extract p(choice_2 | state) via NLL trick -> sample choice_2
         4. Sample reward from drifting reward_probs[state][choice_2]
         """
+        if rng is None:
+            rng = np.random.default_rng()
+
         # Column indices in model function signature
         COL_A1 = 0   # choice_1 / action_1
         COL_S = 1     # state
@@ -175,7 +197,7 @@ class TwoStepSimulator(TaskSimulator):
         action_2 = np.zeros(n_trials, dtype=int)
         reward = np.zeros(n_trials, dtype=int)
 
-        reward_probs = self._generate_reward_walks(n_trials)
+        reward_probs = self._generate_reward_walks(n_trials, rng)
 
         data_arrays = [action_1, state, action_2, reward]
 
@@ -184,22 +206,22 @@ class TwoStepSimulator(TaskSimulator):
             probs_a1 = _extract_choice_probs(
                 model_func, data_arrays, t, COL_A1, 2, true_params
             )
-            a1 = np.random.choice(2, p=probs_a1)
+            a1 = rng.choice(2, p=probs_a1)
             action_1[t] = a1
 
             # --- Environment: determine state from transition ---
-            s = np.random.choice(2, p=self.transition_probs[a1])
+            s = rng.choice(2, p=self.transition_probs[a1])
             state[t] = s
 
             # --- Stage 2: extract p(choice_2 | state) and sample ---
             probs_a2 = _extract_choice_probs(
                 model_func, data_arrays, t, COL_A2, 2, true_params
             )
-            a2 = np.random.choice(2, p=probs_a2)
+            a2 = rng.choice(2, p=probs_a2)
             action_2[t] = a2
 
             # --- Environment: determine reward ---
-            r = np.random.binomial(1, reward_probs[s, a2, t])
+            r = rng.binomial(1, reward_probs[s, a2, t])
             reward[t] = r
 
         return [action_1, state, action_2, reward]
@@ -243,6 +265,54 @@ def get_simulator(recovery_cfg):
 
 
 # ============================================================
+# Worker function for parallel execution
+# ============================================================
+
+def _recover_one_subject(model_func, simulator, n_trials, bounds_list,
+                         n_fitting_starts, seed):
+    """Simulate and fit a single subject. Runs in a worker process.
+
+    Returns
+    -------
+    tuple (true_params, recovered_params) or None on failure.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Sample true parameters
+    true_params = np.array([
+        rng.uniform(lb, ub) for lb, ub in bounds_list
+    ])
+
+    # Simulate data
+    sim_data = simulator.simulate_subject(model_func, true_params, n_trials, rng=rng)
+
+    # Fit model with multiple random starts
+    best_nll = np.inf
+    best_params = None
+
+    for _ in range(n_fitting_starts):
+        x0 = np.array([rng.uniform(lb, ub) for lb, ub in bounds_list])
+        try:
+            result = minimize(
+                lambda params: model_func(*sim_data, params),
+                x0=x0,
+                method="L-BFGS-B",
+                bounds=bounds_list,
+                options={"maxiter": 200, "ftol": 1e-8},
+            )
+            if result.fun < best_nll and np.isfinite(result.fun):
+                best_nll = result.fun
+                best_params = result.x.copy()
+        except Exception:
+            continue
+
+    if best_params is None:
+        return None
+
+    return (true_params, best_params)
+
+
+# ============================================================
 # Parameter recovery checker
 # ============================================================
 
@@ -258,15 +328,19 @@ class ParameterRecoveryChecker:
 
     The model passes if the mean Pearson r across parameters
     exceeds the threshold.
+
+    Subjects are processed in parallel using loky (respects SLURM
+    CPU allocation via $SLURM_CPUS_PER_TASK).
     """
 
     def __init__(self, simulator, n_subjects=50, n_trials=100,
-                 threshold=0.5, n_fitting_starts=3):
+                 threshold=0.5, n_fitting_starts=3, n_jobs=-1):
         self.simulator = simulator
         self.n_subjects = n_subjects
         self.n_trials = n_trials
         self.threshold = threshold
         self.n_fitting_starts = n_fitting_starts
+        self.n_jobs = n_jobs
 
     def check(self, spec):
         """Run parameter recovery check on a model.
@@ -304,31 +378,32 @@ class ParameterRecoveryChecker:
         # Build ordered bounds list
         bounds_list = [bounds_dict[p] for p in param_names]
 
+        # Generate independent seeds for each subject
+        seed_seq = np.random.SeedSequence()
+        seeds = seed_seq.spawn(self.n_subjects)
+
+        n_workers = _resolve_n_jobs(self.n_jobs, self.n_subjects)
+        console.print(
+            f"    [dim]Simulating & fitting {self.n_subjects} subjects "
+            f"across {n_workers} workers...[/]"
+        )
+
+        if n_workers > 1:
+            results = self._run_parallel(
+                spec.func, bounds_list, seeds, n_workers
+            )
+        else:
+            results = self._run_sequential(
+                spec.func, bounds_list, seeds
+            )
+
+        # Collect successful results
         true_params_all = []
         recovered_params_all = []
-
-        for subj in range(self.n_subjects):
-            try:
-                # Sample true parameters
-                true_params = self._sample_params(bounds_list)
-
-                # Simulate data
-                sim_data = self.simulator.simulate_subject(
-                    spec.func, true_params, self.n_trials
-                )
-
-                # Fit model to simulated data
-                recovered = self._fit_subject(
-                    spec.func, sim_data, bounds_list
-                )
-
-                if recovered is not None:
-                    true_params_all.append(true_params)
-                    recovered_params_all.append(recovered)
-
-            except Exception:
-                # Model crashed during simulation or fitting — skip subject
-                continue
+        for res in results:
+            if res is not None:
+                true_params_all.append(res[0])
+                recovered_params_all.append(res[1])
 
         n_successful = len(true_params_all)
 
@@ -382,40 +457,49 @@ class ParameterRecoveryChecker:
             "elapsed_seconds": elapsed,
         }
 
-    @staticmethod
-    def _sample_params(bounds_list):
-        """Sample parameters uniformly from bounds."""
-        return np.array([
-            np.random.uniform(lb, ub) for lb, ub in bounds_list
-        ])
-
-    def _fit_subject(self, model_func, sim_data, bounds_list):
-        """Fit model to a single subject's simulated data.
-
-        Uses L-BFGS-B with multiple random starts.
-
-        Returns
-        -------
-        np.array or None
-            Recovered parameter values, or None if all starts failed.
-        """
-        best_nll = np.inf
-        best_params = None
-
-        for _ in range(self.n_fitting_starts):
-            x0 = self._sample_params(bounds_list)
+    def _run_sequential(self, model_func, bounds_list, seeds):
+        """Run recovery for all subjects sequentially."""
+        results = []
+        for seed in seeds:
             try:
-                result = minimize(
-                    lambda params: model_func(*sim_data, params),
-                    x0=x0,
-                    method="L-BFGS-B",
-                    bounds=bounds_list,
-                    options={"maxiter": 200, "ftol": 1e-8},
+                res = _recover_one_subject(
+                    model_func, self.simulator, self.n_trials,
+                    bounds_list, self.n_fitting_starts, seed,
                 )
-                if result.fun < best_nll and np.isfinite(result.fun):
-                    best_nll = result.fun
-                    best_params = result.x.copy()
+                results.append(res)
             except Exception:
-                continue
+                results.append(None)
+        return results
 
-        return best_params
+    def _run_parallel(self, model_func, bounds_list, seeds, n_workers):
+        """Run recovery for all subjects in parallel using loky.
+
+        Falls back to concurrent.futures.ProcessPoolExecutor if loky
+        is not installed.
+        """
+        from concurrent.futures import as_completed
+
+        try:
+            from loky import get_reusable_executor
+            executor = get_reusable_executor(max_workers=n_workers)
+        except ImportError:
+            from concurrent.futures import ProcessPoolExecutor
+            executor = ProcessPoolExecutor(max_workers=n_workers)
+        futures = {}
+        for idx, seed in enumerate(seeds):
+            fut = executor.submit(
+                _recover_one_subject,
+                model_func, self.simulator, self.n_trials,
+                bounds_list, self.n_fitting_starts, seed,
+            )
+            futures[fut] = idx
+
+        results = [None] * len(seeds)
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception:
+                results[idx] = None
+
+        return results

@@ -142,23 +142,28 @@ class GeCCoModelSearch:
                 "system_instruction": self.cfg.llm.system_prompt,
             }
 
+            use_thinking = False
             if reasoning_effort:
-                assert reasoning_effort in ["low", "high"], \
-                    f"Invalid reasoning_effort: {reasoning_effort}. Choose from 'low', 'high'."
+                valid_levels = ["minimal", "low", "medium", "high"]
+                assert reasoning_effort in valid_levels, \
+                    f"Invalid reasoning_effort: {reasoning_effort}. Choose from {valid_levels}."
                 if self.cfg.llm.base_model.lower().startswith("gemini-3"):
-                    #note: flash models allow minimal and medium thinking levels but only low and high are exposed to be compatible with pro and flash
                     config_args["thinking_config"] = types.ThinkingConfig(
                         thinking_level=reasoning_effort
                     )
+                    use_thinking = True
                 elif self.cfg.llm.base_model.lower().startswith("gemini-2"):
-                    #note: for Gemini 2, we set thinking_budget to approximate low/high levels (max thinking tokens for 2.5 pro is 32768; 2.5 flash is 24576)
-                    # max set to 24576 to make it compatible with both 2.5 pro and flash
+                    budget_map = {"minimal": 0, "low": 4096, "medium": 12288, "high": 24576}
                     config_args["thinking_config"] = types.ThinkingConfig(
-                        thinking_budget= 4096 if reasoning_effort == 'low' else 24576
-                        )
+                        thinking_budget=budget_map[reasoning_effort]
+                    )
+                    use_thinking = True
 
-            # Structured output via response schema
-            if getattr(self.cfg.llm, "structured_output", True):
+            # Structured output via response schema.
+            # Gemini may not support response_schema + thinking_config together,
+            # so when thinking is enabled we rely on the prompt-level JSON
+            # instructions instead.
+            if getattr(self.cfg.llm, "structured_output", True) and not use_thinking:
                 from gecco.structured_output import get_model_schema, get_gemini_schema
                 include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
                 schema = get_model_schema(

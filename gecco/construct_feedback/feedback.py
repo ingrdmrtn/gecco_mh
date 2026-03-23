@@ -854,20 +854,33 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
         elif "gemini" in provider:
             from google.genai import types
-            reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
+            reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", None)
 
             print(
                 f"[GeCCo] Using Gemini model '{self.cfg.llm.base_model}' "
                 f"(reasoning={reasoning_effort})"
             )
+
+            config_args = {
+                "temperature": self.cfg.llm.temperature,
+                "system_instruction": self.cfg.llm.system_prompt,
+            }
+
+            if reasoning_effort:
+                if self.cfg.llm.base_model.lower().startswith("gemini-3"):
+                    config_args["thinking_config"] = types.ThinkingConfig(
+                        thinking_level=reasoning_effort
+                    )
+                elif self.cfg.llm.base_model.lower().startswith("gemini-2"):
+                    budget_map = {"minimal": 0, "low": 4096, "medium": 12288, "high": 24576}
+                    config_args["thinking_config"] = types.ThinkingConfig(
+                        thinking_budget=budget_map.get(reasoning_effort, 4096)
+                    )
+
             resp = self.model.models.generate_content(
                 model=self.cfg.llm.base_model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                       temperature=self.cfg.llm.temperature,
-                       system_instruction=self.cfg.llm.system_prompt,
-                       thinking_config=types.ThinkingConfig(thinking_level=reasoning_effort),
-                )
+                config=types.GenerateContentConfig(**config_args),
             )
             decoded = resp.text.strip()
 

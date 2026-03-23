@@ -98,24 +98,26 @@ def build_client_df(data: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_baseline_row(data: dict[str, Any]) -> pd.DataFrame | None:
+    """Build a single-row DataFrame for the baseline model, or None if unavailable."""
+    baseline = data.get("baseline") or {}
+    if baseline.get("metric_value") is None:
+        return None
+    row = {
+        "Model": baseline.get("function_name", "baseline_model"),
+        "BIC": baseline["metric_value"],
+        "Max R²": baseline.get("max_r2"),
+        "Best Param": baseline.get("best_param"),
+        "Mean R²": baseline.get("mean_r2"),
+        "Params": ", ".join(baseline.get("param_names", [])),
+        "Client": "baseline",
+        "Iteration": 0,
+    }
+    return pd.DataFrame([row])
+
+
 def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-
-    # Include baseline model if available
-    baseline = data.get("baseline") or {}
-    if baseline.get("metric_value") is not None:
-        rows.append(
-            {
-                "Model": baseline.get("function_name", "baseline_model"),
-                "BIC": baseline["metric_value"],
-                "Max R²": baseline.get("max_r2"),
-                "Best Param": baseline.get("best_param"),
-                "Mean R²": baseline.get("mean_r2"),
-                "Params": ", ".join(baseline.get("param_names", [])),
-                "Client": "baseline",
-                "Iteration": 0,
-            }
-        )
 
     for entry in data.get("iteration_history", []):
         cid = entry.get("client_id")

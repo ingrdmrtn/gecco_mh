@@ -9,6 +9,7 @@ import streamlit as st
 from pathlib import Path
 
 from dashboard.data_adapter import (
+    build_baseline_row,
     build_client_df,
     build_iteration_df,
     build_landscape_df,
@@ -98,11 +99,19 @@ def render_trajectory(data: dict[str, Any]) -> None:
 
 def render_models(data: dict[str, Any], top_n: int) -> None:
     st.subheader("Model landscape")
+
+    # Show baseline as a fixed reference row
+    baseline_df = build_baseline_row(data)
+    if baseline_df is not None:
+        st.caption("Baseline")
+        st.dataframe(baseline_df, use_container_width=True, hide_index=True)
+
     ldf = build_landscape_df(data)
     if ldf.empty:
         st.info("No models evaluated yet.")
         return
 
+    st.caption(f"Top {top_n} models (by BIC)")
     show = ldf.head(top_n).copy()
     st.dataframe(show, use_container_width=True, hide_index=True)
 

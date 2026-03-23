@@ -124,6 +124,8 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
                 )
                 result["individual_differences"] = {
                     "mean_r2": id_results.get("mean_r2"),
+                    "max_r2": id_results.get("max_r2"),
+                    "best_param": id_results.get("best_param"),
                     "per_param_r2": id_results.get("per_param_r2"),
                     "summary_text": id_results.get("summary_text", ""),
                 }

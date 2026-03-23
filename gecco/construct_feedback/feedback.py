@@ -41,8 +41,12 @@ class FeedbackGenerator:
 
         iter_bests = []
         for entry in self.history:
-            if entry["results"]:
-                best_bic = min(r["metric_value"] for r in entry["results"])
+            valid_results = [
+                r for r in entry["results"]
+                if r.get("metric_name") != "RECOVERY_FAILED"
+            ]
+            if valid_results:
+                best_bic = min(r["metric_value"] for r in valid_results)
                 iter_bests.append((entry["iteration"], best_bic))
 
         if len(iter_bests) < 2:
@@ -102,8 +106,17 @@ class FeedbackGenerator:
 
         # Collect every model from every iteration
         all_models = []
+        recovery_failures = []
         for entry in self.history:
             for r in entry["results"]:
+                if r.get("metric_name") == "RECOVERY_FAILED":
+                    recovery_failures.append({
+                        "name": r["function_name"],
+                        "recovery_r": r.get("recovery_r", 0.0),
+                        "params": r.get("param_names", []),
+                        "iter": entry["iteration"],
+                    })
+                    continue
                 all_models.append({
                     "name": r["function_name"],
                     "bic": r["metric_value"],
@@ -156,6 +169,22 @@ class FeedbackGenerator:
             lines.append("\nConvergence zones (similar BIC, different structures):")
             for note in convergence_notes[:3]:
                 lines.append(f"  • {note}")
+
+        # --- Recovery failures ---
+        if recovery_failures:
+            lines.append(
+                f"\nParameter recovery failures: {len(recovery_failures)} model(s) rejected "
+                f"due to poor parameter identifiability:"
+            )
+            for rf in recovery_failures[:5]:
+                param_str = "[" + ", ".join(rf["params"]) + "]"
+                lines.append(
+                    f"  • {rf['name']} (r={rf['recovery_r']:.2f}, params={param_str}, iter {rf['iter']})"
+                )
+            lines.append(
+                "  Avoid similar parameter structures — these models have redundant "
+                "or unidentifiable parameters."
+            )
 
         # --- Parameter importance ---
         # Which params appear more often in the top half vs bottom half?
@@ -219,8 +248,9 @@ class FeedbackGenerator:
         recent = self.history[-window:]
         best_bics = []
         for entry in recent:
-            if entry["results"]:
-                best_bics.append(min(r["metric_value"] for r in entry["results"]))
+            valid = [r for r in entry["results"] if r.get("metric_name") != "RECOVERY_FAILED"]
+            if valid:
+                best_bics.append(min(r["metric_value"] for r in valid))
 
         if len(best_bics) < 2:
             return "exploiting"
@@ -254,6 +284,8 @@ class FeedbackGenerator:
         all_models = []
         for entry in self.history:
             for r in entry["results"]:
+                if r.get("metric_name") == "RECOVERY_FAILED":
+                    continue
                 code = r.get("code", "")
                 if code:
                     all_models.append({

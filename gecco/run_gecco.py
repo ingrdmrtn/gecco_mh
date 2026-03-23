@@ -67,6 +67,19 @@ class GeCCoModelSearch:
         # --- Track which registry entries we've already merged ---
         self._merged_history_count = 0
 
+        # --- Parameter recovery checker (optional) ---
+        self.recovery_checker = None
+        if hasattr(cfg, 'parameter_recovery') and getattr(cfg.parameter_recovery, 'enabled', False):
+            from gecco.parameter_recovery import ParameterRecoveryChecker, get_simulator
+            simulator = get_simulator(cfg.parameter_recovery)
+            self.recovery_checker = ParameterRecoveryChecker(
+                simulator=simulator,
+                n_subjects=getattr(cfg.parameter_recovery, 'n_subjects', 50),
+                n_trials=getattr(cfg.parameter_recovery, 'n_trials', 100),
+                threshold=getattr(cfg.parameter_recovery, 'threshold', 0.5),
+                n_fitting_starts=getattr(cfg.parameter_recovery, 'n_fitting_starts', 3),
+            )
+
     def generate(self, model, tokenizer=None, prompt=None):
         """
         Unified text generation function for any supported backend.
@@ -340,6 +353,45 @@ class GeCCoModelSearch:
                     continue
 
                 try:
+                    # --- Parameter recovery check (optional) ---
+                    if self.recovery_checker is not None:
+                        from gecco.offline_evaluation.utils import build_model_spec
+                        try:
+                            spec = build_model_spec(
+                                func_code, expected_func_name=func_name, cfg=self.cfg
+                            )
+                            recovery = self.recovery_checker.check(spec)
+                            if not recovery["passed"]:
+                                console.print(
+                                    f"  [yellow]{func_name} failed parameter recovery "
+                                    f"(mean r={recovery['mean_r']:.2f}, "
+                                    f"threshold={self.recovery_checker.threshold})[/]"
+                                )
+                                iteration_results.append({
+                                    "function_name": func_name,
+                                    "metric_name": "RECOVERY_FAILED",
+                                    "metric_value": float("inf"),
+                                    "param_names": spec.param_names,
+                                    "code": func_code,
+                                    "recovery_r": recovery["mean_r"],
+                                    "recovery_per_param": recovery["per_param_r"],
+                                })
+                                continue
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]{func_name} recovery check error: {e}[/]"
+                            )
+                            iteration_results.append({
+                                "function_name": func_name,
+                                "metric_name": "RECOVERY_FAILED",
+                                "metric_value": float("inf"),
+                                "param_names": [],
+                                "code": func_code,
+                                "recovery_r": 0.0,
+                                "recovery_per_param": {},
+                            })
+                            continue
+
                     fit_res = run_fit(self.df, func_code, cfg=self.cfg, expected_func_name=func_name)
 
                     mean_metric = float(fit_res["metric_value"])

@@ -266,6 +266,8 @@ python -m vllm.entrypoints.openai.api_server \
     --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B \
     --port 8000 \
     --tensor-parallel-size 4 \
+    --max-model-len 65536 \
+    --gpu-memory-utilization 0.95 \
     --trust-remote-code
 ```
 

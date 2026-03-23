@@ -37,6 +37,9 @@ fi
 
 mkdir -p logs
 
+# Change to the directory where sbatch was submitted (repo root)
+cd "${SLURM_SUBMIT_DIR:-.}"
+
 # Activate conda environment if specified
 if [ -n "$CONDA_ENV" ]; then
     echo "[GeCCo] Activating conda env: $CONDA_ENV"

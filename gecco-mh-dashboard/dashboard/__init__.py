@@ -1,0 +1,1 @@
+"""GeCCo dashboard package."""

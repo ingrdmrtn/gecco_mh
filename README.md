@@ -116,6 +116,9 @@ GeCCo reads API keys from environment variables or a `.env` file in the project 
 # OpenAI (required if using provider: "openai")
 OPENAI_API_KEY=your_openai_api_key_here
 
+# Google Gemini (required if using provider: "gemini")
+GEMINI_API_KEY=your_gemini_api_key_here
+
 # HuggingFace (optional — increases rate limits and is required for gated models such as LLaMA)
 HF_TOKEN=your_hf_token_here
 ```
@@ -124,10 +127,35 @@ Alternatively, export them in your shell before running:
 
 ```bash
 export OPENAI_API_KEY=your_openai_api_key_here
+export GEMINI_API_KEY=your_gemini_api_key_here
 export HF_TOKEN=your_hf_token_here
 ```
 
 A HuggingFace token can be created at huggingface.co/settings/tokens. For gated models (e.g. LLaMA), you must also accept the model licence on the model's HuggingFace page.
+
+### Using the Google Gemini API
+
+GeCCo supports Google Gemini models via the `google-genai` Python SDK. To use Gemini:
+
+1. **Get an API key** from [Google AI Studio](https://aistudio.google.com/apikey)
+2. **Set the key** in your `.env` file or shell (see above)
+3. **Install the SDK** (included in `requirements.txt`):
+
+   ```bash
+   pip install google-genai
+   ```
+
+4. **Configure your YAML** with `provider: "gemini"` and a supported model name:
+
+```yaml
+llm:
+  provider: "gemini"
+  base_model: "gemini-3-flash-preview"
+  temperature: 0.2
+  max_output_tokens: 2048
+  models_per_iteration: 3
+  include_feedback: true
+```
 
 ### Using local LLMs
 
@@ -471,6 +499,32 @@ python scripts/monitor_distributed.py --task two_step_factors
 # Live dashboard (refreshes every 10s, Ctrl+C to exit)
 python scripts/monitor_distributed.py --task two_step_factors --watch 10
 ```
+
+#### Step 4 (optional): Streamlit dashboard (interactive, SSH tunnel)
+
+An interactive web dashboard is available in `gecco-mh-dashboard/`.
+
+Install dashboard dependencies:
+
+```bash
+pip install -r gecco-mh-dashboard/requirements.txt
+```
+
+On the remote machine, start Streamlit bound to localhost only:
+
+```bash
+streamlit run gecco-mh-dashboard/app.py \
+  --server.address 127.0.0.1 \
+  --server.port 8501
+```
+
+From your local machine, create an SSH tunnel:
+
+```bash
+ssh -N -L 8501:127.0.0.1:8501 <user>@<remote-host>
+```
+
+Then open <http://127.0.0.1:8501> locally.
 
 #### How coordination works
 

@@ -318,6 +318,94 @@ class FeedbackGenerator:
             results.append((m["name"], m["bic"], m["code"], factors))
         return results
 
+    def _build_r2_landscape(self):
+        """
+        Analyse which parameter types predict symptoms across all models.
+
+        Mines individual_differences data from history to report:
+        - Which parameter names tend to have highest R² for symptom prediction
+        - Which symptom predictors are most strongly linked to model parameters
+        """
+        # Collect (param_name, r2, predictor_coefficients) across all models
+        param_r2_records: list[dict] = []
+        for entry in self.history:
+            for r in entry["results"]:
+                id_res = r.get("individual_differences")
+                if not id_res or not isinstance(id_res, dict):
+                    continue
+                per_param_r2 = id_res.get("per_param_r2", {})
+                per_param_detail = id_res.get("per_param_detail", {})
+                model_name = r.get("function_name", "?")
+                bic = r.get("metric_value", float("inf"))
+                for pname, r2 in per_param_r2.items():
+                    coeffs = per_param_detail.get(pname, {}).get("coefficients", {})
+                    param_r2_records.append({
+                        "param": pname,
+                        "r2": r2,
+                        "model": model_name,
+                        "bic": bic,
+                        "coefficients": coeffs,
+                    })
+
+        if len(param_r2_records) < 3:
+            return ""
+
+        # Group by parameter name: average R² and best R²
+        from collections import defaultdict
+        param_stats = defaultdict(lambda: {"r2_values": [], "best_coeffs": {}, "best_r2": 0.0})
+        for rec in param_r2_records:
+            ps = param_stats[rec["param"]]
+            ps["r2_values"].append(rec["r2"])
+            if rec["r2"] > ps["best_r2"]:
+                ps["best_r2"] = rec["r2"]
+                ps["best_coeffs"] = rec["coefficients"]
+
+        # Sort by best R² descending
+        ranked = sorted(
+            param_stats.items(),
+            key=lambda x: x[1]["best_r2"],
+            reverse=True,
+        )
+
+        lines = ["Cross-model parameter-symptom links (which parameter types predict symptoms):"]
+
+        for pname, stats in ranked[:8]:  # Top 8 parameter types
+            avg_r2 = sum(stats["r2_values"]) / len(stats["r2_values"])
+            best_r2 = stats["best_r2"]
+            n_models = len(stats["r2_values"])
+
+            # Find strongest predictor for this parameter
+            best_pred = ""
+            best_beta = 0.0
+            for pred, coef in stats["best_coeffs"].items():
+                if abs(coef) > abs(best_beta):
+                    best_beta = coef
+                    best_pred = pred
+
+            pred_note = f", strongest predictor: {best_pred} (β={best_beta:.3f})" if best_pred else ""
+            lines.append(
+                f"  - '{pname}': best R² = {best_r2:.3f}, avg R² = {avg_r2:.3f} "
+                f"(across {n_models} model(s){pred_note})"
+            )
+
+        # Highlight top finding
+        if ranked and ranked[0][1]["best_r2"] > 0.05:
+            top_param, top_stats = ranked[0]
+            top_pred = ""
+            top_beta = 0.0
+            for pred, coef in top_stats["best_coeffs"].items():
+                if abs(coef) > abs(top_beta):
+                    top_beta = coef
+                    top_pred = pred
+            if top_pred:
+                lines.append(
+                    f"\nStrongest link found so far: '{top_param}' parameters predict "
+                    f"'{top_pred}' (R²={top_stats['best_r2']:.3f}). "
+                    f"Consider designing parameters that capture similar mechanisms."
+                )
+
+        return "\n".join(lines)
+
     def _build_factor_coverage(self):
         """
         Build a summary of which psychiatric factor-mechanism pairings
@@ -644,7 +732,7 @@ class FeedbackGenerator:
         if subgroup:
             parts.append(subgroup)
 
-        # Individual differences
+        # Individual differences (current best model)
         if id_results is not None:
             parts.append(
                 f"Individual Differences Analysis:\n"
@@ -655,6 +743,11 @@ class FeedbackGenerator:
                 "symptom dimensions. One strong parameter-symptom relationship matters more "
                 "than many weak ones."
             )
+
+        # Cross-model parameter-symptom links
+        r2_landscape = self._build_r2_landscape()
+        if r2_landscape:
+            parts.append(r2_landscape)
 
         # Factor coverage
         factor_coverage = self._build_factor_coverage()
@@ -770,6 +863,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 "Focus on designing parameters with interpretable links to specific "
                 "symptom dimensions."
             )
+
+        # --- Cross-model parameter-symptom links ---
+        r2_landscape = self._build_r2_landscape()
+        if r2_landscape:
+            context_parts.append(f"## Parameter-Symptom Links Across Models\n{r2_landscape}")
 
         # --- Multi-client context ---
         n_clients = self._count_clients()

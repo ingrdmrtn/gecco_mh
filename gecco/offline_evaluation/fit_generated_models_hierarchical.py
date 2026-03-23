@@ -130,5 +130,6 @@ def run_fit_hierarchical(
         "model_name": spec.name,
         "parameter_values": parameter_values,
         "eval_metrics": eval_metrics,
+        "participant_n_trials": participant_n_trials,
         "hbi_result": hbi_result,
     }

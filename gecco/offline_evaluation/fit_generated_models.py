@@ -61,6 +61,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
 
     eval_metrics = []
     parameter_estimates = []
+    participant_n_trials = []
     n_participants = len(participants)
     t0_fit = time.time()
     _log(f"[GeCCo] Fitting {expected_func_name} to {n_participants} participants ({n_starts} starts each)")
@@ -68,6 +69,7 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
     # --- Fit per participant ---
     for pi, p in enumerate(participants):
         df_p = df[df[data_cfg.id_column] == p].reset_index(drop=True)
+        participant_n_trials.append(len(df_p))
 
         # Extract task-relevant input columns dynamically
         input_cols = list(data_cfg.input_columns)
@@ -105,8 +107,8 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
         "param_names": list(spec.param_names),
         "model_name": spec.name,
         "parameter_values": parameter_estimates,
-        "eval_metrics": eval_metrics
-
+        "eval_metrics": eval_metrics,
+        "participant_n_trials": participant_n_trials,
     }
 
 

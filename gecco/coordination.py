@@ -139,6 +139,10 @@ class SharedRegistry:
                     eval_metrics = r.get("eval_metrics")
                     if eval_metrics:
                         entry["eval_metrics"] = eval_metrics
+                    # Include per-participant trial counts for chance-level detection
+                    participant_n_trials = r.get("participant_n_trials")
+                    if participant_n_trials:
+                        entry["participant_n_trials"] = participant_n_trials
                     # Include individual differences R² if available
                     id_res = r.get("individual_differences")
                     if id_res and isinstance(id_res, dict):

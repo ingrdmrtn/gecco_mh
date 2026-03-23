@@ -1,3 +1,4 @@
+import math
 import re
 import numpy as np
 from datetime import datetime
@@ -49,8 +50,12 @@ class FeedbackGenerator:
             return ""
 
         bics = [b for _, b in iter_bests]
+        n_iters = len(iter_bests)
         traj_str = " → ".join(f"iter {i} → {b:.1f}" for i, b in iter_bests)
-        lines = [f"BIC trajectory: {traj_str}."]
+        lines = []
+        if n_iters <= 3:
+            lines.append(f"(Based on only {n_iters} iterations — trend estimates are preliminary.)")
+        lines.append(f"BIC trajectory: {traj_str}.")
 
         n = len(bics)
         half = max(1, n // 2)
@@ -120,7 +125,9 @@ class FeedbackGenerator:
         # --- Ranked table (top 10) ---
         n_clients = self._count_clients()
         client_note = f" from {n_clients} parallel search clients" if n_clients > 1 else ""
-        lines = [f"Model landscape (all iterations{client_note}, ranked by BIC):"]
+        lines = [f"Model landscape ({len(all_models)} models across all iterations{client_note}, ranked by BIC):"]
+        if len(all_models) < 10:
+            lines.append("(Few models evaluated so far — rankings may shift substantially.)")
         lines.append(f"{'Model':<22} {'BIC':>8}  {'Params':<45}  Iter")
         lines.append("-" * 82)
         for m in all_models[:10]:
@@ -207,14 +214,14 @@ class FeedbackGenerator:
     # Level 3: Stagnation detection, factor extraction, top-N code
     # ------------------------------------------------------------------
 
-    def _detect_stagnation(self, threshold=2.0, window=3):
+    def _build_search_momentum(self, window=3):
         """
-        Check whether the search has stagnated.
-        Returns "exploring" if best BIC hasn't improved by more than
-        *threshold* over the last *window* iterations, "exploiting" otherwise.
+        Compute recent BIC improvement over the last *window* iterations.
+        Returns a short descriptive string with the raw numbers,
+        or empty string if not enough data.
         """
-        if len(self.history) < window:
-            return "exploiting"
+        if len(self.history) < 2:
+            return ""
 
         recent = self.history[-window:]
         best_bics = []
@@ -223,10 +230,16 @@ class FeedbackGenerator:
                 best_bics.append(min(r["metric_value"] for r in entry["results"]))
 
         if len(best_bics) < 2:
-            return "exploiting"
+            return ""
 
         improvement = best_bics[0] - best_bics[-1]
-        return "exploring" if improvement < threshold else "exploiting"
+        n = len(best_bics)
+        rate = improvement / (n - 1)
+
+        return (
+            f"Recent momentum (last {n} iterations): "
+            f"BIC improved by {improvement:.1f} total ({rate:.1f}/iter)."
+        )
 
     def _extract_factor_usage(self, code):
         """
@@ -331,12 +344,22 @@ class FeedbackGenerator:
     # Level 4: Per-participant fit quality
     # ------------------------------------------------------------------
 
+    def _count_choice_columns(self):
+        """Count the number of choice/action columns in input_columns."""
+        choice_keywords = ["choice", "action", "decision"]
+        input_cols = getattr(self.cfg.data, "input_columns", [])
+        n = sum(
+            1 for col in input_cols
+            if any(kw in col.lower() for kw in choice_keywords)
+        )
+        return max(n, 1)
+
     def _build_fit_quality_summary(self):
         """
-        Analyse per-participant fit metrics for the best model in the most
-        recent iteration. Flags outliers and reports distribution stats.
+        Analyse per-participant fit metrics for the best model.
+        Reports fit tiers (well-fit / moderate / poor / at chance)
+        and flags participants where the model captures nothing.
         """
-        # Find the best model's eval_metrics from the most recent iteration
         if not self.history:
             return ""
 
@@ -344,6 +367,8 @@ class FeedbackGenerator:
         best_metrics = None
         best_bic = float("inf")
         best_name = ""
+        best_n_trials = None
+        best_param_names = []
         for entry in self.history:
             for r in entry["results"]:
                 metrics = r.get("eval_metrics", [])
@@ -351,6 +376,8 @@ class FeedbackGenerator:
                     best_bic = r["metric_value"]
                     best_metrics = metrics
                     best_name = r["function_name"]
+                    best_n_trials = r.get("participant_n_trials", [])
+                    best_param_names = r.get("param_names", [])
 
         if not best_metrics or len(best_metrics) < 2:
             return ""
@@ -360,28 +387,122 @@ class FeedbackGenerator:
         std_val = np.std(metrics)
         min_val = np.min(metrics)
         max_val = np.max(metrics)
+        median_val = np.median(metrics)
         n_total = len(metrics)
 
-        # Outliers: participants with BIC > mean + 2*std
+        # Fit tiers
         outlier_threshold = mean_val + 2 * std_val
-        n_outliers = int(np.sum(metrics > outlier_threshold))
-        pct_outliers = 100 * n_outliers / n_total
-
-        # Well-fit: participants with BIC below median
-        median_val = np.median(metrics)
+        n_well_fit = int(np.sum(metrics <= median_val))
+        n_moderate = int(np.sum((metrics > median_val) & (metrics <= outlier_threshold)))
+        n_poor = int(np.sum(metrics > outlier_threshold))
 
         lines = [
-            f"Participant fit quality for best model ({best_name}):",
-            f"  Mean BIC: {mean_val:.1f} (std: {std_val:.1f}, min: {min_val:.1f}, max: {max_val:.1f})",
+            f"Participant fit quality for best model ({best_name}, {len(best_param_names)} params):",
+            f"  Mean BIC: {mean_val:.1f} (std: {std_val:.1f}, range: [{min_val:.1f}, {max_val:.1f}])",
             f"  Median BIC: {median_val:.1f}",
-            f"  Poorly-fit participants (BIC > mean + 2σ): {n_outliers}/{n_total} ({pct_outliers:.1f}%)",
+            f"  Fit tiers:",
+            f"    Well-fit (≤ median):       {n_well_fit}/{n_total} ({100*n_well_fit/n_total:.0f}%)",
+            f"    Moderate (median to +2σ):  {n_moderate}/{n_total} ({100*n_moderate/n_total:.0f}%)",
+            f"    Poor (> mean + 2σ):        {n_poor}/{n_total} ({100*n_poor/n_total:.0f}%)",
         ]
 
-        # Report the spread — large std relative to mean indicates heterogeneity
+        # Chance-level detection
+        if best_n_trials and len(best_n_trials) == n_total:
+            n_choice_cols = self._count_choice_columns()
+            chance_bics = np.array([
+                2 * n_choice_cols * nt * math.log(2)
+                for nt in best_n_trials
+            ])
+            n_at_chance = int(np.sum(metrics >= chance_bics))
+            pct_at_chance = 100 * n_at_chance / n_total
+            lines.append(
+                f"    At chance level:           {n_at_chance}/{n_total} ({pct_at_chance:.0f}%)"
+            )
+            if n_at_chance > 0:
+                lines.append(
+                    "  WARNING: Some participants are at chance level — the model is not "
+                    "capturing their behavior at all. These participants may use a "
+                    "qualitatively different strategy that requires a different model."
+                )
+
+        # High heterogeneity signal
         if std_val > 0.5 * mean_val:
             lines.append(
                 "  High variability in fit quality across participants — "
                 "the model may not capture an important source of individual differences."
+            )
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Cross-model subgroup comparison
+    # ------------------------------------------------------------------
+
+    def _build_subgroup_comparison(self):
+        """
+        Compare per-participant fit across the top models to detect
+        subgroups that different models serve better.
+        """
+        if not self.history:
+            return ""
+
+        # Collect all models with eval_metrics
+        all_models = []
+        for entry in self.history:
+            for r in entry["results"]:
+                em = r.get("eval_metrics", [])
+                if em:
+                    all_models.append({
+                        "name": r["function_name"],
+                        "bic": r["metric_value"],
+                        "eval_metrics": em,
+                        "iter": entry["iteration"],
+                    })
+
+        if len(all_models) < 2:
+            return ""
+
+        # Sort by mean BIC and take top 3
+        all_models.sort(key=lambda x: x["bic"])
+        top = all_models[:3]
+
+        # All must have the same number of participants
+        n_participants = len(top[0]["eval_metrics"])
+        if not all(len(m["eval_metrics"]) == n_participants for m in top):
+            return ""
+
+        # For each participant, find which model fits best
+        metrics_matrix = np.array([m["eval_metrics"] for m in top])
+        best_model_per_participant = np.argmin(metrics_matrix, axis=0)
+
+        lines = [f"Cross-model subgroup comparison (top {len(top)} models):"]
+        for i, m in enumerate(top):
+            count = int(np.sum(best_model_per_participant == i))
+            pct = 100 * count / n_participants
+            lines.append(
+                f"  {m['name']} (mean BIC={m['bic']:.1f}): "
+                f"best for {count}/{n_participants} participants ({pct:.0f}%)"
+            )
+
+        # Flag large disagreements
+        bic_range = np.max(metrics_matrix, axis=0) - np.min(metrics_matrix, axis=0)
+        median_range = np.median(bic_range)
+        std_range = np.std(bic_range)
+        large_disagreement = int(np.sum(bic_range > median_range + 2 * std_range))
+        if large_disagreement > 0:
+            lines.append(
+                f"\n  {large_disagreement} participants show large model disagreement "
+                f"(BIC spread > median + 2σ across models). These participants may use "
+                f"qualitatively different strategies that no single model captures well."
+            )
+
+        # If the global best model is NOT best for a substantial portion
+        global_best_pct = 100 * np.sum(best_model_per_participant == 0) / n_participants
+        if global_best_pct < 70:
+            lines.append(
+                "\n  The globally best model is NOT best for all participants. "
+                "Consider proposing models that target the subgroup where "
+                "alternative models excel."
             )
 
         return "\n".join(lines)
@@ -407,12 +528,12 @@ class FeedbackGenerator:
         if best_bic == float("inf"):
             return ""
 
-        mode = self._detect_stagnation()
-        trend = "improving" if mode == "exploiting" else "stagnating"
-
         n_clients = self._count_clients()
         client_note = f" across {n_clients} clients" if n_clients > 1 else ""
-        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}{client_note}). Trend: {trend}."]
+        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}{client_note})."]
+        momentum = self._build_search_momentum()
+        if momentum:
+            lines.append(momentum)
 
         # ID summary
         if id_results is not None:
@@ -436,14 +557,12 @@ class FeedbackGenerator:
             else:
                 lines.append(f"Individual differences: mean R² = {mean_r2:.3f}.")
 
-        # Fit quality summary
+        # Fit quality summary — extract key lines
         fit_quality = self._build_fit_quality_summary()
         if fit_quality:
-            # Extract just the outlier line
             for line in fit_quality.split("\n"):
-                if "Poorly-fit" in line:
+                if "Poor" in line or "At chance" in line:
                     lines.append(line.strip())
-                    break
 
         return "\n".join(lines)
 
@@ -484,6 +603,11 @@ class FeedbackGenerator:
         if fit_quality:
             parts.append(fit_quality)
 
+        # Cross-model subgroup comparison
+        subgroup = self._build_subgroup_comparison()
+        if subgroup:
+            parts.append(subgroup)
+
         # Individual differences
         if id_results is not None:
             parts.append(
@@ -500,19 +624,10 @@ class FeedbackGenerator:
         if factor_coverage:
             parts.append(factor_coverage)
 
-        # Stagnation signal
-        mode = self._detect_stagnation()
-        if mode == "exploring":
-            parts.append(
-                "Search status: STAGNATING. BIC has not improved meaningfully "
-                "in recent iterations. Try structurally different mechanisms "
-                "rather than refining the current approach."
-            )
-        elif len(self.history) >= 3:
-            parts.append(
-                "Search status: IMPROVING. Current direction is productive — "
-                "refine and build on the best model's mechanisms."
-            )
+        # Search momentum
+        momentum = self._build_search_momentum()
+        if momentum:
+            parts.append(momentum)
 
         search_context = ("\n\n".join(parts) + "\n\n") if parts else ""
 
@@ -551,6 +666,21 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # --- Build landscape context (Levels 1-3) ---
         context_parts = []
 
+        # --- Data quantity context ---
+        n_iterations = len(self.history)
+        total_models = sum(len(entry["results"]) for entry in self.history)
+        quantity_note = (
+            f"## Data Quantity\n"
+            f"Iterations completed: {n_iterations}\n"
+            f"Total models evaluated: {total_models}"
+        )
+        if n_iterations < 5 or total_models < 10:
+            quantity_note += (
+                "\nNote: Conclusions drawn from fewer than 5 iterations / 10 models "
+                "should be treated as preliminary."
+            )
+        context_parts.append(quantity_note)
+
         trajectory = self._build_trajectory_summary()
         if trajectory:
             context_parts.append(f"## Search Trajectory\n{trajectory}")
@@ -564,12 +694,18 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         if fit_quality:
             context_parts.append(f"## Participant Fit Quality\n{fit_quality}")
 
+        # --- Cross-model subgroup comparison ---
+        subgroup = self._build_subgroup_comparison()
+        if subgroup:
+            context_parts.append(f"## Cross-Model Subgroup Comparison\n{subgroup}")
+
         factor_coverage = self._build_factor_coverage()
         if factor_coverage:
             context_parts.append(f"## Psychiatric Factor Usage\n{factor_coverage}")
 
-        mode = self._detect_stagnation()
-        context_parts.append(f"## Search Status\nMode: {mode.upper()}")
+        momentum = self._build_search_momentum()
+        if momentum:
+            context_parts.append(f"## Search Momentum\n{momentum}")
 
         # --- Top N model code ---
         top_models = self._get_top_n_code(n=3)
@@ -612,9 +748,18 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
         # --- Judge prompt ---
         judge_prompt = (
-            "You are analysing a computational model search. Be purely data-driven — "
+            "You are critiquing another agent's search to find the optimal cognitive "
+            "computational model to fit behavioural data and measures. Be purely data-driven — "
             "report what the BIC values show. Do NOT interpret mechanisms based on "
             "literature or prior knowledge. The goal is novel discovery.\n\n"
+            "Qualify the confidence of your claims based on the amount of data available. "
+            "With fewer than 5 iterations or 10 total models, use hedging language "
+            "(e.g., 'preliminary evidence suggests', 'early indications are'). "
+            "Only make strong claims when supported by consistent patterns across "
+            "many iterations.\n\n"
+            "For each suggestion you make, provide a confidence rating on a scale of "
+            "1-10 (1 = speculative/little data, 10 = strong evidence across many iterations). "
+            "Format as e.g. '[confidence: 7/10]' inline with each suggestion.\n\n"
             f"{search_context}\n\n"
             "Based on the data above:\n"
             "1. Which parameters or mechanisms consistently appear in well-fitting models?\n"
@@ -622,11 +767,18 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             "3. What parameter or mechanism combinations have not been tried yet?\n"
             "4. Are there patterns in which participants fit poorly? Does the model "
             "struggle with a specific subset of participants?\n"
-            "5. Which symptom dimensions (questionnaire factors) most strongly predict "
+            "5. What proportion of participants are at chance level (model not capturing "
+            "their behavior at all)? What might this suggest about missing mechanisms "
+            "or qualitatively different strategies in the population?\n"
+            "6. Do different models fit different subgroups of participants better? "
+            "If so, what does this suggest about population heterogeneity and "
+            "the potential for subgroup-specific model proposals?\n"
+            "7. Which symptom dimensions (questionnaire factors) most strongly predict "
             "model parameters, and what does this suggest about individual differences?\n"
-            "6. Is improvement stagnating? If so, suggest structurally different directions "
-            "to explore.\n"
-            "7. Provide specific, actionable guidance for generating the next set of models.\n\n"
+            "8. Based on the search momentum, is improvement slowing down? If so, suggest "
+            "structurally different directions to explore.\n"
+            "9. Provide specific, actionable guidance for generating the next set of models. "
+            "Report fit quality proportions (% well-fit, % moderate, % poor, % at chance).\n\n"
             "Keep your response concise and focused on actionable next steps. "
             "Do NOT include Python code or pseudocode — describe mechanisms conceptually only."
         )

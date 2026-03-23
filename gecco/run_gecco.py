@@ -369,6 +369,7 @@ class GeCCoModelSearch:
                         "individual_differences": id_results,
                         "code": func_code,
                         "eval_metrics": fit_res.get("eval_metrics", []),
+                    "participant_n_trials": fit_res.get("participant_n_trials", []),
                     })
 
                     if mean_metric < self.best_metric:

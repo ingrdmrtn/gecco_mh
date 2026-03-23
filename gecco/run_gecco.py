@@ -476,7 +476,8 @@ class GeCCoModelSearch:
                 with open(structured_file, "w") as f:
                     json.dump(
                         [{"name": m["name"], "rationale": m.get("rationale", ""),
-                          "analysis": m.get("analysis", "")} for m in parsed_models],
+                          "analysis": m.get("analysis", ""),
+                          "parameters": m.get("parameters", [])} for m in parsed_models],
                         f, indent=2,
                     )
 
@@ -487,6 +488,7 @@ class GeCCoModelSearch:
                 func_name = f"cognitive_model{i + 1}"
                 display_name = model_dict.get("name", func_name)
                 func_code = model_dict["code"]
+                structured_params = model_dict.get("parameters")
 
                 if not func_code:
                     continue
@@ -498,7 +500,8 @@ class GeCCoModelSearch:
                         from gecco.offline_evaluation.utils import build_model_spec
                         try:
                             spec = build_model_spec(
-                                func_code, expected_func_name=func_name, cfg=self.cfg
+                                func_code, expected_func_name=func_name, cfg=self.cfg,
+                                structured_params=structured_params,
                             )
                             console.print(
                                 f"  [dim]Running parameter recovery check for {display_name} "
@@ -538,7 +541,8 @@ class GeCCoModelSearch:
                             continue
 
                     self._set_activity(f"fitting model {i+1}/{n_models}: {display_name} (iter {it})")
-                    fit_res = run_fit(self.df, func_code, cfg=self.cfg, expected_func_name=func_name)
+                    fit_res = run_fit(self.df, func_code, cfg=self.cfg, expected_func_name=func_name,
+                                      structured_params=structured_params)
 
                     mean_metric = float(fit_res["metric_value"])
                     metric_name = fit_res["metric_name"]

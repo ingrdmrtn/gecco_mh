@@ -20,6 +20,7 @@ def run_fit_hierarchical(
     code_text,
     cfg,
     expected_func_name="cognitive_model",
+    structured_params=None,
     max_iter=50,
     tol=1e-5,
     n_starts=3,
@@ -60,6 +61,7 @@ def run_fit_hierarchical(
         code_text,
         expected_func_name=expected_func_name,
         cfg=cfg,
+        structured_params=structured_params,
     )
 
     data_cfg = cfg.data

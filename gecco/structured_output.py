@@ -54,6 +54,33 @@ def get_model_schema(n_models: int, include_analysis: bool = True) -> dict:
                 "this architecture might improve on previous models"
             ),
         },
+        "parameters": {
+            "type": "array",
+            "description": (
+                "List of model parameters with their names and bounds. "
+                "Must match the parameters unpacked from model_parameters "
+                "in the code, in the same order."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Parameter name matching the variable in the code",
+                    },
+                    "lower_bound": {
+                        "type": "number",
+                        "description": "Lower bound for optimization (e.g. 0)",
+                    },
+                    "upper_bound": {
+                        "type": "number",
+                        "description": "Upper bound for optimization (e.g. 1 for rates, 10 for inverse temperature)",
+                    },
+                },
+                "required": ["name", "lower_bound", "upper_bound"],
+                "additionalProperties": False,
+            },
+        },
         "code": {
             "type": "string",
             "description": (
@@ -63,7 +90,7 @@ def get_model_schema(n_models: int, include_analysis: bool = True) -> dict:
             ),
         },
     }
-    required = ["name", "rationale", "code"]
+    required = ["name", "rationale", "parameters", "code"]
 
     if include_analysis:
         model_properties["analysis"] = {
@@ -75,7 +102,7 @@ def get_model_schema(n_models: int, include_analysis: bool = True) -> dict:
                 "by step before writing code."
             ),
         }
-        required = ["analysis", "name", "rationale", "code"]
+        required = ["analysis", "name", "rationale", "parameters", "code"]
 
     return {
         "type": "object",
@@ -125,6 +152,10 @@ You MUST respond with valid JSON in exactly this format (no markdown, no extra t
     {{
 {analysis_field}      "name": "descriptive_snake_case_name",
       "rationale": "One sentence explaining the model's hypothesis",
+      "parameters": [
+        {{"name": "alpha", "lower_bound": 0, "upper_bound": 1}},
+        {{"name": "beta", "lower_bound": 0, "upper_bound": 10}}
+      ],
       "code": "def cognitive_model1(action_1, state, action_2, reward, model_parameters):\\n    ..."
     }}
   ]
@@ -133,6 +164,7 @@ You MUST respond with valid JSON in exactly this format (no markdown, no extra t
 Field descriptions:
 {analysis_example}  - `name`: Concise descriptive snake_case name (2-4 words) capturing the key mechanism (e.g. `dual_lr_perseveration`, `bayesian_transition_learner`, `attention_weighted_mbmf`). Must be unique across all models you propose.
   - `rationale`: One sentence explaining the model's hypothesis and why this architecture might improve on previous models.
+  - `parameters`: List of model parameters with bounds. Each entry has `name` (matching the variable in code), `lower_bound`, and `upper_bound`. Must match the parameters unpacked from `model_parameters` in the same order.
   - `code`: Complete Python function definition. Functions must be named `cognitive_model1`, `cognitive_model2`, etc.
 
 You must provide exactly {n_models} model(s) in the `models` array.

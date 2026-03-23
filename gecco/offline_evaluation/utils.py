@@ -178,11 +178,14 @@ def parse_bounds_from_docstring(doc: Optional[str]) -> Dict[str, List[float]]:
     bounds: Dict[str, List[float]] = {}
 
     # --- Case 1: explicit per-parameter bounds ---
+    # Allows optional descriptive text in parens between param name and bounds,
+    # e.g. "alpha (learning_rate): [0, 1]" or "alpha: [0, 1]"
     explicit_pattern = re.compile(
         r"""
         (?:^|\n)\s*[-*]?\s*
-        ([A-Za-z_][A-Za-z0-9_]*)
-        [^()\[\]\n]*?
+        ([A-Za-z_][A-Za-z0-9_]*)       # parameter name
+        (?:\s*\([^)]*\))?               # optional description in parens, e.g. (learning_rate)
+        [^()\[\]\n]*?                   # separator chars (colon, spaces, etc.)
         [\(\[\{]\s*
         ([\-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*
         [,\s]+\s*
@@ -216,21 +219,25 @@ def _get_docstring_from_class(code: str, class_name: str) -> str:
 # ============================================================
 
 def build_model_spec(
-    code: str, 
+    code: str,
     expected_func_name: str = "cognitive_model",
     cfg = None,
-    base_class_code: Optional[str] = None
+    base_class_code: Optional[str] = None,
+    structured_params: Optional[List[Dict[str, Any]]] = None,
 ) -> ModelSpec:
     """
     Build ModelSpec from LLM-generated code.
     Automatically detects class-based vs function-based code.
-    
+
     Args:
         code: Raw code string from LLM
         expected_func_name: Name of the function to extract
         cfg: Config object (used to get base class code if not provided)
         base_class_code: Base class code (optional, extracted from cfg if not provided)
-    
+        structured_params: Optional list of parameter dicts from structured JSON output,
+            each with 'name', 'lower_bound', 'upper_bound'. Takes priority over
+            docstring-parsed bounds when available.
+
     Returns:
         ModelSpec with compiled function, parameter names, and bounds
     """
@@ -273,27 +280,42 @@ def build_model_spec(
         param_names = extract_parameter_names(code)
         doc = func.__doc__ or ""
     
-    # Parse bounds
-    bounds = parse_bounds_from_docstring(doc)
+    # Build bounds from structured JSON params (preferred) or docstring (fallback)
+    structured_bounds: Dict[str, List[float]] = {}
+    if structured_params:
+        for sp in structured_params:
+            name = sp.get("name", "")
+            lo = sp.get("lower_bound")
+            hi = sp.get("upper_bound")
+            if name and lo is not None and hi is not None:
+                structured_bounds[name] = [float(lo), float(hi)]
+        # If structured params provide parameter names and code extraction
+        # found none, use the structured param names as authoritative
+        if structured_bounds and not param_names:
+            param_names = [sp["name"] for sp in structured_params if sp.get("name")]
 
-    # Fill in missing bounds with defaults
+    docstring_bounds = parse_bounds_from_docstring(doc)
+
+    # Fill in bounds: structured > docstring > defaults
     default_bound = [0, 1]
     beta_bound = [0, 10]
-    
+
     final_bounds = {}
     for p in param_names:
-        if p in bounds:
-            final_bounds[p] = bounds[p]
-        elif p.lower() in bounds:
-            final_bounds[p] = bounds[p.lower()]
+        if p in structured_bounds:
+            final_bounds[p] = structured_bounds[p]
+        elif p in docstring_bounds:
+            final_bounds[p] = docstring_bounds[p]
+        elif p.lower() in docstring_bounds:
+            final_bounds[p] = docstring_bounds[p.lower()]
         elif 'beta' in p.lower() or 'temperature' in p.lower():
             final_bounds[p] = beta_bound
         else:
             final_bounds[p] = default_bound
-    
+
     if not param_names:
         print(f"[⚠️ GeCCo] No parameters found in {expected_func_name}")
-    if not bounds:
+    if not structured_bounds and not docstring_bounds:
         print(f"[⚠️ GeCCo] No bounds found in {expected_func_name}; using defaults")
     
     return ModelSpec(

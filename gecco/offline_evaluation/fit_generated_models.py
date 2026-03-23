@@ -10,7 +10,7 @@ def _log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
-def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
+def run_fit(df, code_text, cfg, expected_func_name="cognitive_model", structured_params=None):
     """
     Compile an LLM-generated cognitive model, fit it to participant data,
     and return fit statistics (AIC/BIC) across participants.
@@ -38,9 +38,10 @@ def run_fit(df, code_text, cfg, expected_func_name="cognitive_model"):
     """
     # --- Build model specification from code ---
     spec = build_model_spec(
-        code_text, 
+        code_text,
         expected_func_name=expected_func_name,
-        cfg=cfg  # Pass config so it can extract base class
+        cfg=cfg,
+        structured_params=structured_params,
     )
 
     # --- Prepare metric function ---

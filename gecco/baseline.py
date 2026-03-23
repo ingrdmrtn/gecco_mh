@@ -47,9 +47,13 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
     dict or None
         Baseline result dict, or None if no template model is configured.
     """
-    template_code = getattr(cfg.llm, "template_model", None)
-    if not template_code:
-        _log("[GeCCo] No template_model in config — skipping baseline")
+    # Prefer explicit baseline.model; fall back to llm.template_model
+    baseline_cfg = getattr(cfg, "baseline", None)
+    baseline_code = getattr(baseline_cfg, "model", None) if baseline_cfg else None
+    if not baseline_code:
+        baseline_code = getattr(cfg.llm, "template_model", None)
+    if not baseline_code:
+        _log("[GeCCo] No baseline model or template_model in config — skipping baseline")
         return None
 
     baseline_path = Path(baseline_path)
@@ -81,20 +85,24 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
                 registry.set_baseline(result)
             return result
 
-        # Fit the template model
-        _log("[GeCCo] Fitting baseline (template) model...")
-        console.print("[bold]Fitting baseline model...[/]")
+        # Extract function name from the baseline code
+        import re
+        func_match = re.search(r'def\s+(\w+)\s*\(', baseline_code)
+        func_name = func_match.group(1) if func_match else "cognitive_model"
+
+        _log(f"[GeCCo] Fitting baseline model ({func_name})...")
+        console.print(f"[bold]Fitting baseline model ({func_name})...[/]")
 
         from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
 
-        fit_res = run_fit(df_eval, template_code, cfg=cfg, expected_func_name="cognitive_model")
+        fit_res = run_fit(df_eval, baseline_code, cfg=cfg, expected_func_name=func_name)
 
         result = {
             "function_name": "baseline_model",
             "metric_name": fit_res["metric_name"],
             "metric_value": float(fit_res["metric_value"]),
             "param_names": fit_res["param_names"],
-            "code": template_code,
+            "code": baseline_code,
             "eval_metrics": [float(v) for v in fit_res.get("eval_metrics", [])],
             "participant_n_trials": fit_res.get("participant_n_trials", []),
         }

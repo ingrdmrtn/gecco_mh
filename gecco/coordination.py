@@ -170,11 +170,21 @@ class SharedRegistry:
                         entry["per_param_r2"] = id_res.get("per_param_r2")
                     serializable_results.append(entry)
 
-                data["iteration_history"].append({
+                # Replace existing entry for same (client_id, iteration), or append
+                new_entry = {
                     "client_id": client_id,
                     "iteration": iteration,
                     "results": serializable_results,
-                })
+                }
+                replaced = False
+                for idx, existing_entry in enumerate(data["iteration_history"]):
+                    if (existing_entry.get("client_id") == client_id
+                            and existing_entry.get("iteration") == iteration):
+                        data["iteration_history"][idx] = new_entry
+                        replaced = True
+                        break
+                if not replaced:
+                    data["iteration_history"].append(new_entry)
 
                 # Merge tried param sets (deduplicate)
                 if tried_param_sets:

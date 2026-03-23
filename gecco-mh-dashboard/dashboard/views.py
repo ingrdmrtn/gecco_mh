@@ -14,7 +14,7 @@ from dashboard.data_adapter import (
     build_iteration_df,
     build_landscape_df,
     build_r2_df,
-    get_iteration_results,
+    get_iteration_results_by_idx,
     list_iterations,
     load_json_file,
     load_text_file,
@@ -164,16 +164,30 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
         )
     # Filter iterations for selected client
     client_iters = [it for it in iterations if str(it["client_id"]) == selected_client]
-    iter_options = [it["iteration"] for it in client_iters]
+
+    # Build display labels that disambiguate re-runs of the same iteration
+    iter_labels: list[str] = []
+    for it in client_iters:
+        label = str(it["iteration"])
+        if it["run"] > 0:
+            label += f" (run {it['run'] + 1})"
+        iter_labels.append(label)
+
     with col2:
-        selected_iter = st.selectbox(
-            "Iteration", iter_options,
-            index=len(iter_options) - 1 if iter_options else 0,
+        selected_label = st.selectbox(
+            "Iteration", iter_labels,
+            index=len(iter_labels) - 1 if iter_labels else 0,
             key="results_iter",
         )
 
-    if selected_iter is None:
+    if not selected_label:
         return
+
+    # Map selected label back to the iteration info
+    label_idx = iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    iter_info = client_iters[label_idx]
+    history_idx = iter_info["history_idx"]
+    selected_iter = iter_info["iteration"]
 
     # Resolve client_id back to its original type
     client_id_typed: Any = selected_client
@@ -182,12 +196,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
             client_id_typed = it["client_id"]
             break
 
-    results = get_iteration_results(data, client_id_typed, selected_iter)
-
-    # --- Iteration summary ---
-    iter_info = next(
-        (it for it in client_iters if it["iteration"] == selected_iter), None
-    )
+    results = get_iteration_results_by_idx(data, history_idx)
     with st.container(border=True):
         st.markdown(
             f"**Iteration {selected_iter}** · Client {selected_client} · "

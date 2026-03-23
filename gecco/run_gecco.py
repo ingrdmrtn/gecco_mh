@@ -60,6 +60,8 @@ class GeCCoModelSearch:
         self.best_metric = np.inf
         self.best_params = []
         self.best_iter = -1
+        self.best_param_names = []
+        self.best_param_values = None
         self.tried_param_sets = []
         self.best_id_results = None
 
@@ -650,9 +652,7 @@ class GeCCoModelSearch:
         )
 
         # --- save best parameters ---
-        if self.best_model is not None and self.best_params:
-
-            # if getattr(self.cfg.evaluation, "fit_type", "group") == "individual":
+        if self.best_model is not None and self.best_params and self.best_param_values is not None:
             param_df = pd.DataFrame(
                 self.best_param_values,
                 columns=self.best_param_names

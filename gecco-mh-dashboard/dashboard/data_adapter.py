@@ -254,28 +254,39 @@ def summary_stats(data: dict[str, Any]) -> dict[str, int]:
 # ============================================================
 
 def list_iterations(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract unique (client, iteration) pairs from iteration_history, sorted."""
+    """Extract all (client, iteration) entries from iteration_history, sorted.
+
+    Duplicate (client, iteration) pairs from re-runs are preserved and
+    disambiguated with a 'run' index (0-based) and 'history_idx' for lookup.
+    """
     seen: list[dict[str, Any]] = []
-    for entry in data.get("iteration_history", []):
+    dup_counts: dict[tuple, int] = {}
+    for idx, entry in enumerate(data.get("iteration_history", [])):
         cid = entry.get("client_id")
         it = entry.get("iteration")
+        key = (cid, it)
+        run = dup_counts.get(key, 0)
+        dup_counts[key] = run + 1
         n_models = len(entry.get("results", []))
         bics = [r.get("metric_value") for r in entry.get("results", [])
                 if r.get("metric_value") is not None]
         seen.append({
             "client_id": cid,
             "iteration": it,
+            "run": run,
+            "history_idx": idx,
             "n_models": n_models,
             "best_bic": min(bics) if bics else None,
         })
-    return sorted(seen, key=lambda x: (x["client_id"] or 0, x["iteration"] or 0))
+    return sorted(seen, key=lambda x: (str(x["client_id"] or ""), x["iteration"] or 0, x["run"]))
 
 
-def get_iteration_results(data: dict[str, Any], client_id: Any, iteration: int) -> list[dict[str, Any]]:
-    """Get model results for a specific (client, iteration)."""
-    for entry in data.get("iteration_history", []):
-        if entry.get("client_id") == client_id and entry.get("iteration") == iteration:
-            return entry.get("results", [])
+def get_iteration_results_by_idx(data: dict[str, Any], history_idx: int) -> list[dict[str, Any]]:
+    """Get model results by history index (handles duplicates unambiguously)."""
+    history = data.get("iteration_history", [])
+    if 0 <= history_idx < len(history):
+        return history[history_idx].get("results", [])
+    return []
     return []
 
 

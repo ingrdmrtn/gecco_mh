@@ -64,6 +64,7 @@ class SharedRegistry:
     def _empty_registry():
         return {
             "global_best": None,
+            "baseline": None,
             "tried_param_sets": [],
             "client_entries": {},
             "iteration_history": [],
@@ -202,6 +203,37 @@ class SharedRegistry:
                 if str(client_id) in data["client_entries"]:
                     data["client_entries"][str(client_id)]["status"] = "complete"
                     data["client_entries"][str(client_id)]["updated_at"] = datetime.now().isoformat()
+
+                self._atomic_write(data)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+    def set_baseline(self, baseline_result):
+        """Write baseline result to the registry under the 'baseline' key."""
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                # Store a serializable subset (no numpy arrays)
+                data["baseline"] = {
+                    "function_name": baseline_result.get("function_name", "baseline_model"),
+                    "metric_name": baseline_result.get("metric_name", "BIC"),
+                    "metric_value": baseline_result.get("metric_value"),
+                    "param_names": baseline_result.get("param_names", []),
+                    "eval_metrics": baseline_result.get("eval_metrics", []),
+                }
+                # Include individual differences if available
+                id_res = baseline_result.get("individual_differences")
+                if id_res and isinstance(id_res, dict):
+                    data["baseline"]["mean_r2"] = id_res.get("mean_r2")
+                    data["baseline"]["per_param_r2"] = id_res.get("per_param_r2")
 
                 self._atomic_write(data)
             finally:

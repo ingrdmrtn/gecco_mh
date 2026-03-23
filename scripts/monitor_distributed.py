@@ -93,8 +93,10 @@ def build_client_table(data):
 
 
 def build_global_best_panel(data):
-    """Build a panel showing the global best model."""
+    """Build a panel showing the global best model and baseline comparison."""
     best = data.get("global_best")
+    baseline = data.get("baseline")
+
     if not best:
         return Panel("[dim]No models fitted yet[/]", title="Global Best", style="blue")
 
@@ -103,7 +105,38 @@ def build_global_best_panel(data):
         f"[bold]Found by:[/] Client {best['client_id']}, Iteration {best['iteration']}",
         f"[bold]Parameters:[/] {', '.join(best.get('param_names', []))}",
     ]
+
+    if baseline and baseline.get("metric_value") is not None:
+        improvement = baseline["metric_value"] - best["metric_value"]
+        pct = 100 * improvement / abs(baseline["metric_value"]) if baseline["metric_value"] != 0 else 0
+        style = "green" if improvement > 0 else "red"
+        lines.append(
+            f"[bold]vs Baseline:[/] [{style}]{improvement:+.2f} ({pct:+.1f}%)[/{style}]"
+        )
+
     return Panel("\n".join(lines), title="Global Best Model", style="green")
+
+
+def build_baseline_panel(data):
+    """Build a panel showing the baseline (template) model results."""
+    baseline = data.get("baseline")
+    if not baseline or baseline.get("metric_value") is None:
+        return Panel("[dim]Baseline not yet fitted[/]", title="Baseline Model", style="dim")
+
+    lines = [
+        f"[bold]BIC:[/] [yellow]{baseline['metric_value']:.2f}[/]",
+        f"[bold]Parameters:[/] {', '.join(baseline.get('param_names', []))}",
+    ]
+
+    r2 = baseline.get("mean_r2")
+    if r2 is not None:
+        lines.append(f"[bold]Mean R²:[/] {r2:.3f}")
+        per_param = baseline.get("per_param_r2", {})
+        if per_param:
+            r2_strs = [f"{k}: {v:.3f}" for k, v in per_param.items()]
+            lines.append(f"[dim]  {', '.join(r2_strs)}[/]")
+
+    return Panel("\n".join(lines), title="Baseline Model (Template)", style="yellow")
 
 
 def build_landscape_table(data, top_n=15):
@@ -143,6 +176,18 @@ def build_landscape_table(data, top_n=15):
     table.add_column("Params", width=40)
     table.add_column("Client", justify="center", width=6)
     table.add_column("Iter", justify="right", width=4)
+
+    # Add baseline as reference row first (if available)
+    baseline = data.get("baseline")
+    if baseline and baseline.get("metric_value") is not None:
+        b_r2 = baseline.get("mean_r2")
+        b_r2_str = f"{b_r2:.3f}" if b_r2 is not None else "-"
+        b_param_str = ", ".join(baseline.get("param_names", []))
+        b_row = ["—", "BASELINE (template)", f"{baseline['metric_value']:.2f}"]
+        if has_r2:
+            b_row.append(b_r2_str)
+        b_row.extend([b_param_str, "—", "—"])
+        table.add_row(*b_row, style="dim yellow")
 
     for i, m in enumerate(all_models[:top_n]):
         style = "bold green" if i == 0 else ""
@@ -303,6 +348,7 @@ def render_dashboard(results_dir):
 
     elements = [
         build_summary_stats(data),
+        build_baseline_panel(data),
         build_client_table(data),
         build_global_best_panel(data),
         build_trajectory_table(data),

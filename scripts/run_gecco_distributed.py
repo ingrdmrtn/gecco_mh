@@ -134,6 +134,25 @@ def main():
     )
     registry = SharedRegistry(results_dir / "shared_registry.json")
 
+    # --- Fit baseline model (once, with locking) ---
+    from gecco.baseline import fit_baseline_if_needed
+
+    id_eval_data = None
+    if hasattr(cfg, 'individual_differences_eval'):
+        from gecco.offline_evaluation.individual_differences import load_id_data
+        id_eval_data = load_id_data(cfg)
+
+    baseline_path = results_dir / "baseline.json"
+    baseline_result = fit_baseline_if_needed(
+        baseline_path, cfg, df_eval, registry=registry,
+        id_eval_data=id_eval_data,
+    )
+    if baseline_result:
+        console.print(
+            f"[dim]Baseline {baseline_result['metric_name']}: "
+            f"{baseline_result['metric_value']:.2f}[/]"
+        )
+
     # --- Run GeCCo iterative model search ---
     search = GeCCoModelSearch(
         model, tokenizer, cfg, df_eval, prompt_builder,

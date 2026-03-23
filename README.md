@@ -116,6 +116,12 @@ GeCCo reads API keys from environment variables or a `.env` file in the project 
 # OpenAI (required if using provider: "openai")
 OPENAI_API_KEY=your_openai_api_key_here
 
+# Google Gemini (required if using provider: "gemini")
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# KCL AI API (required if using provider: "kcl")
+KCL_API_KEY=your_kcl_api_key_here
+
 # HuggingFace (optional — increases rate limits and is required for gated models such as LLaMA)
 HF_TOKEN=your_hf_token_here
 ```
@@ -124,10 +130,81 @@ Alternatively, export them in your shell before running:
 
 ```bash
 export OPENAI_API_KEY=your_openai_api_key_here
+export GEMINI_API_KEY=your_gemini_api_key_here
+export KCL_API_KEY=your_kcl_api_key_here
 export HF_TOKEN=your_hf_token_here
 ```
 
 A HuggingFace token can be created at huggingface.co/settings/tokens. For gated models (e.g. LLaMA), you must also accept the model licence on the model's HuggingFace page.
+
+### Using the Google Gemini API
+
+GeCCo supports Google Gemini models via the `google-genai` Python SDK. To use Gemini:
+
+1. **Get an API key** from [Google AI Studio](https://aistudio.google.com/apikey)
+2. **Set the key** in your `.env` file or shell (see above)
+3. **Install the SDK** (included in `requirements.txt`):
+
+   ```bash
+   pip install google-genai
+   ```
+
+4. **Configure your YAML** with `provider: "gemini"` and a supported model name:
+
+```yaml
+llm:
+  provider: "gemini"
+  base_model: "gemini-2.5-flash"
+  temperature: 0.2
+  max_output_tokens: 2048
+  models_per_iteration: 3
+  include_feedback: true
+```
+
+**Available models:**
+
+| `base_model` | Notes |
+| --- | --- |
+| `gemini-2.5-pro` | Most capable; supports extended thinking |
+| `gemini-2.5-flash` | Fast and cost-effective; supports extended thinking |
+| `gemini-2.0-flash` | Previous generation, fast |
+
+**Extended thinking:** Gemini 2.5+ models support a reasoning/thinking step before generating. Enable it by setting `reasoning_effort` in your config:
+
+```yaml
+llm:
+  provider: "gemini"
+  base_model: "gemini-2.5-flash"
+  reasoning_effort: "low"   # "low" or "high"
+```
+
+For Gemini 2.5 models, `low` allocates a small thinking budget (4096 tokens) while `high` uses the maximum (24576 tokens).
+
+### Using the KCL AI API
+
+KCL members can use the university's hosted LLM API, which serves open-source models behind an OpenAI-compatible endpoint.
+
+1. **Get an API key** from KCL's AI platform
+2. **Set the key** in your `.env` file or shell (see above)
+3. **Configure your YAML** with `provider: "kcl"`:
+
+```yaml
+llm:
+  provider: "kcl"
+  base_model: "arc:lite"
+  temperature: 0.2
+  max_output_tokens: 2048
+  models_per_iteration: 3
+  include_feedback: true
+```
+
+Set `base_model` to whichever model is available on the KCL API (e.g. `arc:lite`). Check the platform documentation for the current list of served models.
+
+The base URL defaults to `https://api.ai.create.kcl.ac.uk/v1`. To override it (e.g. for a different endpoint), set `KCL_BASE_URL` in your `.env` file or shell:
+
+```bash
+export KCL_BASE_URL=https://your-custom-endpoint/v1
+```
 
 ### Using local LLMs
 

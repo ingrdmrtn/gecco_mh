@@ -180,14 +180,15 @@ class GeCCoModelSearch:
             return decoded
 
         # -----------------------------
-        # vLLM (OpenAI-compatible API)
+        # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
-        elif "vllm" in provider:
+        elif "vllm" in provider or "kcl" in provider:
             max_out = getattr(self.cfg.llm, "max_output_tokens",
                               getattr(self.cfg.llm, "max_tokens", 2048))
 
+            provider_label = "KCL" if "kcl" in provider else "vLLM"
             console.print(
-                f"[dim]Generating with vLLM [cyan]{self.cfg.llm.base_model}[/] "
+                f"[dim]Generating with {provider_label} [cyan]{self.cfg.llm.base_model}[/] "
                 f"(max_tokens={max_out}, temp={self.cfg.llm.temperature})[/]"
             )
 

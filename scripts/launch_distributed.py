@@ -108,13 +108,20 @@ def main():
     profiles_csv = ",".join(all_profiles)
     array_spec = f"0-{n_total - 1}"
 
+    # Detect provider from config
+    with open(config_path, "r") as f:
+        cfg_raw = yaml.safe_load(f)
+    provider = cfg_raw.get("llm", {}).get("provider", "vllm")
+
     print(f"Config:       {args.config}")
+    print(f"Provider:     {provider}")
     print(f"Profiles:     {profiles if profiles else '(none)'}")
     print(f"Extra clients: {args.extra_clients}")
     print(f"Total clients: {n_total}")
     print(f"Array spec:   --array={array_spec}")
     print(f"Profiles CSV: {profiles_csv}")
-    print(f"vLLM URL:     {args.vllm_url or '(from env / .vllm_env)'}")
+    if provider == "vllm":
+        print(f"vLLM URL:     {args.vllm_url or '(from env / .vllm_env)'}")
     print()
 
     # --- Resolve vLLM model from config if needed ---

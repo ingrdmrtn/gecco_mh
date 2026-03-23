@@ -77,7 +77,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 
     introduce_data =  """Here is the participant data: """ if  fit_type == "individual" else """Here is the data from several participants: """ 
 
-    if cfg.llm.provider in ["openai", "claude", "gemini"]:
+    if cfg.llm.provider in ["openai", "claude", "gemini", "kcl"]:
         # --- prompt layout for closed models ---
 
 # {metadata_section}

@@ -47,40 +47,52 @@ echo "[GeCCo] Client $SLURM_ARRAY_TASK_ID starting (profile: ${PROFILE:-default}
 echo "[GeCCo] Config: $CONFIG"
 echo "[GeCCo] Python: $(which python)"
 
-# Resolve vLLM server URL: explicit arg > .vllm_env > environment
-if [ -n "$VLLM_URL_ARG" ]; then
-    export VLLM_BASE_URL="$VLLM_URL_ARG"
-    echo "[GeCCo] vLLM server (from arg): $VLLM_BASE_URL"
-elif [ -f "$HOME/.vllm_env" ]; then
-    source "$HOME/.vllm_env"
-    echo "[GeCCo] vLLM server (from .vllm_env): $VLLM_BASE_URL"
-elif [ -n "$VLLM_BASE_URL" ]; then
-    echo "[GeCCo] vLLM server (from env): $VLLM_BASE_URL"
-else
-    echo "[GeCCo] WARNING: No vLLM URL found. Set VLLM_BASE_URL, pass as 3rd arg, or create \$HOME/.vllm_env"
-fi
+# Detect provider from config to skip vLLM setup for API-based providers
+PROVIDER=$(python -c "
+import yaml, sys
+with open('config/$CONFIG' if '/' not in '$CONFIG' else '$CONFIG') as f:
+    cfg = yaml.safe_load(f)
+print(cfg.get('llm', {}).get('provider', 'vllm'))
+" 2>/dev/null || echo "vllm")
+echo "[GeCCo] Provider: $PROVIDER"
 
-# Wait for vLLM server to be ready (retry for up to 5 minutes)
-MAX_RETRIES=30
-RETRY_INTERVAL=10
-for i in $(seq 1 $MAX_RETRIES); do
-    if curl -s "${VLLM_BASE_URL}/models" > /dev/null 2>&1; then
-        echo "[GeCCo] vLLM server is ready"
-        break
+VLLM_ARG=""
+if [ "$PROVIDER" = "vllm" ]; then
+    # Resolve vLLM server URL: explicit arg > .vllm_env > environment
+    if [ -n "$VLLM_URL_ARG" ]; then
+        export VLLM_BASE_URL="$VLLM_URL_ARG"
+        echo "[GeCCo] vLLM server (from arg): $VLLM_BASE_URL"
+    elif [ -f "$HOME/.vllm_env" ]; then
+        source "$HOME/.vllm_env"
+        echo "[GeCCo] vLLM server (from .vllm_env): $VLLM_BASE_URL"
+    elif [ -n "$VLLM_BASE_URL" ]; then
+        echo "[GeCCo] vLLM server (from env): $VLLM_BASE_URL"
+    else
+        echo "[GeCCo] WARNING: No vLLM URL found. Set VLLM_BASE_URL, pass as 3rd arg, or create \$HOME/.vllm_env"
     fi
-    if [ $i -eq $MAX_RETRIES ]; then
-        echo "[GeCCo] ERROR: vLLM server not reachable after ${MAX_RETRIES} retries"
-        exit 1
-    fi
-    echo "[GeCCo] Waiting for vLLM server (attempt $i/$MAX_RETRIES)..."
-    sleep $RETRY_INTERVAL
-done
 
-# Build vLLM URL argument
-if [ -n "$VLLM_BASE_URL" ]; then
-    VLLM_ARG="--vllm-url $VLLM_BASE_URL"
+    # Wait for vLLM server to be ready (retry for up to 5 minutes)
+    MAX_RETRIES=30
+    RETRY_INTERVAL=10
+    for i in $(seq 1 $MAX_RETRIES); do
+        if curl -s "${VLLM_BASE_URL}/models" > /dev/null 2>&1; then
+            echo "[GeCCo] vLLM server is ready"
+            break
+        fi
+        if [ $i -eq $MAX_RETRIES ]; then
+            echo "[GeCCo] ERROR: vLLM server not reachable after ${MAX_RETRIES} retries"
+            exit 1
+        fi
+        echo "[GeCCo] Waiting for vLLM server (attempt $i/$MAX_RETRIES)..."
+        sleep $RETRY_INTERVAL
+    done
+
+    # Build vLLM URL argument
+    if [ -n "$VLLM_BASE_URL" ]; then
+        VLLM_ARG="--vllm-url $VLLM_BASE_URL"
+    fi
 else
-    VLLM_ARG=""
+    echo "[GeCCo] Using API provider '$PROVIDER' — skipping vLLM server check"
 fi
 
 # Run the distributed client

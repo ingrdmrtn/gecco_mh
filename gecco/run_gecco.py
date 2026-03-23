@@ -311,7 +311,11 @@ class GeCCoModelSearch:
                 reflection_text, n_models, structured_output=structured
             )
             if revised and len(revised) == len(models):
-                models = revised
+                # Preserve original name and analysis — reflection only updates code/rationale
+                for orig, rev in zip(models, revised):
+                    orig["code"] = rev["code"]
+                    if rev.get("rationale"):
+                        orig["rationale"] = rev["rationale"]
                 console.print("[dim]Reflection complete — using revised models[/]")
             else:
                 console.print("[dim]Reflection parsing failed — keeping original models[/]")

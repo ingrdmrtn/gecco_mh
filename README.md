@@ -266,6 +266,8 @@ python -m vllm.entrypoints.openai.api_server \
     --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B \
     --port 8000 \
     --tensor-parallel-size 4 \
+    --max-model-len 65536 \
+    --gpu-memory-utilization 0.95 \
     --trust-remote-code
 ```
 
@@ -435,7 +437,25 @@ python scripts/launch_distributed.py --config two_step_factors_distributed.yaml 
 python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --dry-run
 ```
 
-For local testing without SLURM, run clients directly:
+**Conda environment**: If your project dependencies (e.g. `pydantic`, `scipy`) are installed in a specific conda environment, pass `--conda-env` so each SLURM client job activates it before running Python:
+
+```bash
+python scripts/launch_distributed.py --config two_step_factors_distributed.yaml \
+    --vllm-url http://gpu-node:8000/v1 \
+    --conda-env my_gecco_env
+```
+
+If running the shell script directly via `sbatch`, the conda environment is the 4th positional argument:
+
+```bash
+sbatch --array=0-3 bash/run_gecco_distributed.sh \
+    two_step_factors_distributed.yaml \
+    "exploit,explore,diverse,minimal" \
+    "http://gpu-node:8000/v1" \
+    "my_gecco_env"
+```
+
+For local testing without SLURM, run clients directly (ensure the correct conda environment is already active):
 
 ```bash
 python scripts/run_gecco_distributed.py --config two_step_factors_distributed.yaml \

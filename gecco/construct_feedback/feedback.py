@@ -877,7 +877,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # -----------------------------
         elif "vllm" in provider:
             max_out = getattr(self.cfg.llm, "max_output_tokens",
-                              getattr(self.cfg.llm, "max_tokens", 2048))
+                              getattr(self.cfg.llm, "max_tokens", 4096))
 
             _log(
                 f"[GeCCo] Using vLLM model '{self.cfg.llm.base_model}' "
@@ -898,7 +898,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # Hugging Face-style generation
         # -----------------------------
         else:
-            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
+            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 4096))
 
             _log(
                 f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "

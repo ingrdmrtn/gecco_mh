@@ -184,7 +184,7 @@ class GeCCoModelSearch:
         # -----------------------------
         elif "vllm" in provider or "kcl" in provider:
             max_out = getattr(self.cfg.llm, "max_output_tokens",
-                              getattr(self.cfg.llm, "max_tokens", 2048))
+                              getattr(self.cfg.llm, "max_tokens", 4096))
 
             provider_label = "KCL" if "kcl" in provider else "vLLM"
             console.print(
@@ -202,13 +202,19 @@ class GeCCoModelSearch:
                 "max_tokens": max_out,
             }
 
-            # Structured output via json_object mode
-            if getattr(self.cfg.llm, "structured_output", True):
+            # Structured output via json_object mode (vLLM only — KCL API
+            # may not support response_format; prompt instructions suffice)
+            if "vllm" in provider and getattr(self.cfg.llm, "structured_output", True):
                 from gecco.structured_output import get_vllm_response_format
                 create_kwargs["response_format"] = get_vllm_response_format()
 
             resp = model.chat.completions.create(**create_kwargs)
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content is None:
+                finish = getattr(resp.choices[0], "finish_reason", "unknown")
+                console.print(f"[yellow]API returned empty response (finish_reason={finish})[/]")
+                return ""
+            return content.strip()
 
         # -----------------------------
         # Hugging Face-style generation
@@ -216,7 +222,7 @@ class GeCCoModelSearch:
         else:
             from transformers import TextStreamer
 
-            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 2048))
+            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 4096))
             n_input = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
 
             console.print(

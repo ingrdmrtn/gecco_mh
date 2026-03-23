@@ -22,7 +22,7 @@ class DataConfig(BaseModel):
 class LLMConfig(BaseModel):
     base_model: str
     temperature: float = 0.7
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     guardrails: List[str]
 
 class EvaluationConfig(BaseModel):

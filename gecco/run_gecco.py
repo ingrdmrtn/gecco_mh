@@ -11,7 +11,6 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.table import Table
 
 from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
-from gecco.utils import extract_model_code
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 
@@ -103,14 +102,28 @@ class GeCCoModelSearch:
                 f"(reasoning={reasoning_effort}, max_tokens={max_out})[/]"
             )
 
-            resp = model.responses.create(
-                model=self.cfg.llm.base_model,
-                reasoning={"effort": "low"},
-                input=[
+            create_kwargs = {
+                "model": self.cfg.llm.base_model,
+                "input": [
                     {"role": "developer", "content": self.cfg.llm.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-            )
+            }
+
+            if reasoning_effort:
+                create_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+            # Structured output via JSON schema
+            if getattr(self.cfg.llm, "structured_output", True):
+                from gecco.structured_output import get_model_schema, get_openai_response_format
+                include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
+                schema = get_model_schema(
+                    self.cfg.llm.models_per_iteration,
+                    include_analysis=include_analysis,
+                )
+                create_kwargs["text"] = {"format": get_openai_response_format(schema)}
+
+            resp = model.responses.create(**create_kwargs)
             decoded = resp.output_text.strip()
 
             return decoded
@@ -144,6 +157,17 @@ class GeCCoModelSearch:
                         thinking_budget= 4096 if reasoning_effort == 'low' else 24576
                         )
 
+            # Structured output via response schema
+            if getattr(self.cfg.llm, "structured_output", True):
+                from gecco.structured_output import get_model_schema
+                include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
+                schema = get_model_schema(
+                    self.cfg.llm.models_per_iteration,
+                    include_analysis=include_analysis,
+                )
+                config_args["response_mime_type"] = "application/json"
+                config_args["response_schema"] = schema
+
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,
                 contents=prompt,
@@ -167,15 +191,22 @@ class GeCCoModelSearch:
                 f"(max_tokens={max_out}, temp={self.cfg.llm.temperature})[/]"
             )
 
-            resp = model.chat.completions.create(
-                model=self.cfg.llm.base_model,
-                messages=[
+            create_kwargs = {
+                "model": self.cfg.llm.base_model,
+                "messages": [
                     {"role": "system", "content": self.cfg.llm.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=self.cfg.llm.temperature,
-                max_tokens=max_out,
-            )
+                "temperature": self.cfg.llm.temperature,
+                "max_tokens": max_out,
+            }
+
+            # Structured output via json_object mode
+            if getattr(self.cfg.llm, "structured_output", True):
+                from gecco.structured_output import get_vllm_response_format
+                create_kwargs["response_format"] = get_vllm_response_format()
+
+            resp = model.chat.completions.create(**create_kwargs)
             return resp.choices[0].message.content.strip()
 
         # -----------------------------
@@ -235,6 +266,57 @@ class GeCCoModelSearch:
                 f"({n_tokens/elapsed:.1f} tok/s)[/]"
             )
             return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    def generate_models(self, prompt):
+        """
+        Generate cognitive models with structured output, parsing, and
+        optional self-critique reflection.
+
+        Returns
+        -------
+        tuple of (raw_text, list of model dicts)
+            Each model dict has keys: name, rationale, code, analysis.
+        """
+        from gecco.structured_output import (
+            parse_model_response,
+            build_reflection_prompt,
+        )
+
+        structured = getattr(self.cfg.llm, "structured_output", True)
+        n_models = self.cfg.llm.models_per_iteration
+
+        # --- Initial generation ---
+        raw_text = self.generate(self.model, self.tokenizer, prompt)
+        models = parse_model_response(raw_text, n_models, structured_output=structured)
+
+        if not models:
+            console.print("[yellow]No models extracted from LLM response[/]")
+            return raw_text, []
+
+        # Log analysis scratchpads
+        for m in models:
+            if m.get("analysis"):
+                console.print(
+                    f"  [dim]{m['name']} analysis:[/] "
+                    f"{m['analysis'][:200]}{'...' if len(m['analysis']) > 200 else ''}"
+                )
+
+        # --- Reflection step (optional) ---
+        if getattr(self.cfg.llm, "reflection", True) and models:
+            console.print("[dim]Running self-critique reflection...[/]")
+            guardrails = getattr(self.cfg.llm, "guardrails", [])
+            reflection_prompt = build_reflection_prompt(models, guardrails=guardrails)
+            reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
+            revised = parse_model_response(
+                reflection_text, n_models, structured_output=structured
+            )
+            if revised and len(revised) == len(models):
+                models = revised
+                console.print("[dim]Reflection complete — using revised models[/]")
+            else:
+                console.print("[dim]Reflection parsing failed — keeping original models[/]")
+
+        return raw_text, models
 
     def _file_tag(self):
         """Return a client tag for filenames, or empty string if not distributed."""
@@ -332,7 +414,7 @@ class GeCCoModelSearch:
                     f.write(feedback)
 
             prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
-            code_text = self.generate(self.model, self.tokenizer, prompt)
+            code_text, parsed_models = self.generate_models(prompt)
 
             tag = self._file_tag()
             model_file = (
@@ -344,11 +426,22 @@ class GeCCoModelSearch:
             with open(model_file, "w") as f:
                 f.write(code_text)
 
+            # Save structured output (analysis, names, rationale) for inspection
+            if parsed_models:
+                structured_file = model_file.with_suffix(".json")
+                with open(structured_file, "w") as f:
+                    json.dump(
+                        [{"name": m["name"], "rationale": m.get("rationale", ""),
+                          "analysis": m.get("analysis", "")} for m in parsed_models],
+                        f, indent=2,
+                    )
+
             iteration_results = []
 
-            for i in range(1, self.cfg.llm.models_per_iteration + 1):
-                func_name = f"cognitive_model{i}"
-                func_code = extract_model_code(code_text, i)
+            for i, model_dict in enumerate(parsed_models):
+                func_name = f"cognitive_model{i + 1}"
+                display_name = model_dict.get("name", func_name)
+                func_code = model_dict["code"]
 
                 if not func_code:
                     continue
@@ -362,19 +455,19 @@ class GeCCoModelSearch:
                                 func_code, expected_func_name=func_name, cfg=self.cfg
                             )
                             console.print(
-                                f"  [dim]Running parameter recovery check for {func_name} "
+                                f"  [dim]Running parameter recovery check for {display_name} "
                                 f"({self.recovery_checker.n_subjects} subjects, "
                                 f"{self.recovery_checker.n_trials} trials)...[/]"
                             )
                             recovery = self.recovery_checker.check(spec)
                             if not recovery["passed"]:
                                 console.print(
-                                    f"  [yellow]{func_name} failed parameter recovery "
+                                    f"  [yellow]{display_name} failed parameter recovery "
                                     f"(mean r={recovery['mean_r']:.2f}, "
                                     f"threshold={self.recovery_checker.threshold})[/]"
                                 )
                                 iteration_results.append({
-                                    "function_name": func_name,
+                                    "function_name": display_name,
                                     "metric_name": "RECOVERY_FAILED",
                                     "metric_value": float("inf"),
                                     "param_names": spec.param_names,
@@ -385,10 +478,10 @@ class GeCCoModelSearch:
                                 continue
                         except Exception as e:
                             console.print(
-                                f"  [yellow]{func_name} recovery check error: {e}[/]"
+                                f"  [yellow]{display_name} recovery check error: {e}[/]"
                             )
                             iteration_results.append({
-                                "function_name": func_name,
+                                "function_name": display_name,
                                 "metric_name": "RECOVERY_FAILED",
                                 "metric_value": float("inf"),
                                 "param_names": [],
@@ -405,7 +498,7 @@ class GeCCoModelSearch:
                     params = fit_res["param_names"]
                     self.tried_param_sets.append(params)
 
-                    console.print(f"  [bold]{func_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]")
+                    console.print(f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]")
 
                     # --- Individual differences evaluation (optional) ---
                     id_results = None
@@ -416,10 +509,10 @@ class GeCCoModelSearch:
                                 fit_res, self.df, self.cfg, id_data=self.id_eval_data
                             )
                         except Exception as e:
-                            console.print(f"  [yellow]Individual differences eval failed for {func_name}:[/] {e}")
+                            console.print(f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}")
 
                     iteration_results.append({
-                        "function_name": func_name,
+                        "function_name": display_name,
                         "metric_name": metric_name,
                         "metric_value": mean_metric,
                         "param_names": params,
@@ -427,7 +520,7 @@ class GeCCoModelSearch:
                         "individual_differences": id_results,
                         "code": func_code,
                         "eval_metrics": fit_res.get("eval_metrics", []),
-                    "participant_n_trials": fit_res.get("participant_n_trials", []),
+                        "participant_n_trials": fit_res.get("participant_n_trials", []),
                     })
 
                     if mean_metric < self.best_metric:
@@ -438,7 +531,7 @@ class GeCCoModelSearch:
                         self.best_param_names = fit_res["param_names"]
                         self.best_param_values = fit_res["parameter_values"]
                         self.best_id_results = id_results
-                        console.print(f"  [bold green]New best model:[/] {func_name} ({metric_name}={mean_metric:.2f})")
+                        console.print(f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})")
 
                         best_model_file = (
                             self.results_dir / "models" / f"best_model{tag}_{run_idx}.txt"
@@ -464,7 +557,7 @@ class GeCCoModelSearch:
                         break
 
                 except Exception as e:
-                    console.print(f"  [bold red]Error fitting {func_name}:[/] {e}")
+                    console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
 
             # ✅ always save what happened this iteration (even if stopping)
             bic_file = (

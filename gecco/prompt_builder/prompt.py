@@ -60,6 +60,16 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
         else ""
     )
 
+    # Structured output instructions (appended to prompt when enabled)
+    structured_output_section = ""
+    if getattr(llm, "structured_output", True):
+        from gecco.structured_output import get_schema_instructions
+        include_analysis = getattr(llm, "analysis_scratchpad", True)
+        structured_output_section = get_schema_instructions(
+            llm.models_per_iteration,
+            include_analysis=include_analysis,
+        )
+
     metadata_section = (
         f"### Metadata\n{cfg.metadata.description.strip()}" 
         if metadata 
@@ -101,6 +111,8 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 ### Your Task
 {goal_text.strip()}
 
+{structured_output_section}
+
 {feedback_section}
 """.strip()
 
@@ -123,6 +135,8 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {llm.template_model.strip()}
 
 {"" if not id_eval_section else id_eval_section}
+
+{structured_output_section}
 
 Your function:
 

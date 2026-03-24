@@ -989,9 +989,9 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
             return decoded
         # -----------------------------
-        # vLLM (OpenAI-compatible API)
+        # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
-        elif "vllm" in provider:
+        elif "vllm" in provider or "kcl" in provider:
             max_out = getattr(self.cfg.llm, "max_output_tokens",
                               getattr(self.cfg.llm, "max_tokens", 4096))
 

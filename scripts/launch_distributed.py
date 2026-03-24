@@ -79,6 +79,8 @@ def main():
                              "Passed to all clients. If omitted, clients read $VLLM_BASE_URL or $HOME/.vllm_env")
     parser.add_argument("--conda-env", type=str, default=None,
                         help="Conda environment to activate in each client job")
+    parser.add_argument("--partition", type=str, default=None,
+                        help="SLURM partition to submit jobs to (e.g. gpu, cpu, batch)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without submitting")
     args = parser.parse_args()
@@ -113,6 +115,8 @@ def main():
         cfg_raw = yaml.safe_load(f)
     provider = cfg_raw.get("llm", {}).get("provider", "vllm")
 
+    partition_flag = f"--partition={args.partition}" if args.partition else ""
+
     print(f"Config:       {args.config}")
     print(f"Provider:     {provider}")
     print(f"Profiles:     {profiles if profiles else '(none)'}")
@@ -120,6 +124,8 @@ def main():
     print(f"Total clients: {n_total}")
     print(f"Array spec:   --array={array_spec}")
     print(f"Profiles CSV: {profiles_csv}")
+    if args.partition:
+        print(f"Partition:    {args.partition}")
     if provider == "vllm":
         print(f"vLLM URL:     {args.vllm_url or '(from env / .vllm_env)'}")
     print()
@@ -136,7 +142,7 @@ def main():
     if args.launch_vllm:
         print("Launching vLLM server...")
         cmd = (
-            f"sbatch --parsable bash/launch_vllm_server.sh "
+            f"sbatch --parsable {partition_flag} bash/launch_vllm_server.sh "
             f'"{vllm_model}" {args.vllm_port} {args.vllm_tp}'
         )
         vllm_job_id = run_cmd(cmd, dry_run=args.dry_run)
@@ -150,7 +156,7 @@ def main():
     vllm_url_arg = f'"{args.vllm_url}"' if args.vllm_url else '""'
     conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
     cmd = (
-        f"sbatch --array={array_spec} {dep_flag} "
+        f"sbatch --array={array_spec} {dep_flag} {partition_flag} "
         f'bash/run_gecco_distributed.sh "{args.config}" "{profiles_csv}" {vllm_url_arg} {conda_arg}'
     )
     client_job_id = run_cmd(cmd, dry_run=args.dry_run)

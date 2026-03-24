@@ -104,7 +104,10 @@ def extract_full_function(text: str, func_name: str) -> str:
 
     # Clean up markdown or stray comments
     func_block = re.sub(r"^(\s*#+.*$)", "", func_block, flags=re.M)
-    # Remove invalid line continuations (backslash followed by space/non-newline)
+    # Remove invalid line continuations (backslash followed by whitespace before newline)
     func_block = re.sub(r"\\\s+\n", "\n", func_block)
-    func_block = re.sub(r"\\([^\n])", r"\1", func_block)
+    # Convert literal \n and \t from JSON-encoded code to real newlines/tabs
+    # (happens when regex fallback extracts code from inside a JSON string)
+    if "\n" not in func_block and "\\n" in func_block:
+        func_block = func_block.replace("\\n", "\n").replace("\\t", "\t")
     return func_block.strip()

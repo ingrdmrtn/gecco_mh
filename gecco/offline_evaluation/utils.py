@@ -84,7 +84,14 @@ def _safe_exec_user_code(
         "math": _math,
         "scipy": _scipy,
         "itertools": _itertools,
+        # JavaScript-style literals (common from non-Python-native LLMs)
+        "true": True,
+        "false": False,
+        "null": None,
     }
+
+    # Strip non-ASCII characters that some models inject (e.g. ✓, →)
+    code = code.encode("ascii", errors="ignore").decode("ascii")
     
     try:
         if inject_base_class:
@@ -267,7 +274,12 @@ def build_model_spec(
     if func is None:
         func = _find_first_function(ns)
     if func is None:
-        raise ValueError(f"Function '{expected_func_name}' not found in code")
+        # Log the first few lines to help diagnose extraction issues
+        preview = code[:200].replace("\n", "\\n") if code else "(empty)"
+        raise ValueError(
+            f"Function '{expected_func_name}' not found in code. "
+            f"Code preview: {preview}"
+        )
     
     # Extract parameters and docstring
     if is_class:

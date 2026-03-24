@@ -279,6 +279,9 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         code = m.get("code", "")
         if not code:
             return None
+        # Fix double-escaped newlines (model wrote \\n instead of \n in JSON)
+        if "\n" not in code and "\\n" in code:
+            code = code.replace("\\n", "\n").replace("\\t", "\t")
 
         result.append({
             "name": m.get("name", f"cognitive_model{i + 1}"),

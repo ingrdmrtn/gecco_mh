@@ -213,13 +213,35 @@ def parse_model_response(
     return _fallback_regex_extraction(text, n_models), False
 
 
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>...</think> blocks produced by reasoning models."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _try_parse_dict(data) -> Optional[List[Dict]]:
+    """Try to interpret a parsed JSON value as a model list."""
+    if isinstance(data, dict):
+        if "models" in data and isinstance(data["models"], list):
+            return _validate_models(data["models"])
+        # Single model object (e.g. Minimax outputs one dict directly)
+        if "code" in data:
+            return _validate_models([data])
+    if isinstance(data, list):
+        return _validate_models(data)
+    return None
+
+
 def _try_parse_json(text: str) -> Optional[List[Dict]]:
     """Attempt to parse JSON from the response text."""
+    # Strip reasoning/thinking blocks first
+    text = _strip_thinking_tags(text)
+
     # Try direct JSON parse
     try:
         data = json.loads(text.strip())
-        if "models" in data and isinstance(data["models"], list):
-            return _validate_models(data["models"])
+        result = _try_parse_dict(data)
+        if result is not None:
+            return result
     except json.JSONDecodeError:
         pass
 
@@ -228,8 +250,9 @@ def _try_parse_json(text: str) -> Optional[List[Dict]]:
     if json_match:
         try:
             data = json.loads(json_match.group(1).strip())
-            if "models" in data and isinstance(data["models"], list):
-                return _validate_models(data["models"])
+            result = _try_parse_dict(data)
+            if result is not None:
+                return result
         except json.JSONDecodeError:
             pass
 
@@ -238,8 +261,9 @@ def _try_parse_json(text: str) -> Optional[List[Dict]]:
     if brace_match:
         try:
             data = json.loads(brace_match.group(0))
-            if "models" in data and isinstance(data["models"], list):
-                return _validate_models(data["models"])
+            result = _try_parse_dict(data)
+            if result is not None:
+                return result
         except json.JSONDecodeError:
             pass
 

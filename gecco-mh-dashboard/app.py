@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dashboard.config import DashboardConfig, default_results_dir
+from dashboard.config import DashboardConfig, available_tasks, default_results_dir
 from dashboard.data_adapter import load_registry_snapshot
 from dashboard.history_store import append_snapshot, init_history_state
 from dashboard.views import (
@@ -39,7 +39,12 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Controls")
-        task = st.text_input("Task name", value=cfg.default_task)
+        tasks = available_tasks()
+        if tasks:
+            default_idx = tasks.index(cfg.default_task) if cfg.default_task in tasks else 0
+            task = st.selectbox("Task", options=tasks, index=default_idx)
+        else:
+            task = st.text_input("Task name", value=cfg.default_task)
         results_override = st.text_input("Results directory (optional)", value="")
         refresh_seconds = st.slider("Refresh interval (seconds)", min_value=2, max_value=120, value=cfg.default_refresh_seconds)
         max_history_points = st.slider("Max session history points", min_value=50, max_value=5000, value=cfg.default_max_history_points, step=50)

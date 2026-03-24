@@ -542,12 +542,11 @@ class GeCCoModelSearch:
                             )
                             iteration_results.append({
                                 "function_name": display_name,
-                                "metric_name": "RECOVERY_FAILED",
+                                "metric_name": "FIT_ERROR",
                                 "metric_value": float("inf"),
                                 "param_names": [],
                                 "code": func_code,
-                                "recovery_r": 0.0,
-                                "recovery_per_param": {},
+                                "error": str(e),
                             })
                             continue
 

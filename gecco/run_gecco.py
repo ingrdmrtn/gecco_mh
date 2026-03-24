@@ -209,9 +209,9 @@ class GeCCoModelSearch:
                 "max_tokens": max_out,
             }
 
-            # Structured output via json_object mode (vLLM only — KCL API
-            # may not support response_format; prompt instructions suffice)
-            if "vllm" in provider and getattr(self.cfg.llm, "structured_output", True):
+            # Structured output via json_object mode (both vLLM and KCL use
+            # OpenAI-compatible API and support response_format)
+            if getattr(self.cfg.llm, "structured_output", True):
                 from gecco.structured_output import get_vllm_response_format
                 create_kwargs["response_format"] = get_vllm_response_format()
 

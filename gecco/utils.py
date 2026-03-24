@@ -104,4 +104,7 @@ def extract_full_function(text: str, func_name: str) -> str:
 
     # Clean up markdown or stray comments
     func_block = re.sub(r"^(\s*#+.*$)", "", func_block, flags=re.M)
+    # Remove invalid line continuations (backslash followed by space/non-newline)
+    func_block = re.sub(r"\\\s+\n", "\n", func_block)
+    func_block = re.sub(r"\\([^\n])", r"\1", func_block)
     return func_block.strip()

@@ -77,7 +77,14 @@ def _safe_exec_user_code(
         inject_base_class: Whether to inject base class first
         base_class_code: The base class code (required if inject_base_class=True)
     """
-    ns: Dict[str, Any] = {"np": np}
+    import json as _json, math as _math, scipy as _scipy, itertools as _itertools
+    ns: Dict[str, Any] = {
+        "np": np,
+        "json": _json,
+        "math": _math,
+        "scipy": _scipy,
+        "itertools": _itertools,
+    }
     
     try:
         if inject_base_class:

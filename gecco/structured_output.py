@@ -186,9 +186,12 @@ def get_model_schema(n_models: int, include_analysis: bool = True) -> dict:
         "code": {
             "type": "string",
             "description": (
-                "Complete Python function definition. The function must be "
-                "named cognitive_modelN (where N is its position in the list, "
-                "starting from 1)"
+                "Complete Python function definition. Must start with the "
+                "@njit decorator on its own line, followed by the function "
+                "definition on the next line (i.e. '@njit\\ndef cognitive_modelN(...):...'). "
+                "The function must be named cognitive_modelN (where N is its "
+                "position in the list, starting from 1). Encode newlines as "
+                "\\n within the JSON string."
             ),
         },
     }
@@ -258,7 +261,7 @@ You MUST respond with valid JSON in exactly this format (no markdown, no extra t
         {{"name": "alpha", "lower_bound": 0, "upper_bound": 1}},
         {{"name": "beta", "lower_bound": 0, "upper_bound": 10}}
       ],
-      "code": "def cognitive_model1(action_1, state, action_2, reward, model_parameters):\\n    ..."
+      "code": "@njit\\ndef cognitive_model1(action_1, state, action_2, reward, model_parameters):\\n    ..."
     }}
   ]
 }}
@@ -267,7 +270,7 @@ Field descriptions:
 {analysis_example}  - `name`: Concise descriptive snake_case name (2-4 words) capturing the key mechanism (e.g. `dual_lr_perseveration`, `bayesian_transition_learner`, `attention_weighted_mbmf`). Must be unique across all models you propose.
   - `rationale`: One sentence explaining the model's hypothesis and why this architecture might improve on previous models.
   - `parameters`: List of model parameters with bounds. Each entry has `name` (matching the variable in code), `lower_bound`, and `upper_bound`. Must match the parameters unpacked from `model_parameters` in the same order.
-  - `code`: Complete Python function definition. Functions must be named `cognitive_model1`, `cognitive_model2`, etc.
+  - `code`: Complete Python function definition. Must begin with `@njit` on its own line, then `def cognitive_model1(...)` on the next line. Functions must be named `cognitive_model1`, `cognitive_model2`, etc. Encode newlines as `\\n` within the JSON string.
 
 You must provide exactly {n_models} model(s) in the `models` array.
 Important: Ensure all string values are properly escaped JSON (newlines as \\n, quotes as \\", etc.)."""
@@ -387,11 +390,37 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
     for i, m in enumerate(models):
         if not isinstance(m, dict):
             return None
+        # Normalise field name: some models return "corrected_code" instead of "code"
+        if "code" not in m and "corrected_code" in m:
+            m = {**m, "code": m["corrected_code"]}
         code = m.get("code", "")
         if not code:
             return None
-        if "\n" not in code and "\\n" in code:
-            code = code.replace("\\n", "\n").replace("\\t", "\t")
+        # Fix double-escaped sequences from models that over-escape JSON strings.
+        # Use count comparison: if there are more \\n than real newlines, the code
+        # is still JSON-encoded (e.g. minimax outputs \\n instead of \n).
+        n_escaped = code.count("\\n")
+        n_real = code.count("\n")
+        if n_escaped > n_real:
+            code = code.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+        # Fix @njit / @numba.njit placed on the same line as def (invalid Python syntax).
+        # Some small models generate "@njit def func():" instead of "@njit\ndef func():".
+        code = re.sub(r"@((?:numba\.)?njit)\s+def\s+", r"@\1\ndef ", code)
+        # Infer minimal parameters from code when missing (common in fix responses).
+        # The fix flow only uses `code` — original parameters are preserved upstream.
+        if "parameters" not in m or not m["parameters"]:
+            param_match = re.search(
+                r"(?:^|\n)\s*([\w\s,]+?)\s*=\s*model_parameters", code
+            )
+            if param_match:
+                names = [p.strip() for p in param_match.group(1).split(",")]
+                m = {
+                    **m,
+                    "parameters": [
+                        {"name": n, "lower_bound": 0, "upper_bound": 1}
+                        for n in names
+                    ],
+                }
         processed.append({**m, "code": code})
 
     try:
@@ -415,7 +444,22 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         ]
     except ValidationError as e:
         print(f"[⚠️ GeCCo] Pydantic validation failed: {e}")
-        return None
+        # JSON parsed successfully — the data exists in `processed`. Return it
+        # as-is so the caller can use the structured fields (name, rationale,
+        # parameters, code) rather than falling back to regex extraction on the
+        # raw JSON text, which is strictly worse (picks up JSON artifacts).
+        # The validation-retry loop downstream will catch and fix code errors.
+        return [
+            {
+                "name": m.get("name", f"cognitive_model{i + 1}"),
+                "rationale": m.get("rationale", ""),
+                "parameters": m.get("parameters", []),
+                "code": m.get("code", ""),
+                "analysis": m.get("analysis", None),
+            }
+            for i, m in enumerate(processed)
+            if m.get("code")
+        ] or None
 
 
 @dataclass

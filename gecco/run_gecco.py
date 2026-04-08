@@ -281,6 +281,12 @@ class GeCCoModelSearch:
                     create_kwargs["response_format"] = get_chat_json_schema_format(
                         response_schema
                     )
+                    # Route only to providers that honour the response_format parameter.
+                    # Without this, OpenRouter may silently forward to a provider that
+                    # ignores json_schema and returns free-form text.
+                    create_kwargs["extra_body"] = {
+                        "provider": {"require_parameters": True}
+                    }
                 else:
                     from gecco.structured_output import (
                         get_openai_compatible_response_format,
@@ -290,7 +296,28 @@ class GeCCoModelSearch:
                         get_openai_compatible_response_format()
                     )
 
-            resp = model.chat.completions.create(**create_kwargs)
+            try:
+                resp = model.chat.completions.create(**create_kwargs)
+            except Exception as api_exc:
+                # Catch 404 from OpenRouter when no endpoint supports the
+                # requested parameters (e.g. json_schema mode not available
+                # for this model).  Surface a clear actionable message rather
+                # than a raw stack trace.
+                exc_str = str(api_exc)
+                if "404" in exc_str and "No endpoints found" in exc_str:
+                    hint = ""
+                    if "extra_body" in create_kwargs and create_kwargs.get(
+                        "extra_body", {}
+                    ).get("provider", {}).get("require_parameters"):
+                        hint = (
+                            f"\n  [bold]Cause:[/] [cyan]{self.cfg.llm.base_model}[/] has no "
+                            f"OpenRouter endpoint that supports [bold]json_schema[/] structured output. "
+                            f"Remove [bold]supports_json_schema: true[/] from the config to fall back "
+                            f"to json_object mode."
+                        )
+                    console.print(f"[red]OpenRouter 404 — no matching endpoint.{hint}[/]")
+                    return ""
+                raise
             if not hasattr(resp, "choices"):
                 raise TypeError(
                     f"Expected a ChatCompletion response but got {type(resp).__name__!r}. "

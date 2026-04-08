@@ -1,3 +1,4 @@
+import ast
 import re
 from typing import Dict, List,Optional
 
@@ -113,4 +114,19 @@ def extract_full_function(text: str, func_name: str) -> str:
     n_real = func_block.count("\n")
     if n_escaped > n_real:
         func_block = func_block.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    # Strip trailing JSON artifacts (e.g. closing `"`, `}`, `]` from the surrounding
+    # JSON object) that the regex may have captured past the end of the function body.
+    # This applies both after JSON unescaping and when the raw JSON uses real newlines.
+    try:
+        ast.parse(func_block)
+    except SyntaxError:
+        lines = func_block.split("\n")
+        for end in range(len(lines), 0, -1):
+            candidate = "\n".join(lines[:end]).strip()
+            try:
+                ast.parse(candidate)
+                func_block = candidate
+                break
+            except SyntaxError:
+                continue
     return func_block.strip()

@@ -65,7 +65,9 @@ class LLMModelResponse(BaseModel):
     code: str = Field(
         ..., min_length=10, description="Complete Python function definition"
     )
-    analysis: Optional[str] = Field(default=None, description="LLM's reasoning scratchpad")
+    analysis: Optional[str] = Field(
+        default=None, description="LLM's reasoning scratchpad"
+    )
 
     @model_validator(mode="after")
     def params_match_code(self):
@@ -506,7 +508,7 @@ def build_correction_prompt(
 
     return f"""The following model has validation errors and needs to be corrected.
 
-### Model {model_index}: {model.get('name', 'unnamed')}
+### Model {model_index}: {model.get("name", "unnamed")}
 
 {params_str}
 Rationale: {rationale}
@@ -1006,4 +1008,25 @@ def get_openai_response_format(schema: dict) -> dict:
 
 def get_vllm_response_format() -> dict:
     """Build vLLM-compatible response format."""
+    return {"type": "json_object"}
+
+
+def get_openai_compatible_response_format() -> dict:
+    """
+    JSON mode for any OpenAI-compatible API.
+
+    Use this for providers that support JSON mode but not full JSON Schema:
+    - vLLM (self-hosted)
+    - KCL (internal)
+    - OpenCode Zen
+    - OpenRouter
+
+    Ensures output is syntactically valid JSON. Schema enforcement is handled
+    by the Pydantic validation layer (see pydantic_schema_enforcement.md).
+
+    Returns
+    -------
+    dict
+        OpenAI-compatible response format specification.
+    """
     return {"type": "json_object"}

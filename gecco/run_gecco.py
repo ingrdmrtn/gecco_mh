@@ -221,16 +221,28 @@ class GeCCoModelSearch:
             return decoded
 
         # -----------------------------
-        # vLLM / KCL (OpenAI-compatible API)
+        # vLLM / KCL / OpenCode / OpenRouter (OpenAI-compatible API)
         # -----------------------------
-        elif "vllm" in provider or "kcl" in provider:
+        elif (
+            "vllm" in provider
+            or "kcl" in provider
+            or "opencode" in provider
+            or "openrouter" in provider
+        ):
             max_out = getattr(
                 self.cfg.llm,
                 "max_output_tokens",
                 getattr(self.cfg.llm, "max_tokens", 4096),
             )
 
-            provider_label = "KCL" if "kcl" in provider else "vLLM"
+            if "kcl" in provider:
+                provider_label = "KCL"
+            elif "opencode" in provider:
+                provider_label = "OpenCode Zen"
+            elif "openrouter" in provider:
+                provider_label = "OpenRouter"
+            else:
+                provider_label = "vLLM"
             console.print(
                 f"[dim]Generating with {provider_label} [cyan]{self.cfg.llm.base_model}[/] "
                 f"(max_tokens={max_out}, temp={self.cfg.llm.temperature})[/]"
@@ -246,12 +258,15 @@ class GeCCoModelSearch:
                 "max_tokens": max_out,
             }
 
-            # Structured output via json_object mode (both vLLM and KCL use
-            # OpenAI-compatible API and support response_format)
+            # Structured output via json_object mode (OpenAI-compatible APIs)
             if getattr(self.cfg.llm, "structured_output", True):
-                from gecco.structured_output import get_vllm_response_format
+                from gecco.structured_output import (
+                    get_openai_compatible_response_format,
+                )
 
-                create_kwargs["response_format"] = get_vllm_response_format()
+                create_kwargs["response_format"] = (
+                    get_openai_compatible_response_format()
+                )
 
             resp = model.chat.completions.create(**create_kwargs)
             content = resp.choices[0].message.content
@@ -350,7 +365,11 @@ class GeCCoModelSearch:
         structured = getattr(self.cfg.llm, "structured_output", True)
         n_models = self.cfg.llm.models_per_iteration
         validation_cfg = getattr(self.cfg, "validation", None)
-        max_retries = getattr(validation_cfg, "retry_limit", 3) if validation_cfg is not None else 3
+        max_retries = (
+            getattr(validation_cfg, "retry_limit", 3)
+            if validation_cfg is not None
+            else 3
+        )
 
         # --- Initial generation ---
         raw_text = self.generate(self.model, self.tokenizer, prompt)
@@ -383,7 +402,9 @@ class GeCCoModelSearch:
                 validation_result = validate_single_model(validated_model)
 
                 if validation_result.is_valid:
-                    console.print(f"  [dim]Model {i + 1} ({model_name}) passed validation[/]")
+                    console.print(
+                        f"  [dim]Model {i + 1} ({model_name}) passed validation[/]"
+                    )
                     break
 
                 error_trace = "\n".join(f"  {err}" for err in validation_result.errors)
@@ -400,8 +421,12 @@ class GeCCoModelSearch:
                     schema_instructions=schema_instructions,
                 )
 
-                correction_text = self.generate(self.model, self.tokenizer, correction_prompt)
-                corrected, _ = parse_model_response(correction_text, 1, structured_output=structured)
+                correction_text = self.generate(
+                    self.model, self.tokenizer, correction_prompt
+                )
+                corrected, _ = parse_model_response(
+                    correction_text, 1, structured_output=structured
+                )
 
                 if corrected:
                     validated_model = corrected[0]
@@ -416,18 +441,24 @@ class GeCCoModelSearch:
                     f"  [bold red]Model {i + 1} ({model_name}) failed validation "
                     f"after {max_retries} retries — skipping[/]"
                 )
-                validated_models.append({
-                    "name": model_name,
-                    "rationale": model.get("rationale", ""),
-                    "code": model.get("code", ""),
-                    "analysis": model.get("analysis", ""),
-                    "validation_failed": True,
-                    "validation_errors": validation_result.errors if validation_result else [],
-                })
+                validated_models.append(
+                    {
+                        "name": model_name,
+                        "rationale": model.get("rationale", ""),
+                        "code": model.get("code", ""),
+                        "analysis": model.get("analysis", ""),
+                        "validation_failed": True,
+                        "validation_errors": validation_result.errors
+                        if validation_result
+                        else [],
+                    }
+                )
 
         models = validated_models
         if not models:
-            console.print("[yellow]All models failed validation — no models to process[/]")
+            console.print(
+                "[yellow]All models failed validation — no models to process[/]"
+            )
             return raw_text, []
 
         # --- Review-and-Fix cycle (optional) ---
@@ -685,13 +716,16 @@ class GeCCoModelSearch:
 
                 try:
                     from gecco.offline_evaluation.exceptions import ModelValidationError  # noqa: F811
+
                     # --- Parameter recovery check (optional) ---
                     if self.recovery_checker is not None:
                         self._set_activity(
                             f"parameter recovery {i + 1}/{n_models}: {display_name} (iter {it})"
                         )
                         from gecco.offline_evaluation.utils import build_model_spec
-                        from gecco.offline_evaluation.exceptions import ModelValidationError
+                        from gecco.offline_evaluation.exceptions import (
+                            ModelValidationError,
+                        )
 
                         try:
                             spec = build_model_spec(
@@ -853,7 +887,9 @@ class GeCCoModelSearch:
                         break
 
                 except ModelValidationError as e:
-                    console.print(f"  [bold red]Validation error in {display_name}:[/] {e.message}")
+                    console.print(
+                        f"  [bold red]Validation error in {display_name}:[/] {e.message}"
+                    )
                     iteration_results.append(
                         {
                             "function_name": display_name,

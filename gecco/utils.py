@@ -108,6 +108,9 @@ def extract_full_function(text: str, func_name: str) -> str:
     func_block = re.sub(r"\\\s+\n", "\n", func_block)
     # Convert literal \n and \t from JSON-encoded code to real newlines/tabs
     # (happens when regex fallback extracts code from inside a JSON string)
-    if "\n" not in func_block and "\\n" in func_block:
-        func_block = func_block.replace("\\n", "\n").replace("\\t", "\t")
+    # Use count comparison: JSON-encoded code has many \\n but few real \n
+    n_escaped = func_block.count("\\n")
+    n_real = func_block.count("\n")
+    if n_escaped > n_real:
+        func_block = func_block.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
     return func_block.strip()

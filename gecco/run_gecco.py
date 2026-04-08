@@ -296,6 +296,26 @@ class GeCCoModelSearch:
                     f"Expected a ChatCompletion response but got {type(resp).__name__!r}. "
                     f"Response: {resp!r:.200}"
                 )
+            if not resp.choices:
+                api_error = getattr(resp, "error", None)
+                if api_error:
+                    code = api_error.get("code", "?")
+                    message = api_error.get("message", "unknown error")
+                    console.print(f"[yellow]API error {code}: {message}[/]")
+                else:
+                    msg = "[yellow]API returned empty choices list"
+                    if "response_format" in create_kwargs:
+                        fmt = create_kwargs["response_format"]
+                        fmt_type = fmt.get("type", "unknown") if isinstance(fmt, dict) else getattr(fmt, "type", "unknown")
+                        msg += (
+                            f"\n  [bold]Likely cause:[/] structured output was requested "
+                            f"(response_format={fmt_type!r}) but [cyan]{self.cfg.llm.base_model}[/] "
+                            f"may not support it. Try setting [bold]structured_output: false[/] in the config."
+                        )
+                    msg += "[/]"
+                    console.print(msg)
+                    console.print(f"[dim]Full response: {resp!r}[/]")
+                return ""
             message = resp.choices[0].message
             reasoning = getattr(message, "reasoning_content", None)
             if reasoning:
@@ -306,7 +326,12 @@ class GeCCoModelSearch:
             if content is None:
                 finish = getattr(resp.choices[0], "finish_reason", "unknown")
                 msg = f"[yellow]API returned empty response (finish_reason={finish})"
-                if "response_format" in create_kwargs:
+                if finish == "length":
+                    msg += (
+                        f"\n  [bold]Likely cause:[/] response was truncated at max_tokens={max_out}. "
+                        f"Try increasing [bold]max_tokens[/] in the config."
+                    )
+                elif "response_format" in create_kwargs:
                     fmt = create_kwargs["response_format"]
                     fmt_type = fmt.get("type", "unknown") if isinstance(fmt, dict) else getattr(fmt, "type", "unknown")
                     msg += (
@@ -828,6 +853,9 @@ class GeCCoModelSearch:
                             console.print(
                                 f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
                             )
+                            if e.details:
+                                for k, v in e.details.items():
+                                    console.print(f"    [dim]{k}: {v}[/]")
                             safe_details = {}
                             for k, v in e.details.items():
                                 try:

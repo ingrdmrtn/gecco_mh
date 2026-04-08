@@ -34,6 +34,13 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
+    # Print the port on startup (only once per session)
+    if "port_printed" not in st.session_state:
+        port = st.get_option("server.port")
+        address = st.get_option("server.address")
+        print(f"🚀 Dashboard running on http://{address}:{port}")
+        st.session_state.port_printed = True
+
     cfg = DashboardConfig()
     init_history_state()
 
@@ -41,18 +48,35 @@ def main() -> None:
         st.header("Controls")
         tasks = available_tasks()
         if tasks:
-            default_idx = tasks.index(cfg.default_task) if cfg.default_task in tasks else 0
+            default_idx = (
+                tasks.index(cfg.default_task) if cfg.default_task in tasks else 0
+            )
             task = st.selectbox("Task", options=tasks, index=default_idx)
         else:
             task = st.text_input("Task name", value=cfg.default_task)
         results_override = st.text_input("Results directory (optional)", value="")
-        refresh_seconds = st.slider("Refresh interval (seconds)", min_value=2, max_value=120, value=cfg.default_refresh_seconds)
-        max_history_points = st.slider("Max session history points", min_value=50, max_value=5000, value=cfg.default_max_history_points, step=50)
+        refresh_seconds = st.slider(
+            "Refresh interval (seconds)",
+            min_value=2,
+            max_value=120,
+            value=cfg.default_refresh_seconds,
+        )
+        max_history_points = st.slider(
+            "Max session history points",
+            min_value=50,
+            max_value=5000,
+            value=cfg.default_max_history_points,
+            step=50,
+        )
         top_n = st.slider("Top models to show", min_value=5, max_value=100, value=20)
         auto_refresh = st.toggle("Auto refresh", value=True)
         refresh_now = st.button("Refresh now", type="primary")
 
-    results_dir = Path(results_override).expanduser() if results_override else default_results_dir(task)
+    results_dir = (
+        Path(results_override).expanduser()
+        if results_override
+        else default_results_dir(task)
+    )
 
     render_header(str(results_dir))
 

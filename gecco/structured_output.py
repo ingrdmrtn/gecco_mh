@@ -909,13 +909,14 @@ def build_fix_prompt(
 
 ## Your Task
 
-Fix each model to address ALL identified issues. Return the corrected models in the same 
+Fix each model to address ALL identified issues. Return the corrected models in the same
 JSON format as your original generation:
 
 - Keep model names exactly the same
 - Update the code to address each issue
 - Update the rationale if the fix changes the model's approach
 - Keep parameters the same unless bounds were incorrect
+- IMPORTANT: Every function MUST use the @njit decorator for performance (e.g. @njit above def)
 
 If a model has critical issues that cannot be fixed, note this in the rationale and 
 propose an alternative architecture that addresses the core problems.
@@ -1061,12 +1062,31 @@ def get_gemini_schema(schema: dict) -> dict:
     return _clean(schema)
 
 
+def _strip_unsupported_strict_keywords(schema: dict) -> dict:
+    """Strip JSON Schema keywords unsupported by OpenAI strict mode.
+
+    ``strict: true`` rejects schemas containing ``minItems``, ``maxItems``,
+    ``minimum``, ``maximum``, ``pattern``, and similar validation-only
+    keywords.  Remove them so the schema is accepted.
+    """
+    _UNSUPPORTED = {"minItems", "maxItems", "minimum", "maximum", "pattern"}
+
+    def _clean(obj):
+        if isinstance(obj, dict):
+            return {k: _clean(v) for k, v in obj.items() if k not in _UNSUPPORTED}
+        if isinstance(obj, list):
+            return [_clean(item) for item in obj]
+        return obj
+
+    return _clean(schema)
+
+
 def get_openai_response_format(schema: dict) -> dict:
     """Build OpenAI Responses API text format spec."""
     return {
         "type": "json_schema",
         "name": "cognitive_models",
-        "schema": schema,
+        "schema": _strip_unsupported_strict_keywords(schema),
         "strict": True,
     }
 
@@ -1093,7 +1113,7 @@ def get_chat_json_schema_format(schema: dict) -> dict:
         "type": "json_schema",
         "json_schema": {
             "name": "cognitive_models",
-            "schema": schema,
+            "schema": _strip_unsupported_strict_keywords(schema),
             "strict": True,
         },
     }

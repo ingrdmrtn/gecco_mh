@@ -93,14 +93,14 @@ def extract_full_function(text: str, func_name: str) -> str:
     if blocks:
         text = "\n\n".join(block.strip() for block in blocks if block.strip())
 
-    # Match the specific function by name (greedy until next def or end)
-    pattern = rf"(def\s+{func_name}\s*\([^)]*\)\s*:[\s\S]+?)(?=\n\s*def|\Z)"
+    # Match the specific function by name, including any decorators above `def`
+    pattern = rf"((?:@\w[\w.]*(?:\([^)]*\))?\s*\n\s*)*def\s+{func_name}\s*\([^)]*\)\s*:[\s\S]+?)(?=\n\s*(?:@\w[\w.]*\s*\n\s*)*def\s|\Z)"
     match = re.search(pattern, text, re.M)
     if match:
         func_block = match.group(1).strip()
     else:
-        # Fallback: try to find any def block as a last resort
-        match = re.search(r"(def\s+\w+\s*\([^)]*\)\s*:[\s\S]+?)(?=\n\s*def|\Z)", text, re.M)
+        # Fallback: try to find any def block (with decorators) as a last resort
+        match = re.search(r"((?:@\w[\w.]*(?:\([^)]*\))?\s*\n\s*)*def\s+\w+\s*\([^)]*\)\s*:[\s\S]+?)(?=\n\s*(?:@\w[\w.]*\s*\n\s*)*def\s|\Z)", text, re.M)
         func_block = match.group(1).strip() if match else text.strip()
 
     # Clean up markdown or stray comments

@@ -1116,7 +1116,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # -----------------------------
         # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
-        elif "vllm" in provider or "kcl" in provider:
+        elif "vllm" in provider or "kcl" in provider or "opencode" in provider or "openrouter" in provider:
             max_out = getattr(
                 self.cfg.llm,
                 "max_output_tokens",

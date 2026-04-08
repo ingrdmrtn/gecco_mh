@@ -3,6 +3,7 @@ import types
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 import numpy as np
+import numba
 
 # ============================================================
 # Dataclass for unified representation of model specifications
@@ -84,6 +85,8 @@ def _safe_exec_user_code(
         "math": _math,
         "scipy": _scipy,
         "itertools": _itertools,
+        "numba": numba,
+        "njit": numba.njit,
         # JavaScript-style literals (common from non-Python-native LLMs)
         "true": True,
         "false": False,

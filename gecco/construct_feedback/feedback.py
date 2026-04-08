@@ -1137,7 +1137,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 temperature=self.cfg.llm.temperature,
                 max_tokens=max_out,
             )
-            return resp.choices[0].message.content.strip()
+            message = resp.choices[0].message
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning:
+                print(f"[GeCCo] Feedback: reasoning tokens present ({len(reasoning)} chars)")
+            return message.content.strip()
         # -----------------------------
         # Hugging Face-style generation
         # -----------------------------

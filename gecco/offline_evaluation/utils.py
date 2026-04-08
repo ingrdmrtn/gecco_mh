@@ -5,7 +5,14 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import numba
 
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+    ConfigDict,
+    ValidationError,
+)
 
 # ============================================================
 # Code validation schema
@@ -13,18 +20,39 @@ from pydantic import BaseModel, Field, field_validator, model_validator, ConfigD
 
 FORBIDDEN_PATTERNS = {
     # Dangerous/System access
-    "import os", "import sys", "import subprocess",
-    "import eval", "import exec", "import compile",
-    "__import__", "open(", "file(", "input(", "raw_input(",
-    "__builtins__", "__class__", "__bases__",
-    "globals()", "locals()", "vars(", "dir(",
+    "import os",
+    "import sys",
+    "import subprocess",
+    "import eval",
+    "import exec",
+    "import compile",
+    "__import__",
+    "open(",
+    "file(",
+    "input(",
+    "raw_input(",
+    "__builtins__",
+    "__class__",
+    "__bases__",
+    "globals()",
+    "locals()",
+    "vars(",
+    "dir(",
     # Already-injected packages (LLMs should use these without importing)
-    "import numba", "from numba", "import njit",
-    "import numpy", "from numpy", "import np",
-    "import scipy", "from scipy",
-    "import json", "from json",
-    "import math", "from math",
-    "import itertools", "from itertools",
+    "import numba",
+    "from numba",
+    "import njit",
+    "import numpy",
+    "from numpy",
+    "import np",
+    "import scipy",
+    "from scipy",
+    "import json",
+    "from json",
+    "import math",
+    "from math",
+    "import itertools",
+    "from itertools",
 }
 
 
@@ -58,16 +86,6 @@ class CodeValidationSchema(BaseModel):
                 "Model must use @njit decorator for performance. "
                 "Add @njit above the function definition. "
                 "Example: @njit\\ndef cognitive_model(...):"
-            )
-        return v
-
-    @field_validator("code")
-    @classmethod
-    def validate_function_signature(cls, v):
-        if not re.search(r"def\s+cognitive_model\d*\s*\(", v):
-            raise ValueError(
-                "No cognitive_model function found. "
-                "Define a function named cognitive_model (or cognitive_model1, etc.)"
             )
         return v
 
@@ -115,30 +133,31 @@ class ModelSpec(BaseModel):
 # Helper utilities
 # ============================================================
 
+
 def _extract_code_from_markdown(text: str) -> str:
     """Extract Python code from markdown code blocks."""
     # Try ```python block
     code_match = re.search(r"```\s*python(.*?)```", text, flags=re.S | re.I)
     if code_match:
         return code_match.group(1).strip()
-    
+
     # Try generic ``` block
     code_match = re.search(r"```(.*?)```", text, flags=re.S)
     if code_match:
-        return code_match.group(1).strip()  
+        return code_match.group(1).strip()
     return text.strip()
 
 
 def _extract_code_block(text: str) -> str:
     """Extract the Python code from an LLM output text."""
     code = _extract_code_from_markdown(text)
-    
+
     # If no code block found, look for class/def definitions
     if "class " not in code and "def " not in code:
         func_match = re.search(r"((?:class|def)\s+\w+\s*\(.*)", text, flags=re.S)
         if func_match:
             return func_match.group(0).strip()
-    
+
     return code
 
 
@@ -152,27 +171,26 @@ def get_base_class_code(cfg) -> str:
     Get the base class code from config.
     Extracts clean Python code from the config's abstract_base_model field.
     """
-    if hasattr(cfg, 'llm') and hasattr(cfg.llm, 'abstract_base_model'):
+    if hasattr(cfg, "llm") and hasattr(cfg.llm, "abstract_base_model"):
         raw = cfg.llm.abstract_base_model
         return _extract_code_from_markdown(raw)
-    
+
     raise ValueError("No abstract_base_model found in config.llm")
 
 
 def _safe_exec_user_code(
-    code: str, 
-    inject_base_class: bool = False,
-    base_class_code: Optional[str] = None
+    code: str, inject_base_class: bool = False, base_class_code: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Safely execute user code and return namespace.
-    
+
     Args:
         code: User code to execute
         inject_base_class: Whether to inject base class first
         base_class_code: The base class code (required if inject_base_class=True)
     """
     import json as _json, math as _math, scipy as _scipy, itertools as _itertools
+
     ns: Dict[str, Any] = {
         "np": np,
         "json": _json,
@@ -189,7 +207,7 @@ def _safe_exec_user_code(
 
     # Strip non-ASCII characters that some models inject (e.g. ✓, →)
     code = code.encode("ascii", errors="ignore").decode("ascii")
-    
+
     try:
         if inject_base_class:
             if base_class_code is None:
@@ -213,16 +231,26 @@ def _find_first_function(ns: Dict[str, Any]) -> Optional[Any]:
 def find_softmax_index_in_list(target_list: List[str]) -> List[int]:
     """Find indices of beta/softmax parameters in a list."""
     search_terms = {
-        'beta', 'beta1', 'beta2', 'beta_1', 'beta_2', 
-        'softmax', 'softmax_beta', 'theta', 'temperature',
-        'inverse_temperature'
+        "beta",
+        "beta1",
+        "beta2",
+        "beta_1",
+        "beta_2",
+        "softmax",
+        "softmax_beta",
+        "theta",
+        "temperature",
+        "inverse_temperature",
     }
-    return [i for i, element in enumerate(target_list) if element.lower() in search_terms]
+    return [
+        i for i, element in enumerate(target_list) if element.lower() in search_terms
+    ]
 
 
 # ============================================================
 # Parameter & bounds extraction
 # ============================================================
+
 
 def extract_parameter_names(text: str) -> List[str]:
     """
@@ -232,34 +260,40 @@ def extract_parameter_names(text: str) -> List[str]:
     # Pattern 1: Class-based - look in unpack_parameters for self.x, self.y = model_parameters
     for line in text.splitlines():
         stripped = line.strip()
-        if 'model_parameters' in stripped and 'self.' in stripped and '=' in stripped:
-            match = re.match(r'^(self\.\w+(?:\s*,\s*self\.\w+)*)\s*=\s*model_parameters', stripped)
+        if "model_parameters" in stripped and "self." in stripped and "=" in stripped:
+            match = re.match(
+                r"^(self\.\w+(?:\s*,\s*self\.\w+)*)\s*=\s*model_parameters", stripped
+            )
             if match:
                 lhs = match.group(1)
-                params = re.findall(r'self\.(\w+)', lhs)
+                params = re.findall(r"self\.(\w+)", lhs)
                 if params:
                     return params
-    
+
     # Pattern 2: Function-based - look for var1, var2 = model_parameters
     for line in text.splitlines():
         stripped = line.strip()
-        if 'model_parameters' in stripped and '=' in stripped and 'self.' not in stripped:
-            match = re.match(r'^([\w\s,]+?)\s*=\s*model_parameters', stripped)
+        if (
+            "model_parameters" in stripped
+            and "=" in stripped
+            and "self." not in stripped
+        ):
+            match = re.match(r"^([\w\s,]+?)\s*=\s*model_parameters", stripped)
             if match:
                 lhs = match.group(1)
-                params = [p.strip() for p in lhs.split(',') if p.strip()]
+                params = [p.strip() for p in lhs.split(",") if p.strip()]
                 if len(params) >= 1:
                     return params
-    
+
     # Pattern 3: Fallback - any multi-variable assignment
     for line in text.splitlines():
         # Strip leading/trailing whitespace to be robust to indentation
         stripped = line.strip()
         # Match lines like: a, b, c = something
-        match = re.match(r'^([\w\s,]+?)\s*=\s*[A-Za-z_][A-Za-z0-9_]*$', stripped)
+        match = re.match(r"^([\w\s,]+?)\s*=\s*[A-Za-z_][A-Za-z0-9_]*$", stripped)
         if match:
             lhs = match.group(1)
-            params = [p.strip() for p in lhs.split(',') if p.strip()]
+            params = [p.strip() for p in lhs.split(",") if p.strip()]
             if len(params) > 1:
                 return params
     return []
@@ -267,16 +301,16 @@ def extract_parameter_names(text: str) -> List[str]:
 
 def extract_parameter_names_from_class(code: str, class_name: str) -> List[str]:
     """Extract parameter names from a specific class's unpack_parameters method."""
-    class_pattern = rf'class\s+{class_name}\s*\([^)]*\):\s*(.*?)(?=\nclass\s+\w+\s*\(|cognitive_model\d*\s*=|$)'
+    class_pattern = rf"class\s+{class_name}\s*\([^)]*\):\s*(.*?)(?=\nclass\s+\w+\s*\(|cognitive_model\d*\s*=|$)"
     class_match = re.search(class_pattern, code, re.DOTALL)
-    
+
     if not class_match:
-        class_pattern = rf'class\s+{class_name}\s*\([^)]*\):(.*?)(?=\n\S)'
+        class_pattern = rf"class\s+{class_name}\s*\([^)]*\):(.*?)(?=\n\S)"
         class_match = re.search(class_pattern, code, re.DOTALL)
-    
+
     if not class_match:
         return []
-    
+
     class_code = class_match.group(0)
     return extract_parameter_names(class_code)
 
@@ -329,10 +363,11 @@ def _get_docstring_from_class(code: str, class_name: str) -> str:
 # High-level builder
 # ============================================================
 
+
 def build_model_spec(
     code: str,
     expected_func_name: str = "cognitive_model",
-    cfg = None,
+    cfg=None,
     base_class_code: Optional[str] = None,
     structured_params: Optional[List[Dict[str, Any]]] = None,
 ) -> ModelSpec:
@@ -357,25 +392,39 @@ def build_model_spec(
         CodeValidationSchema(code=code)
     except ValidationError as e:
         from gecco.offline_evaluation.exceptions import CodeSafetyError
+
         raise CodeSafetyError(
             "Code validation failed",
             details={"pydantic_errors": e.errors()},
         )
 
+    # Enforce cognitive_model* naming for generated models (not baselines)
+    is_baseline = not re.match(r"cognitive_model\d*$", expected_func_name)
+    if not is_baseline and not re.search(r"def\s+cognitive_model\d*\s*\(", code):
+        from gecco.offline_evaluation.exceptions import CodeSafetyError
+
+        raise CodeSafetyError(
+            "No cognitive_model function found. "
+            "Define a function named cognitive_model (or cognitive_model1, etc.)",
+            details={"invalid_func_name": expected_func_name},
+        )
+
     # Extract code block if wrapped in markdown
     code = _extract_code_block(code)
     is_class = is_class_based_code(code)
-    
+
     # Get base class code if needed
     if is_class and base_class_code is None:
         if cfg is not None:
             base_class_code = get_base_class_code(cfg)
         else:
             raise ValueError("cfg or base_class_code required for class-based models")
-    
+
     # Execute code
-    ns = _safe_exec_user_code(code, inject_base_class=is_class, base_class_code=base_class_code)
-    
+    ns = _safe_exec_user_code(
+        code, inject_base_class=is_class, base_class_code=base_class_code
+    )
+
     # Get the function
     func = ns.get(expected_func_name)
     if func is None:
@@ -387,25 +436,28 @@ def build_model_spec(
             f"Function '{expected_func_name}' not found in code. "
             f"Code preview: {preview}"
         )
-    
+
     # Extract parameters and docstring
     if is_class:
         class_match = re.search(
-            rf'{expected_func_name}\s*=\s*make_cognitive_model\s*\(\s*(\w+)\s*\)',
-            code
+            rf"{expected_func_name}\s*=\s*make_cognitive_model\s*\(\s*(\w+)\s*\)", code
         )
         if class_match:
             class_name = class_match.group(1)
         else:
-            num_match = re.search(r'(\d+)$', expected_func_name)
-            class_name = f"ParticipantModel{num_match.group(1)}" if num_match else "ParticipantModel"
-        
+            num_match = re.search(r"(\d+)$", expected_func_name)
+            class_name = (
+                f"ParticipantModel{num_match.group(1)}"
+                if num_match
+                else "ParticipantModel"
+            )
+
         param_names = extract_parameter_names_from_class(code, class_name)
         doc = _get_docstring_from_class(code, class_name)
     else:
         param_names = extract_parameter_names(code)
         doc = func.__doc__ or ""
-    
+
     # Build bounds from structured JSON params (preferred) or docstring (fallback)
     structured_bounds: Dict[str, List[float]] = {}
     if structured_params:
@@ -434,7 +486,7 @@ def build_model_spec(
             final_bounds[p] = docstring_bounds[p]
         elif p.lower() in docstring_bounds:
             final_bounds[p] = docstring_bounds[p.lower()]
-        elif 'beta' in p.lower() or 'temperature' in p.lower():
+        elif "beta" in p.lower() or "temperature" in p.lower():
             final_bounds[p] = beta_bound
         else:
             final_bounds[p] = default_bound
@@ -453,23 +505,20 @@ def build_model_spec(
         )
     except ValidationError as e:
         from gecco.offline_evaluation.exceptions import PydanticSchemaError
+
         raise PydanticSchemaError(e)
 
 
 # Aliases for backward compatibility
 def build_model_spec_from_llm_output(
-    text: str, 
-    expected_func_name: str = "cognitive_model",
-    cfg = None
+    text: str, expected_func_name: str = "cognitive_model", cfg=None
 ) -> ModelSpec:
     """Alias for build_model_spec (backward compatibility)."""
     return build_model_spec(text, expected_func_name, cfg=cfg)
 
 
 def build_model_spec_from_class_code(
-    code: str, 
-    expected_func_name: str = "cognitive_model1",
-    cfg = None
+    code: str, expected_func_name: str = "cognitive_model1", cfg=None
 ) -> ModelSpec:
     """Alias for build_model_spec (backward compatibility)."""
     return build_model_spec(code, expected_func_name, cfg=cfg)

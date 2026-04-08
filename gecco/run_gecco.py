@@ -267,16 +267,28 @@ class GeCCoModelSearch:
                 "max_tokens": max_out,
             }
 
-            # Structured output via json_object mode (OpenAI-compatible APIs)
-            # Applied when response_schema is provided (any schema triggers JSON mode)
+            # Structured output for OpenAI-compatible APIs.
+            # OpenRouter supports full json_schema enforcement when the model supports it
+            # (opt-in via supports_json_schema: true in config).
+            # All other providers (vLLM, KCL, OpenCode) fall back to json_object mode.
             if response_schema is not None:
-                from gecco.structured_output import (
-                    get_openai_compatible_response_format,
+                use_json_schema = "openrouter" in provider and getattr(
+                    self.cfg.llm, "supports_json_schema", False
                 )
+                if use_json_schema:
+                    from gecco.structured_output import get_chat_json_schema_format
 
-                create_kwargs["response_format"] = (
-                    get_openai_compatible_response_format()
-                )
+                    create_kwargs["response_format"] = get_chat_json_schema_format(
+                        response_schema
+                    )
+                else:
+                    from gecco.structured_output import (
+                        get_openai_compatible_response_format,
+                    )
+
+                    create_kwargs["response_format"] = (
+                        get_openai_compatible_response_format()
+                    )
 
             resp = model.chat.completions.create(**create_kwargs)
             if not hasattr(resp, "choices"):
@@ -284,7 +296,13 @@ class GeCCoModelSearch:
                     f"Expected a ChatCompletion response but got {type(resp).__name__!r}. "
                     f"Response: {resp!r:.200}"
                 )
-            content = resp.choices[0].message.content
+            message = resp.choices[0].message
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning:
+                console.print(
+                    f"[dim](reasoning tokens present, {len(reasoning)} chars)[/]"
+                )
+            content = message.content
             if content is None:
                 finish = getattr(resp.choices[0], "finish_reason", "unknown")
                 console.print(
@@ -802,6 +820,13 @@ class GeCCoModelSearch:
                             console.print(
                                 f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
                             )
+                            safe_details = {}
+                            for k, v in e.details.items():
+                                try:
+                                    json.dumps(v)
+                                    safe_details[k] = v
+                                except (TypeError, ValueError):
+                                    safe_details[k] = str(v)
                             iteration_results.append(
                                 {
                                     "function_name": display_name,
@@ -811,7 +836,7 @@ class GeCCoModelSearch:
                                     "code": func_code,
                                     "error_type": e.error_type,
                                     "error_message": e.message,
-                                    "error_details": e.details,
+                                    "error_details": safe_details,
                                 }
                             )
                             continue
@@ -930,6 +955,13 @@ class GeCCoModelSearch:
                     console.print(
                         f"  [bold red]Validation error in {display_name}:[/] {e.message}"
                     )
+                    safe_details = {}
+                    for k, v in e.details.items():
+                        try:
+                            json.dumps(v)
+                            safe_details[k] = v
+                        except (TypeError, ValueError):
+                            safe_details[k] = str(v)
                     iteration_results.append(
                         {
                             "function_name": display_name,
@@ -939,7 +971,7 @@ class GeCCoModelSearch:
                             "code": func_code,
                             "error_type": e.error_type,
                             "error_message": e.message,
-                            "error_details": e.details,
+                            "error_details": safe_details,
                         }
                     )
                 except Exception as e:

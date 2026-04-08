@@ -1018,6 +1018,34 @@ def get_openai_response_format(schema: dict) -> dict:
     }
 
 
+def get_chat_json_schema_format(schema: dict) -> dict:
+    """
+    Build a response_format dict for providers supporting json_schema in
+    the Chat Completions API (OpenRouter, and OpenAI chat.completions).
+
+    This is distinct from get_openai_response_format(), which targets the
+    OpenAI Responses API (text.format, not response_format).
+
+    Parameters
+    ----------
+    schema : dict
+        JSON schema dict, e.g. from get_model_schema() or get_review_schema().
+
+    Returns
+    -------
+    dict
+        response_format value to pass to chat.completions.create().
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "cognitive_models",
+            "schema": schema,
+            "strict": True,
+        },
+    }
+
+
 def get_vllm_response_format() -> dict:
     """Build vLLM-compatible response format."""
     return {"type": "json_object"}

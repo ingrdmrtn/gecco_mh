@@ -511,12 +511,18 @@ def build_correction_prompt(
 
     params_str = ""
     if params:
-        params_str = "Parameters:\n"
+        params_str = "Current parameters:\n"
         for p in params:
             params_str += (
                 f"  - {p.get('name', '?')}: "
                 f"[{p.get('lower_bound', 0)}, {p.get('upper_bound', 1)}]\n"
             )
+    else:
+        params_str = (
+            "WARNING: The `parameters` field is missing from this model. "
+            "You MUST extract the parameters from the code and include them "
+            "in your response.\n"
+        )
 
     return f"""The following model has validation errors and needs to be corrected.
 
@@ -537,6 +543,9 @@ Please provide a corrected version of this model that:
 1. Fixes ALL validation errors listed above
 2. Maintains the same cognitive mechanism (don't change the core idea)
 3. Uses the same function name and parameters
+
+IMPORTANT: Your response MUST include ALL fields: `name`, `rationale`, `parameters`, and `code`.
+The `parameters` array is REQUIRED — it must list every parameter unpacked from `model_parameters` in the code, with `name`, `lower_bound`, and `upper_bound` for each.
 
 {schema_instructions}
 

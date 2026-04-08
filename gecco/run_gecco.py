@@ -859,11 +859,18 @@ class GeCCoModelSearch:
                             )
                             recovery = self.recovery_checker.check(spec)
                             if not recovery["passed"]:
-                                console.print(
-                                    f"  [yellow]{display_name} failed parameter recovery "
-                                    f"(mean r={recovery['mean_r']:.2f}, "
-                                    f"threshold={self.recovery_checker.threshold})[/]"
-                                )
+                                sim_err = recovery.get("simulation_error")
+                                if sim_err and recovery["n_successful"] == 0:
+                                    console.print(
+                                        f"  [yellow]{display_name} failed parameter recovery "
+                                        f"— simulation error: {sim_err}[/]"
+                                    )
+                                else:
+                                    console.print(
+                                        f"  [yellow]{display_name} failed parameter recovery "
+                                        f"(mean r={recovery['mean_r']:.2f}, "
+                                        f"threshold={self.recovery_checker.threshold})[/]"
+                                    )
                                 iteration_results.append(
                                     {
                                         "function_name": display_name,
@@ -873,6 +880,8 @@ class GeCCoModelSearch:
                                         "code": func_code,
                                         "recovery_r": recovery["mean_r"],
                                         "recovery_per_param": recovery["per_param_r"],
+                                        "recovery_n_successful": recovery["n_successful"],
+                                        "simulation_error": sim_err,
                                     }
                                 )
                                 continue

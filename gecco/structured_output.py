@@ -322,8 +322,25 @@ def parse_model_response(
 
 
 def _strip_thinking_tags(text: str) -> str:
-    """Remove <think>...</think> blocks produced by reasoning models."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Remove thinking/reasoning blocks produced by reasoning models.
+
+    Handles:
+    - <think>...</think> XML tags (DeepSeek, Qwen, etc.)
+    - GLM-5.x "Mirrored thinking" inline prefix lines
+      e.g. "json Mirrored thinkingHere is the output:"
+    """
+    # Remove <think>...</think> blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove GLM-style "* Mirrored thinking*" prefix lines.
+    # These appear as: "json Mirrored thinking<prose>\n\njson Mirrored thinking..."
+    # Strip every segment that matches "* Mirrored thinking<text>" up to a JSON
+    # boundary (``` or {), keeping only the part after the last such prefix.
+    if "Mirrored thinking" in text:
+        # Split on any "Mirrored thinking" occurrence and keep only what follows
+        # the last one (the actual output).
+        parts = re.split(r"(?:json\s+)?Mirrored thinking", text)
+        text = parts[-1]
+    return text.strip()
 
 
 def _try_parse_dict(data) -> Optional[List[Dict]]:
@@ -410,6 +427,13 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         # keyword. Replace with np.max()/np.min() which Numba does support.
         code = re.sub(r"\bmax\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
         code = re.sub(r"\bmin\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
+        # Fix doubled np prefix (e.g. np.np.max → np.max). Some models
+        # generate this directly or it can result from partial self-correction.
+        code = re.sub(r"\bnp\.np\.", "np.", code)
+        # Strip trailing JSON brace that leaks into the code field when models
+        # (e.g. GLM-5.1) wrap code in a JSON object or fail to close the string
+        # cleanly.  A lone `}` after `return ...` is never valid Python.
+        code = re.sub(r"\n\}\s*$", "", code)
         # Infer minimal parameters from code when missing (common in fix responses).
         # The fix flow only uses `code` — original parameters are preserved upstream.
         if "parameters" not in m or not m["parameters"]:

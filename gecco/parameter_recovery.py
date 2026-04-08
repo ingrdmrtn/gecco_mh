@@ -354,7 +354,7 @@ class ParameterRecoveryChecker:
         )
         t_sim = time.time()
 
-        sim_results = self._simulate_all(spec.func, bounds_list, seeds)
+        sim_results, sim_error = self._simulate_all(spec.func, bounds_list, seeds)
 
         # Collect successful simulations
         true_params_all = []
@@ -377,6 +377,7 @@ class ParameterRecoveryChecker:
                 "per_param_r": {p: 0.0 for p in param_names},
                 "n_successful": n_simulated,
                 "elapsed_seconds": time.time() - t0,
+                "simulation_error": sim_error,
             }
 
         # --- Step 2: Fit all subjects as a group using HBI ---
@@ -440,10 +441,18 @@ class ParameterRecoveryChecker:
             "per_param_r": per_param_r,
             "n_successful": n_simulated,
             "elapsed_seconds": elapsed,
+            "simulation_error": None,
         }
 
     def _simulate_all(self, model_func, bounds_list, seeds):
-        """Simulate all subjects, parallelised across cores."""
+        """Simulate all subjects, parallelised across cores.
+
+        Returns
+        -------
+        tuple[list, str | None]
+            (results, first_error_str) where first_error_str is the first
+            exception message encountered, or None if all succeeded.
+        """
         n_workers = self._resolve_n_jobs()
 
         if n_workers > 1:
@@ -458,7 +467,7 @@ class ParameterRecoveryChecker:
     def _simulate_sequential(self, model_func, bounds_list, seeds):
         """Simulate all subjects sequentially."""
         results = []
-        first_error_logged = False
+        first_error = None
         for seed in seeds:
             try:
                 res = _simulate_one_subject(
@@ -467,11 +476,11 @@ class ParameterRecoveryChecker:
                 )
                 results.append(res)
             except Exception as e:
-                if not first_error_logged:
+                if first_error is None:
+                    first_error = f"{type(e).__name__}: {e}"
                     console.print(f"    [yellow]Simulation error: {e}[/]")
-                    first_error_logged = True
                 results.append(None)
-        return results
+        return results, first_error
 
     def _simulate_parallel(self, model_func, bounds_list, seeds, n_workers):
         """Simulate all subjects in parallel.
@@ -498,8 +507,9 @@ class ParameterRecoveryChecker:
         try:
             test_result = test_fut.result(timeout=120)
         except Exception as e:
+            parallel_err = f"{type(e).__name__}: {e}"
             console.print(
-                f"    [yellow]Parallel simulation failed ({type(e).__name__}: {e}), "
+                f"    [yellow]Parallel simulation failed ({parallel_err}), "
                 f"falling back to sequential...[/]"
             )
             return self._simulate_sequential(model_func, bounds_list, seeds)
@@ -517,18 +527,18 @@ class ParameterRecoveryChecker:
             )
             futures[fut] = idx
 
-        first_error_logged = False
+        first_error = None
         for fut in as_completed(futures):
             idx = futures[fut]
             try:
                 results[idx] = fut.result()
             except Exception as e:
-                if not first_error_logged:
+                if first_error is None:
+                    first_error = f"{type(e).__name__}: {e}"
                     console.print(f"    [yellow]Simulation error (subject {idx}): {e}[/]")
-                    first_error_logged = True
                 results[idx] = None
 
-        return results
+        return results, first_error
 
     def _fit_group_hbi(self, spec, participant_data):
         """Fit all simulated subjects as a group using HBI.

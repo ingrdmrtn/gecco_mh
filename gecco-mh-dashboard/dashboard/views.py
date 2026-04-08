@@ -252,9 +252,12 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
             # Status indicator
             if metric_name == "RECOVERY_FAILED":
                 icon = "🔴"
-                recovery_r = r.get("recovery_r")
-                r_note = f" (r={recovery_r:.2f})" if recovery_r is not None else ""
-                status_note = f" — recovery failed{r_note}"
+                if r.get("simulation_error") and r.get("recovery_n_successful", -1) == 0:
+                    status_note = " — simulation error"
+                else:
+                    recovery_r = r.get("recovery_r")
+                    r_note = f" (r={recovery_r:.2f})" if recovery_r is not None else ""
+                    status_note = f" — recovery failed{r_note}"
             elif metric_name == "FIT_ERROR":
                 icon = "🔴"
                 status_note = " — fitting error"
@@ -272,6 +275,9 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                 error_msg = r.get("error")
                 if error_msg:
                     st.error(f"**Error:** {error_msg}")
+                sim_error = r.get("simulation_error")
+                if sim_error:
+                    st.error(f"**Simulation error:** {sim_error}")
                 recovery_per_param = r.get("recovery_per_param")
                 if metric_name == "RECOVERY_FAILED" and recovery_per_param:
                     parts = [f"{k}: r={v:.2f}" for k, v in recovery_per_param.items()]

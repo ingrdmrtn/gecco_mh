@@ -106,10 +106,27 @@ class GeCCoModelSearch:
                 n_jobs=getattr(cfg.parameter_recovery, "n_jobs", -1),
             )
 
-    def generate(self, model, tokenizer=None, prompt=None):
+    def generate(self, model, tokenizer=None, prompt=None, response_schema=None):
         """
         Unified text generation function for any supported backend.
         Handles both OpenAI GPT and Hugging Face-style models cleanly.
+
+        Parameters
+        ----------
+        model : object
+            The model object (OpenAI client, HF model, etc.)
+        tokenizer : object, optional
+            Tokenizer for HuggingFace models.
+        prompt : str, optional
+            The prompt text to send to the model.
+        response_schema : dict, optional
+            JSON schema for structured output. If None, no schema enforcement
+            is applied (free-form text response).
+
+        Returns
+        -------
+        str
+            The generated text response.
         """
         if model is None:
             raise ValueError("Model not initialized correctly.")
@@ -139,19 +156,13 @@ class GeCCoModelSearch:
             if reasoning_effort:
                 create_kwargs["reasoning"] = {"effort": reasoning_effort}
 
-            # Structured output via JSON schema
-            if getattr(self.cfg.llm, "structured_output", True):
-                from gecco.structured_output import (
-                    get_model_schema,
-                    get_openai_response_format,
-                )
+            # Structured output via JSON schema (only if schema provided)
+            if response_schema is not None:
+                from gecco.structured_output import get_openai_response_format
 
-                include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
-                schema = get_model_schema(
-                    self.cfg.llm.models_per_iteration,
-                    include_analysis=include_analysis,
-                )
-                create_kwargs["text"] = {"format": get_openai_response_format(schema)}
+                create_kwargs["text"] = {
+                    "format": get_openai_response_format(response_schema)
+                }
 
             resp = model.responses.create(**create_kwargs)
             decoded = resp.output_text.strip()
@@ -200,16 +211,14 @@ class GeCCoModelSearch:
             # Gemini may not support response_schema + thinking_config together,
             # so when thinking is enabled we rely on the prompt-level JSON
             # instructions instead.
-            if getattr(self.cfg.llm, "structured_output", True) and not use_thinking:
-                from gecco.structured_output import get_model_schema, get_gemini_schema
+            # Skip review schema for Gemini — use prompt-only JSON
+            if response_schema is not None and not use_thinking:
+                from gecco.structured_output import get_gemini_schema
 
-                include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
-                schema = get_model_schema(
-                    self.cfg.llm.models_per_iteration,
-                    include_analysis=include_analysis,
-                )
-                config_args["response_mime_type"] = "application/json"
-                config_args["response_schema"] = get_gemini_schema(schema)
+                is_review = "reviews" in response_schema.get("properties", {})
+                if not is_review:
+                    config_args["response_mime_type"] = "application/json"
+                    config_args["response_schema"] = get_gemini_schema(response_schema)
 
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,
@@ -259,7 +268,8 @@ class GeCCoModelSearch:
             }
 
             # Structured output via json_object mode (OpenAI-compatible APIs)
-            if getattr(self.cfg.llm, "structured_output", True):
+            # Applied when response_schema is provided (any schema triggers JSON mode)
+            if response_schema is not None:
                 from gecco.structured_output import (
                     get_openai_compatible_response_format,
                 )
@@ -360,6 +370,8 @@ class GeCCoModelSearch:
             validate_single_model,
             build_correction_prompt,
             get_schema_instructions,
+            get_model_schema,
+            get_review_schema,
         )
 
         structured = getattr(self.cfg.llm, "structured_output", True)
@@ -372,7 +384,15 @@ class GeCCoModelSearch:
         )
 
         # --- Initial generation ---
-        raw_text = self.generate(self.model, self.tokenizer, prompt)
+        include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
+        model_schema = get_model_schema(n_models, include_analysis=include_analysis)
+
+        raw_text = self.generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            response_schema=model_schema if structured else None,
+        )
         models, json_ok = parse_model_response(
             raw_text, n_models, structured_output=structured
         )
@@ -421,8 +441,12 @@ class GeCCoModelSearch:
                     schema_instructions=schema_instructions,
                 )
 
+                correction_schema = get_model_schema(1, include_analysis=False)
                 correction_text = self.generate(
-                    self.model, self.tokenizer, correction_prompt
+                    self.model,
+                    self.tokenizer,
+                    correction_prompt,
+                    response_schema=correction_schema if structured else None,
                 )
                 corrected, _ = parse_model_response(
                     correction_text, 1, structured_output=structured
@@ -476,7 +500,13 @@ class GeCCoModelSearch:
                 persona=persona,
                 focus_areas=focus_areas,
             )
-            review_text = self.generate(self.model, self.tokenizer, review_prompt)
+            review_schema = get_review_schema()
+            review_text = self.generate(
+                self.model,
+                self.tokenizer,
+                review_prompt,
+                response_schema=review_schema if structured else None,
+            )
             review = parse_review_response(review_text)
 
             # --- Save review to disk ---
@@ -497,7 +527,12 @@ class GeCCoModelSearch:
                 fix_prompt = build_fix_prompt(models, review, guardrails=guardrails)
                 if fix_prompt:
                     console.print("[dim]Requesting fixes...[/]")
-                    fix_text = self.generate(self.model, self.tokenizer, fix_prompt)
+                    fix_text = self.generate(
+                        self.model,
+                        self.tokenizer,
+                        fix_prompt,
+                        response_schema=model_schema if structured else None,
+                    )
                     fixed_models, fixed_json_ok = parse_model_response(
                         fix_text, n_models, structured_output=structured
                     )

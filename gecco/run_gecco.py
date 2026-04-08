@@ -279,6 +279,11 @@ class GeCCoModelSearch:
                 )
 
             resp = model.chat.completions.create(**create_kwargs)
+            if not hasattr(resp, "choices"):
+                raise TypeError(
+                    f"Expected a ChatCompletion response but got {type(resp).__name__!r}. "
+                    f"Response: {resp!r:.200}"
+                )
             content = resp.choices[0].message.content
             if content is None:
                 finish = getattr(resp.choices[0], "finish_reason", "unknown")

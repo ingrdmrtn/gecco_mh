@@ -41,7 +41,7 @@ def load_llm(provider: str, model_name: str, **kwargs):
     elif "opencode" in provider:
         from gecco.load_llms.opencode_backend import load_opencode
 
-        model = load_opencode(model_name)
+        model = load_opencode(model_name, base_url=kwargs.get("base_url"))
         tokenizer = None
 
     elif "openrouter" in provider:

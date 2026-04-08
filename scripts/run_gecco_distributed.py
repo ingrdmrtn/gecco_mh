@@ -127,7 +127,11 @@ def main():
     prompt_builder = PromptBuilderWrapper(cfg, data_text, df_prompt)
 
     # --- Load LLM ---
-    model, tokenizer = load_llm(cfg.llm.provider, cfg.llm.base_model)
+    model, tokenizer = load_llm(
+        cfg.llm.provider,
+        cfg.llm.base_model,
+        base_url=getattr(cfg.llm, "base_url", None),
+    )
 
     # --- Create shared registry ---
     results_dir = (

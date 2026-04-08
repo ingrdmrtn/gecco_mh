@@ -305,9 +305,17 @@ class GeCCoModelSearch:
             content = message.content
             if content is None:
                 finish = getattr(resp.choices[0], "finish_reason", "unknown")
-                console.print(
-                    f"[yellow]API returned empty response (finish_reason={finish})[/]"
-                )
+                msg = f"[yellow]API returned empty response (finish_reason={finish})"
+                if "response_format" in create_kwargs:
+                    fmt = create_kwargs["response_format"]
+                    fmt_type = fmt.get("type", "unknown") if isinstance(fmt, dict) else getattr(fmt, "type", "unknown")
+                    msg += (
+                        f"\n  [bold]Likely cause:[/] structured output was requested "
+                        f"(response_format={fmt_type!r}) but [cyan]{self.cfg.llm.base_model}[/] "
+                        f"may not support it. Try setting [bold]structured_output: false[/] in the config."
+                    )
+                msg += "[/]"
+                console.print(msg)
                 return ""
             return content.strip()
 

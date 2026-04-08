@@ -121,7 +121,9 @@ def main():
     # Resolve cpus-per-task: CLI > config > default
     cpus_per_task = args.cpus_per_task or slurm_cfg.get("cpus_per_task", 48)
 
-    partition_flag = f"--partition={args.partition}" if args.partition else ""
+    # Resolve partition: CLI > config
+    partition = args.partition or slurm_cfg.get("partition")
+    partition_flag = f"--partition={partition}" if partition else ""
 
     print(f"Config:       {args.config}")
     print(f"Provider:     {provider}")
@@ -131,8 +133,8 @@ def main():
     print(f"Total clients: {n_total}")
     print(f"Array spec:   --array={array_spec}")
     print(f"Profiles CSV: {profiles_csv}")
-    if args.partition:
-        print(f"Partition:    {args.partition}")
+    if partition:
+        print(f"Partition:    {partition}")
     if provider == "vllm":
         print(f"vLLM URL:     {args.vllm_url or '(from env / .vllm_env)'}")
     print()

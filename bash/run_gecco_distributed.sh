@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH -J gecco-client
 #SBATCH -N 1
-#SBATCH --cpus-per-task=48
+# --cpus-per-task is set dynamically by launch_distributed.py (or override with sbatch --cpus-per-task=N)
 #SBATCH --mem=64G
 #SBATCH -t 8:00:00
 #SBATCH --output=logs/gecco-client-%A_%a.out

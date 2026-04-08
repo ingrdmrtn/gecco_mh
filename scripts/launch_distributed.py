@@ -81,6 +81,8 @@ def main():
                         help="Conda environment to activate in each client job")
     parser.add_argument("--partition", type=str, default=None,
                         help="SLURM partition to submit jobs to (e.g. gpu, cpu, batch)")
+    parser.add_argument("--cpus-per-task", type=int, default=None,
+                        help="CPUs per client node (overrides config slurm.cpus_per_task, default: 48)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without submitting")
     args = parser.parse_args()
@@ -110,15 +112,20 @@ def main():
     profiles_csv = ",".join(all_profiles)
     array_spec = f"0-{n_total - 1}"
 
-    # Detect provider from config
+    # Detect provider and SLURM settings from config
     with open(config_path, "r") as f:
         cfg_raw = yaml.safe_load(f)
     provider = cfg_raw.get("llm", {}).get("provider", "vllm")
+    slurm_cfg = cfg_raw.get("slurm", {})
+
+    # Resolve cpus-per-task: CLI > config > default
+    cpus_per_task = args.cpus_per_task or slurm_cfg.get("cpus_per_task", 48)
 
     partition_flag = f"--partition={args.partition}" if args.partition else ""
 
     print(f"Config:       {args.config}")
     print(f"Provider:     {provider}")
+    print(f"CPUs/task:    {cpus_per_task}")
     print(f"Profiles:     {profiles if profiles else '(none)'}")
     print(f"Extra clients: {args.extra_clients}")
     print(f"Total clients: {n_total}")
@@ -156,7 +163,7 @@ def main():
     vllm_url_arg = f'"{args.vllm_url}"' if args.vllm_url else '""'
     conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
     cmd = (
-        f"sbatch --array={array_spec} {dep_flag} {partition_flag} "
+        f"sbatch --array={array_spec} --cpus-per-task={cpus_per_task} {dep_flag} {partition_flag} "
         f'bash/run_gecco_distributed.sh "{args.config}" "{profiles_csv}" {vllm_url_arg} {conda_arg}'
     )
     client_job_id = run_cmd(cmd, dry_run=args.dry_run)

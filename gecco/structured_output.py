@@ -70,7 +70,15 @@ class LLMModelResponse(BaseModel):
     @field_validator("code")
     @classmethod
     def validate_syntax(cls, v):
-        """Validate Python syntax using AST parser."""
+        """Validate Python syntax using AST parser. Strips markdown fences first."""
+        # Strip markdown code fences if present
+        code_match = re.search(r"```\s*python(.*?)```", v, flags=re.S | re.I)
+        if code_match:
+            v = code_match.group(1).strip()
+        else:
+            fence_match = re.search(r"```(.*?)```", v, flags=re.S)
+            if fence_match:
+                v = fence_match.group(1).strip()
         try:
             ast.parse(v)
         except SyntaxError as e:
@@ -395,6 +403,39 @@ def _try_parse_json(text: str) -> Optional[List[Dict]]:
     return None
 
 
+def _normalise_code(code: str) -> str:
+    """Apply deterministic fixes for known LLM code generation quirks.
+
+    All transforms here are safe and idempotent — they fix structural problems
+    that the LLM should never have emitted rather than semantic errors.  Applied
+    on EVERY code path (JSON parse, regex fallback, fix responses) so the
+    validation / compilation stages never see these known-bad patterns.
+    """
+    # Fix double-escaped sequences (minimax and similar over-escape JSON strings).
+    n_escaped = code.count("\\n")
+    n_real = code.count("\n")
+    if n_escaped > n_real:
+        code = code.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    # Strip markdown fences if the code field itself contains them.
+    fence_match = re.search(r"```\s*(?:python)?(.*?)```", code, flags=re.S | re.I)
+    if fence_match:
+        code = fence_match.group(1).strip()
+    # Fix @njit on same line as def: "@njit def func():" → "@njit\ndef func():"
+    code = re.sub(r"@((?:numba\.)?njit)\s+def\s+", r"@\1\ndef ", code)
+    # Add @njit if missing entirely (e.g. stripped during review/fix cycles).
+    if "@njit" not in code and "@numba.njit" not in code:
+        code = re.sub(r"(def\s+cognitive_model\w*\s*\()", r"@njit\n\1", code, count=1)
+    # LLMs sometimes write the Python builtin max(arr, axis=) instead of np.max(arr, axis=).
+    # np.max with axis= is fine in Numba 0.43+; the builtin never accepts axis=.
+    code = re.sub(r"\bmax\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
+    code = re.sub(r"\bmin\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
+    # Fix doubled np prefix: np.np.max → np.max
+    code = re.sub(r"\bnp\.np\.", "np.", code)
+    # Strip trailing lone `}` that leaks from malformed JSON code fields.
+    code = re.sub(r"\n\}\s*$", "", code)
+    return code
+
+
 def _validate_models(models: list) -> Optional[List[Dict]]:
     """Validate and normalize parsed model dicts using Pydantic.
 
@@ -402,7 +443,6 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         List of validated model dicts if validation succeeds, None otherwise.
         Returning None triggers the fallback regex extraction in parse_model_response().
     """
-    # Pre-process: fix double-escaped newlines before Pydantic validation
     processed = []
     for i, m in enumerate(models):
         if not isinstance(m, dict):
@@ -413,27 +453,7 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         code = m.get("code", "")
         if not code:
             return None
-        # Fix double-escaped sequences from models that over-escape JSON strings.
-        # Use count comparison: if there are more \\n than real newlines, the code
-        # is still JSON-encoded (e.g. minimax outputs \\n instead of \n).
-        n_escaped = code.count("\\n")
-        n_real = code.count("\n")
-        if n_escaped > n_real:
-            code = code.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
-        # Fix @njit / @numba.njit placed on the same line as def (invalid Python syntax).
-        # Some small models generate "@njit def func():" instead of "@njit\ndef func():".
-        code = re.sub(r"@((?:numba\.)?njit)\s+def\s+", r"@\1\ndef ", code)
-        # Numba nopython mode doesn't support Python's built-in max()/min() with axis=
-        # keyword. Replace with np.max()/np.min() which Numba does support.
-        code = re.sub(r"\bmax\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
-        code = re.sub(r"\bmin\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
-        # Fix doubled np prefix (e.g. np.np.max → np.max). Some models
-        # generate this directly or it can result from partial self-correction.
-        code = re.sub(r"\bnp\.np\.", "np.", code)
-        # Strip trailing JSON brace that leaks into the code field when models
-        # (e.g. GLM-5.1) wrap code in a JSON object or fail to close the string
-        # cleanly.  A lone `}` after `return ...` is never valid Python.
-        code = re.sub(r"\n\}\s*$", "", code)
+        code = _normalise_code(code)
         # Infer minimal parameters from code when missing (common in fix responses).
         # The fix flow only uses `code` — original parameters are preserved upstream.
         if "parameters" not in m or not m["parameters"]:
@@ -635,7 +655,7 @@ def _fallback_regex_extraction(text: str, n_models: int) -> List[Dict]:
                 {
                     "name": f"cognitive_model{i}",
                     "rationale": "",
-                    "code": code,
+                    "code": _normalise_code(code),
                     "analysis": "",
                 }
             )

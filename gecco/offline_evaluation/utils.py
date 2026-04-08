@@ -72,6 +72,14 @@ class CodeValidationSchema(BaseModel):
     @field_validator("code")
     @classmethod
     def validate_syntax(cls, v):
+        # Strip markdown code fences if present
+        code_match = re.search(r"```\s*python(.*?)```", v, flags=re.S | re.I)
+        if code_match:
+            v = code_match.group(1).strip()
+        else:
+            fence_match = re.search(r"```(.*?)```", v, flags=re.S)
+            if fence_match:
+                v = fence_match.group(1).strip()
         try:
             ast.parse(v)
         except SyntaxError as e:

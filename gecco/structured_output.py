@@ -5,6 +5,7 @@ Provides JSON schema definitions, response parsing with fallback to regex
 extraction, and reflection/self-critique prompt construction.
 """
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -65,6 +66,17 @@ class LLMModelResponse(BaseModel):
     code: str = Field(
         ..., min_length=10, description="Complete Python function definition"
     )
+
+    @field_validator("code")
+    @classmethod
+    def validate_syntax(cls, v):
+        """Validate Python syntax using AST parser."""
+        try:
+            ast.parse(v)
+        except SyntaxError as e:
+            raise ValueError(f"Syntax error in model code: {e}")
+        return v
+
     analysis: Optional[str] = Field(
         default=None, description="LLM's reasoning scratchpad"
     )

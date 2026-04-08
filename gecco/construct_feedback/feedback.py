@@ -23,10 +23,12 @@ class FeedbackGenerator:
         """
         Store results from a given iteration (list of dicts with param_names, etc.)
         """
-        self.history.append({
-            "iteration": iteration_idx,
-            "results": results,
-        })
+        self.history.append(
+            {
+                "iteration": iteration_idx,
+                "results": results,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Level 1: BIC trajectory and improvement rate
@@ -43,7 +45,8 @@ class FeedbackGenerator:
         iter_bests = []
         for entry in self.history:
             valid_results = [
-                r for r in entry["results"]
+                r
+                for r in entry["results"]
                 if r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR")
             ]
             if valid_results:
@@ -58,7 +61,9 @@ class FeedbackGenerator:
         traj_str = " → ".join(f"iter {i} → {b:.1f}" for i, b in iter_bests)
         lines = []
         if n_iters <= 3:
-            lines.append(f"(Based on only {n_iters} iterations — trend estimates are preliminary.)")
+            lines.append(
+                f"(Based on only {n_iters} iterations — trend estimates are preliminary.)"
+            )
         lines.append(f"BIC trajectory: {traj_str}.")
 
         n = len(bics)
@@ -115,20 +120,24 @@ class FeedbackGenerator:
         for entry in self.history:
             for r in entry["results"]:
                 if r.get("metric_name") == "RECOVERY_FAILED":
-                    recovery_failures.append({
-                        "name": r["function_name"],
-                        "recovery_r": r.get("recovery_r", 0.0),
-                        "params": r.get("param_names", []),
-                        "iter": entry["iteration"],
-                    })
+                    recovery_failures.append(
+                        {
+                            "name": r["function_name"],
+                            "recovery_r": r.get("recovery_r", 0.0),
+                            "params": r.get("param_names", []),
+                            "iter": entry["iteration"],
+                        }
+                    )
                     continue
-                all_models.append({
-                    "name": r["function_name"],
-                    "bic": r["metric_value"],
-                    "params": r["param_names"],
-                    "iter": entry["iteration"],
-                    "client_id": entry.get("client_id"),
-                })
+                all_models.append(
+                    {
+                        "name": r["function_name"],
+                        "bic": r["metric_value"],
+                        "params": r["param_names"],
+                        "iter": entry["iteration"],
+                        "client_id": entry.get("client_id"),
+                    }
+                )
 
         if not all_models:
             return ""
@@ -137,10 +146,16 @@ class FeedbackGenerator:
 
         # --- Ranked table (top 10) ---
         n_clients = self._count_clients()
-        client_note = f" from {n_clients} parallel search clients" if n_clients > 1 else ""
-        lines = [f"Model landscape ({len(all_models)} models across all iterations{client_note}, ranked by BIC):"]
+        client_note = (
+            f" from {n_clients} parallel search clients" if n_clients > 1 else ""
+        )
+        lines = [
+            f"Model landscape ({len(all_models)} models across all iterations{client_note}, ranked by BIC):"
+        ]
         if len(all_models) < 10:
-            lines.append("(Few models evaluated so far — rankings may shift substantially.)")
+            lines.append(
+                "(Few models evaluated so far — rankings may shift substantially.)"
+            )
         lines.append(f"{'Model':<22} {'BIC':>8}  {'Params':<45}  Iter")
         lines.append("-" * 82)
         for m in all_models[:10]:
@@ -228,13 +243,13 @@ class FeedbackGenerator:
                 for p, g, po, direction in signals[:5]:
                     if direction == "good":
                         lines.append(
-                            f"  • '{p}' appears in {g*100:.0f}% of top models vs "
-                            f"{po*100:.0f}% of weaker models — likely a critical mechanism."
+                            f"  • '{p}' appears in {g * 100:.0f}% of top models vs "
+                            f"{po * 100:.0f}% of weaker models — likely a critical mechanism."
                         )
                     else:
                         lines.append(
-                            f"  • '{p}' appears in {po*100:.0f}% of weaker models vs "
-                            f"{g*100:.0f}% of top models — may not be capturing meaningful variance."
+                            f"  • '{p}' appears in {po * 100:.0f}% of weaker models vs "
+                            f"{g * 100:.0f}% of top models — may not be capturing meaningful variance."
                         )
 
         return "\n".join(lines)
@@ -255,7 +270,11 @@ class FeedbackGenerator:
         recent = self.history[-window:]
         best_bics = []
         for entry in recent:
-            valid = [r for r in entry["results"] if r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR")]
+            valid = [
+                r
+                for r in entry["results"]
+                if r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR")
+            ]
             if valid:
                 best_bics.append(min(r["metric_value"] for r in valid))
 
@@ -301,12 +320,14 @@ class FeedbackGenerator:
                     continue
                 code = r.get("code", "")
                 if code:
-                    all_models.append({
-                        "name": r["function_name"],
-                        "bic": r["metric_value"],
-                        "code": code,
-                        "iter": entry["iteration"],
-                    })
+                    all_models.append(
+                        {
+                            "name": r["function_name"],
+                            "bic": r["metric_value"],
+                            "code": code,
+                            "iter": entry["iteration"],
+                        }
+                    )
 
         if not all_models:
             return []
@@ -339,20 +360,25 @@ class FeedbackGenerator:
                 bic = r.get("metric_value", float("inf"))
                 for pname, r2 in per_param_r2.items():
                     coeffs = per_param_detail.get(pname, {}).get("coefficients", {})
-                    param_r2_records.append({
-                        "param": pname,
-                        "r2": r2,
-                        "model": model_name,
-                        "bic": bic,
-                        "coefficients": coeffs,
-                    })
+                    param_r2_records.append(
+                        {
+                            "param": pname,
+                            "r2": r2,
+                            "model": model_name,
+                            "bic": bic,
+                            "coefficients": coeffs,
+                        }
+                    )
 
         if len(param_r2_records) < 3:
             return ""
 
         # Group by parameter name: average R² and best R²
         from collections import defaultdict
-        param_stats = defaultdict(lambda: {"r2_values": [], "best_coeffs": {}, "best_r2": 0.0})
+
+        param_stats = defaultdict(
+            lambda: {"r2_values": [], "best_coeffs": {}, "best_r2": 0.0}
+        )
         for rec in param_r2_records:
             ps = param_stats[rec["param"]]
             ps["r2_values"].append(rec["r2"])
@@ -367,7 +393,9 @@ class FeedbackGenerator:
             reverse=True,
         )
 
-        lines = ["Cross-model parameter-symptom links (which parameter types predict symptoms):"]
+        lines = [
+            "Cross-model parameter-symptom links (which parameter types predict symptoms):"
+        ]
 
         for pname, stats in ranked[:8]:  # Top 8 parameter types
             avg_r2 = sum(stats["r2_values"]) / len(stats["r2_values"])
@@ -382,7 +410,11 @@ class FeedbackGenerator:
                     best_beta = coef
                     best_pred = pred
 
-            pred_note = f", strongest predictor: {best_pred} (β={best_beta:.3f})" if best_pred else ""
+            pred_note = (
+                f", strongest predictor: {best_pred} (β={best_beta:.3f})"
+                if best_pred
+                else ""
+            )
             lines.append(
                 f"  - '{pname}': best R² = {best_r2:.3f}, avg R² = {avg_r2:.3f} "
                 f"(across {n_models} model(s){pred_note})"
@@ -419,12 +451,14 @@ class FeedbackGenerator:
                 if code:
                     factors = self._extract_factor_usage(code)
                     if factors:
-                        all_factor_usage.append({
-                            "name": r["function_name"],
-                            "bic": r["metric_value"],
-                            "factors": factors,
-                            "iter": entry["iteration"],
-                        })
+                        all_factor_usage.append(
+                            {
+                                "name": r["function_name"],
+                                "bic": r["metric_value"],
+                                "factors": factors,
+                                "iter": entry["iteration"],
+                            }
+                        )
 
         if not all_factor_usage:
             return ""
@@ -469,8 +503,7 @@ class FeedbackGenerator:
         choice_keywords = ["choice", "action", "decision"]
         input_cols = getattr(self.cfg.data, "input_columns", [])
         n = sum(
-            1 for col in input_cols
-            if any(kw in col.lower() for kw in choice_keywords)
+            1 for col in input_cols if any(kw in col.lower() for kw in choice_keywords)
         )
         return max(n, 1)
 
@@ -513,7 +546,9 @@ class FeedbackGenerator:
         # Fit tiers
         outlier_threshold = mean_val + 2 * std_val
         n_well_fit = int(np.sum(metrics <= median_val))
-        n_moderate = int(np.sum((metrics > median_val) & (metrics <= outlier_threshold)))
+        n_moderate = int(
+            np.sum((metrics > median_val) & (metrics <= outlier_threshold))
+        )
         n_poor = int(np.sum(metrics > outlier_threshold))
 
         lines = [
@@ -521,18 +556,17 @@ class FeedbackGenerator:
             f"  Mean BIC: {mean_val:.1f} (std: {std_val:.1f}, range: [{min_val:.1f}, {max_val:.1f}])",
             f"  Median BIC: {median_val:.1f}",
             f"  Fit tiers:",
-            f"    Well-fit (≤ median):       {n_well_fit}/{n_total} ({100*n_well_fit/n_total:.0f}%)",
-            f"    Moderate (median to +2σ):  {n_moderate}/{n_total} ({100*n_moderate/n_total:.0f}%)",
-            f"    Poor (> mean + 2σ):        {n_poor}/{n_total} ({100*n_poor/n_total:.0f}%)",
+            f"    Well-fit (≤ median):       {n_well_fit}/{n_total} ({100 * n_well_fit / n_total:.0f}%)",
+            f"    Moderate (median to +2σ):  {n_moderate}/{n_total} ({100 * n_moderate / n_total:.0f}%)",
+            f"    Poor (> mean + 2σ):        {n_poor}/{n_total} ({100 * n_poor / n_total:.0f}%)",
         ]
 
         # Chance-level detection
         if best_n_trials and len(best_n_trials) == n_total:
             n_choice_cols = self._count_choice_columns()
-            chance_bics = np.array([
-                2 * n_choice_cols * nt * math.log(2)
-                for nt in best_n_trials
-            ])
+            chance_bics = np.array(
+                [2 * n_choice_cols * nt * math.log(2) for nt in best_n_trials]
+            )
             n_at_chance = int(np.sum(metrics >= chance_bics))
             pct_at_chance = 100 * n_at_chance / n_total
             lines.append(
@@ -572,12 +606,14 @@ class FeedbackGenerator:
             for r in entry["results"]:
                 em = r.get("eval_metrics", [])
                 if em:
-                    all_models.append({
-                        "name": r["function_name"],
-                        "bic": r["metric_value"],
-                        "eval_metrics": em,
-                        "iter": entry["iteration"],
-                    })
+                    all_models.append(
+                        {
+                            "name": r["function_name"],
+                            "bic": r["metric_value"],
+                            "eval_metrics": em,
+                            "iter": entry["iteration"],
+                        }
+                    )
 
         if len(all_models) < 2:
             return ""
@@ -650,7 +686,9 @@ class FeedbackGenerator:
 
         n_clients = self._count_clients()
         client_note = f" across {n_clients} clients" if n_clients > 1 else ""
-        lines = [f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}{client_note})."]
+        lines = [
+            f"Best BIC: {best_bic:.1f} ({best_name}, iter {best_iter}{client_note})."
+        ]
         momentum = self._build_search_momentum()
         if momentum:
             lines.append(momentum)
@@ -665,7 +703,9 @@ class FeedbackGenerator:
             best_pred = ""
             best_beta = 0.0
             if best_param_name and best_param_name in detail:
-                for pred, coef in detail[best_param_name].get("coefficients", {}).items():
+                for pred, coef in (
+                    detail[best_param_name].get("coefficients", {}).items()
+                ):
                     if abs(coef) > abs(best_beta):
                         best_beta = coef
                         best_pred = pred
@@ -691,6 +731,73 @@ class FeedbackGenerator:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Validation feedback
+    # ------------------------------------------------------------------
+
+    def _build_validation_feedback(self) -> str:
+        """
+        Generate actionable feedback from validation errors recorded in history.
+        """
+        validation_errors = []
+        for entry in self.history:
+            for r in entry.get("results", []):
+                if r.get("metric_name") == "VALIDATION_ERROR":
+                    validation_errors.append(
+                        {
+                            "name": r.get("function_name"),
+                            "error_type": r.get("error_type"),
+                            "message": r.get("error_message"),
+                            "details": r.get("error_details", {}),
+                            "iter": entry.get("iteration"),
+                        }
+                    )
+
+        if not validation_errors:
+            return ""
+
+        lines = [
+            f"\nValidation errors ({len(validation_errors)} model(s) rejected):",
+            "These issues must be fixed in your next iteration:\n",
+        ]
+
+        for err in validation_errors[:5]:
+            lines.append(f"  • {err['name']}: {err['message']}")
+
+            if err["error_type"] == "CodeSafetyError":
+                lines.append(
+                    "    Forbidden code patterns detected. "
+                    "Packages are already injected - do NOT write import statements."
+                )
+                lines.append(
+                    "    Allowed: @njit, np, json, math, scipy, itertools, numba (use directly, no import)."
+                )
+                for detail in err["details"].get("pydantic_errors", []):
+                    lines.append(f"    - {detail}")
+
+            elif err["error_type"] == "ParameterMismatchError":
+                lines.append(
+                    "    Parameters in code don't match JSON declaration. "
+                    "Ensure model_parameters unpacking matches declared parameters."
+                )
+
+            elif err["error_type"] == "PydanticSchemaError":
+                for val_err in err["details"].get("validation_errors", []):
+                    lines.append(f"    - {val_err}")
+
+        lines.append(
+            "\n  All models MUST satisfy ALL of the following:\n"
+            "    1. Use @njit decorator directly above function definition (e.g., @njit\\ndef cognitive_model(...))\n"
+            "    2. Do NOT write import statements - packages are already injected and available\n"
+            "    3. Define a function named 'cognitive_model' (or cognitive_model1, etc.)\n"
+            "    4. Unpack parameters from model_parameters tuple\n"
+            "    5. Match declared parameter names to model_parameters unpacking\n"
+            "    6. Provide valid numeric bounds for each parameter\n"
+            "    7. Use snake_case for all parameter and function names\n"
+        )
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -700,12 +807,16 @@ class FeedbackGenerator:
         Includes high-level summary, BIC trajectory, landscape, fit quality,
         individual differences detail, and stagnation signal.
         """
-        previous_parameters = "\n".join(
-            [", ".join(s) for s in tried_param_sets]
-        )
+        previous_parameters = "\n".join([", ".join(s) for s in tried_param_sets])
 
         # --- High-level summary ---
         parts = []
+
+        # Validation feedback first — most actionable
+        validation_feedback = self._build_validation_feedback()
+        if validation_feedback:
+            parts.append(validation_feedback)
+
         summary = self._build_high_level_summary(id_results=id_results)
         if summary:
             parts.append(f"## Summary\n{summary}")
@@ -867,17 +978,25 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # --- Cross-model parameter-symptom links ---
         r2_landscape = self._build_r2_landscape()
         if r2_landscape:
-            context_parts.append(f"## Parameter-Symptom Links Across Models\n{r2_landscape}")
+            context_parts.append(
+                f"## Parameter-Symptom Links Across Models\n{r2_landscape}"
+            )
 
         # --- Multi-client context ---
         n_clients = self._count_clients()
         if n_clients > 1:
-            context_parts.insert(0,
+            context_parts.insert(
+                0,
                 f"## Distributed Search\n"
                 f"This search is running across {n_clients} parallel clients, "
                 f"each exploring different model architectures. The data below "
-                f"aggregates results from all clients."
+                f"aggregates results from all clients.",
             )
+
+        # --- Validation feedback (most actionable - insert first) ---
+        validation_feedback = self._build_validation_feedback()
+        if validation_feedback:
+            context_parts.insert(0, f"## Validation Errors\n{validation_feedback}")
 
         search_context = "\n\n".join(context_parts)
 
@@ -957,6 +1076,7 @@ class LLMFeedbackGenerator(FeedbackGenerator):
 
         elif "gemini" in provider:
             from google.genai import types
+
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", None)
 
             print(
@@ -975,7 +1095,12 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                         thinking_level=reasoning_effort
                     )
                 elif self.cfg.llm.base_model.lower().startswith("gemini-2"):
-                    budget_map = {"minimal": 0, "low": 4096, "medium": 12288, "high": 24576}
+                    budget_map = {
+                        "minimal": 0,
+                        "low": 4096,
+                        "medium": 12288,
+                        "high": 24576,
+                    }
                     config_args["thinking_config"] = types.ThinkingConfig(
                         thinking_budget=budget_map.get(reasoning_effort, 4096)
                     )
@@ -992,8 +1117,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
         elif "vllm" in provider or "kcl" in provider:
-            max_out = getattr(self.cfg.llm, "max_output_tokens",
-                              getattr(self.cfg.llm, "max_tokens", 4096))
+            max_out = getattr(
+                self.cfg.llm,
+                "max_output_tokens",
+                getattr(self.cfg.llm, "max_tokens", 4096),
+            )
 
             _log(
                 f"[GeCCo] Using vLLM model '{self.cfg.llm.base_model}' "
@@ -1014,7 +1142,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # Hugging Face-style generation
         # -----------------------------
         else:
-            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 4096))
+            max_new = getattr(
+                self.cfg.llm,
+                "max_output_tokens",
+                getattr(self.cfg.llm, "max_tokens", 4096),
+            )
 
             _log(
                 f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "

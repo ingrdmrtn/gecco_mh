@@ -7,10 +7,19 @@ import numpy as np
 import pandas as pd
 
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn,
+)
 from rich.table import Table
 
-from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
+from gecco.offline_evaluation.fit_generated_models import (
+    run_fit_hierarchical as run_fit,
+)
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 
@@ -18,8 +27,16 @@ console = Console()
 
 
 class GeCCoModelSearch:
-    def __init__(self, model, tokenizer, cfg, df, prompt_builder,
-                 client_id=None, shared_registry=None):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        cfg,
+        df,
+        prompt_builder,
+        client_id=None,
+        shared_registry=None,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.cfg = cfg
@@ -29,7 +46,10 @@ class GeCCoModelSearch:
         self.shared_registry = shared_registry
 
         # --- Choose feedback generator based on config ---
-        if hasattr(cfg, "feedback") and getattr(cfg.feedback, "type", "manual") == "llm":
+        if (
+            hasattr(cfg, "feedback")
+            and getattr(cfg.feedback, "type", "manual") == "llm"
+        ):
             self.feedback = LLMFeedbackGenerator(cfg, model, tokenizer)
         else:
             self.feedback = FeedbackGenerator(cfg)
@@ -51,8 +71,9 @@ class GeCCoModelSearch:
 
         # --- Individual differences evaluation (optional) ---
         self.id_eval_data = None
-        if hasattr(cfg, 'individual_differences_eval'):
+        if hasattr(cfg, "individual_differences_eval"):
             from gecco.offline_evaluation.individual_differences import load_id_data
+
             self.id_eval_data = load_id_data(cfg)
 
         # --- Tracking ---
@@ -70,16 +91,19 @@ class GeCCoModelSearch:
 
         # --- Parameter recovery checker (optional) ---
         self.recovery_checker = None
-        if hasattr(cfg, 'parameter_recovery') and getattr(cfg.parameter_recovery, 'enabled', False):
+        if hasattr(cfg, "parameter_recovery") and getattr(
+            cfg.parameter_recovery, "enabled", False
+        ):
             from gecco.parameter_recovery import ParameterRecoveryChecker, get_simulator
+
             simulator = get_simulator(cfg.parameter_recovery)
             self.recovery_checker = ParameterRecoveryChecker(
                 simulator=simulator,
-                n_subjects=getattr(cfg.parameter_recovery, 'n_subjects', 50),
-                n_trials=getattr(cfg.parameter_recovery, 'n_trials', 100),
-                threshold=getattr(cfg.parameter_recovery, 'threshold', 0.5),
-                n_fitting_starts=getattr(cfg.parameter_recovery, 'n_fitting_starts', 3),
-                n_jobs=getattr(cfg.parameter_recovery, 'n_jobs', -1),
+                n_subjects=getattr(cfg.parameter_recovery, "n_subjects", 50),
+                n_trials=getattr(cfg.parameter_recovery, "n_trials", 100),
+                threshold=getattr(cfg.parameter_recovery, "threshold", 0.5),
+                n_fitting_starts=getattr(cfg.parameter_recovery, "n_fitting_starts", 3),
+                n_jobs=getattr(cfg.parameter_recovery, "n_jobs", -1),
             )
 
     def generate(self, model, tokenizer=None, prompt=None):
@@ -117,7 +141,11 @@ class GeCCoModelSearch:
 
             # Structured output via JSON schema
             if getattr(self.cfg.llm, "structured_output", True):
-                from gecco.structured_output import get_model_schema, get_openai_response_format
+                from gecco.structured_output import (
+                    get_model_schema,
+                    get_openai_response_format,
+                )
+
                 include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
                 schema = get_model_schema(
                     self.cfg.llm.models_per_iteration,
@@ -132,6 +160,7 @@ class GeCCoModelSearch:
 
         elif "gemini" in provider:
             from google.genai import types
+
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
 
             console.print(
@@ -147,15 +176,21 @@ class GeCCoModelSearch:
             use_thinking = False
             if reasoning_effort:
                 valid_levels = ["minimal", "low", "medium", "high"]
-                assert reasoning_effort in valid_levels, \
+                assert reasoning_effort in valid_levels, (
                     f"Invalid reasoning_effort: {reasoning_effort}. Choose from {valid_levels}."
+                )
                 if self.cfg.llm.base_model.lower().startswith("gemini-3"):
                     config_args["thinking_config"] = types.ThinkingConfig(
                         thinking_level=reasoning_effort
                     )
                     use_thinking = True
                 elif self.cfg.llm.base_model.lower().startswith("gemini-2"):
-                    budget_map = {"minimal": 0, "low": 4096, "medium": 12288, "high": 24576}
+                    budget_map = {
+                        "minimal": 0,
+                        "low": 4096,
+                        "medium": 12288,
+                        "high": 24576,
+                    }
                     config_args["thinking_config"] = types.ThinkingConfig(
                         thinking_budget=budget_map[reasoning_effort]
                     )
@@ -167,6 +202,7 @@ class GeCCoModelSearch:
             # instructions instead.
             if getattr(self.cfg.llm, "structured_output", True) and not use_thinking:
                 from gecco.structured_output import get_model_schema, get_gemini_schema
+
                 include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
                 schema = get_model_schema(
                     self.cfg.llm.models_per_iteration,
@@ -178,9 +214,7 @@ class GeCCoModelSearch:
             resp = model.models.generate_content(
                 model=self.cfg.llm.base_model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    **config_args
-                )
+                config=types.GenerateContentConfig(**config_args),
             )
             decoded = resp.text.strip()
 
@@ -190,8 +224,11 @@ class GeCCoModelSearch:
         # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
         elif "vllm" in provider or "kcl" in provider:
-            max_out = getattr(self.cfg.llm, "max_output_tokens",
-                              getattr(self.cfg.llm, "max_tokens", 4096))
+            max_out = getattr(
+                self.cfg.llm,
+                "max_output_tokens",
+                getattr(self.cfg.llm, "max_tokens", 4096),
+            )
 
             provider_label = "KCL" if "kcl" in provider else "vLLM"
             console.print(
@@ -213,13 +250,16 @@ class GeCCoModelSearch:
             # OpenAI-compatible API and support response_format)
             if getattr(self.cfg.llm, "structured_output", True):
                 from gecco.structured_output import get_vllm_response_format
+
                 create_kwargs["response_format"] = get_vllm_response_format()
 
             resp = model.chat.completions.create(**create_kwargs)
             content = resp.choices[0].message.content
             if content is None:
                 finish = getattr(resp.choices[0], "finish_reason", "unknown")
-                console.print(f"[yellow]API returned empty response (finish_reason={finish})[/]")
+                console.print(
+                    f"[yellow]API returned empty response (finish_reason={finish})[/]"
+                )
                 return ""
             return content.strip()
 
@@ -229,7 +269,11 @@ class GeCCoModelSearch:
         else:
             from transformers import TextStreamer
 
-            max_new = getattr(self.cfg.llm, "max_output_tokens", getattr(self.cfg.llm, "max_tokens", 4096))
+            max_new = getattr(
+                self.cfg.llm,
+                "max_output_tokens",
+                getattr(self.cfg.llm, "max_tokens", 4096),
+            )
             n_input = len(tokenizer(prompt, return_tensors="pt")["input_ids"][0])
 
             console.print(
@@ -251,7 +295,9 @@ class GeCCoModelSearch:
 
             class _ProgressStreamer(TextStreamer):
                 def __init__(self, tokenizer, progress, task_id):
-                    super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    super().__init__(
+                        tokenizer, skip_prompt=True, skip_special_tokens=True
+                    )
                     self.token_count = 0
                     self._progress = progress
                     self._task_id = task_id
@@ -277,14 +323,14 @@ class GeCCoModelSearch:
             n_tokens = output.shape[1] - inputs["input_ids"].shape[1]
             console.print(
                 f"[dim]Generated [cyan]{n_tokens}[/] tokens in {elapsed:.1f}s "
-                f"({n_tokens/elapsed:.1f} tok/s)[/]"
+                f"({n_tokens / elapsed:.1f} tok/s)[/]"
             )
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
     def generate_models(self, prompt):
         """
         Generate cognitive models with structured output, parsing, and
-        optional self-critique reflection.
+        optional review-and-fix cycle.
 
         Returns
         -------
@@ -293,15 +339,24 @@ class GeCCoModelSearch:
         """
         from gecco.structured_output import (
             parse_model_response,
-            build_reflection_prompt,
+            build_review_prompt,
+            build_fix_prompt,
+            parse_review_response,
+            validate_single_model,
+            build_correction_prompt,
+            get_schema_instructions,
         )
 
         structured = getattr(self.cfg.llm, "structured_output", True)
         n_models = self.cfg.llm.models_per_iteration
+        validation_cfg = getattr(self.cfg, "validation", None)
+        max_retries = getattr(validation_cfg, "retry_limit", 3) if validation_cfg is not None else 3
 
         # --- Initial generation ---
         raw_text = self.generate(self.model, self.tokenizer, prompt)
-        models, json_ok = parse_model_response(raw_text, n_models, structured_output=structured)
+        models, json_ok = parse_model_response(
+            raw_text, n_models, structured_output=structured
+        )
 
         if not models:
             console.print("[yellow]No models extracted from LLM response[/]")
@@ -315,47 +370,155 @@ class GeCCoModelSearch:
                     f"{m['analysis'][:200]}{'...' if len(m['analysis']) > 200 else ''}"
                 )
 
-        # --- Reflection step (optional) ---
-        # When JSON parsing succeeded, use JSON-format reflection.
-        # When it fell back to regex, use plain-text reflection (code blocks only)
-        # to avoid re-embedding Python code into JSON strings.
-        if getattr(self.cfg.llm, "reflection", True) and models:
-            guardrails = getattr(self.cfg.llm, "guardrails", [])
-            if json_ok:
-                console.print("[dim]Running self-critique reflection (JSON)...[/]")
-                reflection_prompt = build_reflection_prompt(
-                    models, guardrails=guardrails, use_json=True
+        # --- Validation correction loop ---
+        # Validate each model with Pydantic and retry on failures,
+        # BEFORE the review-and-fix cycle to avoid wasting compute on invalid models.
+        validated_models = []
+        for i, model in enumerate(models):
+            validated_model = model
+            model_name = model.get("name", f"cognitive_model{i + 1}")
+            validation_result = None
+
+            for retry_attempt in range(max_retries):
+                validation_result = validate_single_model(validated_model)
+
+                if validation_result.is_valid:
+                    console.print(f"  [dim]Model {i + 1} ({model_name}) passed validation[/]")
+                    break
+
+                error_trace = "\n".join(f"  {err}" for err in validation_result.errors)
+                console.print(
+                    f"  [yellow]Model {i + 1} ({model_name}) failed validation "
+                    f"(attempt {retry_attempt + 1}/{max_retries}):[/]\n{error_trace}"
                 )
-                reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
-                revised, _ = parse_model_response(
-                    reflection_text, n_models, structured_output=structured
+
+                schema_instructions = get_schema_instructions(1, include_analysis=False)
+                correction_prompt = build_correction_prompt(
+                    model=validated_model,
+                    model_index=i + 1,
+                    validation_errors=validation_result.errors,
+                    schema_instructions=schema_instructions,
                 )
-                if revised and len(revised) == len(models):
-                    for orig, rev in zip(models, revised):
-                        orig["code"] = rev["code"]
-                        if rev.get("rationale"):
-                            orig["rationale"] = rev["rationale"]
-                    console.print("[dim]Reflection complete — using revised models[/]")
+
+                correction_text = self.generate(self.model, self.tokenizer, correction_prompt)
+                corrected, _ = parse_model_response(correction_text, 1, structured_output=structured)
+
+                if corrected:
+                    validated_model = corrected[0]
                 else:
-                    console.print("[dim]Reflection parsing failed — keeping original models[/]")
+                    console.print("  [yellow]Failed to parse correction attempt[/]")
+                    break
+
+            if validation_result is not None and validation_result.is_valid:
+                validated_models.append(validated_model)
             else:
-                console.print("[dim]Running self-critique reflection (plain text)...[/]")
-                reflection_prompt = build_reflection_prompt(
-                    models, guardrails=guardrails, use_json=False
+                console.print(
+                    f"  [bold red]Model {i + 1} ({model_name}) failed validation "
+                    f"after {max_retries} retries — skipping[/]"
                 )
-                reflection_text = self.generate(self.model, self.tokenizer, reflection_prompt)
-                # Extract revised code via regex; preserve names/analysis from originals
-                revised, _ = parse_model_response(
-                    reflection_text, n_models, structured_output=False
+                validated_models.append({
+                    "name": model_name,
+                    "rationale": model.get("rationale", ""),
+                    "code": model.get("code", ""),
+                    "analysis": model.get("analysis", ""),
+                    "validation_failed": True,
+                    "validation_errors": validation_result.errors if validation_result else [],
+                })
+
+        models = validated_models
+        if not models:
+            console.print("[yellow]All models failed validation — no models to process[/]")
+            return raw_text, []
+
+        # --- Review-and-Fix cycle (optional) ---
+        reviewer_config = getattr(self.cfg.llm, "reviewer", None)
+        if reviewer_config and getattr(reviewer_config, "enabled", False) and models:
+            guardrails = getattr(self.cfg.llm, "guardrails", [])
+            persona = getattr(reviewer_config, "persona", None)
+            focus_areas = getattr(reviewer_config, "focus_areas", None)
+
+            # --- Review phase ---
+            console.print("[dim]Running code review...[/]")
+            review_prompt = build_review_prompt(
+                models,
+                guardrails=guardrails,
+                persona=persona,
+                focus_areas=focus_areas,
+            )
+            review_text = self.generate(self.model, self.tokenizer, review_prompt)
+            review = parse_review_response(review_text)
+
+            # --- Save review to disk ---
+            self._save_review(review)
+
+            # --- Check if any issues found ---
+            total_issues = sum(
+                len(r.get("issues", [])) for r in review.get("reviews", [])
+            )
+
+            if total_issues > 0:
+                console.print(
+                    f"[dim]Review found {total_issues} issue(s) across "
+                    f"{sum(1 for r in review.get('reviews', []) if r.get('issues'))} model(s)[/]"
                 )
-                if revised and len(revised) == len(models):
-                    for orig, rev in zip(models, revised):
-                        orig["code"] = rev["code"]
-                    console.print("[dim]Reflection complete (plain text) — using revised code[/]")
+
+                # --- Fix phase ---
+                fix_prompt = build_fix_prompt(models, review, guardrails=guardrails)
+                if fix_prompt:
+                    console.print("[dim]Requesting fixes...[/]")
+                    fix_text = self.generate(self.model, self.tokenizer, fix_prompt)
+                    fixed_models, fixed_json_ok = parse_model_response(
+                        fix_text, n_models, structured_output=structured
+                    )
+
+                    if fixed_models and len(fixed_models) == len(models):
+                        # Preserve names/analysis from originals, use fixed code
+                        for orig, fixed in zip(models, fixed_models):
+                            orig["code"] = fixed["code"]
+                            if fixed.get("rationale"):
+                                orig["rationale"] = fixed["rationale"]
+                        console.print(
+                            f"[dim]Applied fixes to {len(models)} model(s)[/]"
+                        )
+                    else:
+                        console.print(
+                            "[yellow]Fix parsing failed — using original models[/]"
+                        )
+            else:
+                # Check if any models have non-passing assessments
+                non_passing = sum(
+                    1
+                    for r in review.get("reviews", [])
+                    if r.get("overall_assessment", "passes") != "passes"
+                )
+                if non_passing == 0:
+                    console.print("[dim]Review passed — no issues found[/]")
                 else:
-                    console.print("[dim]Reflection parsing failed — keeping original models[/]")
+                    console.print(
+                        f"[dim]Review found {non_passing} model(s) with issues (no fix attempted)[/]"
+                    )
 
         return raw_text, models
+
+    def _save_review(self, review: dict):
+        """
+        Save review comments to disk for debugging.
+
+        Parameters
+        ----------
+        review : dict
+            Structured review from parse_review_response().
+        """
+        review_dir = self.results_dir / "reviews"
+        review_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use iteration count for filename
+        existing = list(review_dir.glob("iter*.json"))
+        iteration = len(existing) + 1
+        review_file = review_dir / f"iter{iteration}{self._file_tag()}.json"
+
+        with open(review_file, "w") as f:
+            json.dump(review, f, indent=2)
 
     def _file_tag(self):
         """Return a client tag for filenames, or empty string if not distributed."""
@@ -396,18 +559,20 @@ class GeCCoModelSearch:
 
         # Merge cross-client iteration history into feedback.history
         all_history = data.get("iteration_history", [])
-        new_entries = all_history[self._merged_history_count:]
+        new_entries = all_history[self._merged_history_count :]
 
         for entry in new_entries:
             # Skip our own entries (already in feedback.history)
             if entry.get("client_id") == self.client_id:
                 continue
 
-            self.feedback.history.append({
-                "iteration": entry["iteration"],
-                "results": entry["results"],
-                "client_id": entry.get("client_id"),
-            })
+            self.feedback.history.append(
+                {
+                    "iteration": entry["iteration"],
+                    "results": entry["results"],
+                    "client_id": entry.get("client_id"),
+                }
+            )
 
         self._merged_history_count = len(all_history)
 
@@ -439,7 +604,9 @@ class GeCCoModelSearch:
             max_existing = self.shared_registry.get_max_iteration()
             if max_existing >= 0:
                 start_iter = max_existing + 1
-                console.print(f"[dim]Resuming from iteration {start_iter} (registry has up to {max_existing})[/]")
+                console.print(
+                    f"[dim]Resuming from iteration {start_iter} (registry has up to {max_existing})[/]"
+                )
 
         end_iter = start_iter + self.cfg.loop.max_iterations
         for it in range(start_iter, end_iter):
@@ -453,8 +620,9 @@ class GeCCoModelSearch:
             feedback = ""
             if self.best_model is not None:
                 feedback = self.feedback.get_feedback(
-                    self.best_model, self.tried_param_sets,
-                    id_results=self.best_id_results
+                    self.best_model,
+                    self.tried_param_sets,
+                    id_results=self.best_id_results,
                 )
 
                 # Save feedback for inspection
@@ -462,7 +630,9 @@ class GeCCoModelSearch:
                 feedback_file = (
                     self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}.txt"
                     if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                    else self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                    else self.results_dir
+                    / "feedback"
+                    / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
                 )
                 with open(feedback_file, "w") as f:
                     f.write(feedback)
@@ -475,7 +645,9 @@ class GeCCoModelSearch:
             model_file = (
                 self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                else self.results_dir
+                / "models"
+                / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
             )
 
             with open(model_file, "w") as f:
@@ -486,10 +658,17 @@ class GeCCoModelSearch:
                 structured_file = model_file.with_suffix(".json")
                 with open(structured_file, "w") as f:
                     json.dump(
-                        [{"name": m["name"], "rationale": m.get("rationale", ""),
-                          "analysis": m.get("analysis", ""),
-                          "parameters": m.get("parameters", [])} for m in parsed_models],
-                        f, indent=2,
+                        [
+                            {
+                                "name": m["name"],
+                                "rationale": m.get("rationale", ""),
+                                "analysis": m.get("analysis", ""),
+                                "parameters": m.get("parameters", []),
+                            }
+                            for m in parsed_models
+                        ],
+                        f,
+                        indent=2,
                     )
 
             iteration_results = []
@@ -505,13 +684,20 @@ class GeCCoModelSearch:
                     continue
 
                 try:
+                    from gecco.offline_evaluation.exceptions import ModelValidationError  # noqa: F811
                     # --- Parameter recovery check (optional) ---
                     if self.recovery_checker is not None:
-                        self._set_activity(f"parameter recovery {i+1}/{n_models}: {display_name} (iter {it})")
+                        self._set_activity(
+                            f"parameter recovery {i + 1}/{n_models}: {display_name} (iter {it})"
+                        )
                         from gecco.offline_evaluation.utils import build_model_spec
+                        from gecco.offline_evaluation.exceptions import ModelValidationError
+
                         try:
                             spec = build_model_spec(
-                                func_code, expected_func_name=func_name, cfg=self.cfg,
+                                func_code,
+                                expected_func_name=func_name,
+                                cfg=self.cfg,
                                 structured_params=structured_params,
                             )
                             console.print(
@@ -526,63 +712,102 @@ class GeCCoModelSearch:
                                     f"(mean r={recovery['mean_r']:.2f}, "
                                     f"threshold={self.recovery_checker.threshold})[/]"
                                 )
-                                iteration_results.append({
-                                    "function_name": display_name,
-                                    "metric_name": "RECOVERY_FAILED",
-                                    "metric_value": float("inf"),
-                                    "param_names": spec.param_names,
-                                    "code": func_code,
-                                    "recovery_r": recovery["mean_r"],
-                                    "recovery_per_param": recovery["per_param_r"],
-                                })
+                                iteration_results.append(
+                                    {
+                                        "function_name": display_name,
+                                        "metric_name": "RECOVERY_FAILED",
+                                        "metric_value": float("inf"),
+                                        "param_names": spec.param_names,
+                                        "code": func_code,
+                                        "recovery_r": recovery["mean_r"],
+                                        "recovery_per_param": recovery["per_param_r"],
+                                    }
+                                )
                                 continue
+                        except ModelValidationError as e:
+                            console.print(
+                                f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
+                            )
+                            iteration_results.append(
+                                {
+                                    "function_name": display_name,
+                                    "metric_name": "VALIDATION_ERROR",
+                                    "metric_value": float("inf"),
+                                    "param_names": [],
+                                    "code": func_code,
+                                    "error_type": e.error_type,
+                                    "error_message": e.message,
+                                    "error_details": e.details,
+                                }
+                            )
+                            continue
                         except Exception as e:
                             console.print(
                                 f"  [yellow]{display_name} recovery check error: {e}[/]"
                             )
-                            iteration_results.append({
-                                "function_name": display_name,
-                                "metric_name": "FIT_ERROR",
-                                "metric_value": float("inf"),
-                                "param_names": [],
-                                "code": func_code,
-                                "error": str(e),
-                            })
+                            iteration_results.append(
+                                {
+                                    "function_name": display_name,
+                                    "metric_name": "FIT_ERROR",
+                                    "metric_value": float("inf"),
+                                    "param_names": [],
+                                    "code": func_code,
+                                    "error": str(e),
+                                }
+                            )
                             continue
 
-                    self._set_activity(f"fitting model {i+1}/{n_models}: {display_name} (iter {it})")
-                    fit_res = run_fit(self.df, func_code, cfg=self.cfg, expected_func_name=func_name,
-                                      structured_params=structured_params)
+                    self._set_activity(
+                        f"fitting model {i + 1}/{n_models}: {display_name} (iter {it})"
+                    )
+                    fit_res = run_fit(
+                        self.df,
+                        func_code,
+                        cfg=self.cfg,
+                        expected_func_name=func_name,
+                        structured_params=structured_params,
+                    )
 
                     mean_metric = float(fit_res["metric_value"])
                     metric_name = fit_res["metric_name"]
                     params = fit_res["param_names"]
                     self.tried_param_sets.append(params)
 
-                    console.print(f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]")
+                    console.print(
+                        f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
+                    )
 
                     # --- Individual differences evaluation (optional) ---
                     id_results = None
                     if self.id_eval_data is not None:
                         try:
-                            from gecco.offline_evaluation.individual_differences import evaluate_individual_differences
+                            from gecco.offline_evaluation.individual_differences import (
+                                evaluate_individual_differences,
+                            )
+
                             id_results = evaluate_individual_differences(
                                 fit_res, self.df, self.cfg, id_data=self.id_eval_data
                             )
                         except Exception as e:
-                            console.print(f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}")
+                            console.print(
+                                f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
+                            )
 
-                    iteration_results.append({
-                        "function_name": display_name,
-                        "metric_name": metric_name,
-                        "metric_value": mean_metric,
-                        "param_names": params,
-                        "code_file": str(model_file),
-                        "individual_differences": id_results,
-                        "code": func_code,
-                        "eval_metrics": fit_res.get("eval_metrics", []),
-                        "participant_n_trials": fit_res.get("participant_n_trials", []),
-                    })
+                    iteration_results.append(
+                        {
+                            "function_name": display_name,
+                            "metric_name": metric_name,
+                            "metric_value": mean_metric,
+                            "param_names": params,
+                            "code_file": str(model_file),
+                            "individual_differences": id_results,
+                            "code": func_code,
+                            "eval_metrics": fit_res.get("eval_metrics", []),
+                            "participant_n_trials": fit_res.get(
+                                "participant_n_trials", []
+                            ),
+                        }
+                    )
 
                     if mean_metric < self.best_metric:
                         self.best_metric = mean_metric
@@ -592,21 +817,31 @@ class GeCCoModelSearch:
                         self.best_param_names = fit_res["param_names"]
                         self.best_param_values = fit_res["parameter_values"]
                         self.best_id_results = id_results
-                        console.print(f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})")
+                        console.print(
+                            f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})"
+                        )
 
                         best_model_file = (
-                            self.results_dir / "models" / f"best_model{tag}_{run_idx}.txt"
-                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                            else self.results_dir / "models" / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
+                            self.results_dir
+                            / "models"
+                            / f"best_model{tag}_{run_idx}.txt"
+                            if getattr(self.cfg.evaluation, "fit_type", "group")
+                            != "individual"
+                            else self.results_dir
+                            / "models"
+                            / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
                         )
                         with open(best_model_file, "w") as f:
                             f.write(func_code)
-                        
+
                         # save best model bic
                         best_bic_file = (
                             self.results_dir / "bics" / f"best_bic{tag}_{run_idx}.json"
-                            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                            else self.results_dir / "bics" / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
+                            if getattr(self.cfg.evaluation, "fit_type", "group")
+                            != "individual"
+                            else self.results_dir
+                            / "bics"
+                            / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                         )
                         with open(best_bic_file, "w") as f:
                             json.dump({"bic": mean_metric}, f)
@@ -617,16 +852,32 @@ class GeCCoModelSearch:
                         # optional: break here to save compute evaluating remaining models
                         break
 
+                except ModelValidationError as e:
+                    console.print(f"  [bold red]Validation error in {display_name}:[/] {e.message}")
+                    iteration_results.append(
+                        {
+                            "function_name": display_name,
+                            "metric_name": "VALIDATION_ERROR",
+                            "metric_value": float("inf"),
+                            "param_names": [],
+                            "code": func_code,
+                            "error_type": e.error_type,
+                            "error_message": e.message,
+                            "error_details": e.details,
+                        }
+                    )
                 except Exception as e:
                     console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
-                    iteration_results.append({
-                        "function_name": display_name,
-                        "metric_name": "FIT_ERROR",
-                        "metric_value": float("inf"),
-                        "param_names": [],
-                        "code": func_code,
-                        "error": str(e),
-                    })
+                    iteration_results.append(
+                        {
+                            "function_name": display_name,
+                            "metric_name": "FIT_ERROR",
+                            "metric_value": float("inf"),
+                            "param_names": [],
+                            "code": func_code,
+                            "error": str(e),
+                        }
+                    )
 
             self._set_activity(f"saving results (iter {it})")
 
@@ -634,7 +885,9 @@ class GeCCoModelSearch:
             bic_file = (
                 self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}.json"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
+                else self.results_dir
+                / "bics"
+                / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
             )
             with open(bic_file, "w") as f:
                 json.dump(iteration_results, f, indent=2)
@@ -651,10 +904,13 @@ class GeCCoModelSearch:
         )
 
         # --- save best parameters ---
-        if self.best_model is not None and self.best_params and self.best_param_values is not None:
+        if (
+            self.best_model is not None
+            and self.best_params
+            and self.best_param_values is not None
+        ):
             param_df = pd.DataFrame(
-                self.best_param_values,
-                columns=self.best_param_names
+                self.best_param_values, columns=self.best_param_names
             )
 
             param_dir = self.results_dir / "parameters"
@@ -664,7 +920,8 @@ class GeCCoModelSearch:
             param_file = (
                 param_dir / f"best_params{tag}_run{run_idx}.csv"
                 if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else param_dir / f"best_params{tag}_run{run_idx}_participant{self.df.participant[0]}.csv"
+                else param_dir
+                / f"best_params{tag}_run{run_idx}_participant{self.df.participant[0]}.csv"
             )
 
             param_df.to_csv(param_file, index=False)
@@ -674,4 +931,3 @@ class GeCCoModelSearch:
             self.shared_registry.mark_complete(self.client_id)
 
         return self.best_model, self.best_metric, self.best_params
-

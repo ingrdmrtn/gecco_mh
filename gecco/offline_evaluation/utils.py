@@ -1,20 +1,114 @@
+import ast
 import re
 import types
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
 import numpy as np
 import numba
 
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, ValidationError
+
 # ============================================================
-# Dataclass for unified representation of model specifications
+# Code validation schema
 # ============================================================
 
-@dataclass
-class ModelSpec:
-    name: str
-    func: Any
-    param_names: List[str]
-    bounds: Dict[str, List[float]]
+FORBIDDEN_PATTERNS = {
+    # Dangerous/System access
+    "import os", "import sys", "import subprocess",
+    "import eval", "import exec", "import compile",
+    "__import__", "open(", "file(", "input(", "raw_input(",
+    "__builtins__", "__class__", "__bases__",
+    "globals()", "locals()", "vars(", "dir(",
+    # Already-injected packages (LLMs should use these without importing)
+    "import numba", "from numba", "import njit",
+    "import numpy", "from numpy", "import np",
+    "import scipy", "from scipy",
+    "import json", "from json",
+    "import math", "from math",
+    "import itertools", "from itertools",
+}
+
+
+class CodeValidationSchema(BaseModel):
+    """Validates that model code is safe, well-formed, and uses @njit."""
+
+    code: str
+
+    @field_validator("code")
+    @classmethod
+    def validate_safety(cls, v):
+        for pattern in FORBIDDEN_PATTERNS:
+            if pattern in v:
+                raise ValueError(f"Forbidden pattern in code: {pattern}")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def validate_syntax(cls, v):
+        try:
+            ast.parse(v)
+        except SyntaxError as e:
+            raise ValueError(f"Invalid Python syntax: {e}")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def validate_njit_decorator(cls, v):
+        if "@njit" not in v and "@numba.njit" not in v:
+            raise ValueError(
+                "Model must use @njit decorator for performance. "
+                "Add @njit above the function definition. "
+                "Example: @njit\\ndef cognitive_model(...):"
+            )
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def validate_function_signature(cls, v):
+        if not re.search(r"def\s+cognitive_model\d*\s*\(", v):
+            raise ValueError(
+                "No cognitive_model function found. "
+                "Define a function named cognitive_model (or cognitive_model1, etc.)"
+            )
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def validate_parameter_unpacking(cls, v):
+        if "model_parameters" not in v:
+            raise ValueError(
+                "Code must unpack parameters from model_parameters. "
+                "Add parameter unpacking like: alpha, beta = model_parameters"
+            )
+        return v
+
+
+# ============================================================
+# Pydantic model for unified representation of model specifications
+# ============================================================
+
+
+class ModelSpec(BaseModel):
+    """Unified representation of a cognitive model specification."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    name: str = Field(..., min_length=1)
+    func: Any = Field(..., description="Compiled cognitive model function")
+    param_names: List[str] = Field(..., min_length=1)
+    bounds: Dict[str, List[float]] = Field(...)
+
+    @field_validator("bounds")
+    @classmethod
+    def bounds_match_params(cls, v, info):
+        param_names = info.data.get("param_names", [])
+        missing = set(param_names) - set(v.keys())
+        if missing:
+            raise ValueError(f"Missing bounds for parameters: {sorted(missing)}")
+        return v
+
+    def model_post_init(self, __context):
+        if not callable(self.func):
+            raise ValueError(f"func must be callable, got {type(self.func)}")
 
 
 # ============================================================
@@ -258,6 +352,16 @@ def build_model_spec(
     Returns:
         ModelSpec with compiled function, parameter names, and bounds
     """
+    # --- Stage 1: Code safety validation ---
+    try:
+        CodeValidationSchema(code=code)
+    except ValidationError as e:
+        from gecco.offline_evaluation.exceptions import CodeSafetyError
+        raise CodeSafetyError(
+            "Code validation failed",
+            details={"pydantic_errors": e.errors()},
+        )
+
     # Extract code block if wrapped in markdown
     code = _extract_code_block(code)
     is_class = is_class_based_code(code)
@@ -339,13 +443,17 @@ def build_model_spec(
         print(f"[⚠️ GeCCo] No parameters found in {expected_func_name}")
     if not structured_bounds and not docstring_bounds:
         print(f"[⚠️ GeCCo] No bounds found in {expected_func_name}; using defaults")
-    
-    return ModelSpec(
-        name=expected_func_name,
-        func=func,
-        param_names=param_names,
-        bounds=final_bounds
-    )
+
+    try:
+        return ModelSpec(
+            name=expected_func_name,
+            func=func,
+            param_names=param_names,
+            bounds=final_bounds,
+        )
+    except ValidationError as e:
+        from gecco.offline_evaluation.exceptions import PydanticSchemaError
+        raise PydanticSchemaError(e)
 
 
 # Aliases for backward compatibility

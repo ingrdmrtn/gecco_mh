@@ -406,6 +406,10 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
         # Fix @njit / @numba.njit placed on the same line as def (invalid Python syntax).
         # Some small models generate "@njit def func():" instead of "@njit\ndef func():".
         code = re.sub(r"@((?:numba\.)?njit)\s+def\s+", r"@\1\ndef ", code)
+        # Numba nopython mode doesn't support Python's built-in max()/min() with axis=
+        # keyword. Replace with np.max()/np.min() which Numba does support.
+        code = re.sub(r"\bmax\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
+        code = re.sub(r"\bmin\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
         # Infer minimal parameters from code when missing (common in fix responses).
         # The fix flow only uses `code` — original parameters are preserved upstream.
         if "parameters" not in m or not m["parameters"]:
@@ -745,6 +749,7 @@ def build_review_prompt(
             "parameter_bounds",
             "choice_indexing",
             "likelihood_correctness",
+            "numba_compatibility",
         ]
 
     focus_descriptions = {
@@ -775,6 +780,14 @@ def build_review_prompt(
 - Return NEGATIVE log-likelihood (for minimization).
 - Sum over ALL choice probabilities across both stages.
 - Use log(p_choice + eps) inside the sum, not outside.""",
+        "numba_compatibility": """
+- All code runs inside @njit (Numba nopython mode). Only NumPy functions and basic Python are supported.
+- Use np.max() / np.min() instead of Python built-in max() / min() for arrays — built-in max/min do NOT support axis= in Numba.
+- Use np.abs(), np.exp(), np.log(), np.sum() — NOT abs(), math.exp(), math.log(), sum() on arrays.
+- No Python lists, dicts, sets, or list comprehensions — use NumPy arrays only.
+- No string operations, f-strings, or print() calls.
+- No scipy, pandas, or other non-NumPy imports — only numpy is available inside @njit.
+- np.zeros() shape must be a tuple of constants or integer variables, not Python lists.""",
     }
 
     focus_text = ""

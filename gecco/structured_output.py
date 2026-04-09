@@ -745,7 +745,7 @@ def get_review_schema() -> dict:
                                         "description": "Optional suggestion for how to fix",
                                     },
                                 },
-                                "required": ["type", "severity", "description"],
+                                "required": ["type", "location", "severity", "description", "suggested_fix"],
                                 "additionalProperties": False,
                             },
                             "description": "List of issues found in the model",
@@ -1179,10 +1179,11 @@ def get_chat_json_schema_format(schema: dict) -> dict:
     """
     return {
         "type": "json_schema",
+        "strict": True,
         "json_schema": {
             "name": "cognitive_models",
             "schema": _strip_unsupported_strict_keywords(schema),
-            "strict": True,
+            # "strict": True,
         },
     }
 

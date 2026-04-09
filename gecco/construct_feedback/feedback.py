@@ -1137,6 +1137,11 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 temperature=self.cfg.llm.temperature,
                 max_tokens=max_out,
             )
+            if not resp.choices:
+                raise RuntimeError(
+                    f"LLM returned empty response (no choices). "
+                    f"Raw response: {resp!r}"
+                )
             message = resp.choices[0].message
             reasoning = getattr(message, "reasoning_content", None)
             if reasoning:

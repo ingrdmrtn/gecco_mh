@@ -136,6 +136,9 @@ class GeCCoModelSearch:
         # OpenAI / GPT-style generation
         # -----------------------------
         if "openai" in provider or "gpt" in provider:
+            console.print(
+                f"[yellow]Using OpenAI-compatible API provider: {self.cfg.llm.base_model}[/]"
+            )
             max_out = self.cfg.llm.max_output_tokens
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
             text_verbosity = getattr(self.cfg.llm, "text_verbosity", "low")
@@ -170,6 +173,9 @@ class GeCCoModelSearch:
             return decoded
 
         elif "gemini" in provider:
+            console.print(
+                f"[yellow]Using Gemini-compatible API provider: {self.cfg.llm.base_model}[/]"
+            )
             from google.genai import types
 
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "low")
@@ -238,6 +244,9 @@ class GeCCoModelSearch:
             or "opencode" in provider
             or "openrouter" in provider
         ):
+            console.print(
+                f"[yellow]Using vLLM-compatible API provider: {self.cfg.llm.base_model}[/]"
+            )
             max_out = getattr(
                 self.cfg.llm,
                 "max_output_tokens",
@@ -252,9 +261,10 @@ class GeCCoModelSearch:
                 provider_label = "OpenRouter"
             else:
                 provider_label = "vLLM"
+            temperature = getattr(self.cfg.llm, "temperature", None)
             console.print(
                 f"[dim]Generating with {provider_label} [cyan]{self.cfg.llm.base_model}[/] "
-                f"(max_tokens={max_out}, temp={self.cfg.llm.temperature})[/]"
+                f"(max_tokens={max_out}, temp={temperature})[/]"
             )
 
             create_kwargs = {
@@ -263,9 +273,10 @@ class GeCCoModelSearch:
                     {"role": "system", "content": self.cfg.llm.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": self.cfg.llm.temperature,
                 "max_tokens": max_out,
             }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
 
             # Structured output for OpenAI-compatible APIs.
             # OpenRouter supports full json_schema enforcement when the model supports it
@@ -296,14 +307,21 @@ class GeCCoModelSearch:
                         get_openai_compatible_response_format()
                     )
 
+            debug_kwargs = {k: v for k, v in create_kwargs.items() if k != "messages"}
+            console.print(f"[dim]Request kwargs (excl. messages): {debug_kwargs!r}[/]")
             try:
                 resp = model.chat.completions.create(**create_kwargs)
+                # Log the raw response for debugging, especially to inspect reasoning_details and any API error messages
+                console.print(f"RAW response object:")
+                console.print(f"[dim]Raw response: {resp!r}[/]")
             except Exception as api_exc:
                 # Catch 404 from OpenRouter when no endpoint supports the
                 # requested parameters (e.g. json_schema mode not available
                 # for this model).  Surface a clear actionable message rather
                 # than a raw stack trace.
                 exc_str = str(api_exc)
+                # Log the raw exception for debugging
+                console.print(f"[dim]API exception: {exc_str}[/]")
                 if "404" in exc_str and "No endpoints found" in exc_str:
                     hint = ""
                     if "extra_body" in create_kwargs and create_kwargs.get(

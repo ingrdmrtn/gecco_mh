@@ -4,6 +4,7 @@ import types
 from typing import Any, Dict, List, Optional
 import numpy as np
 import numba
+from numba import njit
 
 from pydantic import (
     BaseModel,
@@ -13,6 +14,88 @@ from pydantic import (
     ConfigDict,
     ValidationError,
 )
+
+# ============================================================
+# Numba-safe replacements for np.max/min/argmax/argmin(axis=)
+# Numba's nopython mode does not support the axis= keyword.
+# ============================================================
+
+
+@njit
+def _nb_max_ax0(arr):
+    """np.max(arr, axis=0) — Numba-safe."""
+    result = np.empty(arr.shape[1])
+    for j in range(arr.shape[1]):
+        result[j] = arr[0, j]
+        for i in range(1, arr.shape[0]):
+            if arr[i, j] > result[j]:
+                result[j] = arr[i, j]
+    return result
+
+
+@njit
+def _nb_max_ax1(arr):
+    """np.max(arr, axis=1) — Numba-safe."""
+    result = np.empty(arr.shape[0])
+    for i in range(arr.shape[0]):
+        result[i] = arr[i, 0]
+        for j in range(1, arr.shape[1]):
+            if arr[i, j] > result[i]:
+                result[i] = arr[i, j]
+    return result
+
+
+@njit
+def _nb_min_ax0(arr):
+    """np.min(arr, axis=0) — Numba-safe."""
+    result = np.empty(arr.shape[1])
+    for j in range(arr.shape[1]):
+        result[j] = arr[0, j]
+        for i in range(1, arr.shape[0]):
+            if arr[i, j] < result[j]:
+                result[j] = arr[i, j]
+    return result
+
+
+@njit
+def _nb_min_ax1(arr):
+    """np.min(arr, axis=1) — Numba-safe."""
+    result = np.empty(arr.shape[0])
+    for i in range(arr.shape[0]):
+        result[i] = arr[i, 0]
+        for j in range(1, arr.shape[1]):
+            if arr[i, j] < result[i]:
+                result[i] = arr[i, j]
+    return result
+
+
+@njit
+def _nb_argmax_ax0(arr):
+    """np.argmax(arr, axis=0) — Numba-safe."""
+    result = np.empty(arr.shape[1], dtype=np.int64)
+    for j in range(arr.shape[1]):
+        best = arr[0, j]
+        result[j] = 0
+        for i in range(1, arr.shape[0]):
+            if arr[i, j] > best:
+                best = arr[i, j]
+                result[j] = i
+    return result
+
+
+@njit
+def _nb_argmax_ax1(arr):
+    """np.argmax(arr, axis=1) — Numba-safe."""
+    result = np.empty(arr.shape[0], dtype=np.int64)
+    for i in range(arr.shape[0]):
+        best = arr[i, 0]
+        result[i] = 0
+        for j in range(1, arr.shape[1]):
+            if arr[i, j] > best:
+                best = arr[i, j]
+                result[i] = j
+    return result
+
 
 # ============================================================
 # Code validation schema
@@ -207,6 +290,13 @@ def _safe_exec_user_code(
         "itertools": _itertools,
         "numba": numba,
         "njit": numba.njit,
+        # Numba-safe axis-aware reductions (np.max/min axis= unsupported in njit)
+        "_nb_max_ax0": _nb_max_ax0,
+        "_nb_max_ax1": _nb_max_ax1,
+        "_nb_min_ax0": _nb_min_ax0,
+        "_nb_min_ax1": _nb_min_ax1,
+        "_nb_argmax_ax0": _nb_argmax_ax0,
+        "_nb_argmax_ax1": _nb_argmax_ax1,
         # JavaScript-style literals (common from non-Python-native LLMs)
         "true": True,
         "false": False,

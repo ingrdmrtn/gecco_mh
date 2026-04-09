@@ -425,10 +425,20 @@ def _normalise_code(code: str) -> str:
     # Add @njit if missing entirely (e.g. stripped during review/fix cycles).
     if "@njit" not in code and "@numba.njit" not in code:
         code = re.sub(r"(def\s+cognitive_model\w*\s*\()", r"@njit\n\1", code, count=1)
-    # LLMs sometimes write the Python builtin max(arr, axis=) instead of np.max(arr, axis=).
-    # np.max with axis= is fine in Numba 0.43+; the builtin never accepts axis=.
-    code = re.sub(r"\bmax\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
-    code = re.sub(r"\bmin\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
+    # Numba nopython mode does NOT support axis= on np.max/min/argmax.
+    # Replace with pre-compiled Numba-safe helpers (_nb_max_ax0, _nb_max_ax1, etc.)
+    # injected into the exec namespace by _exec_code_to_namespace.
+    # First normalise bare builtins to np. prefix so one set of patterns handles both.
+    code = re.sub(r"(?<!\w)(?<!np\.)max\s*\(([^)]*axis\s*=)", r"np.max(\1", code)
+    code = re.sub(r"(?<!\w)(?<!np\.)min\s*\(([^)]*axis\s*=)", r"np.min(\1", code)
+    # Now replace np.max/min/argmax(X, axis=N) → _nb_{func}_ax{N}(X)
+    for func in ("max", "min", "argmax"):
+        for axis in (0, 1):
+            code = re.sub(
+                rf"\bnp\.{func}\s*\((.+?),\s*axis\s*=\s*{axis}\s*\)",
+                rf"_nb_{func}_ax{axis}(\1)",
+                code,
+            )
     # Fix doubled np prefix: np.np.max → np.max
     code = re.sub(r"\bnp\.np\.", "np.", code)
     # Strip trailing lone `}` that leaks from malformed JSON code fields.
@@ -826,7 +836,8 @@ def build_review_prompt(
 - Use log(p_choice + eps) inside the sum, not outside.""",
         "numba_compatibility": """
 - All code runs inside @njit (Numba nopython mode). Only NumPy functions and basic Python are supported.
-- Use np.max() / np.min() instead of Python built-in max() / min() for arrays — built-in max/min do NOT support axis= in Numba.
+- CRITICAL: np.max(arr, axis=N), np.min(arr, axis=N), and np.argmax(arr, axis=N) do NOT work in Numba — the axis= keyword is unsupported. Use explicit loops instead (e.g. for i in range(arr.shape[0]): row_max = arr[i, 0]; for j in ...).
+- Use np.max() / np.min() WITHOUT axis= for global max/min of an array.
 - Use np.abs(), np.exp(), np.log(), np.sum() — NOT abs(), math.exp(), math.log(), sum() on arrays.
 - No Python lists, dicts, sets, or list comprehensions — use NumPy arrays only.
 - No string operations, f-strings, or print() calls.

@@ -31,10 +31,30 @@ Each record has keys:
 
 from __future__ import annotations
 
+import os
 import warnings
+from concurrent.futures import as_completed
 from typing import Any
 
 import numpy as np
+
+
+# ======================================================================
+# Utility functions
+# ======================================================================
+
+def _resolve_n_jobs(n_jobs):
+    """Resolve n_jobs respecting SLURM allocation."""
+    if n_jobs == -1:
+        slurm_cpus = (
+            os.environ.get("SLURM_CPUS_PER_TASK")
+            or os.environ.get("SLURM_CPUS_ON_NODE")
+        )
+        if slurm_cpus is not None:
+            n_jobs = int(slurm_cpus)
+        else:
+            n_jobs = os.cpu_count() or 1
+    return max(1, n_jobs)
 
 
 # ======================================================================
@@ -271,6 +291,105 @@ def _simulate_forward(
 
 
 # ======================================================================
+# Worker function for parallel PPC
+# ======================================================================
+
+def _compute_ppc_one_participant(
+    participant_info: tuple,
+    fitted_params: np.ndarray,
+    obs_data: dict[str, np.ndarray],
+    obs_arrays: list[np.ndarray],
+    n_trials: int,
+    input_columns: list[str],
+    simulator,
+    model_func,
+    n_sims: int,
+    participant_hash: int,
+    root_seed: int | None,
+) -> list[dict[str, Any]]:
+    """Compute PPC records for one participant.
+
+    Parameters
+    ----------
+    participant_info : tuple
+        (participant_id, participant_index)
+    fitted_params : np.ndarray
+        Fitted parameters for this participant.
+    obs_data : dict
+        Dictionary of observed data columns.
+    obs_arrays : list
+        List of observed data arrays.
+    n_trials : int
+        Number of trials for this participant.
+    input_columns : list
+        Ordered list of input column names.
+    simulator : TaskSimulator
+        Task simulator instance.
+    model_func : callable
+        Compiled model function.
+    n_sims : int
+        Number of forward simulations to run.
+    participant_hash : int
+        Hash of participant ID for seeding.
+    root_seed : int or None
+        Root seed for reproducibility.
+
+    Returns
+    -------
+    list of PPC record dicts
+    """
+    participant_id, _ = participant_info
+
+    # Compute observed statistics
+    obs_stats = _compute_statistics(obs_data, input_columns)
+
+    # Run n_sims forward simulations
+    sim_stats_list: list[dict[str, float]] = []
+    for sim_i in range(n_sims):
+        # Build reproducible seed per (participant, sim)
+        rng = np.random.default_rng([root_seed or 0, participant_hash, sim_i])
+        try:
+            sim_data = _simulate_forward(
+                simulator, model_func, fitted_params, n_trials, rng, input_columns
+            )
+            sim_stats = _compute_statistics(sim_data, input_columns)
+            sim_stats_list.append(sim_stats)
+        except Exception as e:
+            warnings.warn(f"PPC simulation failed for participant {participant_id}, sim {sim_i}: {e}")
+            continue
+
+    if not sim_stats_list:
+        return []
+
+    # Aggregate simulated statistics
+    all_stat_names = set(obs_stats.keys())
+    for s in sim_stats_list:
+        all_stat_names.update(s.keys())
+
+    records: list[dict[str, Any]] = []
+    for stat_name in all_stat_names:
+        obs_val = obs_stats.get(stat_name)
+        sim_vals = np.array([s.get(stat_name, np.nan) for s in sim_stats_list])
+        valid_sims = sim_vals[np.isfinite(sim_vals)]
+
+        if len(valid_sims) == 0:
+            continue
+
+        records.append({
+            "participant_id": participant_id,
+            "statistic_name": stat_name,
+            "condition": None,
+            "observed": float(obs_val) if obs_val is not None else None,
+            "simulated_mean": float(np.mean(valid_sims)),
+            "simulated_q025": float(np.quantile(valid_sims, 0.025)),
+            "simulated_q975": float(np.quantile(valid_sims, 0.975)),
+            "n_sims": len(valid_sims),
+        })
+
+    return records
+
+
+# ======================================================================
 # Main PPC entry point
 # ======================================================================
 
@@ -281,6 +400,9 @@ def compute_ppc(
     simulator,
     n_sims: int = 100,
     input_columns: list[str] | None = None,
+    n_jobs: int = 1,
+    progress_callback=None,
+    root_seed: int | None = None,
 ) -> dict:
     """Compute posterior predictive checks for one model.
 
@@ -302,6 +424,13 @@ def compute_ppc(
     input_columns:
         Ordered list of input column names.  If None, inferred from the
         simulator.
+    n_jobs:
+        Number of parallel jobs. -1 = use all available CPUs, respecting SLURM.
+        1 = sequential (default).
+    progress_callback:
+        Optional callable invoked with no arguments after each participant completes.
+    root_seed:
+        Root seed for reproducibility. If None, uses 0.
 
     Returns
     -------
@@ -313,6 +442,88 @@ def compute_ppc(
     records: list[dict[str, Any]] = []
     id_col, participants = _get_participants(df)
 
+    # Resolve n_jobs
+    n_workers = _resolve_n_jobs(n_jobs)
+
+    if n_workers > 1:
+        return _compute_ppc_parallel(
+            spec, df, fitted_params_list, simulator, n_sims, input_columns,
+            id_col, participants, n_workers, progress_callback, root_seed
+        )
+    else:
+        return _compute_ppc_sequential(
+            spec, df, fitted_params_list, simulator, n_sims, input_columns,
+            id_col, participants, progress_callback, root_seed
+        )
+
+
+def _compute_ppc_sequential(
+    spec, df, fitted_params_list, simulator, n_sims, input_columns,
+    id_col, participants, progress_callback, root_seed
+):
+    """Compute PPC sequentially, calling progress_callback per participant."""
+    records: list[dict[str, Any]] = []
+
+    for p_idx, participant in enumerate(participants):
+        if p_idx >= len(fitted_params_list):
+            break
+
+        fitted = np.array(fitted_params_list[p_idx], dtype=float)
+        if len(fitted) == 0:
+            if progress_callback:
+                progress_callback()
+            continue
+
+        participant_arrays = _extract_participant_arrays(
+            df=df,
+            participant=participant,
+            input_columns=input_columns,
+            id_col=id_col,
+        )
+        if participant_arrays is None:
+            if progress_callback:
+                progress_callback()
+            continue
+
+        participant_id, obs_data, arrays = participant_arrays
+        n_trials_p = len(arrays[0])
+
+        # Hash participant ID for seeding
+        participant_hash = (
+            int(participant) if str(participant).isdigit()
+            else hash(str(participant)) % (2**31)
+        )
+
+        # Process this participant
+        p_records = _compute_ppc_one_participant(
+            (participant_id, p_idx),
+            fitted, obs_data, arrays, n_trials_p, input_columns,
+            simulator, spec.func, n_sims, participant_hash, root_seed
+        )
+        records.extend(p_records)
+
+        if progress_callback:
+            progress_callback()
+
+    return {"records": records}
+
+
+def _compute_ppc_parallel(
+    spec, df, fitted_params_list, simulator, n_sims, input_columns,
+    id_col, participants, n_workers, progress_callback, root_seed
+):
+    """Compute PPC in parallel using ProcessPoolExecutor."""
+    try:
+        from loky import get_reusable_executor
+        executor = get_reusable_executor(max_workers=n_workers)
+    except ImportError:
+        from concurrent.futures import ProcessPoolExecutor
+        executor = ProcessPoolExecutor(max_workers=n_workers)
+
+    records: list[dict[str, Any]] = []
+    participant_data = []
+
+    # Gather participant data upfront
     for p_idx, participant in enumerate(participants):
         if p_idx >= len(fitted_params_list):
             break
@@ -332,50 +543,64 @@ def compute_ppc(
 
         participant_id, obs_data, arrays = participant_arrays
         n_trials_p = len(arrays[0])
+        participant_hash = (
+            int(participant) if str(participant).isdigit()
+            else hash(str(participant)) % (2**31)
+        )
 
-        # --- Compute observed statistics ---
-        obs_stats = _compute_statistics(obs_data, input_columns)
+        participant_data.append({
+            "participant_info": (participant_id, p_idx),
+            "fitted": fitted,
+            "obs_data": obs_data,
+            "arrays": arrays,
+            "n_trials": n_trials_p,
+            "participant_hash": participant_hash,
+        })
 
-        # --- Run n_sims forward simulations ---
-        sim_stats_list: list[dict[str, float]] = []
-        for sim_i in range(n_sims):
-            rng = np.random.default_rng([int(participant) if str(participant).isdigit() else hash(str(participant)) % (2**31), sim_i])
+    # Test the first job
+    if participant_data:
+        first = participant_data[0]
+        test_fut = executor.submit(
+            _compute_ppc_one_participant,
+            first["participant_info"], first["fitted"], first["obs_data"],
+            first["arrays"], first["n_trials"], input_columns,
+            simulator, spec.func, n_sims, first["participant_hash"], root_seed
+        )
+        try:
+            test_result = test_fut.result(timeout=300)
+        except Exception as e:
+            # Fall back to sequential
+            return _compute_ppc_sequential(
+                spec, df, fitted_params_list, simulator, n_sims, input_columns,
+                id_col, participants, progress_callback, root_seed
+            )
+
+        records.extend(test_result)
+        if progress_callback:
+            progress_callback()
+
+        # Submit remaining participants
+        futures = {}
+        for p_data in participant_data[1:]:
+            fut = executor.submit(
+                _compute_ppc_one_participant,
+                p_data["participant_info"], p_data["fitted"], p_data["obs_data"],
+                p_data["arrays"], p_data["n_trials"], input_columns,
+                simulator, spec.func, n_sims, p_data["participant_hash"], root_seed
+            )
+            futures[fut] = p_data["participant_info"][0]
+
+        # Collect results as they complete
+        for fut in as_completed(futures):
             try:
-                sim_data = _simulate_forward(
-                    simulator, spec.func, fitted, n_trials_p, rng, input_columns
-                )
-                sim_stats = _compute_statistics(sim_data, input_columns)
-                sim_stats_list.append(sim_stats)
+                p_records = fut.result()
+                records.extend(p_records)
             except Exception as e:
-                warnings.warn(f"PPC simulation failed for participant {participant}, sim {sim_i}: {e}")
-                continue
+                participant_id = futures[fut]
+                warnings.warn(f"PPC failed for participant {participant_id}: {e}")
 
-        if not sim_stats_list:
-            continue
-
-        # --- Aggregate simulated statistics ---
-        all_stat_names = set(obs_stats.keys())
-        for s in sim_stats_list:
-            all_stat_names.update(s.keys())
-
-        for stat_name in all_stat_names:
-            obs_val = obs_stats.get(stat_name)
-            sim_vals = np.array([s.get(stat_name, np.nan) for s in sim_stats_list])
-            valid_sims = sim_vals[np.isfinite(sim_vals)]
-
-            if len(valid_sims) == 0:
-                continue
-
-            records.append({
-                "participant_id": participant_id,
-                "statistic_name": stat_name,
-                "condition": None,
-                "observed": float(obs_val) if obs_val is not None else None,
-                "simulated_mean": float(np.mean(valid_sims)),
-                "simulated_q025": float(np.quantile(valid_sims, 0.025)),
-                "simulated_q975": float(np.quantile(valid_sims, 0.975)),
-                "n_sims": len(valid_sims),
-            })
+            if progress_callback:
+                progress_callback()
 
     return {"records": records}
 

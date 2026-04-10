@@ -28,6 +28,15 @@ _log = lambda msg: print(f"[{__import__('datetime').datetime.now().strftime('%Y-
 console = Console()
 
 
+class _NumpyJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, np.generic):
+            return o.item()
+        return super().default(o)
+
+
 class GeCCoModelSearch:
     def __init__(
         self,
@@ -120,7 +129,8 @@ class GeCCoModelSearch:
             try:
                 from gecco.diagnostic_store import DiagnosticStore
 
-                db_path = self.results_dir / "diagnostics.duckdb"
+                shard = f"_{self.client_id}" if self.client_id else ""
+                db_path = self.results_dir / f"diagnostics{shard}.duckdb"
                 self.diagnostic_store = DiagnosticStore(db_path)
                 console.print(f"[dim]Diagnostic store: {db_path}[/]")
             except ImportError:
@@ -1103,14 +1113,35 @@ class GeCCoModelSearch:
                                 f"  [dim]Computing PPC for {display_name} "
                                 f"(n_sims={self.ppc_n_sims})...[/]"
                             )
-                            ppc_result = compute_ppc(
-                                spec=diagnostic_spec,
-                                df=self.df,
-                                fitted_params_list=fit_res["parameter_values"],
-                                simulator=self._ppc_simulator,
-                                n_sims=self.ppc_n_sims,
-                                input_columns=list(self.cfg.data.input_columns),
+
+                            # Count participants for progress bar
+                            from gecco.offline_evaluation.ppc import _get_participants
+                            _, participants = _get_participants(self.df)
+                            n_participants = len(participants)
+
+                            # Create progress bar for PPC
+                            ppc_progress = Progress(
+                                TextColumn("[progress.description]{task.description}"),
+                                BarColumn(),
+                                MofNCompleteColumn(),
+                                TimeElapsedColumn(),
                             )
+
+                            with ppc_progress:
+                                task_id = ppc_progress.add_task(
+                                    f"  [dim]PPC {display_name}[/]",
+                                    total=n_participants
+                                )
+                                ppc_result = compute_ppc(
+                                    spec=diagnostic_spec,
+                                    df=self.df,
+                                    fitted_params_list=fit_res["parameter_values"],
+                                    simulator=self._ppc_simulator,
+                                    n_sims=self.ppc_n_sims,
+                                    input_columns=list(self.cfg.data.input_columns),
+                                    n_jobs=-1,
+                                    progress_callback=lambda: ppc_progress.advance(task_id),
+                                )
                         except Exception as e:
                             console.print(
                                 f"  [yellow]PPC failed for {display_name}:[/] {e}"
@@ -1196,7 +1227,7 @@ class GeCCoModelSearch:
                             / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                         )
                         with open(best_bic_file, "w") as f:
-                            json.dump({"bic": mean_metric}, f)
+                            json.dump({"bic": mean_metric}, f, cls=_NumpyJSONEncoder)
 
                     # ✅ stop if ANY model beats baseline
                     if baseline_bic is not None and mean_metric < baseline_bic:
@@ -1251,7 +1282,7 @@ class GeCCoModelSearch:
                 / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
             )
             with open(bic_file, "w") as f:
-                json.dump(iteration_results, f, indent=2)
+                json.dump(iteration_results, f, indent=2, cls=_NumpyJSONEncoder)
 
             self.feedback.record_iteration(it, iteration_results)
 

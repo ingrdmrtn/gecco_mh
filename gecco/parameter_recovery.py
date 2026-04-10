@@ -94,11 +94,20 @@ def _extract_choice_probs(model_func, data_arrays, trial_idx,
     log_likes = np.zeros(n_options)
     end = trial_idx + 1
 
+    # Create slices (views, no allocation) rather than full copies
+    sliced = [col[:end] for col in data_arrays]
+
+    # Save the original value at the trial index
+    original_val = data_arrays[choice_col_idx][trial_idx]
+
     for opt in range(n_options):
-        data_copy = [col[:end].copy() for col in data_arrays]
-        data_copy[choice_col_idx][trial_idx] = opt
-        nll = model_func(*data_copy, params)
+        # Mutate the underlying array; sliced[choice_col_idx] is a view so it sees the change
+        data_arrays[choice_col_idx][trial_idx] = opt
+        nll = model_func(*sliced, params)
         log_likes[opt] = -nll  # convert NLL to log-likelihood
+
+    # Restore the original value
+    data_arrays[choice_col_idx][trial_idx] = original_val
 
     # Subtract max for numerical stability before exp
     log_likes -= np.max(log_likes)
@@ -194,18 +203,18 @@ class TwoStepSimulator(TaskSimulator):
             probs_a1 = _extract_choice_probs(
                 model_func, data_arrays, t, COL_A1, 2, true_params
             )
-            a1 = rng.choice(2, p=probs_a1)
+            a1 = int(rng.random() < probs_a1[1])
             action_1[t] = a1
 
             # --- Environment: determine state from transition ---
-            s = rng.choice(2, p=self.transition_probs[a1])
+            s = int(rng.random() < self.transition_probs[a1][1])
             state[t] = s
 
             # --- Stage 2: extract p(choice_2 | state) and sample ---
             probs_a2 = _extract_choice_probs(
                 model_func, data_arrays, t, COL_A2, 2, true_params
             )
-            a2 = rng.choice(2, p=probs_a2)
+            a2 = int(rng.random() < probs_a2[1])
             action_2[t] = a2
 
             # --- Environment: determine reward ---

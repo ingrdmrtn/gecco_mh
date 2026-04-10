@@ -1085,9 +1085,10 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             )
 
             config_args = {
-                "temperature": self.cfg.llm.temperature,
                 "system_instruction": self.cfg.llm.system_prompt,
             }
+            if hasattr(self.cfg.llm, "temperature"):
+                config_args["temperature"] = self.cfg.llm.temperature
 
             if reasoning_effort:
                 if self.cfg.llm.base_model.lower().startswith("gemini-3"):
@@ -1123,20 +1124,23 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 getattr(self.cfg.llm, "max_tokens", 4096),
             )
 
+            temperature = getattr(self.cfg.llm, "temperature", None)
             _log(
                 f"[GeCCo] Using vLLM model '{self.cfg.llm.base_model}' "
-                f"(max_tokens={max_out}, temperature={self.cfg.llm.temperature})"
+                f"(max_tokens={max_out}, temperature={temperature})"
             )
 
-            resp = self.model.chat.completions.create(
+            create_kwargs = dict(
                 model=self.cfg.llm.base_model,
                 messages=[
                     {"role": "system", "content": self.cfg.llm.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=self.cfg.llm.temperature,
                 max_tokens=max_out,
             )
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+            resp = self.model.chat.completions.create(**create_kwargs)
             if not resp.choices:
                 raise RuntimeError(
                     f"LLM returned empty response (no choices). "
@@ -1157,16 +1161,19 @@ class LLMFeedbackGenerator(FeedbackGenerator):
                 getattr(self.cfg.llm, "max_tokens", 4096),
             )
 
+            temperature = getattr(self.cfg.llm, "temperature", None)
             _log(
                 f"[GeCCo] Using HF model '{self.cfg.llm.base_model}' "
-                f"(max_new_tokens={max_new}, temperature={self.cfg.llm.temperature})"
+                f"(max_new_tokens={max_new}, temperature={temperature})"
             )
 
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            output = self.model.generate(
+            generate_kwargs = dict(
                 **inputs,
                 max_new_tokens=max_new,
-                temperature=self.cfg.llm.temperature,
                 do_sample=True,
             )
+            if temperature is not None:
+                generate_kwargs["temperature"] = temperature
+            output = self.model.generate(**generate_kwargs)
             return self.tokenizer.decode(output[0], skip_special_tokens=True)

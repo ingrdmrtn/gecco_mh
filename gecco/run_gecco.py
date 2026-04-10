@@ -307,13 +307,13 @@ class GeCCoModelSearch:
                         get_openai_compatible_response_format()
                     )
 
-            debug_kwargs = {k: v for k, v in create_kwargs.items() if k != "messages"}
-            console.print(f"[dim]Request kwargs (excl. messages): {debug_kwargs!r}[/]")
+            # debug_kwargs = {k: v for k, v in create_kwargs.items() if k != "messages"}
+            # console.print(f"[dim]Request kwargs (excl. messages): {debug_kwargs!r}[/]")
             try:
                 resp = model.chat.completions.create(**create_kwargs)
                 # Log the raw response for debugging, especially to inspect reasoning_details and any API error messages
-                console.print(f"RAW response object:")
-                console.print(f"[dim]Raw response: {resp!r}[/]")
+                # console.print(f"RAW response object:")
+                # console.print(f"[dim]Raw response: {resp!r}[/]")
             except Exception as api_exc:
                 # Catch 404 from OpenRouter when no endpoint supports the
                 # requested parameters (e.g. json_schema mode not available

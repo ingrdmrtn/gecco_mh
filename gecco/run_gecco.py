@@ -23,6 +23,8 @@ from gecco.offline_evaluation.fit_generated_models import (
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from pathlib import Path
 
+_log = lambda msg: print(f"[{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
 console = Console()
 
 
@@ -91,6 +93,7 @@ class GeCCoModelSearch:
 
         # --- Parameter recovery checker (optional) ---
         self.recovery_checker = None
+        self._ppc_simulator = None
         if hasattr(cfg, "parameter_recovery") and getattr(
             cfg.parameter_recovery, "enabled", False
         ):
@@ -105,6 +108,63 @@ class GeCCoModelSearch:
                 n_fitting_starts=getattr(cfg.parameter_recovery, "n_fitting_starts", 3),
                 n_jobs=getattr(cfg.parameter_recovery, "n_jobs", -1),
             )
+            # Reuse the same simulator for PPC
+            self._ppc_simulator = simulator
+
+        # --- Diagnostic store (optional) ---
+        self.diagnostic_store = None
+        judge_cfg = getattr(cfg, "judge", None)
+        if judge_cfg and getattr(
+            getattr(judge_cfg, "diagnostic_store", None), "enabled", False
+        ):
+            try:
+                from gecco.diagnostic_store import DiagnosticStore
+
+                db_path = self.results_dir / "diagnostics.duckdb"
+                self.diagnostic_store = DiagnosticStore(db_path)
+                console.print(f"[dim]Diagnostic store: {db_path}[/]")
+            except ImportError:
+                console.print(
+                    "[yellow]duckdb not installed — diagnostic store disabled.[/]"
+                )
+
+        # --- Tool-using judge (optional) ---
+        self.tool_judge = None
+        if judge_cfg and getattr(judge_cfg, "mode", "manual") == "tool_using":
+            if self.diagnostic_store is None:
+                console.print(
+                    "[yellow]tool_using judge requires diagnostic_store.enabled=true — "
+                    "falling back to standard feedback.[/]"
+                )
+            else:
+                from gecco.construct_feedback.tool_judge import ToolUsingJudge
+
+                self.tool_judge = ToolUsingJudge(
+                    cfg=cfg,
+                    diagnostic_store=self.diagnostic_store,
+                    model=model,
+                    tokenizer=tokenizer,
+                    results_dir=self.results_dir,
+                )
+                console.print("[dim]Tool-using judge initialised.[/]")
+
+        # --- PPC config ---
+        ppc_cfg = getattr(judge_cfg, "ppc", None) if judge_cfg else None
+        self.ppc_enabled = bool(ppc_cfg and getattr(ppc_cfg, "enabled", False))
+        self.ppc_n_sims: int = getattr(ppc_cfg, "n_sims", 100) if ppc_cfg else 100
+        block_residual_cfg = getattr(judge_cfg, "block_residuals", None) if judge_cfg else None
+        self.block_residuals_enabled = bool(
+            getattr(
+                block_residual_cfg,
+                "enabled",
+                self.ppc_enabled,
+            ) if judge_cfg else False
+        )
+        self.block_residuals_n_blocks: int = getattr(
+            block_residual_cfg,
+            "n_blocks",
+            10,
+        ) if block_residual_cfg else 10
 
     def generate(self, model, tokenizer=None, prompt=None, response_schema=None):
         """
@@ -786,11 +846,33 @@ class GeCCoModelSearch:
 
             feedback = ""
             if self.best_model is not None:
-                feedback = self.feedback.get_feedback(
-                    self.best_model,
-                    self.tried_param_sets,
-                    id_results=self.best_id_results,
-                )
+                # --- Dispatch judge ---
+                if self.tool_judge is not None:
+                    try:
+                        self._set_activity(f"tool judge (iter {it})")
+                        verdict = self.tool_judge.get_feedback(
+                            iteration=it,
+                            run_idx=run_idx,
+                            tag=tag,
+                            best_model=self.best_model,
+                            best_metric=self.best_metric,
+                        )
+                        feedback = verdict.synthesized_feedback
+                    except Exception as e:
+                        console.print(
+                            f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
+                        )
+                        feedback = self.feedback.get_feedback(
+                            self.best_model,
+                            self.tried_param_sets,
+                            id_results=self.best_id_results,
+                        )
+                else:
+                    feedback = self.feedback.get_feedback(
+                        self.best_model,
+                        self.tried_param_sets,
+                        id_results=self.best_id_results,
+                    )
 
                 # Save feedback for inspection
                 tag = self._file_tag()
@@ -982,21 +1064,102 @@ class GeCCoModelSearch:
                                 f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
                             )
 
-                    iteration_results.append(
-                        {
-                            "function_name": display_name,
-                            "metric_name": metric_name,
-                            "metric_value": mean_metric,
-                            "param_names": params,
-                            "code_file": str(model_file),
-                            "individual_differences": id_results,
-                            "code": func_code,
-                            "eval_metrics": fit_res.get("eval_metrics", []),
-                            "participant_n_trials": fit_res.get(
-                                "participant_n_trials", []
-                            ),
-                        }
+                    # --- Posterior predictive checks (optional) ---
+                    ppc_result = None
+                    block_residuals_result = None
+                    needs_diagnostic_spec = bool(
+                        fit_res.get("parameter_values")
+                        and (
+                            (self.ppc_enabled and self._ppc_simulator is not None)
+                            or self.block_residuals_enabled
+                        )
                     )
+                    diagnostic_spec = None
+                    if needs_diagnostic_spec:
+                        try:
+                            from gecco.offline_evaluation.utils import build_model_spec
+
+                            diagnostic_spec = build_model_spec(
+                                func_code,
+                                expected_func_name=func_name,
+                                cfg=self.cfg,
+                                structured_params=structured_params,
+                            )
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]Diagnostic spec build failed for {display_name}:[/] {e}"
+                            )
+
+                    if (
+                        self.ppc_enabled
+                        and self._ppc_simulator is not None
+                        and fit_res.get("parameter_values")
+                        and diagnostic_spec is not None
+                    ):
+                        try:
+                            from gecco.offline_evaluation.ppc import compute_ppc
+
+                            console.print(
+                                f"  [dim]Computing PPC for {display_name} "
+                                f"(n_sims={self.ppc_n_sims})...[/]"
+                            )
+                            ppc_result = compute_ppc(
+                                spec=diagnostic_spec,
+                                df=self.df,
+                                fitted_params_list=fit_res["parameter_values"],
+                                simulator=self._ppc_simulator,
+                                n_sims=self.ppc_n_sims,
+                                input_columns=list(self.cfg.data.input_columns),
+                            )
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]PPC failed for {display_name}:[/] {e}"
+                            )
+
+                    if (
+                        self.block_residuals_enabled
+                        and fit_res.get("parameter_values")
+                        and diagnostic_spec is not None
+                    ):
+                        try:
+                            from gecco.offline_evaluation.ppc import compute_block_residuals
+
+                            console.print(
+                                f"  [dim]Computing block residuals for {display_name} "
+                                f"(n_blocks={self.block_residuals_n_blocks})...[/]"
+                            )
+                            block_residuals_result = compute_block_residuals(
+                                spec=diagnostic_spec,
+                                df=self.df,
+                                fitted_params_list=fit_res["parameter_values"],
+                                n_blocks=self.block_residuals_n_blocks,
+                                input_columns=list(self.cfg.data.input_columns),
+                            )
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]Block residuals failed for {display_name}:[/] {e}"
+                            )
+
+                    result_dict = {
+                        "function_name": display_name,
+                        "metric_name": metric_name,
+                        "metric_value": mean_metric,
+                        "param_names": params,
+                        "code_file": str(model_file),
+                        "recovery": recovery if self.recovery_checker is not None else None,
+                        "individual_differences": id_results,
+                        "code": func_code,
+                        "eval_metrics": fit_res.get("eval_metrics", []),
+                        "participant_n_trials": fit_res.get(
+                            "participant_n_trials", []
+                        ),
+                        "parameter_values": fit_res.get("parameter_values", []),
+                    }
+                    if ppc_result is not None:
+                        result_dict["ppc"] = ppc_result
+                    if block_residuals_result is not None:
+                        result_dict["block_residuals"] = block_residuals_result
+                    iteration_results.append(result_dict)
 
                     if mean_metric < self.best_metric:
                         self.best_metric = mean_metric
@@ -1091,6 +1254,24 @@ class GeCCoModelSearch:
                 json.dump(iteration_results, f, indent=2)
 
             self.feedback.record_iteration(it, iteration_results)
+
+            # --- Write to diagnostic store (optional) ---
+            if self.diagnostic_store is not None:
+                try:
+                    ppc_results_map = {}
+                    for r in iteration_results:
+                        if "ppc" in r:
+                            ppc_results_map[r["function_name"]] = r["ppc"]
+                    self.diagnostic_store.write_iteration(
+                        iteration=it,
+                        run_idx=run_idx,
+                        iteration_results=iteration_results,
+                        ppc_results=ppc_results_map if ppc_results_map else None,
+                        tag=tag,
+                        client_id=self.client_id,
+                    )
+                except Exception as e:
+                    console.print(f"  [yellow]Diagnostic store write failed:[/] {e}")
 
             # --- Push results to shared registry (distributed mode) ---
             self._update_registry(it, iteration_results)

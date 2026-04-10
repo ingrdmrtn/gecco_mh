@@ -23,7 +23,9 @@ def _cap_bic_outliers(bic_values: list[float | None]) -> float | None:
     return min(percentile_val, BIC_ABSOLUTE_CAP)
 
 
-def _apply_bic_cap(rows: list[dict[str, Any]], key: str = "BIC") -> list[dict[str, Any]]:
+def _apply_bic_cap(
+    rows: list[dict[str, Any]], key: str = "BIC"
+) -> list[dict[str, Any]]:
     """Cap BIC values in rows for display. Does not modify the original data."""
     if not rows:
         return rows
@@ -140,27 +142,63 @@ def build_landscape_df(data: dict[str, Any]) -> pd.DataFrame:
         it = entry.get("iteration")
         for r in entry.get("results", []):
             bic = r.get("metric_value")
-            if bic is None:
-                continue
+            mn = r.get("metric_name", "BIC")
+
+            # Determine status
+            if mn == "RECOVERY_FAILED":
+                status = "recovery_failed"
+            elif mn in ("FIT_ERROR", "VALIDATION_ERROR"):
+                status = "error"
+            elif bic is not None and bic < float("inf"):
+                status = "success"
+            else:
+                status = "error"  # Catch-all for unexpected states
+
             max_r2, best_param = _fill_r2_from_per_param(r)
             rows.append(
                 {
                     "Model": r.get("function_name", "?"),
-                    "BIC": bic,
+                    "Status": status,
+                    "BIC": bic if bic is not None and bic < float("inf") else None,
                     "Max R²": max_r2,
                     "Best Param": best_param,
                     "Mean R²": r.get("mean_r2"),
                     "Params": ", ".join(r.get("param_names", [])),
                     "Client": cid,
                     "Iteration": it,
+                    "Error": r.get("error") or r.get("error_message"),
+                    "Recovery R": r.get("recovery_r"),
                 }
             )
 
     if not rows:
-        return pd.DataFrame(columns=["Model", "BIC", "Max R²", "Best Param", "Mean R²", "Params", "Client", "Iteration"])
+        return pd.DataFrame(
+            columns=[
+                "Model",
+                "Status",
+                "BIC",
+                "Max R²",
+                "Best Param",
+                "Mean R²",
+                "Params",
+                "Client",
+                "Iteration",
+            ]
+        )
 
     rows = _apply_bic_cap(rows)
-    return pd.DataFrame(rows).sort_values("BIC", ascending=True).reset_index(drop=True)
+
+    # Sort: success first (by BIC), then recovery_failed, then errors
+    def sort_key(row):
+        status_order = {"success": 0, "recovery_failed": 1, "error": 2}
+        bic = row.get("BIC")
+        return (
+            status_order.get(row["Status"], 2),
+            bic if bic is not None else float("inf"),
+        )
+
+    rows = sorted(rows, key=sort_key)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def build_iteration_df(data: dict[str, Any]) -> pd.DataFrame:
@@ -168,10 +206,16 @@ def build_iteration_df(data: dict[str, Any]) -> pd.DataFrame:
     for entry in data.get("iteration_history", []):
         cid = entry.get("client_id")
         it = entry.get("iteration")
-        bics = [r.get("metric_value") for r in entry.get("results", []) if r.get("metric_value") is not None]
+        bics = [
+            r.get("metric_value")
+            for r in entry.get("results", [])
+            if r.get("metric_value") is not None
+        ]
         if not bics:
             continue
-        rows.append({"Client": str(cid), "Iteration": int(it), "Best BIC": float(min(bics))})
+        rows.append(
+            {"Client": str(cid), "Iteration": int(it), "Best BIC": float(min(bics))}
+        )
 
     if not rows:
         return pd.DataFrame(columns=["Client", "Iteration", "Best BIC"])
@@ -217,7 +261,9 @@ def build_r2_df(data: dict[str, Any], top_n: int = 8) -> pd.DataFrame:
     if not candidates:
         return pd.DataFrame()
 
-    candidates = sorted(candidates, key=lambda x: (x["BIC"] if x["BIC"] is not None else float("inf")))[:top_n]
+    candidates = sorted(
+        candidates, key=lambda x: x["BIC"] if x["BIC"] is not None else float("inf")
+    )[:top_n]
     all_params: list[str] = []
     for c in candidates:
         for p in c["per_param"].keys():
@@ -245,20 +291,25 @@ def summary_stats(data: dict[str, Any]) -> dict[str, int]:
     entries = data.get("client_entries", {})
     history = data.get("iteration_history", [])
     total_models = 0
-    failed_models = 0
+    recovery_failed = 0
+    errors = 0
     for h in history:
         for r in h.get("results", []):
             total_models += 1
             mn = r.get("metric_name", "BIC")
-            if mn in ("RECOVERY_FAILED", "FIT_ERROR"):
-                failed_models += 1
+            if mn == "RECOVERY_FAILED":
+                recovery_failed += 1
+            elif mn in ("FIT_ERROR", "VALIDATION_ERROR"):
+                errors += 1
     return {
         "n_clients": len(entries),
         "running": sum(1 for e in entries.values() if e.get("status") == "running"),
         "complete": sum(1 for e in entries.values() if e.get("status") == "complete"),
         "iterations": len(history),
         "models": total_models,
-        "failed": failed_models,
+        "recovery_failed": recovery_failed,
+        "errors": errors,
+        "failed": recovery_failed + errors,  # Keep for backward compatibility
         "param_combos": len(data.get("tried_param_sets", [])),
     }
 
@@ -266,6 +317,7 @@ def summary_stats(data: dict[str, Any]) -> dict[str, int]:
 # ============================================================
 # Results browser helpers
 # ============================================================
+
 
 def list_iterations(data: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract all (client, iteration) entries from iteration_history, sorted.
@@ -282,20 +334,29 @@ def list_iterations(data: dict[str, Any]) -> list[dict[str, Any]]:
         run = dup_counts.get(key, 0)
         dup_counts[key] = run + 1
         n_models = len(entry.get("results", []))
-        bics = [r.get("metric_value") for r in entry.get("results", [])
-                if r.get("metric_value") is not None]
-        seen.append({
-            "client_id": cid,
-            "iteration": it,
-            "run": run,
-            "history_idx": idx,
-            "n_models": n_models,
-            "best_bic": min(bics) if bics else None,
-        })
-    return sorted(seen, key=lambda x: (str(x["client_id"] or ""), x["iteration"] or 0, x["run"]))
+        bics = [
+            r.get("metric_value")
+            for r in entry.get("results", [])
+            if r.get("metric_value") is not None
+        ]
+        seen.append(
+            {
+                "client_id": cid,
+                "iteration": it,
+                "run": run,
+                "history_idx": idx,
+                "n_models": n_models,
+                "best_bic": min(bics) if bics else None,
+            }
+        )
+    return sorted(
+        seen, key=lambda x: (str(x["client_id"] or ""), x["iteration"] or 0, x["run"])
+    )
 
 
-def get_iteration_results_by_idx(data: dict[str, Any], history_idx: int) -> list[dict[str, Any]]:
+def get_iteration_results_by_idx(
+    data: dict[str, Any], history_idx: int
+) -> list[dict[str, Any]]:
     """Get model results by history index (handles duplicates unambiguously)."""
     history = data.get("iteration_history", [])
     if 0 <= history_idx < len(history):
@@ -303,7 +364,9 @@ def get_iteration_results_by_idx(data: dict[str, Any], history_idx: int) -> list
     return []
 
 
-def get_model_code(data: dict[str, Any], model_name: str, client_id: Any, iteration: Any) -> str | None:
+def get_model_code(
+    data: dict[str, Any], model_name: str, client_id: Any, iteration: Any
+) -> str | None:
     """Look up a model's code from iteration_history by name, client, and iteration."""
     for entry in data.get("iteration_history", []):
         if entry.get("client_id") == client_id and entry.get("iteration") == iteration:

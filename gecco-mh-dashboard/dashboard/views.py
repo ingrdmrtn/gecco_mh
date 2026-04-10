@@ -44,14 +44,17 @@ def render_overview(data: dict[str, Any]) -> None:
 
     failed = stats.get("failed", 0)
     succeeded = stats["models"] - failed
-    cols = st.columns(7)
+    recovery_failed = stats.get("recovery_failed", 0)
+    errors = stats.get("errors", 0)
+    cols = st.columns(8)  # Changed from 7 to 8
     cols[0].metric("Clients", f"{stats['n_clients']}", f"{stats['running']} running")
     cols[1].metric("Completed", f"{stats['complete']}")
     cols[2].metric("Iterations", f"{stats['iterations']}")
     cols[3].metric("Models", f"{succeeded}")
-    cols[4].metric("Failed", f"{failed}")
-    cols[5].metric("Param sets", f"{stats['param_combos']}")
-    cols[6].metric("Best BIC", _fmt_float(best.get("metric_value")))
+    cols[4].metric("Recovery Failed", f"{recovery_failed}")
+    cols[5].metric("Errors", f"{errors}")
+    cols[6].metric("Param sets", f"{stats['param_combos']}")
+    cols[7].metric("Best BIC", _fmt_float(best.get("metric_value")))
 
     with st.container(border=True):
         c1, c2 = st.columns(2)
@@ -60,17 +63,23 @@ def render_overview(data: dict[str, Any]) -> None:
             if best:
                 st.write(f"- Client: **{best.get('client_id', '-')}**")
                 st.write(f"- Iteration: **{best.get('iteration', '-')}**")
-                st.write(f"- Parameters: {', '.join(best.get('param_names', [])) or '-'}")
+                st.write(
+                    f"- Parameters: {', '.join(best.get('param_names', [])) or '-'}"
+                )
             else:
                 st.info("No fitted model yet.")
         with c2:
             st.subheader("Baseline")
             if baseline and baseline.get("metric_value") is not None:
-                st.write(f"- Baseline BIC: **{_fmt_float(baseline.get('metric_value'))}**")
+                st.write(
+                    f"- Baseline BIC: **{_fmt_float(baseline.get('metric_value'))}**"
+                )
                 if best and best.get("metric_value") is not None:
                     delta = baseline["metric_value"] - best["metric_value"]
                     st.write(f"- Improvement vs baseline: **{delta:+.2f}**")
-                st.write(f"- Parameters: {', '.join(baseline.get('param_names', [])) or '-'}")
+                st.write(
+                    f"- Parameters: {', '.join(baseline.get('param_names', [])) or '-'}"
+                )
             else:
                 st.info("Baseline not available yet.")
 
@@ -92,7 +101,9 @@ def render_trajectory(data: dict[str, Any]) -> None:
         st.info("No iteration data yet.")
         return
 
-    pivot = tdf.pivot_table(index="Iteration", columns="Client", values="Best BIC", aggfunc="min")
+    pivot = tdf.pivot_table(
+        index="Iteration", columns="Client", values="Best BIC", aggfunc="min"
+    )
     st.line_chart(pivot, use_container_width=True)
     with st.expander("Trajectory table"):
         st.dataframe(tdf, use_container_width=True, hide_index=True)
@@ -113,10 +124,43 @@ def render_models(data: dict[str, Any], top_n: int) -> None:
         return
 
     st.caption(f"Top {top_n} models (by BIC) — click a row to view code")
-    show = ldf.head(top_n).copy()
+
+    # Show top_n successful models first, then up to 10 failed models
+    success_df = ldf[ldf["Status"] == "success"].head(top_n)
+    failed_df = ldf[ldf["Status"] != "success"].head(10)
+
+    show = pd.concat([success_df, failed_df])
+
+    # Configure column styling
+    styled_df = show.copy()
+    styled_df["Status"] = styled_df["Status"].map(
+        {
+            "success": "🟢 Success",
+            "recovery_failed": "🟠 Recovery Failed",
+            "error": "🔴 Error",
+        }
+    )
+
+    # Select display columns
+    display_cols = [
+        "Model",
+        "Status",
+        "BIC",
+        "Max R²",
+        "Best Param",
+        "Mean R²",
+        "Params",
+        "Client",
+        "Iteration",
+    ]
+    display_df = styled_df[display_cols]
+
     event = st.dataframe(
-        show, use_container_width=True, hide_index=True,
-        on_select="rerun", selection_mode="single-row",
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
     )
 
     if event.selection.rows:
@@ -127,6 +171,13 @@ def render_models(data: dict[str, Any], top_n: int) -> None:
             st.code(code, language="python")
         else:
             st.caption("Code not available for this model.")
+
+        # Show error details for failed models
+        if row["Status"] != "success":
+            if row["Status"] == "recovery_failed" and row.get("Recovery R"):
+                st.warning(f"Parameter recovery failed (r={row['Recovery R']:.2f})")
+            elif row["Status"] == "error" and row.get("Error"):
+                st.error(f"Error: {row['Error']}")
 
 
 def render_r2(data: dict[str, Any]) -> None:
@@ -155,6 +206,7 @@ def render_history(history: list[dict[str, Any]]) -> None:
 # Results browser
 # ============================================================
 
+
 def _file_pattern(iteration: int, client_id: Any, suffix: str) -> str:
     """Build the filename pattern for a given iteration/client."""
     tag = f"_client{client_id}" if client_id is not None else ""
@@ -172,9 +224,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
     clients = sorted({str(it["client_id"]) for it in iterations})
     col1, col2 = st.columns(2)
     with col1:
-        selected_client = st.selectbox(
-            "Client", clients, index=0, key="results_client"
-        )
+        selected_client = st.selectbox("Client", clients, index=0, key="results_client")
     # Filter iterations for selected client
     client_iters = [it for it in iterations if str(it["client_id"]) == selected_client]
 
@@ -188,7 +238,8 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
 
     with col2:
         selected_label = st.selectbox(
-            "Iteration", iter_labels,
+            "Iteration",
+            iter_labels,
             index=len(iter_labels) - 1 if iter_labels else 0,
             key="results_iter",
         )
@@ -197,7 +248,9 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
         return
 
     # Map selected label back to the iteration info
-    label_idx = iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    label_idx = (
+        iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    )
     iter_info = client_iters[label_idx]
     history_idx = iter_info["history_idx"]
     selected_iter = iter_info["iteration"]
@@ -244,7 +297,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
         st.caption("No model results for this iteration.")
     else:
         for i, r in enumerate(results):
-            name = r.get("function_name", f"model_{i+1}")
+            name = r.get("function_name", f"model_{i + 1}")
             bic = r.get("metric_value")
             bic_str = f"{bic:.2f}" if bic is not None else "N/A"
             metric_name = r.get("metric_name", "BIC")
@@ -252,12 +305,18 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
             # Status indicator
             if metric_name == "RECOVERY_FAILED":
                 icon = "🔴"
-                if r.get("simulation_error") and r.get("recovery_n_successful", -1) == 0:
+                if (
+                    r.get("simulation_error")
+                    and r.get("recovery_n_successful", -1) == 0
+                ):
                     status_note = " — simulation error"
                 else:
                     recovery_r = r.get("recovery_r")
                     r_note = f" (r={recovery_r:.2f})" if recovery_r is not None else ""
                     status_note = f" — recovery failed{r_note}"
+            elif metric_name == "VALIDATION_ERROR":
+                icon = "🔴"
+                status_note = f" — validation error: {r.get('error_type', 'unknown')}"
             elif metric_name == "FIT_ERROR":
                 icon = "🔴"
                 status_note = " — fitting error"
@@ -268,7 +327,9 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                 icon = "🟡"
                 status_note = " — failed to fit"
 
-            with st.expander(f"{icon} **{name}** — {metric_name}: {bic_str}{status_note}"):
+            with st.expander(
+                f"{icon} **{name}** — {metric_name}: {bic_str}{status_note}"
+            ):
                 meta = meta_by_idx.get(i, {})
 
                 # Error details for failed models
@@ -300,7 +361,11 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                 per_param_r2 = r.get("per_param_r2")
                 if max_r2 is not None:
                     bp_note = f" ({best_param_r2})" if best_param_r2 else ""
-                    st.markdown(f"**Best param R²:** {max_r2:.3f}{bp_note} · **Mean R²:** {mean_r2:.3f}" if mean_r2 is not None else f"**Best param R²:** {max_r2:.3f}{bp_note}")
+                    st.markdown(
+                        f"**Best param R²:** {max_r2:.3f}{bp_note} · **Mean R²:** {mean_r2:.3f}"
+                        if mean_r2 is not None
+                        else f"**Best param R²:** {max_r2:.3f}{bp_note}"
+                    )
                 elif mean_r2 is not None:
                     st.markdown(f"**Mean R²:** {mean_r2:.3f}")
                 if per_param_r2:

@@ -39,6 +39,55 @@ def _hydrate(row: dict) -> dict:
     return {k: _parse_json_col(v) if k in json_cols else v for k, v in row.items()}
 
 
+def _summarize_per_param_r(data: Any) -> Any:
+    """Collapse a per-param r dict into a compact summary (worst 5 highlighted)."""
+    if not isinstance(data, dict) or not data:
+        return data
+    items = sorted(data.items(), key=lambda x: x[1] if x[1] is not None else 1.0)
+    vals = [v for _, v in items if v is not None]
+    return {
+        "n_params": len(items),
+        "mean_r": sum(vals) / len(vals) if vals else None,
+        "min_r": min(vals) if vals else None,
+        "max_r": max(vals) if vals else None,
+        "worst_params": [{"name": k, "r": v} for k, v in items[:5]],
+    }
+
+
+def _summarize_per_param_r2(data: Any) -> Any:
+    """Collapse a per-param R² dict into a compact summary (best 5 highlighted)."""
+    if not isinstance(data, dict) or not data:
+        return data
+    items = sorted(
+        data.items(),
+        key=lambda x: x[1] if x[1] is not None else -1.0,
+        reverse=True,
+    )
+    vals = [v for _, v in items if v is not None]
+    return {
+        "n_params": len(items),
+        "mean_r2": sum(vals) / len(vals) if vals else None,
+        "min_r2": min(vals) if vals else None,
+        "max_r2": max(vals) if vals else None,
+        "best_params": [{"name": k, "r2": v} for k, v in items[:5]],
+    }
+
+
+def _hydrate_for_judge(row: dict) -> dict:
+    """Hydrate a row and replace large per-param fields with compact summaries.
+
+    Drops ``per_param_detail`` entirely (verbose coefficient tables that the
+    judge does not need).
+    """
+    result = _hydrate(row)
+    if "per_param_r" in result:
+        result["per_param_r"] = _summarize_per_param_r(result["per_param_r"])
+    if "per_param_r2" in result:
+        result["per_param_r2"] = _summarize_per_param_r2(result["per_param_r2"])
+    result.pop("per_param_detail", None)
+    return result
+
+
 # ======================================================================
 # Tool implementations
 # ======================================================================
@@ -93,8 +142,19 @@ def get_best_models(store: DiagnosticStore, k: int = 5,
     return [_hydrate(r) for r in store.fetchall(sql, [k])]
 
 
-def get_model(store: DiagnosticStore, model_id: int) -> dict | None:
-    """Return the full record for a single model (including code)."""
+def get_model(store: DiagnosticStore, model_id: int,
+              include_code: bool = True) -> dict | None:
+    """Return the full record for a single model.
+
+    Parameters
+    ----------
+    model_id:
+        The model to retrieve.
+    include_code:
+        When True (default) the ``code`` field is included and truncated to
+        6000 chars.  Pass ``include_code=false`` when you only need metadata
+        (name, BIC, params) to save tokens.
+    """
     sql = """
         SELECT m.*, i.iteration, i.run_idx, i.tag
         FROM models m
@@ -102,64 +162,200 @@ def get_model(store: DiagnosticStore, model_id: int) -> dict | None:
         WHERE m.model_id = ?
     """
     row = store.fetchone(sql, [model_id])
-    return _hydrate(row) if row else None
+    if row is None:
+        return None
+    result = _hydrate(row)
+    if "code" in result and result["code"]:
+        if not include_code:
+            del result["code"]
+        else:
+            code = str(result["code"])
+            if len(code) > 6000:
+                result["code"] = code[:6000] + "\n... [truncated]"
+    return result
 
 
 def get_per_participant_fit(store: DiagnosticStore,
-                            model_id: int) -> list[dict]:
-    """Return per-participant BIC and parameter estimates for a model."""
+                            model_id: int,
+                            full: bool = False) -> dict | list[dict]:
+    """Return per-participant BIC and parameter estimates for a model.
+
+    By default returns an aggregated summary:
+    - overall BIC distribution (mean/std/min/max/quantiles)
+    - per-parameter summary (mean/std/q025/q50/q975 across participants)
+    - top-5 best-fitting participants (lowest BIC) and worst-5 (highest BIC)
+
+    Set ``full=True`` to get raw per-participant rows (capped at 50).
+    """
     sql = """
         SELECT participant_idx, bic, n_trials, params
         FROM model_participants
         WHERE model_id = ?
-        ORDER BY participant_idx
+        ORDER BY bic ASC
     """
-    return [_hydrate(r) for r in store.fetchall(sql, [model_id])]
+    rows = store.fetchall(sql, [model_id])
+    if not rows:
+        return {"model_id": model_id, "n_participants": 0}
+
+    if full:
+        return [_hydrate(r) for r in rows[:50]]
+
+    import numpy as np  # core GeCCo dependency
+
+    n = len(rows)
+    bic_values = [r["bic"] for r in rows if r["bic"] is not None]
+    bic_arr = np.array(bic_values, dtype=float) if bic_values else None
+
+    # Collect per-parameter values across all participants
+    all_params: dict[str, list[float]] = {}
+    for row in rows:
+        params = _parse_json_col(row["params"]) or {}
+        for k, v in params.items():
+            if v is not None:
+                all_params.setdefault(k, []).append(float(v))
+
+    param_summary = {}
+    for pname, vals in all_params.items():
+        arr = np.array(vals, dtype=float)
+        param_summary[pname] = {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "q025": float(np.quantile(arr, 0.025)),
+            "q50": float(np.median(arr)),
+            "q975": float(np.quantile(arr, 0.975)),
+        }
+
+    # rows are sorted BIC ASC: first 5 = best, last 5 = worst
+    best_5 = [_hydrate(r) for r in rows[:5]]
+    worst_5 = [_hydrate(r) for r in rows[-5:]]
+
+    result: dict = {
+        "model_id": model_id,
+        "n_participants": n,
+        "param_summary": param_summary,
+        "best_5_participants": best_5,
+        "worst_5_participants": worst_5,
+    }
+    if bic_arr is not None and len(bic_arr):
+        result["bic_mean"] = float(np.mean(bic_arr))
+        result["bic_std"] = float(np.std(bic_arr))
+        result["bic_min"] = float(np.min(bic_arr))
+        result["bic_max"] = float(np.max(bic_arr))
+        result["bic_quantiles"] = {
+            "q05": float(np.quantile(bic_arr, 0.05)),
+            "q25": float(np.quantile(bic_arr, 0.25)),
+            "q50": float(np.median(bic_arr)),
+            "q75": float(np.quantile(bic_arr, 0.75)),
+            "q95": float(np.quantile(bic_arr, 0.95)),
+        }
+    return result
 
 
 def get_recovery(store: DiagnosticStore, model_id: int) -> dict | None:
-    """Return parameter recovery diagnostics for a model."""
+    """Return parameter recovery diagnostics for a model.
+
+    ``per_param_r`` is summarised to ``{n_params, mean_r, min_r, max_r,
+    worst_params}``.  ``per_param_detail`` (verbose coefficient tables) is
+    omitted entirely.
+    """
     sql = """
         SELECT * FROM parameter_recovery WHERE model_id = ?
     """
     row = store.fetchone(sql, [model_id])
-    return _hydrate(row) if row else None
+    return _hydrate_for_judge(row) if row else None
 
 
 def get_individual_differences(store: DiagnosticStore,
                                 model_id: int) -> dict | None:
-    """Return individual differences R² and predictor coefficients."""
+    """Return individual differences R² and predictor coefficients.
+
+    ``per_param_r2`` is summarised to ``{n_params, mean_r2, min_r2, max_r2,
+    best_params}``.  ``per_param_detail`` (verbose coefficient tables) is
+    omitted entirely.
+    """
     sql = """
         SELECT * FROM individual_differences WHERE model_id = ?
     """
     row = store.fetchone(sql, [model_id])
-    return _hydrate(row) if row else None
+    return _hydrate_for_judge(row) if row else None
 
 
 def get_ppc(store: DiagnosticStore, model_id: int,
             statistic: str | None = None,
-            condition: str | None = None) -> list[dict]:
-    """Return PPC records for a model, optionally filtered."""
-    params: list[Any] = [model_id]
+            condition: str | None = None,
+            participant_detail: bool = False) -> list[dict]:
+    """Return PPC statistics for a model.
+
+    By default returns one aggregated row per (statistic, condition) pair:
+    ``n_participants``, ``n_outside_95ci``, ``frac_outside_95ci``,
+    ``mean_observed``, ``mean_simulated_mean``, ``mean_abs_zscore``.
+    Rows are sorted by ``frac_outside_95ci`` descending so the worst-fitting
+    statistics appear first.
+
+    Set ``participant_detail=True`` to instead get raw per-participant rows
+    for the *single worst* (statistic, condition) combination (cap 50 rows).
+    ``statistic`` and ``condition`` filters are applied before selecting the
+    worst group, so you can use them to pin a specific group.
+    """
+    qparams: list[Any] = [model_id]
     filters = "model_id = ?"
     if statistic:
         filters += " AND statistic_name = ?"
-        params.append(statistic)
+        qparams.append(statistic)
     if condition:
         filters += " AND condition = ?"
-        params.append(condition)
-    sql = f"""
-        SELECT participant_id, statistic_name, condition,
-               observed, simulated_mean, simulated_q025, simulated_q975, n_sims,
-               CASE
-                   WHEN observed < simulated_q025 OR observed > simulated_q975
-                   THEN 1 ELSE 0
-               END AS outside_95ci
+        qparams.append(condition)
+
+    if not participant_detail:
+        sql = f"""
+            SELECT
+                statistic_name,
+                condition,
+                COUNT(DISTINCT participant_id)                              AS n_participants,
+                SUM(CASE WHEN observed < simulated_q025
+                              OR observed > simulated_q975 THEN 1 ELSE 0 END) AS n_outside_95ci,
+                AVG(CASE WHEN observed < simulated_q025
+                              OR observed > simulated_q975 THEN 1.0 ELSE 0.0 END) AS frac_outside_95ci,
+                AVG(observed)                                               AS mean_observed,
+                AVG(simulated_mean)                                         AS mean_simulated_mean,
+                AVG(ABS((observed - simulated_mean)
+                    / NULLIF((simulated_q975 - simulated_q025) / 3.92, 0))) AS mean_abs_zscore
+            FROM ppc
+            WHERE {filters}
+            GROUP BY statistic_name, condition
+            ORDER BY frac_outside_95ci DESC
+        """
+        return store.fetchall(sql, qparams)
+
+    # participant_detail: find worst group, return raw rows (cap 50)
+    worst_group_sql = f"""
+        SELECT statistic_name, condition,
+               AVG(CASE WHEN observed < simulated_q025
+                             OR observed > simulated_q975 THEN 1.0 ELSE 0.0 END) AS frac
         FROM ppc
         WHERE {filters}
-        ORDER BY statistic_name, condition, participant_id
+        GROUP BY statistic_name, condition
+        ORDER BY frac DESC
+        LIMIT 1
     """
-    return store.fetchall(sql, params)
+    worst = store.fetchone(worst_group_sql, qparams)
+    if worst is None:
+        return []
+    detail_params: list[Any] = [model_id, worst["statistic_name"], worst["condition"]]
+    detail_sql = """
+        SELECT participant_id, statistic_name, condition,
+               observed, simulated_mean, simulated_q025, simulated_q975, n_sims,
+               CASE WHEN observed < simulated_q025 OR observed > simulated_q975
+                    THEN 1 ELSE 0
+               END AS outside_95ci
+        FROM ppc
+        WHERE model_id = ?
+          AND statistic_name = ?
+          AND condition = ?
+        ORDER BY participant_id
+        LIMIT 50
+    """
+    return store.fetchall(detail_sql, detail_params)
 
 
 def get_block_residuals(store: DiagnosticStore, model_id: int) -> dict:
@@ -455,8 +651,11 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "get_model",
             "description": (
-                "Retrieve the full record for a single model, including its code, "
-                "parameters, metric value, and iteration."
+                "Retrieve the full record for a single model, including its "
+                "parameters, metric value, and iteration.  By default the model "
+                "code is included (truncated to 6000 chars).  Pass "
+                "include_code=false when you only need metadata (name, BIC, "
+                "param list) to save tokens."
             ),
             "parameters": {
                 "type": "object",
@@ -464,6 +663,14 @@ TOOL_SCHEMAS: list[dict] = [
                     "model_id": {
                         "type": "integer",
                         "description": "The model_id from the diagnostic store."
+                    },
+                    "include_code": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to include the model code field (default true). "
+                            "Use false when you only need metadata."
+                        ),
+                        "default": True
                     }
                 },
                 "required": ["model_id"]
@@ -475,8 +682,13 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "get_per_participant_fit",
             "description": (
-                "Return per-participant BIC values and fitted parameter estimates "
-                "for a given model_id.  Useful for diagnosing heterogeneity in fit quality."
+                "Return a fit summary for a given model_id.  By default returns "
+                "an aggregated summary: overall BIC distribution "
+                "(mean/std/min/max/quantiles), per-parameter summary across "
+                "participants (mean/std/q025/q50/q975), and the top-5 "
+                "best-fitting and worst-5 worst-fitting participant rows.  "
+                "Set full=true to get raw per-participant rows instead (capped "
+                "at 50 rows)."
             ),
             "parameters": {
                 "type": "object",
@@ -484,6 +696,14 @@ TOOL_SCHEMAS: list[dict] = [
                     "model_id": {
                         "type": "integer",
                         "description": "The model_id to look up."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, return raw per-participant rows (capped at 50) "
+                            "instead of the aggregated summary.  Default false."
+                        ),
+                        "default": False
                     }
                 },
                 "required": ["model_id"]
@@ -495,8 +715,10 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "get_recovery",
             "description": (
-                "Return parameter recovery diagnostics for a model: overall pass/fail, "
-                "mean Pearson r, and per-parameter r values."
+                "Return parameter recovery diagnostics for a model: overall "
+                "pass/fail, mean Pearson r, and a compact per-parameter r "
+                "summary (n_params, mean_r, min_r, max_r, worst 5 params by r). "
+                "Verbose coefficient tables are omitted."
             ),
             "parameters": {
                 "type": "object",
@@ -516,8 +738,9 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "get_individual_differences",
             "description": (
                 "Return individual-differences regression results for a model: "
-                "mean and max R², best parameter, and per-parameter R² with "
-                "predictor coefficients."
+                "mean and max R², best parameter, and a compact per-parameter "
+                "R² summary (n_params, mean_r2, min_r2, max_r2, best 5 params "
+                "by R²).  Verbose coefficient tables are omitted."
             ),
             "parameters": {
                 "type": "object",
@@ -536,10 +759,16 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "get_ppc",
             "description": (
-                "Return posterior predictive check (PPC) statistics for a model.  "
-                "Each row reports an observed statistic value, the simulated mean, "
-                "and 95% predictive interval.  The 'outside_95ci' flag marks "
-                "observed values outside the predictive interval."
+                "Return posterior predictive check (PPC) statistics for a model. "
+                "By default returns one aggregated row per (statistic, condition) "
+                "pair: n_participants, n_outside_95ci, frac_outside_95ci, "
+                "mean_observed, mean_simulated_mean, mean_abs_zscore.  Rows are "
+                "sorted by frac_outside_95ci descending so the worst-fitting "
+                "statistics appear first.  "
+                "Set participant_detail=true to get raw per-participant rows "
+                "for the single worst (statistic, condition) group (capped at 50 "
+                "rows); combine with statistic/condition filters to target a "
+                "specific group."
             ),
             "parameters": {
                 "type": "object",
@@ -555,6 +784,15 @@ TOOL_SCHEMAS: list[dict] = [
                     "condition": {
                         "type": "string",
                         "description": "Optional: filter to a specific condition label."
+                    },
+                    "participant_detail": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, return raw per-participant rows for the worst "
+                            "group instead of the aggregated summary (cap 50 rows). "
+                            "Default false."
+                        ),
+                        "default": False
                     }
                 },
                 "required": ["model_id"]

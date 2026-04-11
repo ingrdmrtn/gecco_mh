@@ -854,6 +854,7 @@ class GeCCoModelSearch:
             # --- Sync from shared registry (distributed mode) ---
             self._sync_from_registry()
 
+            tag = self._file_tag()
             feedback = ""
             if self.best_model is not None:
                 # --- Dispatch judge ---
@@ -885,7 +886,6 @@ class GeCCoModelSearch:
                     )
 
                 # Save feedback for inspection
-                tag = self._file_tag()
                 feedback_file = (
                     self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}.txt"
                     if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"

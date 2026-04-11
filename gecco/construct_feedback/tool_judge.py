@@ -41,6 +41,20 @@ from gecco.diagnostic_store.tools import TOOL_SCHEMAS, dispatch_tool
 
 _console = Console()
 
+# Hard cap on any single tool result fed back into the message history.
+# Prevents an unexpectedly large result from reopening the context-limit wound.
+_MAX_TOOL_RESULT_CHARS = 40_000
+
+
+def _cap_tool_result(result_str: str) -> str:
+    """Truncate *result_str* if it exceeds _MAX_TOOL_RESULT_CHARS."""
+    if len(result_str) <= _MAX_TOOL_RESULT_CHARS:
+        return result_str
+    return (
+        result_str[:_MAX_TOOL_RESULT_CHARS]
+        + " ... [truncated: result too large; use more specific filters]"
+    )
+
 
 # ======================================================================
 # Verbose-output helpers
@@ -231,7 +245,7 @@ class _OpenAIToolLoop:
                     args = {}
 
                 result = dispatch_tool(store, tool_name, args)
-                result_str = json.dumps(result, default=str)
+                result_str = _cap_tool_result(json.dumps(result, default=str))
 
                 if self.verbose:
                     _console.print(_format_tool_call(tool_name, args))
@@ -347,7 +361,7 @@ class _GeminiToolLoop:
                     fc = part.function_call
                     args = dict(fc.args) if fc.args else {}
                     result = dispatch_tool(store, fc.name, args)
-                    result_str = json.dumps(result, default=str)
+                    result_str = _cap_tool_result(json.dumps(result, default=str))
 
                     if self.verbose:
                         _console.print(_format_tool_call(fc.name, args))

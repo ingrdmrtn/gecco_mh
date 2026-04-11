@@ -857,6 +857,28 @@ class GeCCoModelSearch:
             tag = self._file_tag()
             feedback = ""
             if self.best_model is not None:
+                # --- Detect recovery failures from previous iteration ---
+                recovery_failures = []
+                prev_had_success = True
+                if self.feedback.history:
+                    last = self.feedback.history[-1]
+                    if last["iteration"] == it - 1:
+                        last_results = last["results"]
+                        prev_had_success = any(
+                            r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR", None)
+                            for r in last_results
+                        )
+                        recovery_failures = [
+                            {
+                                "name": r.get("name") or r.get("model_name") or "unknown",
+                                "mean_r": r.get("recovery_r"),
+                                "per_param_r": r.get("recovery_per_param") or {},
+                                "iteration": last["iteration"],
+                            }
+                            for r in last_results
+                            if r.get("metric_name") == "RECOVERY_FAILED"
+                        ]
+
                 # --- Dispatch judge ---
                 if self.tool_judge is not None:
                     try:
@@ -867,6 +889,8 @@ class GeCCoModelSearch:
                             tag=tag,
                             best_model=self.best_model,
                             best_metric=self.best_metric,
+                            recovery_failures=recovery_failures if recovery_failures else None,
+                            prev_had_success=prev_had_success,
                         )
                         feedback = verdict.synthesized_feedback
                     except Exception as e:

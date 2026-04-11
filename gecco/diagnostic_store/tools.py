@@ -607,14 +607,19 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Enumerate all iterations recorded in the diagnostic store, "
                 "with summary counts of models proposed, successfully fit, "
-                "and the best metric per iteration."
+                "and the best metric per iteration. "
+                "NOTE: run_idx is the client/run identifier (e.g. 0), NOT the "
+                "iteration number. Omit run_idx to query across all runs."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "run_idx": {
                         "type": "integer",
-                        "description": "Filter to a specific run index (omit for all runs)."
+                        "description": (
+                            "Filter to a specific run index (the client/run identifier, "
+                            "NOT the iteration number). Omit to return all runs."
+                        )
                     },
                     "limit": {
                         "type": "integer",
@@ -928,14 +933,19 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "get_bic_trajectory",
             "description": (
                 "Return the best BIC per iteration as a time series.  "
-                "Useful for assessing convergence and improvement rate."
+                "Useful for assessing convergence and improvement rate. "
+                "NOTE: run_idx is the client/run identifier (e.g. 0), NOT the "
+                "iteration number. Omit run_idx to get the trajectory across all runs."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "run_idx": {
                         "type": "integer",
-                        "description": "Filter to a specific run index (omit for all)."
+                        "description": (
+                            "Filter to a specific run index (the client/run identifier, "
+                            "NOT the iteration number). Omit to return all runs."
+                        )
                     }
                 },
                 "required": []

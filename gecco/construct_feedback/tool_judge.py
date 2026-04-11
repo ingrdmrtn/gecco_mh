@@ -163,8 +163,16 @@ give a low confidence rating. If the evidence is strong, give a high confidence 
 
 _JUDGE_USER_TEMPLATE = """The model search has just completed iteration {iteration}.
 Current best BIC: {best_bic}
-Current best model: {best_model_name}
 Total iterations so far: {n_iterations}
+Run index (run_idx) for this client: {run_idx}
+
+IMPORTANT — database conventions:
+- "iteration" and "run_idx" are different fields.  "iteration" is the search step \
+(currently {iteration}); "run_idx" is the client/run identifier ({run_idx}).  Do NOT \
+pass the iteration number as run_idx.  Most tools do not require run_idx — omit it \
+to query across all runs.
+- The best model is identified by its BIC value ({best_bic}).  Use get_best_models() \
+to find it in the database and obtain its model_id.  Do not search by name.
 
 Please query the diagnostic database to analyse this iteration from all six angles, \
 then produce your verdict.
@@ -189,20 +197,31 @@ class _OpenAIToolLoop:
     def run(self, store, system_prompt: str, user_message: str,
             max_tool_calls: int) -> tuple[str, list[dict]]:
         """Run the tool loop and return (final_text, tool_call_trace)."""
+        planning_instruction = (
+            "Before calling any tools, first write a brief plan (a few sentences): "
+            "outline which of the six angles you will investigate and which tools "
+            "you expect to call. Do not call any tools in this first message — "
+            "you will be able to call them in your next message."
+        )
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": user_message + "\n\n" + planning_instruction},
         ]
         trace: list[dict] = []
         n_calls = 0
+        planning_done = False
 
         while n_calls < max_tool_calls:
+            # Force a text-only planning turn before any tool use.
+            is_planning_turn = not planning_done
+            tool_choice = "none" if is_planning_turn else "auto"
             kwargs: dict = {
                 "model": self.model_name,
                 "messages": messages,
                 "tools": TOOL_SCHEMAS,
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
                 "max_tokens": self.max_tokens,
+                "parallel_tool_calls": False,
             }
             if self.temperature is not None:
                 kwargs["temperature"] = self.temperature
@@ -231,6 +250,20 @@ class _OpenAIToolLoop:
                     for tc in msg.tool_calls
                 ]
             messages.append(assistant_msg)
+
+            if is_planning_turn:
+                # Planning turn is done; next iteration may call tools.
+                planning_done = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Good. Now proceed: call the diagnostic tools one at a "
+                        "time to gather the evidence you need. After each tool "
+                        "result, briefly reflect on what you learned before "
+                        "deciding on the next call."
+                    ),
+                })
+                continue
 
             if not msg.tool_calls:
                 # Model finished — return the text content
@@ -610,6 +643,8 @@ class ToolUsingJudge:
         tag: str = "",
         best_model: str | None = None,
         best_metric: float | None = None,
+        recovery_failures: list[dict] | None = None,
+        prev_had_success: bool = True,
         **kwargs,
     ) -> JudgeVerdict:
         """Run the tool-using judge and return a :class:`JudgeVerdict`.
@@ -626,6 +661,12 @@ class ToolUsingJudge:
             Code of the current best model (for context).
         best_metric:
             Current best BIC/metric value.
+        recovery_failures:
+            List of recovery failures from the previous iteration. If non-empty and
+            prev_had_success is False, the judge will attempt to short-circuit and
+            reuse the previous verdict with a failure note appended.
+        prev_had_success:
+            Whether the previous iteration had any successful model fits.
 
         Returns
         -------
@@ -634,22 +675,31 @@ class ToolUsingJudge:
         """
         t0 = time.time()
 
+        # --- Attempt to short-circuit if previous iteration had only recovery failures ---
+        if recovery_failures and not prev_had_success and self.results_dir:
+            shortcut = self._try_shortcut_from_recovery_failure(
+                iteration=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                recovery_failures=recovery_failures,
+            )
+            if shortcut is not None:
+                if self.verbose:
+                    _console.print(
+                        f"[bold magenta]◆ Judge (iter {iteration})[/bold magenta]"
+                        f" — short-circuit: reusing verdict from earlier iteration"
+                    )
+                return shortcut
+
         # --- Build context ---
         best_bic_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
-        best_model_name = "unknown"
-        if best_model:
-            import re
-            m = re.search(r"def\s+(\w+)\s*\(", best_model)
-            if m:
-                best_model_name = m.group(1)
-
         n_iterations = iteration + 1  # iterations seen so far (0-indexed)
 
         user_message = _JUDGE_USER_TEMPLATE.format(
             iteration=iteration,
             best_bic=best_bic_str,
-            best_model_name=best_model_name,
             n_iterations=n_iterations,
+            run_idx=run_idx,
         )
 
         # --- Run tool loop ---
@@ -692,6 +742,124 @@ class ToolUsingJudge:
         # --- Persist audit trace ---
         if self.results_dir:
             self._save_trace(verdict, trace, iteration, run_idx, tag)
+
+        return verdict
+
+    def _try_shortcut_from_recovery_failure(
+        self,
+        iteration: int,
+        run_idx: int,
+        tag: str,
+        recovery_failures: list[dict],
+    ) -> JudgeVerdict | None:
+        """Attempt to short-circuit the full judge analysis when the previous
+        iteration only produced recovery failures.
+
+        Walks backwards through saved judge verdict files to find the most recent
+        "real" (non-short-circuit) verdict, then appends a note about the recovery
+        failures and returns a new JudgeVerdict reusing that verdict's content.
+
+        Returns None if no previous verdict can be found, or if the short-circuit
+        is not applicable; the caller should fall through to the full analysis.
+        """
+        # --- Locate the source verdict (most recent non-short-circuit verdict) ---
+        source_verdict_iter = None
+        source_verdict_data = None
+
+        for k in range(iteration - 1, -1, -1):
+            verdict_path = (
+                self.results_dir / "judge" / f"iter{k}{tag}_run{run_idx}.json"
+            )
+            if verdict_path.exists():
+                try:
+                    with open(verdict_path) as f:
+                        data = json.load(f)
+                    # Stop at the first file that is NOT marked as short-circuit
+                    if not data.get("short_circuit", False):
+                        source_verdict_iter = k
+                        source_verdict_data = data
+                        break
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+        if source_verdict_data is None:
+            return None
+
+        # --- Build the failure note ---
+        failure_lines = [
+            "Update — previous iteration candidate(s) rejected for poor parameter recovery:"
+        ]
+        for fail in recovery_failures:
+            name = fail.get("name", "unknown")
+            mean_r = fail.get("mean_r")
+            per_param_r = fail.get("per_param_r") or {}
+
+            mean_r_str = f"{mean_r:.2f}" if mean_r is not None else "unknown"
+            failure_lines.append(f"- {name}: mean r={mean_r_str}")
+
+            # List worst 3 parameters
+            if per_param_r:
+                worst_params = sorted(
+                    per_param_r.items(),
+                    key=lambda x: x[1] if x[1] is not None else 1.0,
+                )[:3]
+                if worst_params:
+                    param_strs = [
+                        f"{pname} r={r:.2f}" if r is not None else f"{pname} r=unknown"
+                        for pname, r in worst_params
+                    ]
+                    failure_lines.append(
+                        f"    worst: {', '.join(param_strs)}"
+                    )
+
+        failure_lines.append(
+            "Do not repropose these mechanisms without addressing the "
+            "identifiability issues."
+        )
+        failure_note = "\n".join(failure_lines)
+
+        # --- Compose synthesised feedback ---
+        previous_feedback = source_verdict_data.get("synthesized_feedback", "")
+        combined_feedback = (
+            f"{failure_note}\n\n"
+            f"--- Previous verdict (state unchanged since iter {source_verdict_iter}) ---\n"
+            f"{previous_feedback}"
+        )
+
+        # --- Construct verdict with source data ---
+        per_angle = [
+            AngleAnalysis(
+                angle=a.get("angle", ""),
+                findings=a.get("findings", ""),
+                supporting_tool_calls=a.get("supporting_tool_calls", []),
+                confidence=a.get("confidence", "medium"),
+            )
+            for a in source_verdict_data.get("per_angle", [])
+        ]
+
+        verdict = JudgeVerdict(
+            iteration=iteration,
+            per_angle=per_angle,
+            key_recommendations=source_verdict_data.get("key_recommendations", []),
+            synthesized_feedback=combined_feedback,
+            tool_call_count=0,
+            wall_time_seconds=0.1,  # Very small wall time for shortcut
+        )
+
+        # --- Save the shortcut trace ---
+        if self.results_dir:
+            self._save_trace(
+                verdict,
+                [],  # No tool calls
+                iteration,
+                run_idx,
+                tag,
+                extra_payload={
+                    "short_circuit": True,
+                    "source_iter": source_verdict_iter,
+                    "recovery_failures": recovery_failures,
+                },
+            )
 
         return verdict
 
@@ -771,8 +939,16 @@ class ToolUsingJudge:
         return "Judge feedback unavailable (no tool-calling backend configured)."
 
     def _save_trace(self, verdict: JudgeVerdict, trace: list[dict],
-                    iteration: int, run_idx: int, tag: str = "") -> None:
-        """Write the judge trace to results/{task}/judge/iterN_runX.json."""
+                    iteration: int, run_idx: int, tag: str = "",
+                    extra_payload: dict | None = None) -> None:
+        """Write the judge trace to results/{task}/judge/iterN_runX.json.
+
+        Parameters
+        ----------
+        extra_payload:
+            Optional dict of additional fields to merge into the JSON payload.
+            Used for short-circuit markers and source iteration references.
+        """
         judge_dir = self.results_dir / "judge"
         judge_dir.mkdir(parents=True, exist_ok=True)
 
@@ -791,5 +967,7 @@ class ToolUsingJudge:
             "key_recommendations": verdict.key_recommendations,
             "synthesized_feedback": verdict.synthesized_feedback,
         }
+        if extra_payload:
+            payload.update(extra_payload)
         with open(fname, "w") as f:
             json.dump(payload, f, indent=2, default=str)

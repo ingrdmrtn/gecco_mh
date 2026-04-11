@@ -35,8 +35,44 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
+from rich.console import Console
 
 from gecco.diagnostic_store.tools import TOOL_SCHEMAS, dispatch_tool
+
+_console = Console()
+
+
+# ======================================================================
+# Verbose-output helpers
+# ======================================================================
+
+def _format_tool_call(name: str, args: dict) -> str:
+    """Format a tool call as a compact one-liner."""
+    parts = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
+    plain = f"▸ {name}({parts})"
+    if len(plain) > 120:
+        plain = plain[:117] + "..."
+    return f"[bold cyan]{plain}[/bold cyan]"
+
+
+def _format_tool_result(result) -> str:
+    """Compact one-line summary of a tool result."""
+    raw = json.dumps(result, default=str)
+    n_chars = len(raw)
+    if isinstance(result, dict):
+        keys = list(result.keys())
+        key_preview = ", ".join(keys[:5])
+        if len(keys) > 5:
+            key_preview += ", ..."
+        summary = f"{len(keys)} keys: {key_preview}"
+    elif isinstance(result, list):
+        summary = f"{len(result)} rows"
+    else:
+        summary = repr(result)
+    full = f"{summary} ({n_chars} chars)"
+    if len(full) > 120:
+        full = full[:117] + "..."
+    return full
 
 
 # ======================================================================
@@ -129,11 +165,12 @@ class _OpenAIToolLoop:
     """Tool-calling loop for OpenAI-compatible backends."""
 
     def __init__(self, client, model_name: str, max_tokens: int,
-                 temperature: float | None):
+                 temperature: float | None, verbose: bool = False):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.verbose = verbose
 
     def run(self, store, system_prompt: str, user_message: str,
             max_tool_calls: int) -> tuple[str, list[dict]]:
@@ -159,6 +196,11 @@ class _OpenAIToolLoop:
             response = self.client.chat.completions.create(**kwargs)
             choice = response.choices[0]
             msg = choice.message
+
+            # Verbose: print assistant text (if any)
+            if self.verbose and msg.content:
+                for line in msg.content.splitlines():
+                    _console.print(f"[dim]│[/dim] {line}")
 
             # Append assistant message (may contain tool_calls)
             assistant_msg = {"role": "assistant", "content": msg.content or ""}
@@ -190,6 +232,10 @@ class _OpenAIToolLoop:
 
                 result = dispatch_tool(store, tool_name, args)
                 result_str = json.dumps(result, default=str)
+
+                if self.verbose:
+                    _console.print(_format_tool_call(tool_name, args))
+                    _console.print(f"  [dim]└─ {_format_tool_result(result)}[/dim]")
 
                 trace.append({
                     "tool": tool_name,
@@ -228,11 +274,12 @@ class _GeminiToolLoop:
     """Tool-calling loop for Gemini backends."""
 
     def __init__(self, client, model_name: str, max_tokens: int,
-                 temperature: float | None):
+                 temperature: float | None, verbose: bool = False):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.verbose = verbose
 
     def _build_gemini_tools(self):
         """Convert TOOL_SCHEMAS to Gemini FunctionDeclaration objects."""
@@ -282,6 +329,16 @@ class _GeminiToolLoop:
                 config=types.GenerateContentConfig(**config_kwargs),
             )
 
+            # Verbose: print assistant text (if any)
+            if self.verbose:
+                text_parts = [
+                    p.text for p in resp.candidates[0].content.parts
+                    if hasattr(p, "text") and p.text
+                ]
+                if text_parts:
+                    for line in "\n".join(text_parts).splitlines():
+                        _console.print(f"[dim]│[/dim] {line}")
+
             # Check for function calls
             has_function_calls = False
             for part in resp.candidates[0].content.parts:
@@ -291,6 +348,10 @@ class _GeminiToolLoop:
                     args = dict(fc.args) if fc.args else {}
                     result = dispatch_tool(store, fc.name, args)
                     result_str = json.dumps(result, default=str)
+
+                    if self.verbose:
+                        _console.print(_format_tool_call(fc.name, args))
+                        _console.print(f"  [dim]└─ {_format_tool_result(result)}[/dim]")
 
                     trace.append({
                         "tool": fc.name,
@@ -494,6 +555,7 @@ class ToolUsingJudge:
 
         judge_cfg = getattr(cfg, "judge", None)
         self.max_tool_calls: int = getattr(judge_cfg, "max_tool_calls", 20) if judge_cfg else 20
+        self.verbose: bool = bool(getattr(judge_cfg, "verbose", False)) if judge_cfg else False
         self.model_name: str = getattr(cfg.llm, "base_model", "unknown")
         self.provider: str = getattr(cfg.llm, "provider", "").lower()
         self.max_tokens: int = getattr(
@@ -514,11 +576,13 @@ class ToolUsingJudge:
         p = self.provider
         if any(x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")):
             return _OpenAIToolLoop(
-                self.model, self.model_name, self.max_tokens, self.temperature
+                self.model, self.model_name, self.max_tokens, self.temperature,
+                verbose=self.verbose,
             )
         elif "gemini" in p:
             return _GeminiToolLoop(
-                self.model, self.model_name, self.max_tokens, self.temperature
+                self.model, self.model_name, self.max_tokens, self.temperature,
+                verbose=self.verbose,
             )
         else:
             # HuggingFace / unknown: fall back to OpenAI-compatible if possible,
@@ -575,6 +639,12 @@ class ToolUsingJudge:
         )
 
         # --- Run tool loop ---
+        if self.verbose:
+            _console.print(
+                f"[bold magenta]◆ Judge (iter {iteration})[/bold magenta]"
+                f" — model: [cyan]{self.model_name}[/cyan]"
+            )
+
         if self._tool_loop is not None:
             final_text, trace = self._tool_loop.run(
                 self.store,
@@ -594,6 +664,13 @@ class ToolUsingJudge:
             structured_text = final_text
 
         wall_time = time.time() - t0
+
+        if self.verbose:
+            _console.print(
+                f"[bold magenta]◆ Judge verdict[/bold magenta]"
+                f" ({len(trace)} tool calls, {wall_time:.1f}s wall time)"
+            )
+
         verdict = _parse_verdict_from_text(
             structured_text, iteration, len(trace), wall_time
         )
@@ -607,6 +684,9 @@ class ToolUsingJudge:
     def _request_structured_verdict(self, analysis_text: str,
                                       trace: list[dict]) -> str:
         """Ask the LLM to format its analysis as structured JSON."""
+        if self.verbose:
+            _console.print("[bold magenta]◆ Extracting structured verdict...[/bold magenta]")
+
         messages = [
             {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
             {"role": "assistant", "content": analysis_text},
@@ -622,7 +702,10 @@ class ToolUsingJudge:
             if self.temperature is not None:
                 kwargs["temperature"] = self.temperature
             resp = self.model.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content or analysis_text
+            result = resp.choices[0].message.content or analysis_text
+            if self.verbose:
+                _console.print(f"[dim]  └─ structured verdict: {len(result)} chars[/dim]")
+            return result
         elif "gemini" in p:
             try:
                 from google.genai import types
@@ -642,7 +725,10 @@ class ToolUsingJudge:
                 contents=contents,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
-            return resp.text.strip()
+            result = resp.text.strip()
+            if self.verbose:
+                _console.print(f"[dim]  └─ structured verdict: {len(result)} chars[/dim]")
+            return result
         return analysis_text
 
     def _fallback_generate(self, user_message: str) -> str:

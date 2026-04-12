@@ -99,16 +99,25 @@ def rebuild_from_artifacts(
 
         split = _detect_split(json_file.name)
 
+        # Extract PPC data from results (stored inline as result["ppc"])
+        ppc_results_map = {
+            r["function_name"]: r["ppc"]
+            for r in iteration_results
+            if r.get("function_name") and r.get("ppc")
+        }
+
         store.write_iteration(
             iteration=iteration,
             run_idx=run_idx,
             iteration_results=iteration_results,
+            ppc_results=ppc_results_map or None,
             tag=tag,
             client_id=client_id,
         )
+        ppc_count = len(ppc_results_map)
         print(
             f"[rebuild]   iter={iteration} run={run_idx} client='{client_id}' split='{split}' "
-            f"({len(iteration_results)} models)"
+            f"({len(iteration_results)} models, {ppc_count} with PPC)"
         )
 
     top_models_test_file = results_dir / "bics" / "top_models_test.json"

@@ -134,4 +134,6 @@ def run_fit_hierarchical(
         "eval_metrics": eval_metrics,
         "participant_n_trials": participant_n_trials,
         "hbi_result": hbi_result,
+        "per_participant_nll": hbi_result.per_subject_nll[0].tolist(),
+        "mean_nll": float(np.mean(hbi_result.per_subject_nll[0])),
     }

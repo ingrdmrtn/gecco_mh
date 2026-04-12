@@ -9,9 +9,12 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
+from gecco.sentry_init import capture_coordination_error
 from rich.console import Console
 
 console = Console()
@@ -93,17 +96,25 @@ class SharedRegistry:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_path, str(self.registry_path))
-        except Exception:
-            # Clean up temp file on failure
+        except Exception as e:
+            capture_coordination_error(error=e, operation="atomic-write")
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             raise
 
-    def update(self, client_id, iteration, results, best_model=None,
-               best_metric=None, param_names=None, tried_param_sets=None,
-               status="running"):
+    def update(
+        self,
+        client_id,
+        iteration,
+        results,
+        best_model=None,
+        best_metric=None,
+        param_names=None,
+        tried_param_sets=None,
+        status="running",
+    ):
         """
         Atomically merge this client's iteration results into the registry.
 
@@ -168,6 +179,22 @@ class SharedRegistry:
                         entry["max_r2"] = id_res.get("max_r2")
                         entry["best_param"] = id_res.get("best_param")
                         entry["per_param_r2"] = id_res.get("per_param_r2")
+                    # Include validation metrics for test evaluation (Step 9)
+                    if r.get("val_metric_value") is not None:
+                        entry["val_metric_value"] = r["val_metric_value"]
+                        entry["val_mean_nll"] = r.get("val_mean_nll")
+                        entry["val_eval_metrics"] = r.get("val_eval_metrics", [])
+                        entry["val_per_participant_nll"] = r.get(
+                            "val_per_participant_nll", []
+                        )
+                    val_id = r.get("val_individual_differences")
+                    if val_id and isinstance(val_id, dict):
+                        entry["val_individual_differences"] = {
+                            "mean_r2": val_id.get("mean_r2"),
+                            "max_r2": val_id.get("max_r2"),
+                            "best_param": val_id.get("best_param"),
+                            "per_param_r2": val_id.get("per_param_r2"),
+                        }
                     serializable_results.append(entry)
 
                 # Replace existing entry for same (client_id, iteration), or append
@@ -178,8 +205,10 @@ class SharedRegistry:
                 }
                 replaced = False
                 for idx, existing_entry in enumerate(data["iteration_history"]):
-                    if (existing_entry.get("client_id") == client_id
-                            and existing_entry.get("iteration") == iteration):
+                    if (
+                        existing_entry.get("client_id") == client_id
+                        and existing_entry.get("iteration") == iteration
+                    ):
                         data["iteration_history"][idx] = new_entry
                         replaced = True
                         break
@@ -198,7 +227,10 @@ class SharedRegistry:
                 # Update global best if this client has a better model
                 if best_metric is not None and best_model is not None:
                     current_best = data["global_best"]
-                    if current_best is None or best_metric < current_best["metric_value"]:
+                    if (
+                        current_best is None
+                        or best_metric < current_best["metric_value"]
+                    ):
                         data["global_best"] = {
                             "metric_value": best_metric,
                             "model_code": best_model,
@@ -256,12 +288,13 @@ class SharedRegistry:
 
                 if str(client_id) in data["client_entries"]:
                     data["client_entries"][str(client_id)]["status"] = "complete"
-                    data["client_entries"][str(client_id)]["updated_at"] = datetime.now().isoformat()
+                    data["client_entries"][str(client_id)]["updated_at"] = (
+                        datetime.now().isoformat()
+                    )
 
                 self._atomic_write(data)
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
 
     def set_baseline(self, baseline_result):
         """Write baseline result to the registry under the 'baseline' key."""
@@ -277,7 +310,9 @@ class SharedRegistry:
 
                 # Store a serializable subset (no numpy arrays)
                 data["baseline"] = {
-                    "function_name": baseline_result.get("function_name", "baseline_model"),
+                    "function_name": baseline_result.get(
+                        "function_name", "baseline_model"
+                    ),
                     "metric_name": baseline_result.get("metric_name", "BIC"),
                     "metric_value": baseline_result.get("metric_value"),
                     "param_names": baseline_result.get("param_names", []),
@@ -294,6 +329,140 @@ class SharedRegistry:
                 self._atomic_write(data)
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def count_clients_at_iteration(self, iteration: int) -> int:
+        """
+        Count the number of distinct clients that have written results for an iteration.
+
+        Returns the count of unique client_ids in iteration_history with the given iteration.
+        """
+        data = self.read()
+        seen_clients = set()
+        for entry in data.get("iteration_history", []):
+            if entry.get("iteration") == iteration:
+                client_id = entry.get("client_id")
+                if client_id is not None:
+                    seen_clients.add(client_id)
+        return len(seen_clients)
+
+    def wait_for_iteration(
+        self,
+        iteration: int,
+        n_expected: int,
+        timeout_seconds: float,
+        poll_seconds: float = 2.0,
+    ) -> int:
+        """
+        Poll until at least n_expected clients have written iteration results, or timeout.
+
+        Polls count_clients_at_iteration every poll_seconds until:
+        - count >= n_expected (returns count immediately), or
+        - timeout_seconds elapses (returns count at that time)
+
+        Returns the count of clients who contributed to the iteration.
+        """
+        start_time = time.time()
+        while True:
+            count = self.count_clients_at_iteration(iteration)
+            if count >= n_expected:
+                console.print(
+                    f"[green]Iteration {iteration} complete: {count}/{n_expected} clients "
+                    f"in {time.time() - start_time:.1f}s[/]"
+                )
+                return count
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                console.print(
+                    f"[yellow]Iteration {iteration} timeout: got {count}/{n_expected} clients "
+                    f"after {elapsed:.1f}s, proceeding with available results[/]"
+                )
+                return count
+
+            time.sleep(poll_seconds)
+
+    def set_judge_feedback(
+        self,
+        iteration: int,
+        synthesized_feedback: str,
+        verdict_payload: dict,
+    ) -> None:
+        """
+        Store the shared judge verdict for an iteration.
+
+        The verdict is stored in a new top-level 'judge_iterations' dict keyed by iteration.
+        """
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                # Initialize judge_iterations if not present
+                if "judge_iterations" not in data:
+                    data["judge_iterations"] = {}
+
+                # Store the verdict with timestamp
+                data["judge_iterations"][str(iteration)] = {
+                    "synthesized_feedback": synthesized_feedback,
+                    "verdict": verdict_payload,
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+                self._atomic_write(data)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def get_judge_feedback(self, iteration: int) -> Optional[dict]:
+        """
+        Retrieve the stored judge verdict for an iteration.
+
+        Returns the verdict dict (with 'synthesized_feedback' and 'verdict' keys)
+        or None if not yet written.
+        """
+        data = self.read()
+        judge_iterations = data.get("judge_iterations", {})
+        return judge_iterations.get(str(iteration))
+
+    def wait_for_judge_feedback(
+        self,
+        iteration: int,
+        timeout_seconds: float,
+        poll_seconds: float = 2.0,
+    ) -> Optional[dict]:
+        """
+        Client-side helper: poll until judge feedback is available for an iteration, or timeout.
+
+        Polls get_judge_feedback every poll_seconds until:
+        - feedback is available (returns the dict), or
+        - timeout_seconds elapses (returns None)
+
+        Used by clients to wait for the orchestrator's shared verdict.
+        """
+        start_time = time.time()
+        while True:
+            feedback = self.get_judge_feedback(iteration)
+            if feedback is not None:
+                elapsed = time.time() - start_time
+                console.print(
+                    f"[green]Received judge feedback for iteration {iteration} "
+                    f"in {elapsed:.1f}s[/]"
+                )
+                return feedback
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                console.print(
+                    f"[yellow]Timeout waiting for judge feedback (iteration {iteration}) "
+                    f"after {elapsed:.1f}s[/]"
+                )
+                return None
+
+            time.sleep(poll_seconds)
 
 
 def apply_client_profile(cfg, profile_name):

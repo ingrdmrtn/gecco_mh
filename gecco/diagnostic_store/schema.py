@@ -20,7 +20,6 @@ CREATE_STATEMENTS = [
         version  INTEGER NOT NULL
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Iterations — one row per (run_idx, iteration)
     # ------------------------------------------------------------------ #
@@ -39,7 +38,6 @@ CREATE_STATEMENTS = [
         UNIQUE (run_idx, iteration, tag)
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Models — one row per evaluated model candidate
     # ------------------------------------------------------------------ #
@@ -56,11 +54,12 @@ CREATE_STATEMENTS = [
         code           TEXT,
         metric_name    VARCHAR,
         metric_value   DOUBLE,
+        mean_nll       DOUBLE,
+        split          VARCHAR DEFAULT 'train',
         param_names    JSON,
         status         VARCHAR DEFAULT 'ok'
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Per-participant fit data
     # ------------------------------------------------------------------ #
@@ -70,6 +69,7 @@ CREATE_STATEMENTS = [
         model_id        INTEGER REFERENCES models(model_id),
         participant_idx INTEGER NOT NULL,
         bic             DOUBLE,
+        nll             DOUBLE,
         n_trials        INTEGER,
         params          JSON
     )
@@ -80,7 +80,6 @@ CREATE_STATEMENTS = [
     # Replace the table to add the default for id
     # (DuckDB doesn't support ALTER COLUMN DEFAULT easily, so we use a sequence
     # inline at insert time via populate.py)
-
     # ------------------------------------------------------------------ #
     # Parameter recovery
     # ------------------------------------------------------------------ #
@@ -94,7 +93,6 @@ CREATE_STATEMENTS = [
         simulation_error  VARCHAR
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Individual differences
     # ------------------------------------------------------------------ #
@@ -105,10 +103,10 @@ CREATE_STATEMENTS = [
         max_r2           DOUBLE,
         best_param       VARCHAR,
         per_param_r2     JSON,
-        per_param_detail JSON
+        per_param_detail JSON,
+        split            VARCHAR DEFAULT 'train'
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Posterior predictive checks
     # ------------------------------------------------------------------ #
@@ -129,7 +127,6 @@ CREATE_STATEMENTS = [
         n_sims           INTEGER
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Block residuals
     # ------------------------------------------------------------------ #
@@ -148,7 +145,6 @@ CREATE_STATEMENTS = [
         n_trials            INTEGER
     )
     """,
-
     # ------------------------------------------------------------------ #
     # Validation errors
     # ------------------------------------------------------------------ #
@@ -175,6 +171,4 @@ def create_schema(conn) -> None:
     # Insert schema version if not already present
     version_row = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
     if version_row == 0:
-        conn.execute(
-            "INSERT INTO schema_version VALUES (?)", [SCHEMA_VERSION]
-        )
+        conn.execute("INSERT INTO schema_version VALUES (?)", [SCHEMA_VERSION])

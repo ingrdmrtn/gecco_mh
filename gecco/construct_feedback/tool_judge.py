@@ -60,6 +60,7 @@ def _cap_tool_result(result_str: str) -> str:
 # Verbose-output helpers
 # ======================================================================
 
+
 def _format_tool_call(name: str, args: dict) -> str:
     """Format a tool call as a compact one-liner."""
     parts = ", ".join(f"{k}={repr(v)}" for k, v in args.items())
@@ -93,6 +94,7 @@ def _format_tool_result(result) -> str:
 # Output schema
 # ======================================================================
 
+
 class AngleAnalysis(BaseModel):
     angle: str
     findings: str
@@ -115,7 +117,7 @@ class JudgeVerdict(BaseModel):
 
 _JUDGE_SYSTEM_PROMPT = """You are a senior postdoctoral fellow in cognitive computational neuroscience. \
 You are evaluating candidate cognitive models for a reinforcement learning task \
-as part of an iterative model development process. 
+as part of an iterative model development process.
 
 You have expertise in computational modelling, reinforcement learning, Bayesian modelling, \
 and statistical model comparison. You are familiar with common pitfalls in model development \
@@ -126,39 +128,53 @@ database through tool calls, then synthesise actionable feedback for the next it
 
 You will analyse from six angles — call tools to gather evidence for each:
 
-1. **Statistical fit quality** — examine the BIC trajectory, whether it is still \
-improving, which models have the best per-participant fit, whether different participants \
-prefer different models, and whether any participants are outliers.
+1. **Statistical fit quality** — Compare the top 3-5 models, not just the best. Note which \
+models improved over predecessors and which were a step backwards. Identify if improvement \
+has plateaued. Examine whether different participants prefer different models, and whether \
+any participants are outliers.
 
-2. **Parameter identifiability** — check parameter recovery diagnostics for the best \
-models. Flag parameters with low recovery r and suggest whether they should be removed \
-or reparameterised.
+2. **Parameter identifiability** — Check parameter recovery diagnostics for the best 2-3 \
+models, not just the top one. Identify which parameters are well-recovered across models \
+and which are problematic. Flag parameters with low recovery r and suggest whether they \
+should be removed or reparameterised.
 
-3. **Predictive adequacy** — inspect PPC records if available. Identify which observed \
-statistics fall outside the 95% predictive interval, and inspect block-level residuals \
-to identify where in the task the model systematically underperforms.
+3. **Predictive adequacy** — Inspect PPC records if available. Compare PPC performance \
+across the best models — does one capture certain patterns better than another? Identify \
+which observed statistics fall outside the 95% predictive interval, and inspect block-level \
+residuals to identify where in the task the model systematically underperforms.
 
-4. **Individual differences** — examine which parameters predict self-report scores \
-(R²). Also check whether the best-fitting model differs across participants; high \
+4. **Individual differences** — Compare R² across the best models. Which model's parameters \
+have the strongest individual-differences signal? Examine which parameters predict self-report \
+scores (R²). Also check whether the best-fitting model differs across participants; high \
 heterogeneity can indicate a need for hybrid or mixture mechanisms. Highlight parameters \
 with strong individual-differences signal and suggest building on them.
 
-5. **Mechanistic / theoretical coherence** — read the code of the best 2–3 models. \
-Assess whether the mechanisms are psychologically interpretable and parsimonious.
+5. **Mechanistic coherence** — Read the code of the best models AND some that failed. \
+Understand what distinguishes successful from unsuccessful mechanisms. Assess whether \
+the mechanisms are psychologically interpretable and parsimonious.
 
-6. **Coverage** — what types of mechanisms (learning rules, decision rules, memory, \
-attention) have been tried across iterations? What has been neglected?
+6. **Coverage** — Identify which mechanisms have been tried and failed vs. tried and \
+partially succeeded vs. not yet explored. What types of mechanisms (learning rules, \
+decision rules, memory, attention) have been tried across iterations? What has been neglected?
 
 After gathering evidence across all angles, produce:
 - A brief per-angle summary (findings + confidence).
 - A list of 3–5 concrete recommendations for the next iteration.
-- A synthesized_feedback paragraph (≤ 300 words) to improve the next iteration of \
+- A synthesized_feedback paragraph (≤ 500 words) to improve the next iteration of \
     model development.
 
 Be specific: cite model names, parameter names, BIC values, and r values from the data.
 
 Quantify your confidence: If you do not have much data to support an angle, say so and \
 give a low confidence rating. If the evidence is strong, give a high confidence rating.
+
+---
+
+AUDIENCE SEPARATION — IMPORTANT: The `synthesized_feedback` you produce will be read by \
+a different LLM that writes Python model code. That LLM knows nothing about "angles", \
+tool calls, or internal model IDs. Models must be described by their mechanisms \
+(e.g., "the model with separate learning rates for gains and losses") not by ID. \
+The feedback should be comparative — discuss multiple models' strengths and weaknesses.
 """
 
 _JUDGE_USER_TEMPLATE = """The model search has just completed iteration {iteration}.
@@ -183,19 +199,27 @@ then produce your verdict.
 # Backend-specific tool loops
 # ======================================================================
 
+
 class _OpenAIToolLoop:
     """Tool-calling loop for OpenAI-compatible backends."""
 
-    def __init__(self, client, model_name: str, max_tokens: int,
-                 temperature: float | None, verbose: bool = False):
+    def __init__(
+        self,
+        client,
+        model_name: str,
+        max_tokens: int,
+        temperature: float | None,
+        verbose: bool = False,
+    ):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.verbose = verbose
 
-    def run(self, store, system_prompt: str, user_message: str,
-            max_tool_calls: int) -> tuple[str, list[dict]]:
+    def run(
+        self, store, system_prompt: str, user_message: str, max_tool_calls: int
+    ) -> tuple[str, list[dict]]:
         """Run the tool loop and return (final_text, tool_call_trace)."""
         planning_instruction = (
             "Before calling any tools, first write a brief plan (a few sentences): "
@@ -254,15 +278,17 @@ class _OpenAIToolLoop:
             if is_planning_turn:
                 # Planning turn is done; next iteration may call tools.
                 planning_done = True
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Good. Now proceed: call the diagnostic tools one at a "
-                        "time to gather the evidence you need. After each tool "
-                        "result, briefly reflect on what you learned before "
-                        "deciding on the next call."
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Good. Now proceed: call the diagnostic tools one at a "
+                            "time to gather the evidence you need. After each tool "
+                            "result, briefly reflect on what you learned before "
+                            "deciding on the next call."
+                        ),
+                    }
+                )
                 continue
 
             if not msg.tool_calls:
@@ -284,28 +310,34 @@ class _OpenAIToolLoop:
                     _console.print(_format_tool_call(tool_name, args))
                     _console.print(f"  [dim]└─ {_format_tool_result(result)}[/dim]")
 
-                trace.append({
-                    "tool": tool_name,
-                    "args": args,
-                    "result_summary": result_str[:500],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_str,
-                })
+                trace.append(
+                    {
+                        "tool": tool_name,
+                        "args": args,
+                        "result_summary": result_str[:500],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_str,
+                    }
+                )
                 n_calls += 1
                 if n_calls >= max_tool_calls:
                     break
 
         # Hit the cap — ask for a final synthesis without tools
-        messages.append({
-            "role": "user",
-            "content": (
-                "You have reached the tool call limit. "
-                "Please now synthesise your findings into the final verdict."
-            ),
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "You have reached the tool call limit. "
+                    "Please now synthesise your findings into the final verdict."
+                ),
+            }
+        )
         kwargs_final: dict = {
             "model": self.model_name,
             "messages": messages,
@@ -320,8 +352,14 @@ class _OpenAIToolLoop:
 class _GeminiToolLoop:
     """Tool-calling loop for Gemini backends."""
 
-    def __init__(self, client, model_name: str, max_tokens: int,
-                 temperature: float | None, verbose: bool = False):
+    def __init__(
+        self,
+        client,
+        model_name: str,
+        max_tokens: int,
+        temperature: float | None,
+        verbose: bool = False,
+    ):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
@@ -347,8 +385,9 @@ class _GeminiToolLoop:
             )
         return [types.Tool(function_declarations=declarations)]
 
-    def run(self, store, system_prompt: str, user_message: str,
-            max_tool_calls: int) -> tuple[str, list[dict]]:
+    def run(
+        self, store, system_prompt: str, user_message: str, max_tool_calls: int
+    ) -> tuple[str, list[dict]]:
         """Run the Gemini tool loop."""
         try:
             from google.genai import types
@@ -379,7 +418,8 @@ class _GeminiToolLoop:
             # Verbose: print assistant text (if any)
             if self.verbose:
                 text_parts = [
-                    p.text for p in resp.candidates[0].content.parts
+                    p.text
+                    for p in resp.candidates[0].content.parts
                     if hasattr(p, "text") and p.text
                 ]
                 if text_parts:
@@ -400,23 +440,36 @@ class _GeminiToolLoop:
                         _console.print(_format_tool_call(fc.name, args))
                         _console.print(f"  [dim]└─ {_format_tool_result(result)}[/dim]")
 
-                    trace.append({
-                        "tool": fc.name,
-                        "args": args,
-                        "result_summary": result_str[:500],
-                    })
+                    trace.append(
+                        {
+                            "tool": fc.name,
+                            "args": args,
+                            "result_summary": result_str[:500],
+                        }
+                    )
 
                     # Append function response
-                    contents.append({
-                        "role": "model",
-                        "parts": [{"function_call": {"name": fc.name, "args": args}}],
-                    })
-                    contents.append({
-                        "role": "tool",
-                        "parts": [{"function_response": {
-                            "name": fc.name, "response": {"result": result_str}
-                        }}],
-                    })
+                    contents.append(
+                        {
+                            "role": "model",
+                            "parts": [
+                                {"function_call": {"name": fc.name, "args": args}}
+                            ],
+                        }
+                    )
+                    contents.append(
+                        {
+                            "role": "tool",
+                            "parts": [
+                                {
+                                    "function_response": {
+                                        "name": fc.name,
+                                        "response": {"result": result_str},
+                                    }
+                                }
+                            ],
+                        }
+                    )
                     n_calls += 1
                     if n_calls >= max_tool_calls:
                         break
@@ -425,13 +478,19 @@ class _GeminiToolLoop:
                 return resp.text.strip(), trace
 
         # Final synthesis pass
-        contents.append({
-            "role": "user",
-            "parts": [{"text": (
-                "You have reached the tool call limit. "
-                "Please now synthesise your findings into the final verdict."
-            )}],
-        })
+        contents.append(
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            "You have reached the tool call limit. "
+                            "Please now synthesise your findings into the final verdict."
+                        )
+                    }
+                ],
+            }
+        )
         # Remove tools from final call to force text response
         final_config = {k: v for k, v in config_kwargs.items() if k != "tools"}
         final_resp = self.client.models.generate_content(
@@ -472,15 +531,18 @@ _VERDICT_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
         },
-        "synthesized_feedback": {"type": "string"},
+        "synthesized_feedback": {
+            "type": "string",
+            "maxLength": 3500,
+        },
     },
     "required": ["per_angle", "key_recommendations", "synthesized_feedback"],
 }
 
 
-def _parse_verdict_from_text(text: str, iteration: int,
-                              tool_call_count: int,
-                              wall_time: float) -> JudgeVerdict:
+def _parse_verdict_from_text(
+    text: str, iteration: int, tool_call_count: int, wall_time: float
+) -> JudgeVerdict:
     """Parse a JudgeVerdict from the LLM's final text.
 
     Tries JSON parsing first (if the text contains a JSON block),
@@ -547,7 +609,6 @@ _SYNTHESIS_PROMPT = """Based on your analysis above, please produce a final verd
     {
       "angle": "Statistical fit quality",
       "findings": "...",
-      "supporting_tool_calls": ["get_bic_trajectory", "get_best_models"],
       "confidence": "high"
     }
   ],
@@ -555,7 +616,7 @@ _SYNTHESIS_PROMPT = """Based on your analysis above, please produce a final verd
     "Recommendation 1...",
     "Recommendation 2..."
   ],
-  "synthesized_feedback": "A concise paragraph (≤ 300 words) ready to be injected into the next model-generation prompt."
+  "synthesized_feedback": "Structured feedback (≤ 500 words) for the model-generating LLM."
 }
 ```
 
@@ -567,13 +628,30 @@ Include one entry in per_angle for each of the six angles:
 5. Mechanistic / theoretical coherence
 6. Coverage
 
-The synthesized_feedback must be actionable and specific, citing model names and metric values.
+SYNTHESIZED_FEEDBACK FORMAT — The `synthesized_feedback` field must follow this four-section structure:
+
+1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically (not by ID), including BIC values. Example: "The model with separate learning rates for gains and losses (BIC = 2847) performed best..."
+
+2. **What partially worked** (2-3 sentences) — Describe models that showed promise in some areas but had issues in others. Be specific about strengths and weaknesses. Example: "The model with choice-stickiness had good fit for early trials but poor recovery on the stickiness parameter..."
+
+3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them. Example: "Models with decaying learning rates consistently showed poor parameter recovery..."
+
+4. **What to try next** (2-4 sentences) — Concrete suggestions framed as "try X because Y". Example: "Try combining the separate gain/loss learning rates with a perseveration mechanism because both showed promise independently..."
+
+IMPORTANT PROHIBITIONS — Never reference:
+- "Angles" or analytical perspectives (the generator doesn't know what these are)
+- Tool call names (e.g., "get_best_models", "get_bic_trajectory")
+- Model IDs (e.g., "ID 11", "model_5")
+- Internal database fields or conventions
+
+Always describe models by their mechanisms and cite actual metric values (BIC, r, R²) from your analysis.
 """
 
 
 # ======================================================================
 # Main judge class
 # ======================================================================
+
 
 class ToolUsingJudge:
     """LLM-based judge with read-only tool access to the diagnostic store.
@@ -592,8 +670,14 @@ class ToolUsingJudge:
         Path to the task results directory for saving judge trace files.
     """
 
-    def __init__(self, cfg, diagnostic_store, model, tokenizer=None,
-                 results_dir: str | Path | None = None):
+    def __init__(
+        self,
+        cfg,
+        diagnostic_store,
+        model,
+        tokenizer=None,
+        results_dir: str | Path | None = None,
+    ):
         self.cfg = cfg
         self.store = diagnostic_store
         self.model = model
@@ -601,8 +685,12 @@ class ToolUsingJudge:
         self.results_dir = Path(results_dir) if results_dir else None
 
         judge_cfg = getattr(cfg, "judge", None)
-        self.max_tool_calls: int = getattr(judge_cfg, "max_tool_calls", 20) if judge_cfg else 20
-        self.verbose: bool = bool(getattr(judge_cfg, "verbose", False)) if judge_cfg else False
+        self.max_tool_calls: int = (
+            getattr(judge_cfg, "max_tool_calls", 20) if judge_cfg else 20
+        )
+        self.verbose: bool = (
+            bool(getattr(judge_cfg, "verbose", False)) if judge_cfg else False
+        )
         self.model_name: str = getattr(cfg.llm, "base_model", "unknown")
         self.provider: str = getattr(cfg.llm, "provider", "").lower()
         self.max_tokens: int = getattr(
@@ -621,14 +709,22 @@ class ToolUsingJudge:
     def _build_tool_loop(self):
         """Instantiate the right backend tool loop."""
         p = self.provider
-        if any(x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")):
+        if any(
+            x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
+        ):
             return _OpenAIToolLoop(
-                self.model, self.model_name, self.max_tokens, self.temperature,
+                self.model,
+                self.model_name,
+                self.max_tokens,
+                self.temperature,
                 verbose=self.verbose,
             )
         elif "gemini" in p:
             return _GeminiToolLoop(
-                self.model, self.model_name, self.max_tokens, self.temperature,
+                self.model,
+                self.model_name,
+                self.max_tokens,
+                self.temperature,
                 verbose=self.verbose,
             )
         else:
@@ -808,9 +904,7 @@ class ToolUsingJudge:
                         f"{pname} r={r:.2f}" if r is not None else f"{pname} r=unknown"
                         for pname, r in worst_params
                     ]
-                    failure_lines.append(
-                        f"    worst: {', '.join(param_strs)}"
-                    )
+                    failure_lines.append(f"    worst: {', '.join(param_strs)}")
 
         failure_lines.append(
             "Do not repropose these mechanisms without addressing the "
@@ -863,11 +957,12 @@ class ToolUsingJudge:
 
         return verdict
 
-    def _request_structured_verdict(self, analysis_text: str,
-                                      trace: list[dict]) -> str:
+    def _request_structured_verdict(self, analysis_text: str, trace: list[dict]) -> str:
         """Ask the LLM to format its analysis as structured JSON."""
         if self.verbose:
-            _console.print("[bold magenta]◆ Extracting structured verdict...[/bold magenta]")
+            _console.print(
+                "[bold magenta]◆ Extracting structured verdict...[/bold magenta]"
+            )
 
         messages = [
             {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
@@ -875,7 +970,9 @@ class ToolUsingJudge:
             {"role": "user", "content": _SYNTHESIS_PROMPT},
         ]
         p = self.provider
-        if any(x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")):
+        if any(
+            x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
+        ):
             kwargs: dict = {
                 "model": self.model_name,
                 "messages": messages,
@@ -886,7 +983,9 @@ class ToolUsingJudge:
             resp = self.model.chat.completions.create(**kwargs)
             result = resp.choices[0].message.content or analysis_text
             if self.verbose:
-                _console.print(f"[dim]  └─ structured verdict: {len(result)} chars[/dim]")
+                _console.print(
+                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
+                )
             return result
         elif "gemini" in p:
             try:
@@ -909,7 +1008,9 @@ class ToolUsingJudge:
             )
             result = resp.text.strip()
             if self.verbose:
-                _console.print(f"[dim]  └─ structured verdict: {len(result)} chars[/dim]")
+                _console.print(
+                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
+                )
             return result
         return analysis_text
 
@@ -920,6 +1021,7 @@ class ToolUsingJudge:
         # Pull a minimal context from the store directly
         try:
             from gecco.diagnostic_store.tools import get_bic_trajectory, get_best_models
+
             traj = get_bic_trajectory(self.store)
             best = get_best_models(self.store, k=5)
             context_parts.append(f"\n\nBIC trajectory: {json.dumps(traj, default=str)}")
@@ -931,16 +1033,27 @@ class ToolUsingJudge:
 
         if self.tokenizer is not None:
             # HuggingFace
-            max_new = getattr(self.cfg.llm, "max_output_tokens",
-                               getattr(self.cfg.llm, "max_tokens", 2048))
+            max_new = getattr(
+                self.cfg.llm,
+                "max_output_tokens",
+                getattr(self.cfg.llm, "max_tokens", 2048),
+            )
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            output = self.model.generate(**inputs, max_new_tokens=max_new, do_sample=True)
+            output = self.model.generate(
+                **inputs, max_new_tokens=max_new, do_sample=True
+            )
             return self.tokenizer.decode(output[0], skip_special_tokens=True)
         return "Judge feedback unavailable (no tool-calling backend configured)."
 
-    def _save_trace(self, verdict: JudgeVerdict, trace: list[dict],
-                    iteration: int, run_idx: int, tag: str = "",
-                    extra_payload: dict | None = None) -> None:
+    def _save_trace(
+        self,
+        verdict: JudgeVerdict,
+        trace: list[dict],
+        iteration: int,
+        run_idx: int,
+        tag: str = "",
+        extra_payload: dict | None = None,
+    ) -> None:
         """Write the judge trace to results/{task}/judge/iterN_runX.json.
 
         Parameters

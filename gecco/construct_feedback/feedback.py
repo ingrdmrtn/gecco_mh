@@ -1,13 +1,8 @@
 import math
 import re
 import numpy as np
-from datetime import datetime
 
-
-def _log(msg):
-    """Print a timestamped log message."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+from gecco.utils import log as _log
 
 
 class FeedbackGenerator:
@@ -1117,7 +1112,12 @@ class LLMFeedbackGenerator(FeedbackGenerator):
         # -----------------------------
         # vLLM / KCL (OpenAI-compatible API)
         # -----------------------------
-        elif "vllm" in provider or "kcl" in provider or "opencode" in provider or "openrouter" in provider:
+        elif (
+            "vllm" in provider
+            or "kcl" in provider
+            or "opencode" in provider
+            or "openrouter" in provider
+        ):
             max_out = getattr(
                 self.cfg.llm,
                 "max_output_tokens",
@@ -1143,13 +1143,14 @@ class LLMFeedbackGenerator(FeedbackGenerator):
             resp = self.model.chat.completions.create(**create_kwargs)
             if not resp.choices:
                 raise RuntimeError(
-                    f"LLM returned empty response (no choices). "
-                    f"Raw response: {resp!r}"
+                    f"LLM returned empty response (no choices). Raw response: {resp!r}"
                 )
             message = resp.choices[0].message
             reasoning = getattr(message, "reasoning_content", None)
             if reasoning:
-                print(f"[GeCCo] Feedback: reasoning tokens present ({len(reasoning)} chars)")
+                print(
+                    f"[GeCCo] Feedback: reasoning tokens present ({len(reasoning)} chars)"
+                )
             return message.content.strip()
         # -----------------------------
         # Hugging Face-style generation

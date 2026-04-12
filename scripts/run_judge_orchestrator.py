@@ -31,6 +31,7 @@ from gecco.load_llms.model_loader import load_llm
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
+from gecco.sentry_init import init_sentry
 
 console = Console()
 
@@ -79,6 +80,13 @@ def main():
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_config(project_root / "config" / args.config)
 
+    # --- Initialize Sentry ---
+    init_sentry(
+        cfg=cfg,
+        task_name=cfg.task.name,
+        config_name=args.config,
+    )
+
     # --- Determine results directory ---
     if args.results_dir:
         results_dir = Path(args.results_dir)
@@ -122,7 +130,7 @@ def main():
     )
 
     # Build prompt (for judge context)
-    prompt_builder = PromptBuilderWrapper(cfg, data_text)
+    prompt_builder = PromptBuilderWrapper(cfg, data_text, df_prompt)
 
     # --- Determine max iterations and run loop ---
     max_iterations = getattr(cfg.loop, "max_iterations", 10)

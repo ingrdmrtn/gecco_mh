@@ -10,19 +10,17 @@ import fcntl
 import json
 import numpy as np
 from pathlib import Path
-from datetime import datetime
 
 from rich.console import Console
+
+from gecco.utils import log as _log
 
 console = Console()
 
 
-def _log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
-
-
-def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_data=None):
+def fit_baseline_if_needed(
+    baseline_path, cfg, df_train, registry=None, id_eval_data=None
+):
     """
     Fit the template model as a baseline if results don't already exist.
 
@@ -35,8 +33,8 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
         Where to save/load baseline results (e.g. results/task/baseline.json).
     cfg : object
         Full experiment configuration.
-    df_eval : pd.DataFrame
-        Evaluation data to fit the baseline on.
+    df_train : pd.DataFrame
+        Training data to fit the baseline on.
     registry : SharedRegistry, optional
         If provided, baseline results are written to the shared registry.
     id_eval_data : pd.DataFrame, optional
@@ -53,7 +51,9 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
     if not baseline_code:
         baseline_code = getattr(cfg.llm, "template_model", None)
     if not baseline_code:
-        _log("[GeCCo] No baseline model or template_model in config — skipping baseline")
+        _log(
+            "[GeCCo] No baseline model or template_model in config — skipping baseline"
+        )
         return None
 
     baseline_path = Path(baseline_path)
@@ -87,15 +87,20 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
 
         # Extract function name from the baseline code
         import re
-        func_match = re.search(r'def\s+(\w+)\s*\(', baseline_code)
+
+        func_match = re.search(r"def\s+(\w+)\s*\(", baseline_code)
         func_name = func_match.group(1) if func_match else "cognitive_model"
 
         _log(f"[GeCCo] Fitting baseline model ({func_name})...")
         console.print(f"[bold]Fitting baseline model ({func_name})...[/]")
 
-        from gecco.offline_evaluation.fit_generated_models import run_fit_hierarchical as run_fit
+        from gecco.offline_evaluation.fit_generated_models import (
+            run_fit_hierarchical as run_fit,
+        )
 
-        fit_res = run_fit(df_eval, baseline_code, cfg=cfg, expected_func_name=func_name)
+        fit_res = run_fit(
+            df_train, baseline_code, cfg=cfg, expected_func_name=func_name
+        )
 
         result = {
             "function_name": "baseline_model",
@@ -118,9 +123,12 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
         # Individual differences evaluation
         if id_eval_data is not None:
             try:
-                from gecco.offline_evaluation.individual_differences import evaluate_individual_differences
+                from gecco.offline_evaluation.individual_differences import (
+                    evaluate_individual_differences,
+                )
+
                 id_results = evaluate_individual_differences(
-                    fit_res, df_eval, cfg, id_data=id_eval_data
+                    fit_res, df_train, cfg, id_data=id_eval_data
                 )
                 result["individual_differences"] = {
                     "mean_r2": id_results.get("mean_r2"),
@@ -135,7 +143,9 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
         # Save to disk
         with open(baseline_path, "w") as f:
             json.dump(result, f, indent=2)
-        _log(f"[GeCCo] Baseline saved: {fit_res['metric_name']} = {fit_res['metric_value']:.2f}")
+        _log(
+            f"[GeCCo] Baseline saved: {fit_res['metric_name']} = {fit_res['metric_value']:.2f}"
+        )
 
         # Write to shared registry
         if registry is not None:

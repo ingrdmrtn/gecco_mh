@@ -2,7 +2,6 @@
 import os
 import json
 import time
-from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -21,9 +20,9 @@ from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
+from gecco.utils import log as _log
+from gecco.sentry_init import capture_fit_error, capture_recovery_failed
 from pathlib import Path
-
-_log = lambda msg: print(f"[{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 console = Console()
 
@@ -47,11 +46,13 @@ class GeCCoModelSearch:
         prompt_builder,
         client_id=None,
         shared_registry=None,
+        df_val=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.df = df
+        self.df_val = df_val
         self.prompt_builder = prompt_builder
         self.client_id = client_id
         self.shared_registry = shared_registry
@@ -162,19 +163,27 @@ class GeCCoModelSearch:
         ppc_cfg = getattr(judge_cfg, "ppc", None) if judge_cfg else None
         self.ppc_enabled = bool(ppc_cfg and getattr(ppc_cfg, "enabled", False))
         self.ppc_n_sims: int = getattr(ppc_cfg, "n_sims", 100) if ppc_cfg else 100
-        block_residual_cfg = getattr(judge_cfg, "block_residuals", None) if judge_cfg else None
+        block_residual_cfg = (
+            getattr(judge_cfg, "block_residuals", None) if judge_cfg else None
+        )
         self.block_residuals_enabled = bool(
             getattr(
                 block_residual_cfg,
                 "enabled",
                 self.ppc_enabled,
-            ) if judge_cfg else False
+            )
+            if judge_cfg
+            else False
         )
-        self.block_residuals_n_blocks: int = getattr(
-            block_residual_cfg,
-            "n_blocks",
-            10,
-        ) if block_residual_cfg else 10
+        self.block_residuals_n_blocks: int = (
+            getattr(
+                block_residual_cfg,
+                "n_blocks",
+                10,
+            )
+            if block_residual_cfg
+            else 10
+        )
 
     def generate(self, model, tokenizer=None, prompt=None, response_schema=None):
         """
@@ -403,7 +412,9 @@ class GeCCoModelSearch:
                             f"Remove [bold]supports_json_schema: true[/] from the config to fall back "
                             f"to json_object mode."
                         )
-                    console.print(f"[red]OpenRouter 404 — no matching endpoint.{hint}[/]")
+                    console.print(
+                        f"[red]OpenRouter 404 — no matching endpoint.{hint}[/]"
+                    )
                     return ""
                 raise
             if not hasattr(resp, "choices"):
@@ -421,7 +432,11 @@ class GeCCoModelSearch:
                     msg = "[yellow]API returned empty choices list"
                     if "response_format" in create_kwargs:
                         fmt = create_kwargs["response_format"]
-                        fmt_type = fmt.get("type", "unknown") if isinstance(fmt, dict) else getattr(fmt, "type", "unknown")
+                        fmt_type = (
+                            fmt.get("type", "unknown")
+                            if isinstance(fmt, dict)
+                            else getattr(fmt, "type", "unknown")
+                        )
                         msg += (
                             f"\n  [bold]Likely cause:[/] structured output was requested "
                             f"(response_format={fmt_type!r}) but [cyan]{self.cfg.llm.base_model}[/] "
@@ -448,7 +463,11 @@ class GeCCoModelSearch:
                     )
                 elif "response_format" in create_kwargs:
                     fmt = create_kwargs["response_format"]
-                    fmt_type = fmt.get("type", "unknown") if isinstance(fmt, dict) else getattr(fmt, "type", "unknown")
+                    fmt_type = (
+                        fmt.get("type", "unknown")
+                        if isinstance(fmt, dict)
+                        else getattr(fmt, "type", "unknown")
+                    )
                     msg += (
                         f"\n  [bold]Likely cause:[/] structured output was requested "
                         f"(response_format={fmt_type!r}) but [cyan]{self.cfg.llm.base_model}[/] "
@@ -865,12 +884,15 @@ class GeCCoModelSearch:
                     if last["iteration"] == it - 1:
                         last_results = last["results"]
                         prev_had_success = any(
-                            r.get("metric_name") not in ("RECOVERY_FAILED", "FIT_ERROR", None)
+                            r.get("metric_name")
+                            not in ("RECOVERY_FAILED", "FIT_ERROR", None)
                             for r in last_results
                         )
                         recovery_failures = [
                             {
-                                "name": r.get("name") or r.get("model_name") or "unknown",
+                                "name": r.get("name")
+                                or r.get("model_name")
+                                or "unknown",
                                 "mean_r": r.get("recovery_r"),
                                 "per_param_r": r.get("recovery_per_param") or {},
                                 "iteration": last["iteration"],
@@ -880,7 +902,69 @@ class GeCCoModelSearch:
                         ]
 
                 # --- Dispatch judge ---
-                if self.tool_judge is not None:
+                # Check if orchestrated judge is enabled
+                orchestrated_judge_enabled = (
+                    self.shared_registry is not None
+                    and getattr(self.cfg, "judge", None) is not None
+                    and getattr(self.cfg.judge, "orchestrated", False)
+                )
+
+                if orchestrated_judge_enabled:
+                    # Wait for centralized judge feedback from orchestrator
+                    barrier_timeout = getattr(
+                        getattr(self.cfg.judge, "barrier", None),
+                        "client_wait_seconds",
+                        1800,
+                    )
+                    self._set_activity(f"waiting for centralized judge (iter {it})")
+                    shared_feedback_dict = self.shared_registry.wait_for_judge_feedback(
+                        iteration=it - 1,
+                        timeout_seconds=barrier_timeout,
+                        poll_seconds=2.0,
+                    )
+
+                    if shared_feedback_dict is not None:
+                        # Got feedback from orchestrator
+                        feedback = shared_feedback_dict.get("synthesized_feedback", "")
+                        console.print(
+                            f"  [green]Using centralized judge feedback for iteration {it}[/]"
+                        )
+                    else:
+                        # Orchestrator didn't deliver in time; fall back to local judge
+                        console.print(
+                            f"  [yellow]Orchestrator timeout; falling back to local judge[/]"
+                        )
+                        if self.tool_judge is not None:
+                            try:
+                                self._set_activity(f"tool judge (iter {it})")
+                                verdict = self.tool_judge.get_feedback(
+                                    iteration=it,
+                                    run_idx=run_idx,
+                                    tag=tag,
+                                    best_model=self.best_model,
+                                    best_metric=self.best_metric,
+                                    recovery_failures=recovery_failures
+                                    if recovery_failures
+                                    else None,
+                                    prev_had_success=prev_had_success,
+                                )
+                                feedback = verdict.synthesized_feedback
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
+                                )
+                                feedback = self.feedback.get_feedback(
+                                    self.best_model,
+                                    self.tried_param_sets,
+                                    id_results=self.best_id_results,
+                                )
+                        else:
+                            feedback = self.feedback.get_feedback(
+                                self.best_model,
+                                self.tried_param_sets,
+                                id_results=self.best_id_results,
+                            )
+                elif self.tool_judge is not None:
                     try:
                         self._set_activity(f"tool judge (iter {it})")
                         verdict = self.tool_judge.get_feedback(
@@ -889,7 +973,9 @@ class GeCCoModelSearch:
                             tag=tag,
                             best_model=self.best_model,
                             best_metric=self.best_metric,
-                            recovery_failures=recovery_failures if recovery_failures else None,
+                            recovery_failures=recovery_failures
+                            if recovery_failures
+                            else None,
                             prev_had_success=prev_had_success,
                         )
                         feedback = verdict.synthesized_feedback
@@ -1014,9 +1100,18 @@ class GeCCoModelSearch:
                                         "code": func_code,
                                         "recovery_r": recovery["mean_r"],
                                         "recovery_per_param": recovery["per_param_r"],
-                                        "recovery_n_successful": recovery["n_successful"],
+                                        "recovery_n_successful": recovery[
+                                            "n_successful"
+                                        ],
                                         "simulation_error": sim_err,
                                     }
+                                )
+                                capture_recovery_failed(
+                                    iteration=it,
+                                    model_name=display_name,
+                                    error=Exception(
+                                        f"Parameter recovery failed (mean r={recovery['mean_r']:.2f})"
+                                    ),
                                 )
                                 continue
                         except ModelValidationError as e:
@@ -1060,6 +1155,12 @@ class GeCCoModelSearch:
                                     "error": str(e),
                                 }
                             )
+                            capture_fit_error(
+                                iteration=it,
+                                model_name=display_name,
+                                error=e,
+                                run=run_idx,
+                            )
                             continue
 
                     self._set_activity(
@@ -1096,6 +1197,38 @@ class GeCCoModelSearch:
                         except Exception as e:
                             console.print(
                                 f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
+                            )
+
+                    # --- Validation on val split (if provided) ---
+                    val_fit_res = None
+                    val_id_results = None
+                    if self.df_val is not None:
+                        try:
+                            val_fit_res = run_fit(
+                                self.df_val,
+                                func_code,
+                                cfg=self.cfg,
+                                expected_func_name=func_name,
+                                structured_params=structured_params,
+                            )
+                            console.print(
+                                f"    [dim]val {metric_name} = [cyan]{val_fit_res['metric_value']:.2f}[/]"
+                            )
+                            if self.id_eval_data is not None:
+                                try:
+                                    val_id_results = evaluate_individual_differences(
+                                        val_fit_res,
+                                        self.df_val,
+                                        self.cfg,
+                                        id_data=self.id_eval_data,
+                                    )
+                                except Exception as e:
+                                    console.print(
+                                        f"  [yellow]Individual differences eval failed for {display_name} on val:[/] {e}"
+                                    )
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]Val fitting failed for {display_name}:[/] {e}"
                             )
 
                     # --- Posterior predictive checks (optional) ---
@@ -1140,6 +1273,7 @@ class GeCCoModelSearch:
 
                             # Count participants for progress bar
                             from gecco.offline_evaluation.ppc import _get_participants
+
                             _, participants = _get_participants(self.df)
                             n_participants = len(participants)
 
@@ -1154,7 +1288,7 @@ class GeCCoModelSearch:
                             with ppc_progress:
                                 task_id = ppc_progress.add_task(
                                     f"  [dim]PPC {display_name}[/]",
-                                    total=n_participants
+                                    total=n_participants,
                                 )
                                 ppc_result = compute_ppc(
                                     spec=diagnostic_spec,
@@ -1164,7 +1298,9 @@ class GeCCoModelSearch:
                                     n_sims=self.ppc_n_sims,
                                     input_columns=list(self.cfg.data.input_columns),
                                     n_jobs=-1,
-                                    progress_callback=lambda: ppc_progress.advance(task_id),
+                                    progress_callback=lambda: ppc_progress.advance(
+                                        task_id
+                                    ),
                                 )
                         except Exception as e:
                             console.print(
@@ -1177,7 +1313,9 @@ class GeCCoModelSearch:
                         and diagnostic_spec is not None
                     ):
                         try:
-                            from gecco.offline_evaluation.ppc import compute_block_residuals
+                            from gecco.offline_evaluation.ppc import (
+                                compute_block_residuals,
+                            )
 
                             console.print(
                                 f"  [dim]Computing block residuals for {display_name} "
@@ -1201,15 +1339,25 @@ class GeCCoModelSearch:
                         "metric_value": mean_metric,
                         "param_names": params,
                         "code_file": str(model_file),
-                        "recovery": recovery if self.recovery_checker is not None else None,
+                        "recovery": recovery
+                        if self.recovery_checker is not None
+                        else None,
                         "individual_differences": id_results,
                         "code": func_code,
                         "eval_metrics": fit_res.get("eval_metrics", []),
-                        "participant_n_trials": fit_res.get(
-                            "participant_n_trials", []
-                        ),
+                        "participant_n_trials": fit_res.get("participant_n_trials", []),
                         "parameter_values": fit_res.get("parameter_values", []),
+                        "mean_nll": fit_res.get("mean_nll"),
+                        "per_participant_nll": fit_res.get("per_participant_nll"),
                     }
+                    if val_fit_res is not None:
+                        result_dict["val_metric_value"] = val_fit_res["metric_value"]
+                        result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
+                        result_dict["val_eval_metrics"] = val_fit_res["eval_metrics"]
+                        result_dict["val_per_participant_nll"] = val_fit_res[
+                            "per_participant_nll"
+                        ]
+                        result_dict["val_individual_differences"] = val_id_results
                     if ppc_result is not None:
                         result_dict["ppc"] = ppc_result
                     if block_residuals_result is not None:
@@ -1253,6 +1401,32 @@ class GeCCoModelSearch:
                         with open(best_bic_file, "w") as f:
                             json.dump({"bic": mean_metric}, f, cls=_NumpyJSONEncoder)
 
+                        # save best model val metrics
+                        if val_fit_res is not None:
+                            best_bic_val_file = (
+                                self.results_dir
+                                / "bics"
+                                / f"best_bic_val{tag}_{run_idx}.json"
+                                if getattr(self.cfg.evaluation, "fit_type", "group")
+                                != "individual"
+                                else self.results_dir
+                                / "bics"
+                                / f"best_bic_val{tag}_{run_idx}_participant{self.df.participant[0]}.json"
+                            )
+                            with open(best_bic_val_file, "w") as f:
+                                json.dump(
+                                    {
+                                        "mean_BIC": val_fit_res["metric_value"],
+                                        "mean_NLL": val_fit_res["mean_nll"],
+                                        "individual_BIC": val_fit_res["eval_metrics"],
+                                        "individual_NLL": val_fit_res[
+                                            "per_participant_nll"
+                                        ],
+                                    },
+                                    f,
+                                    cls=_NumpyJSONEncoder,
+                                )
+
                     # ✅ stop if ANY model beats baseline
                     if baseline_bic is not None and mean_metric < baseline_bic:
                         stop_iterations = True
@@ -1293,6 +1467,12 @@ class GeCCoModelSearch:
                             "code": func_code,
                             "error": str(e),
                         }
+                    )
+                    capture_fit_error(
+                        iteration=it,
+                        model_name=display_name,
+                        error=e,
+                        run=run_idx,
                     )
 
             self._set_activity(f"saving results (iter {it})")

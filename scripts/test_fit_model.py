@@ -44,8 +44,9 @@ def load_code_from_file(path: str) -> str:
     return Path(path).read_text()
 
 
-def load_code_from_registry(results_dir: Path, model_name: str = None,
-                            model_index: int = None) -> str:
+def load_code_from_registry(
+    results_dir: Path, model_name: str = None, model_index: int = None
+) -> str:
     """Extract model code from the shared registry."""
     registry_path = results_dir / "shared_registry.json"
     if not registry_path.exists():
@@ -60,13 +61,15 @@ def load_code_from_registry(results_dir: Path, model_name: str = None,
         for r in entry.get("results", []):
             code = r.get("code", "")
             if code and r.get("metric_name") not in ("FIT_ERROR", "RECOVERY_FAILED"):
-                all_models.append({
-                    "name": r.get("function_name", "unknown"),
-                    "metric_value": r.get("metric_value", float("inf")),
-                    "client_id": entry.get("client_id"),
-                    "iteration": entry.get("iteration"),
-                    "code": code,
-                })
+                all_models.append(
+                    {
+                        "name": r.get("function_name", "unknown"),
+                        "metric_value": r.get("metric_value", float("inf")),
+                        "client_id": entry.get("client_id"),
+                        "iteration": entry.get("iteration"),
+                        "code": code,
+                    }
+                )
 
     if not all_models:
         raise ValueError("No models with code found in registry")
@@ -75,9 +78,7 @@ def load_code_from_registry(results_dir: Path, model_name: str = None,
         matches = [m for m in all_models if m["name"] == model_name]
         if not matches:
             available = sorted(set(m["name"] for m in all_models))
-            raise ValueError(
-                f"Model '{model_name}' not found. Available: {available}"
-            )
+            raise ValueError(f"Model '{model_name}' not found. Available: {available}")
         # Take the best-scoring match
         model = min(matches, key=lambda m: m["metric_value"])
     elif model_index is not None:
@@ -85,7 +86,7 @@ def load_code_from_registry(results_dir: Path, model_name: str = None,
         all_models.sort(key=lambda m: m["metric_value"])
         if model_index >= len(all_models):
             raise ValueError(
-                f"Index {model_index} out of range (0-{len(all_models)-1})"
+                f"Index {model_index} out of range (0-{len(all_models) - 1})"
             )
         model = all_models[model_index]
     else:
@@ -100,22 +101,27 @@ def load_code_from_registry(results_dir: Path, model_name: str = None,
     return model["code"]
 
 
-def get_eval_test_split(df, df_prompt, cfg):
-    """Replicate the eval/test split from run_gecco_distributed.py."""
+def get_train_val_test_split(df, df_prompt, cfg):
+    """Replicate the train/val/test split from run_gecco_distributed.py."""
     data_cfg = cfg.data
-    eval_test_proportion = getattr(cfg.evaluation, "eval_test_split", 0.7)
+    train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
+    val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
     non_prompt_ids = sorted(
         set(df[data_cfg.id_column].unique())
         - set(df_prompt[data_cfg.id_column].unique())
     )
     np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
     np.random.shuffle(non_prompt_ids)
-    split_idx = int(len(non_prompt_ids) * eval_test_proportion)
-    eval_ids = non_prompt_ids[:split_idx]
-    test_ids = non_prompt_ids[split_idx:]
-    df_eval = df[df[data_cfg.id_column].isin(eval_ids)]
+    n = len(non_prompt_ids)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    train_ids = non_prompt_ids[:n_train]
+    val_ids = non_prompt_ids[n_train : n_train + n_val]
+    test_ids = non_prompt_ids[n_train + n_val :]
+    df_train = df[df[data_cfg.id_column].isin(train_ids)]
+    df_val = df[df[data_cfg.id_column].isin(val_ids)]
     df_test = df[df[data_cfg.id_column].isin(test_ids)]
-    return df_eval, df_test
+    return df_train, df_val, df_test
 
 
 def main():
@@ -124,24 +130,47 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="Config YAML file name (in config/)")
-    parser.add_argument("--code", type=str, default=None,
-                        help="Path to a .py file containing the model code")
-    parser.add_argument("--registry", action="store_true",
-                        help="Load model from the shared registry")
-    parser.add_argument("--model-name", type=str, default=None,
-                        help="Model name to find in registry")
-    parser.add_argument("--model-index", type=int, default=None,
-                        help="Model index in registry (sorted by metric, 0=best)")
-    parser.add_argument("--func-name", type=str, default="cognitive_model1",
-                        help="Function name to extract from code")
-    parser.add_argument("--split", type=str, default="eval",
-                        choices=["eval", "test"],
-                        help="Data split to fit on (default: eval)")
-    parser.add_argument("--fit-type", type=str, default=None,
-                        choices=["mle", "hierarchical"],
-                        help="Fitting method (default: from config)")
+    parser.add_argument(
+        "--config", type=str, required=True, help="Config YAML file name (in config/)"
+    )
+    parser.add_argument(
+        "--code",
+        type=str,
+        default=None,
+        help="Path to a .py file containing the model code",
+    )
+    parser.add_argument(
+        "--registry", action="store_true", help="Load model from the shared registry"
+    )
+    parser.add_argument(
+        "--model-name", type=str, default=None, help="Model name to find in registry"
+    )
+    parser.add_argument(
+        "--model-index",
+        type=int,
+        default=None,
+        help="Model index in registry (sorted by metric, 0=best)",
+    )
+    parser.add_argument(
+        "--func-name",
+        type=str,
+        default="cognitive_model1",
+        help="Function name to extract from code",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "val", "test"],
+        help="Data split to fit on (default: train)",
+    )
+    parser.add_argument(
+        "--fit-type",
+        type=str,
+        default=None,
+        choices=["mle", "hierarchical"],
+        help="Fitting method (default: from config)",
+    )
     args = parser.parse_args()
 
     if not args.code and not args.registry:
@@ -156,17 +185,26 @@ def main():
     df = load_data(data_cfg.path, data_cfg.input_columns)
     splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
     df_prompt = splits["prompt"]
-    df_eval, df_test = get_eval_test_split(df, df_prompt, cfg)
+    df_train, df_val, df_test = get_train_val_test_split(df, df_prompt, cfg)
 
-    df_fit = df_eval if args.split == "eval" else df_test
+    if args.split == "train":
+        df_fit = df_train
+    elif args.split == "val":
+        df_fit = df_val
+    else:
+        df_fit = df_test
 
     split_table = Table(title="Data Split", show_header=True, header_style="bold")
     split_table.add_column("Split")
     split_table.add_column("Participants", justify="right")
     split_table.add_row("Prompt", str(len(df_prompt[data_cfg.id_column].unique())))
     split_table.add_row(
-        f"{'→ ' if args.split == 'eval' else ''}Eval",
-        str(len(df_eval[data_cfg.id_column].unique())),
+        f"{'→ ' if args.split == 'train' else ''}Train",
+        str(len(df_train[data_cfg.id_column].unique())),
+    )
+    split_table.add_row(
+        f"{'→ ' if args.split == 'val' else ''}Val",
+        str(len(df_val[data_cfg.id_column].unique())),
     )
     split_table.add_row(
         f"{'→ ' if args.split == 'test' else ''}Test",
@@ -203,12 +241,14 @@ def main():
         console.print("[dim]Using hierarchical (HBI) fitting[/]")
 
     import time
+
     t0 = time.time()
     try:
         result = fit_func(df_fit, code, cfg=cfg, expected_func_name=args.func_name)
     except Exception as e:
         console.print(f"[bold red]Fit failed:[/] {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     elapsed = time.time() - t0
@@ -223,6 +263,9 @@ def main():
     results_table.add_column("Metric")
     results_table.add_column("Value", justify="right")
     results_table.add_row(f"Mean {metric_name}", f"{metric_value:.4f}")
+    mean_nll = result.get("mean_nll")
+    if mean_nll is not None:
+        results_table.add_row("Mean NLL", f"{mean_nll:.4f}")
     results_table.add_row("Parameters", ", ".join(param_names))
     results_table.add_row("N parameters", str(len(param_names)))
 

@@ -44,7 +44,7 @@ def narrative(
 
 def get_data2text_function(name):
     if name == "narrative":
-        def data2text(df, id_col, template, fit_type,
+        def data2text(df, id_col, template, fit_type="group",
                       metadata=None, max_trials=None, max_blocks=None,
                       value_mappings=None):
 

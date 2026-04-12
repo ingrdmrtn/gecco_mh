@@ -4,60 +4,66 @@ import os
 import numpy as np
 import pdb
 
+
 def load_data(path, input_columns=None):
     # If path is relative, make it relative to project root
     if not os.path.isabs(path):
         # Go up two levels: gecco/prepare_data/__file__ -> gecco/ -> project_root/
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
         path = os.path.join(project_root, path)
 
     df = pd.read_csv(path)
 
     # Optional: keep only specified columns
     if input_columns is not None:
-        df =  df[input_columns + ["participant", "trial"]] \
-            if "participant" in df.columns and "trial" in df.columns \
+        df = (
+            df[input_columns + ["participant", "trial"]]
+            if "participant" in df.columns and "trial" in df.columns
             else df[input_columns]
+        )
     return df
 
-def parse_split(value, unique_ids: List[int]=None):
-        if isinstance(value, list):
-            return value
-        elif isinstance(value, str):
-            if value == "remainder":
-                return None
-            elif value.startswith("[") and value.endswith("]"):
-                slice_str = value[1:-1]
-                start_str, end_str = slice_str.split(":")
-                start = int(start_str) if start_str else None
-                end = int(end_str) if end_str else None
-                return unique_ids[start:end]
-            else:
-                raise ValueError(f"Invalid split string format: {value}")
+
+def parse_split(value, unique_ids: List[int] = None):
+    if isinstance(value, list):
+        return value
+    elif isinstance(value, str):
+        if value == "remainder":
+            return None
+        elif value.startswith("[") and value.endswith("]"):
+            slice_str = value[1:-1]
+            start_str, end_str = slice_str.split(":")
+            start = int(start_str) if start_str else None
+            end = int(end_str) if end_str else None
+            return unique_ids[start:end]
         else:
-            raise ValueError(f"Unsupported split format: {value}")
+            raise ValueError(f"Invalid split string format: {value}")
+    else:
+        raise ValueError(f"Unsupported split format: {value}")
+
 
 def split_by_participant(df, id_col, splits_cfg):
     """
-    Split data into prompt/eval/test sets based on participant IDs.
+    Split data into prompt/train/test sets based on participant IDs.
     Works whether splits_cfg is a dict or SimpleNamespace.
     """
-    # 👇 handle both dicts and namespaces
     if not isinstance(splits_cfg, dict):
-        splits_cfg = vars(splits_cfg)  # convert SimpleNamespace to dict
+        splits_cfg = vars(splits_cfg)
     unique_ids = sorted(np.unique(df[id_col].values).tolist())
     n = len(unique_ids)
 
     prompt_ids = parse_split(splits_cfg.get("prompt", []), unique_ids)
-    eval_ids = parse_split(splits_cfg.get("eval", []), unique_ids)
+    train_ids_cfg = splits_cfg.get("train", splits_cfg.get("eval", []))
+    train_ids = parse_split(train_ids_cfg, unique_ids)
     test_ids = parse_split(splits_cfg.get("test", []), unique_ids)
 
-    used = set((prompt_ids or []) + (eval_ids or []))
+    used = set((prompt_ids or []) + (train_ids or []))
     if test_ids is None:
         test_ids = [pid for pid in unique_ids if pid not in used]
-    # pdb.set_trace()
     return {
         "prompt": df[df[id_col].isin(prompt_ids)],
-        "eval": df[df[id_col].isin(eval_ids)],
+        "train": df[df[id_col].isin(train_ids)],
         "test": df[df[id_col].isin(test_ids)],
     }

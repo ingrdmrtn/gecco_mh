@@ -1,9 +1,10 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Optional
 import yaml
 import pandas as pd
 from gecco.prepare_data.data2text import narrative
 from types import SimpleNamespace
+
 
 class TaskConfig(BaseModel):
     name: str
@@ -12,6 +13,7 @@ class TaskConfig(BaseModel):
     instructions: str
     extra: Optional[str] = ""
 
+
 class DataConfig(BaseModel):
     path: str
     id_column: str
@@ -19,22 +21,69 @@ class DataConfig(BaseModel):
     data2text_function: str = "narrative"
     narrative_template: Optional[str] = None
 
+
 class LLMConfig(BaseModel):
     base_model: str
     temperature: float = 0.7
     max_tokens: int = 4096
     guardrails: List[str]
 
+
 class EvaluationConfig(BaseModel):
     metric: str = "BIC"
     fitting_method: str = "scipy_minimize"
     best_model_path: Optional[str] = None
+    train_ratio: float = 0.6
+    val_ratio: float = 0.2
+    test_ratio: float = 0.2
+    split_seed: int = 42
+    n_test_models: int = 10
+
+    @model_validator(mode="after")
+    def check_ratios_sum_to_one(self):
+        total = self.train_ratio + self.val_ratio + self.test_ratio
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"train_ratio ({self.train_ratio}) + val_ratio ({self.val_ratio}) "
+                f"+ test_ratio ({self.test_ratio}) must sum to 1.0, got {total}"
+            )
+        return self
+
+
+class LoopConfig(BaseModel):
+    max_iterations: int
+    max_independent_runs: int = 1
+    n_clients: Optional[int] = None  # Number of clients for barrier synchronization
+
+
+class BarrierConfig(BaseModel):
+    orchestrator_wait_seconds: float = 1800  # Orchestrator waits for clients
+    client_wait_seconds: float = 1800  # Clients wait for orchestrator
+
+
+class JudgeConfig(BaseModel):
+    mode: str = "manual"  # "manual" or "tool_using"
+    orchestrated: bool = False  # Enable centralized judge orchestration
+    barrier: Optional[BarrierConfig] = BarrierConfig()
+    max_tool_calls: Optional[int] = None
+    verbose: Optional[bool] = False
+
+
+class SentryConfig(BaseModel):
+    environment: str = "development"
+    traces_sample_rate: float = 0.1
+    profiles_sample_rate: float = 0.0
+    release: Optional[str] = None
+
 
 class GeCCoConfig(BaseModel):
     task: TaskConfig
     data: DataConfig
     llm: LLMConfig
     evaluation: EvaluationConfig
+    loop: Optional[LoopConfig] = None
+    judge: Optional[JudgeConfig] = None
+    sentry: Optional[SentryConfig] = None
 
 
 def load_data_from_config(cfg):
@@ -47,6 +96,7 @@ def load_data_from_config(cfg):
     )
     return text_output
 
+
 def dict_to_namespace(d):
     """Recursively convert nested dicts into SimpleNamespace objects."""
     if isinstance(d, dict):
@@ -55,6 +105,7 @@ def dict_to_namespace(d):
         return [dict_to_namespace(i) for i in d]
     else:
         return d
+
 
 def load_config(path: str):
     """Load YAML config and allow dot notation access."""

@@ -1,12 +1,8 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from datetime import datetime
 import time
 import torch
 
-
-def _log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+from gecco.utils import log as _log
 
 
 def load_r1(model_name: str):

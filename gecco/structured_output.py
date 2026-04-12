@@ -9,12 +9,11 @@ import ast
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
 
-from gecco.utils import extract_model_code
+from gecco.utils import extract_model_code, log as _log
 
 
 # ============================================================
@@ -120,11 +119,6 @@ class LLMResponseSchema(BaseModel):
         if len(names) != len(set(names)):
             raise ValueError(f"Duplicate model names: {names}")
         return v
-
-
-def _log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
 
 
 # ============================================================
@@ -475,8 +469,7 @@ def _validate_models(models: list) -> Optional[List[Dict]]:
                 m = {
                     **m,
                     "parameters": [
-                        {"name": n, "lower_bound": 0, "upper_bound": 1}
-                        for n in names
+                        {"name": n, "lower_bound": 0, "upper_bound": 1} for n in names
                     ],
                 }
         processed.append({**m, "code": code})
@@ -745,7 +738,13 @@ def get_review_schema() -> dict:
                                         "description": "Optional suggestion for how to fix",
                                     },
                                 },
-                                "required": ["type", "location", "severity", "description", "suggested_fix"],
+                                "required": [
+                                    "type",
+                                    "location",
+                                    "severity",
+                                    "description",
+                                    "suggested_fix",
+                                ],
                                 "additionalProperties": False,
                             },
                             "description": "List of issues found in the model",

@@ -2,12 +2,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from pathlib import Path
-from datetime import datetime
 
-
-def _log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+from gecco.utils import log as _log
 
 
 def load_id_data(cfg):
@@ -78,7 +74,9 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
         if not data_path.is_absolute():
             project_root = Path(__file__).resolve().parents[2]
             data_path = project_root / data_path
-        full_df = pd.read_csv(data_path, usecols=[fitting_id_col, join_id_col]).drop_duplicates()
+        full_df = pd.read_csv(
+            data_path, usecols=[fitting_id_col, join_id_col]
+        ).drop_duplicates()
         id_map = dict(zip(full_df[fitting_id_col], full_df[join_id_col].astype(str)))
         join_ids = [id_map[p] for p in participants]
     else:
@@ -94,8 +92,10 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
 
     n_dropped = len(participants) - len(merged)
     if n_dropped > 0:
-        _log(f"[GeCCo] Warning: {n_dropped} participants dropped during ID merge "
-             f"({len(merged)} remaining)")
+        _log(
+            f"[GeCCo] Warning: {n_dropped} participants dropped during ID merge "
+            f"({len(merged)} remaining)"
+        )
 
     if len(merged) < 5:
         _log("[GeCCo] Too few participants for individual differences regression")
@@ -130,7 +130,9 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
     # Run regression for each parameter
     per_param_r2 = {}
     per_param_detail = {}
-    summary_lines = ["Individual Differences Analysis (R² from param ~ questionnaire regressions):"]
+    summary_lines = [
+        "Individual Differences Analysis (R² from param ~ questionnaire regressions):"
+    ]
 
     for pname in param_names:
         y = merged[pname].values.astype(float)[valid_mask]
@@ -138,7 +140,10 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
         # Skip if no variance
         if np.std(y) < 1e-10:
             per_param_r2[pname] = 0.0
-            per_param_detail[pname] = {"r2": 0.0, "coefficients": {f: 0.0 for f in all_features}}
+            per_param_detail[pname] = {
+                "r2": 0.0,
+                "coefficients": {f: 0.0 for f in all_features},
+            }
             summary_lines.append(f"  - {pname}: R² = 0.00 (no variance in parameter)")
             continue
 
@@ -153,7 +158,9 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
 
         # Build summary line with predictor coefficients
         predictor_strs = [f"{f}: β={coefficients[f]:.3f}" for f in predictors]
-        summary_lines.append(f"  - {pname}: R² = {r2:.3f} ({', '.join(predictor_strs)})")
+        summary_lines.append(
+            f"  - {pname}: R² = {r2:.3f} ({', '.join(predictor_strs)})"
+        )
 
     mean_r2 = float(np.mean(list(per_param_r2.values()))) if per_param_r2 else 0.0
     max_r2 = float(max(per_param_r2.values())) if per_param_r2 else 0.0
@@ -162,7 +169,9 @@ def evaluate_individual_differences(fit_result, df, cfg, id_data=None):
     summary_lines.append(f"  Best parameter R²: {max_r2:.3f} ({best_param})")
 
     summary_text = "\n".join(summary_lines)
-    _log(f"[GeCCo] Individual differences: mean R² = {mean_r2:.3f}, max R² = {max_r2:.3f} ({best_param})")
+    _log(
+        f"[GeCCo] Individual differences: mean R² = {mean_r2:.3f}, max R² = {max_r2:.3f} ({best_param})"
+    )
 
     return {
         "mean_r2": mean_r2,

@@ -13,11 +13,12 @@ from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
 from gecco.prepare_data.io import load_data, split_by_participant
-from gecco.prepare_data.data2text import get_data2text_function
+from gecco.data2text import get_data2text_function
 from gecco.load_llms.model_loader import load_llm
 from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
 from gecco.coordination import SharedRegistry, apply_client_profile
+from gecco.sentry_init import init_sentry
 import pandas as pd
 import json
 import argparse
@@ -85,6 +86,14 @@ def main():
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_config(project_root / "config" / args.config)
 
+    # --- Initialize Sentry ---
+    init_sentry(
+        cfg=cfg,
+        task_name=cfg.task.name,
+        client_id=client_id,
+        config_name=args.config,
+    )
+
     # --- Apply client profile overrides ---
     if args.client_profile:
         apply_client_profile(cfg, args.client_profile)
@@ -114,26 +123,30 @@ def main():
     splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
     df_prompt = splits["prompt"]
 
-    # --- Split eval/test by proportion of remaining participants ---
-    eval_test_proportion = getattr(cfg.evaluation, "eval_test_split", 0.7)
+    train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
+    val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
     non_prompt_ids = sorted(
         set(df[data_cfg.id_column].unique())
         - set(df_prompt[data_cfg.id_column].unique())
     )
     np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
     np.random.shuffle(non_prompt_ids)
-    split_idx = int(len(non_prompt_ids) * eval_test_proportion)
-    eval_ids = non_prompt_ids[:split_idx]
-    test_ids = non_prompt_ids[split_idx:]
-    df_eval = df[df[data_cfg.id_column].isin(eval_ids)]
+    n = len(non_prompt_ids)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    train_ids = non_prompt_ids[:n_train]
+    val_ids = non_prompt_ids[n_train : n_train + n_val]
+    test_ids = non_prompt_ids[n_train + n_val :]
+    df_train = df[df[data_cfg.id_column].isin(train_ids)]
+    df_val = df[df[data_cfg.id_column].isin(val_ids)]
     df_test = df[df[data_cfg.id_column].isin(test_ids)]
 
-    # Data split summary
     split_table = Table(title="Data Split", show_header=True, header_style="bold")
     split_table.add_column("Split")
     split_table.add_column("Participants", justify="right")
     split_table.add_row("Prompt", str(len(df_prompt[data_cfg.id_column].unique())))
-    split_table.add_row("Eval", str(len(eval_ids)))
+    split_table.add_row("Train", str(len(train_ids)))
+    split_table.add_row("Val", str(len(val_ids)))
     split_table.add_row("Test", str(len(test_ids)))
     console.print(split_table)
 
@@ -142,11 +155,11 @@ def main():
         splits_baselines = split_by_participant(
             df_baselines, data_cfg.id_column, data_cfg.splits
         )
-        df_prompt_splits, df_eval_splits = (
+        df_prompt_splits, df_train_splits = (
             splits_baselines["prompt"],
-            splits_baselines["eval"],
+            splits_baselines["train"],
         )
-        baseline_bic = np.mean(df_eval_splits.baseline_bic)
+        baseline_bic = np.mean(df_train_splits.baseline_bic)
     else:
         baseline_bic = None
 
@@ -195,7 +208,7 @@ def main():
     baseline_result = fit_baseline_if_needed(
         baseline_path,
         cfg,
-        df_eval,
+        df_train,
         registry=registry,
         id_eval_data=id_eval_data,
     )
@@ -210,10 +223,11 @@ def main():
         model,
         tokenizer,
         cfg,
-        df_eval,
+        df_train,
         prompt_builder,
         client_id=client_id,
         shared_registry=registry,
+        df_val=df_val,
     )
     global_best_model = None
     global_best_bic = np.inf
@@ -275,6 +289,8 @@ def main():
                     {
                         "mean_" + metric_name: mean_metric,
                         "individual_" + metric_name: fit_res["eval_metrics"],
+                        "mean_NLL": fit_res["mean_nll"],
+                        "individual_NLL": fit_res["per_participant_nll"],
                     },
                     f,
                 )

@@ -13,7 +13,7 @@ from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
 from gecco.prepare_data.io import load_data, split_by_participant
-from gecco.data2text import get_data2text_function
+from gecco.prepare_data.data2text import get_data2text_function
 from gecco.load_llms.model_loader import load_llm
 from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper

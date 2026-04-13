@@ -128,18 +128,33 @@ def list_iterations(store: DiagnosticStore, run_idx: int | None = None,
 
 
 def get_best_models(store: DiagnosticStore, k: int = 5,
-                    metric: str = "BIC") -> list[dict]:
-    """Return the top-*k* models ordered by metric_value ascending."""
-    sql = """
+                    metric: str = "BIC", split: str = "train") -> list[dict]:
+    """Return the top-*k* models ordered by metric_value ascending.
+
+    Parameters
+    ----------
+    split:
+        Which data split to consider.  Defaults to ``'train'`` so that
+        diagnostic data (recovery, PPC, etc.) is available for every
+        returned model.  Pass ``'val'`` to rank by held-out performance
+        or ``None`` to include all splits.
+    """
+    split_filter = "AND m.split = ?" if split else ""
+    params: list[Any] = []
+    if split:
+        params.append(split)
+    params.append(k)
+    sql = f"""
         SELECT m.model_id, m.run_idx, m.iteration, m.name,
                m.metric_name, m.metric_value, m.param_names, m.status
         FROM models m
         WHERE m.status = 'ok'
           AND m.metric_value IS NOT NULL
+          {split_filter}
         ORDER BY m.metric_value ASC
         LIMIT ?
     """
-    return [_hydrate(r) for r in store.fetchall(sql, [k])]
+    return [_hydrate(r) for r in store.fetchall(sql, params)]
 
 
 def get_model(store: DiagnosticStore, model_id: int,
@@ -269,6 +284,31 @@ def _check_model_exists(store: DiagnosticStore, model_id: int) -> None:
         )
 
 
+def _resolve_train_model_id(store: DiagnosticStore, model_id: int) -> int:
+    """Return the model_id of the train-split counterpart.
+
+    If *model_id* is already a train model, return it unchanged.
+    If it is a val/test model, look up the corresponding train model
+    (same name, iteration, run_idx) and return its model_id.
+    If no train counterpart is found, return the original model_id.
+    """
+    row = store.fetchone(
+        "SELECT split, name, iteration, run_idx FROM models WHERE model_id = ?",
+        [model_id],
+    )
+    if row is None or row.get("split") == "train":
+        return model_id
+    train = store.fetchone(
+        "SELECT model_id FROM models "
+        "WHERE name = ? AND iteration = ? AND run_idx = ? AND split = 'train' "
+        "ORDER BY model_id LIMIT 1",
+        [row["name"], row["iteration"], row["run_idx"]],
+    )
+    if train is not None:
+        return train["model_id"]
+    return model_id
+
+
 def get_recovery(store: DiagnosticStore, model_id: int) -> dict:
     """Return parameter recovery diagnostics for a model.
 
@@ -283,10 +323,11 @@ def get_recovery(store: DiagnosticStore, model_id: int) -> dict:
             ``parameter_recovery.enabled: true`` in config.
     """
     _check_model_exists(store, model_id)
+    train_id = _resolve_train_model_id(store, model_id)
     sql = """
         SELECT * FROM parameter_recovery WHERE model_id = ?
     """
-    row = store.fetchone(sql, [model_id])
+    row = store.fetchone(sql, [train_id])
     if row is None:
         raise DiagnosticNotAvailableError(
             f"Parameter recovery data not found for model_id={model_id}. "
@@ -349,17 +390,18 @@ def get_ppc(store: DiagnosticStore, model_id: int,
             this model.  Enable via ``judge.ppc.enabled: true`` in config.
     """
     _check_model_exists(store, model_id)
+    train_id = _resolve_train_model_id(store, model_id)
     # Existence check — needed because aggregate queries silently return []
     # when no rows exist, giving no signal that the diagnostic wasn't run.
     check_sql = "SELECT 1 FROM ppc WHERE model_id = ? LIMIT 1"
-    if store.fetchone(check_sql, [model_id]) is None:
+    if store.fetchone(check_sql, [train_id]) is None:
         raise DiagnosticNotAvailableError(
             f"PPC data not found for model_id={model_id}. "
             "This diagnostic requires 'judge.ppc.enabled: true' in the config. "
             "Add this section under 'judge:' to enable posterior predictive checks."
         )
 
-    qparams: list[Any] = [model_id]
+    qparams: list[Any] = [train_id]
     filters = "model_id = ?"
     if statistic:
         filters += " AND statistic_name = ?"
@@ -403,7 +445,7 @@ def get_ppc(store: DiagnosticStore, model_id: int,
     worst = store.fetchone(worst_group_sql, qparams)
     if worst is None:
         return []
-    detail_params: list[Any] = [model_id, worst["statistic_name"], worst["condition"]]
+    detail_params: list[Any] = [train_id, worst["statistic_name"], worst["condition"]]
     detail_sql = """
         SELECT participant_id, statistic_name, condition,
                observed, simulated_mean, simulated_q025, simulated_q975, n_sims,
@@ -433,11 +475,12 @@ def get_block_residuals(store: DiagnosticStore, model_id: int) -> dict:
             in config (auto-enabled when PPC is enabled).
     """
     _check_model_exists(store, model_id)
+    train_id = _resolve_train_model_id(store, model_id)
     # Existence check — needed because the current implementation returns
     # {n_participants: 0, blocks: []} for missing data, which could be
     # confused with a legitimate empty result.
     check_sql = "SELECT 1 FROM block_residuals WHERE model_id = ? LIMIT 1"
-    if store.fetchone(check_sql, [model_id]) is None:
+    if store.fetchone(check_sql, [train_id]) is None:
         raise DiagnosticNotAvailableError(
             f"Block residual data not found for model_id={model_id}. "
             "This diagnostic requires 'judge.block_residuals.enabled: true' "
@@ -449,7 +492,7 @@ def get_block_residuals(store: DiagnosticStore, model_id: int) -> dict:
     participant_row = store.fetchone(
         "SELECT COUNT(DISTINCT participant_id) AS n_participants "
         "FROM block_residuals WHERE model_id = ?",
-        [model_id],
+        [train_id],
     )
     summary_rows = store.fetchall(
         """
@@ -467,7 +510,7 @@ def get_block_residuals(store: DiagnosticStore, model_id: int) -> dict:
         GROUP BY block_idx
         ORDER BY block_idx
         """,
-        [model_id],
+        [train_id],
     )
     return {
         "model_id": model_id,
@@ -722,7 +765,9 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "get_best_models",
             "description": (
-                "Return the top-k models by BIC (ascending) across all iterations."
+                "Return the top-k models by BIC (ascending) across all iterations. "
+                "By default only train-split models are returned, ensuring that "
+                "diagnostic data (parameter recovery, PPC, etc.) is available."
             ),
             "parameters": {
                 "type": "object",
@@ -731,6 +776,15 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "integer",
                         "description": "Number of models to return (default 5).",
                         "default": 5
+                    },
+                    "split": {
+                        "type": "string",
+                        "description": (
+                            "Which data split to rank by. 'train' (default) "
+                            "guarantees diagnostic data is available. Use 'val' "
+                            "for held-out performance, or omit/None for all splits."
+                        ),
+                        "default": "train"
                     }
                 },
                 "required": []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -406,4 +407,66 @@ def load_json_file(results_dir: Path, subdir: str, pattern: str) -> list | dict 
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
+        return None
+
+
+_ITER_REGEX = re.compile(r"iter(\d+)(.*?)_run(\d+)\.json")
+
+
+def list_judge_traces(results_dir: Path) -> list[dict[str, Any]]:
+    """Scan judge/ subdirectory for trace files.
+
+    Returns list of dicts sorted by (iteration, run_idx), each containing:
+    - iteration: int
+    - run_idx: int
+    - tag: str
+    - timestamp: str (ISO)
+    - tool_call_count: int
+    - wall_time_seconds: float
+    - short_circuit: bool
+    - source_iter: int | None (only if short_circuit)
+    - file_path: Path (for loading)
+    """
+    judge_dir = results_dir / "judge"
+    if not judge_dir.is_dir():
+        return []
+    traces: list[dict[str, Any]] = []
+    for f in sorted(judge_dir.glob("iter*_run*.json")):
+        m = _ITER_REGEX.match(f.name)
+        if not m:
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        traces.append(
+            {
+                "iteration": int(m.group(1)),
+                "tag": m.group(2),
+                "run_idx": int(m.group(3)),
+                "timestamp": data.get("timestamp", ""),
+                "tool_call_count": data.get("tool_call_count", 0),
+                "wall_time_seconds": data.get("wall_time_seconds", 0.0),
+                "short_circuit": data.get("short_circuit", False),
+                "source_iter": data.get("source_iter"),
+                "file_path": f,
+            }
+        )
+    return traces
+
+
+def load_judge_trace(
+    results_dir: Path,
+    iteration: int,
+    run_idx: int,
+    tag: str = "",
+) -> dict[str, Any] | None:
+    """Load and parse a specific judge trace JSON file by iteration/run_idx/tag."""
+    judge_dir = results_dir / "judge"
+    fname = judge_dir / f"iter{iteration}{tag}_run{run_idx}.json"
+    if not fname.exists():
+        return None
+    try:
+        return json.loads(fname.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
         return None

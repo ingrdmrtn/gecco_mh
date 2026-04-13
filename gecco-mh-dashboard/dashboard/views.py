@@ -17,6 +17,8 @@ from dashboard.data_adapter import (
     get_iteration_results_by_idx,
     get_model_code,
     list_iterations,
+    list_judge_traces,
+    load_judge_trace,
     load_json_file,
     load_text_file,
     summary_stats,
@@ -405,3 +407,214 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
     # --- Raw registry JSON (moved from old Advanced tab) ---
     with st.expander("Raw shared registry JSON"):
         st.json(data)
+
+_CONFIDENCE_ICONS = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+
+
+def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
+    """Render the Judge tab with trace browser."""
+    traces = list_judge_traces(results_dir)
+    if not traces:
+        st.info(
+            "No judge traces available. Judge traces appear when tool-using judge "
+            "mode is enabled (`judge.mode: tool_using` in config)."
+        )
+        return
+
+    iterations = list_iterations(data)
+    if not iterations:
+        st.info("No iteration data available.")
+        return
+
+    clients = sorted({str(it["client_id"]) for it in iterations})
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if len(clients) == 1:
+            selected_client = clients[0]
+            st.markdown(f"**Client:** {selected_client}")
+        else:
+            selected_client = st.selectbox(
+                "Client", clients, index=0, key="judge_client"
+            )
+
+    client_iters = [it for it in iterations if str(it["client_id"]) == selected_client]
+
+    available_trace_keys = {
+        (t["iteration"], t["run_idx"], t["tag"]) for t in traces
+    }
+
+    iter_labels: list[str] = []
+    iter_trace_map: list[tuple | None] = []
+    for it in client_iters:
+        label = str(it["iteration"])
+        if it["run"] > 0:
+            label += f" (run {it['run'] + 1})"
+        key = (it["iteration"], it["run"], "")
+        has_trace = key in available_trace_keys
+        if not has_trace:
+            tag_matches = [
+                k for k in available_trace_keys
+                if k[0] == it["iteration"] and k[1] == it["run"]
+            ]
+            if tag_matches:
+                key = tag_matches[0]
+                has_trace = True
+        if has_trace:
+            label += " ✅"
+        else:
+            label += " ⬜"
+        iter_labels.append(label)
+        iter_trace_map.append(key if has_trace else None)
+
+    with col2:
+        sel_idx = len(iter_labels) - 1 if iter_labels else 0
+        selected_label = st.selectbox(
+            "Iteration", iter_labels, index=sel_idx, key="judge_iter"
+        )
+
+    if not selected_label or not iter_labels:
+        return
+
+    label_idx = iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    trace_key = iter_trace_map[label_idx]
+
+    if trace_key is None:
+        st.info(
+            "No judge trace for this iteration — the tool-using judge may be "
+            "disabled or this is a legacy feedback run."
+        )
+        return
+
+    iteration, run_idx, tag = trace_key
+    trace = load_judge_trace(results_dir, iteration, run_idx, tag)
+    if trace is None:
+        st.warning("Trace file could not be loaded.")
+        return
+
+    render_judge_trace_viewer(trace)
+
+
+def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
+    """Render a single judge trace with all sections."""
+    is_short_circuit = trace.get("short_circuit", False)
+
+    if is_short_circuit:
+        source_iter = trace.get("source_iter", "?")
+        st.warning(
+            f"⚡ **Short-circuit verdict** — All candidate models from iteration "
+            f"{source_iter} failed parameter recovery. The verdict was reused "
+            f"from a prior iteration with failure notes appended."
+        )
+        recovery_failures = trace.get("recovery_failures", [])
+        if recovery_failures:
+            rows = []
+            for rf in recovery_failures:
+                name = rf.get("model", rf.get("function_name", "?"))
+                mean_r = rf.get("mean_r", "N/A")
+                mean_r_str = f"{mean_r:.2f}" if isinstance(mean_r, (int, float)) else str(mean_r)
+                per_param = rf.get("recovery_per_param", {})
+                if per_param:
+                    worst = min(per_param, key=lambda k: per_param[k] if isinstance(per_param[k], (int, float)) else 0)
+                    worst_str = f"{worst} r={per_param[worst]:.2f}" if isinstance(per_param[worst], (int, float)) else ""
+                    worst_params = [f"{k} r={v:.2f}" for k, v in sorted(per_param.items(), key=lambda kv: kv[1] if isinstance(kv[1], (int, float)) else 0)][:3]
+                    worst_str = ", ".join(worst_params)
+                else:
+                    worst_str = "-"
+                rows.append({"Model": name, "Mean r": mean_r_str, "Worst parameters": worst_str})
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    tool_call_count = trace.get("tool_call_count", 0)
+    wall_time = trace.get("wall_time_seconds", 0.0)
+    timestamp = trace.get("timestamp", "")
+    if timestamp:
+        try:
+            from datetime import datetime as _dt
+            ts_display = _dt.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            ts_display = timestamp[:19] if len(timestamp) >= 19 else timestamp
+    else:
+        ts_display = "-"
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Tool calls", tool_call_count)
+    c2.metric("Wall time", f"{wall_time:.1f}s")
+    c3.metric("Timestamp", ts_display)
+
+    tool_calls = trace.get("tool_call_trace", [])
+    if tool_calls:
+        with st.expander(f"**Tool Calls** ({len(tool_calls)} calls)", expanded=False):
+            rows = []
+            for i, tc in enumerate(tool_calls):
+                args = tc.get("args", {})
+                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                if len(args_str) > 80:
+                    args_str = args_str[:77] + "..."
+                result_preview = tc.get("result_summary", "")[:200]
+                rows.append({
+                    "#": i + 1,
+                    "Tool": tc.get("tool", ""),
+                    "Args": args_str,
+                    "Result Preview": result_preview,
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+            for i, tc in enumerate(tool_calls):
+                with st.expander(
+                    f"Call {i + 1}: {tc.get('tool', '?')}", expanded=False
+                ):
+                    st.json(tc.get("args", {}))
+                    st.text(tc.get("result_summary", ""))
+    elif is_short_circuit:
+        st.caption("No tool calls (short-circuit verdict).")
+    else:
+        st.caption("No tool calls recorded.")
+
+    per_angle = trace.get("per_angle", [])
+    if per_angle:
+        st.subheader("Per-Angle Analysis")
+        for row_idx in range(0, len(per_angle), 2):
+            cols = st.columns(2)
+            for col_idx in range(2):
+                angle_idx = row_idx + col_idx
+                if angle_idx >= len(per_angle):
+                    break
+                angle_data = per_angle[angle_idx]
+                with cols[col_idx]:
+                    with st.container(border=True):
+                        angle_name = angle_data.get("angle", "Unknown")
+                        confidence = angle_data.get("confidence", "")
+                        icon = _CONFIDENCE_ICONS.get(confidence, "⚪")
+                        st.markdown(f"**{angle_name}**")
+                        st.markdown(f"{icon} **{confidence.upper()}**" if confidence else "⚪ Analysis pending")
+                        supporting = angle_data.get("supporting_tool_calls", [])
+                        if supporting:
+                            pills = " ".join(f"`{t}`" for t in supporting)
+                            st.markdown(f"<small>📎 {pills}</small>", unsafe_allow_html=True)
+                        findings = angle_data.get("findings", "")
+                        if findings:
+                            lines = findings.split("\n")
+                            preview = "\n".join(lines[:3])
+                            if len(lines) > 3:
+                                with st.expander("Full findings"):
+                                    st.markdown(findings)
+                            else:
+                                st.markdown(preview)
+    elif is_short_circuit:
+        pass
+    else:
+        st.info("No per-angle analysis available.")
+
+    recommendations = trace.get("key_recommendations", [])
+    if recommendations:
+        st.subheader("Key Recommendations")
+        for i, rec in enumerate(recommendations[:5], 1):
+            st.markdown(f"{i}. {rec}")
+
+    feedback = trace.get("synthesized_feedback", "")
+    if feedback:
+        with st.expander("**Synthesized Feedback**"):
+            st.caption(
+                "Feedback is written for the model code generator — not for human interpretation."
+            )
+            st.markdown(feedback)

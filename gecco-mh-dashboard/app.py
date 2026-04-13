@@ -18,6 +18,7 @@ from dashboard.views import (
     render_clients,
     render_header,
     render_history,
+    render_judge_tab,
     render_models,
     render_overview,
     render_r2,
@@ -88,8 +89,8 @@ def main() -> None:
     if refresh_now or auto_refresh:
         append_snapshot(data, max_points=max_history_points)
 
-    tab_overview, tab_clients, tab_models, tab_results = st.tabs(
-        ["Overview", "Clients", "Models", "Results"]
+    tab_overview, tab_clients, tab_models, tab_results, tab_judge = st.tabs(
+        ["Overview", "Clients", "Models", "Results", "Judge"]
     )
 
     with tab_overview:
@@ -106,6 +107,9 @@ def main() -> None:
 
     with tab_results:
         render_results_browser(data, results_dir)
+
+    with tab_judge:
+        render_judge_tab(data, results_dir)
 
     if auto_refresh:
         time.sleep(refresh_seconds)

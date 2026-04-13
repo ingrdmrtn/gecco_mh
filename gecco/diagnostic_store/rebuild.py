@@ -40,12 +40,12 @@ def _detect_split(filename: str) -> str:
 
 def _load_json_file(args: tuple[Path, int, str | None, str]) -> dict | None:
     """Load and parse a single JSON file.
-    
+
     Parameters
     ----------
     args:
         Tuple of (json_file_path, iteration, client_id, tag)
-    
+
     Returns
     -------
     dict with parsed data or None on error
@@ -53,15 +53,24 @@ def _load_json_file(args: tuple[Path, int, str | None, str]) -> dict | None:
     json_file, iteration, client_id, tag = args
     try:
         with open(json_file, "rb") as f:
-            iteration_results = orjson.loads(f.read())
-        
+            raw = f.read()
+
+        # Try orjson first (faster), fall back to json if it fails
+        # (json handles Python's non-standard Infinity/NaN literals)
+        try:
+            iteration_results = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            import json
+
+            iteration_results = json.loads(raw.decode("utf-8"))
+
         # Extract PPC data from results
         ppc_results_map = {
             r["function_name"]: r["ppc"]
             for r in iteration_results
             if r.get("function_name") and r.get("ppc")
         }
-        
+
         return {
             "json_file": json_file,
             "iteration": iteration,
@@ -147,7 +156,9 @@ def rebuild_from_artifacts(
 
     if not files_to_parse:
         if iteration_set is not None:
-            print(f"[rebuild] Warning: No files found for iterations: {sorted(iteration_set)}")
+            print(
+                f"[rebuild] Warning: No files found for iterations: {sorted(iteration_set)}"
+            )
         return store
 
     # Parallel JSON parsing (Opt-E)
@@ -156,7 +167,7 @@ def rebuild_from_artifacts(
         (json_file, iteration, client_id, tag)
         for json_file, iteration, run_idx, client_id, tag in files_to_parse
     ]
-    
+
     parsed_results = []
     if len(parse_args) > 1:
         # Use parallel parsing for multiple files

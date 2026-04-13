@@ -1,6 +1,7 @@
 # engine/model_search.py
 import os
 import json
+import math
 import time
 import numpy as np
 import pandas as pd
@@ -34,6 +35,19 @@ class _NumpyJSONEncoder(json.JSONEncoder):
         if isinstance(o, np.generic):
             return o.item()
         return super().default(o)
+
+    def encode(self, o):
+        return super().encode(self._sanitize(o))
+
+    def _sanitize(self, o):
+        if isinstance(o, float):
+            if math.isinf(o) or math.isnan(o):
+                return None
+        elif isinstance(o, dict):
+            return {k: self._sanitize(v) for k, v in o.items()}
+        elif isinstance(o, list):
+            return [self._sanitize(v) for v in o]
+        return o
 
 
 class GeCCoModelSearch:

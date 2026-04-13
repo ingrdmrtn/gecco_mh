@@ -5,8 +5,9 @@ write and query helpers used by the rest of the diagnostic_store package.
 
 from __future__ import annotations
 
-import json
 import threading
+
+import orjson
 from pathlib import Path
 from typing import Any
 
@@ -78,27 +79,30 @@ class DiagnosticStore:
         timestamp: str | None,
         n_models_proposed: int,
     ) -> int:
-        """Return the iteration_id, creating the row if absent."""
+        """Return the iteration_id, creating the row if absent.
+        
+        Must be called within a transaction and with the lock held.
+        """
         tag = tag or ""
-        row = self.fetchone(
+        row = self._conn.execute(
             "SELECT iteration_id FROM iterations "
             "WHERE run_idx=? AND iteration=? AND tag=?",
             [run_idx, iteration, tag],
-        )
+        ).fetchone()
         if row:
-            return row["iteration_id"]
-        self.execute(
+            return row[0]
+        self._conn.execute(
             "INSERT INTO iterations "
             "(run_idx, iteration, client_id, tag, timestamp, n_models_proposed) "
             "VALUES (?,?,?,?,?,?)",
             [run_idx, iteration, client_id, tag, timestamp, n_models_proposed],
         )
-        row = self.fetchone(
+        row = self._conn.execute(
             "SELECT iteration_id FROM iterations "
             "WHERE run_idx=? AND iteration=? AND tag=?",
             [run_idx, iteration, tag],
-        )
-        return row["iteration_id"]
+        ).fetchone()
+        return row[0]
 
     def _insert_model(
         self,
@@ -114,13 +118,21 @@ class DiagnosticStore:
         mean_nll: float | None = None,
         split: str = "train",
     ) -> int:
-        """Insert a model row and return its model_id."""
-        self.execute(
+        """Insert a model row and return its model_id.
+        
+        Pre-allocates model_id from sequence to avoid post-INSERT SELECT.
+        Must be called within a transaction and with the lock held.
+        """
+        # Pre-allocate model_id from sequence (Opt-C)
+        model_id = self._conn.execute("SELECT nextval('models_id_seq')").fetchone()[0]
+        
+        self._conn.execute(
             "INSERT INTO models "
-            "(iteration_id, run_idx, iteration, name, code, metric_name, "
+            "(model_id, iteration_id, run_idx, iteration, name, code, metric_name, "
             " metric_value, mean_nll, split, param_names, status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
+                model_id,
                 iteration_id,
                 run_idx,
                 iteration,
@@ -130,17 +142,11 @@ class DiagnosticStore:
                 metric_value,
                 mean_nll,
                 split,
-                json.dumps(param_names),
+                orjson.dumps(param_names).decode(),
                 status,
             ],
         )
-        row = self.fetchone(
-            "SELECT model_id FROM models "
-            "WHERE iteration_id=? AND name=? AND split=? "
-            "ORDER BY model_id DESC LIMIT 1",
-            [iteration_id, name, split],
-        )
-        return row["model_id"]
+        return model_id
 
     # ------------------------------------------------------------------ #
     # Public write interface
@@ -185,232 +191,287 @@ class DiagnosticStore:
         ppc_results = ppc_results or {}
         n_models = len(iteration_results)
 
-        iteration_id = self._get_or_create_iteration(
-            run_idx, iteration, tag, client_id, timestamp, n_models
-        )
-
-        for result in iteration_results:
-            name = result.get("function_name", "unknown")
-            metric_name = result.get("metric_name")
-            metric_value = result.get("metric_value")
-            param_names = result.get("param_names") or []
-            code = result.get("code")
-
-            # Derive status from metric_name
-            if metric_name in ("RECOVERY_FAILED", "FIT_ERROR", "VALIDATION_ERROR"):
-                status = metric_name.lower()
-                metric_value_store = None
-            else:
-                status = "ok"
-                metric_value_store = (
-                    float(metric_value)
-                    if metric_value is not None and metric_value != float("inf")
-                    else None
+        with self._lock:
+            # Make iteration ingestion idempotent: clear any existing rows
+            # for this (run_idx, iteration, tag) before inserting fresh data.
+            # We must do this outside the transaction because DuckDB checks
+            # foreign key constraints immediately and the subquery-based deletes
+            # don't affect constraint checking within the same transaction.
+            tag_clean = tag or ""
+            iteration_row = self._conn.execute(
+                "SELECT iteration_id FROM iterations "
+                "WHERE run_idx=? AND iteration=? AND tag=?",
+                [run_idx, iteration, tag_clean],
+            ).fetchone()
+            
+            if iteration_row:
+                iteration_id = iteration_row[0]
+                # Get model IDs to delete
+                model_rows = self._conn.execute(
+                    "SELECT model_id FROM models WHERE iteration_id=?",
+                    [iteration_id],
+                ).fetchall()
+                model_ids = [r[0] for r in model_rows]
+                
+                if model_ids:
+                    placeholders = ','.join(['?' for _ in model_ids])
+                    # Delete from child tables first
+                    for table in ['model_participants', 'parameter_recovery', 
+                                  'individual_differences', 'ppc', 
+                                  'block_residuals', 'validation_errors']:
+                        self._conn.execute(
+                            f"DELETE FROM {table} WHERE model_id IN ({placeholders})",
+                            model_ids,
+                        )
+                    # Delete from models
+                    self._conn.execute(
+                        f"DELETE FROM models WHERE model_id IN ({placeholders})",
+                        model_ids,
+                    )
+                # Delete the iteration row itself
+                self._conn.execute(
+                    "DELETE FROM iterations WHERE iteration_id=?",
+                    [iteration_id],
+                )
+            
+            # Begin explicit transaction for inserts (Opt-A)
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                iteration_id = self._get_or_create_iteration(
+                    run_idx, iteration, tag, client_id, timestamp, n_models
                 )
 
-            model_id = self._insert_model(
-                iteration_id=iteration_id,
-                run_idx=run_idx,
-                iteration=iteration,
-                name=name,
-                code=code,
-                metric_name=metric_name,
-                metric_value=metric_value_store,
-                param_names=param_names,
-                status=status,
-                mean_nll=result.get("mean_nll"),
-                split="train",
-            )
+                # Batch accumulators for bulk inserts (Opt-B)
+                participant_rows = []
+                ppc_rows = []
+                block_residual_rows = []
 
-            # ---- per-participant data (train split) ----
-            eval_metrics = result.get("eval_metrics") or []
-            param_values = result.get("parameter_values") or []
-            n_trials_list = result.get("participant_n_trials") or []
-            per_participant_nll = result.get("per_participant_nll") or []
+                for result in iteration_results:
+                    name = result.get("function_name", "unknown")
+                    metric_name = result.get("metric_name")
+                    metric_value = result.get("metric_value")
+                    param_names = result.get("param_names") or []
+                    code = result.get("code")
 
-            for idx, bic_val in enumerate(eval_metrics):
-                params_i = param_values[idx] if idx < len(param_values) else []
-                n_trials_i = n_trials_list[idx] if idx < len(n_trials_list) else None
-                nll_i = (
-                    per_participant_nll[idx] if idx < len(per_participant_nll) else None
-                )
-                params_dict = {}
-                for pi, pname in enumerate(param_names):
-                    if pi < len(params_i):
-                        params_dict[pname] = float(params_i[pi])
-                self.execute(
-                    "INSERT INTO model_participants "
-                    "(id, model_id, participant_idx, bic, nll, n_trials, params) "
-                    "VALUES (nextval('model_participants_id_seq'),?,?,?,?,?,?)",
-                    [
-                        model_id,
-                        idx,
-                        float(bic_val) if bic_val is not None else None,
-                        nll_i,
-                        n_trials_i,
-                        json.dumps(params_dict),
-                    ],
-                )
+                    # Derive status from metric_name
+                    if metric_name in ("RECOVERY_FAILED", "FIT_ERROR", "VALIDATION_ERROR"):
+                        status = metric_name.lower()
+                        metric_value_store = None
+                    else:
+                        status = "ok"
+                        metric_value_store = (
+                            float(metric_value)
+                            if metric_value is not None and metric_value != float("inf")
+                            else None
+                        )
 
-            # ---- parameter recovery ----
-            recovery = result.get("recovery")
-            if recovery is None and metric_name == "RECOVERY_FAILED":
-                # Reconstruct a minimal recovery record from the result dict
-                recovery = {
-                    "passed": False,
-                    "mean_r": result.get("recovery_r", 0.0),
-                    "n_successful": result.get("recovery_n_successful", 0),
-                    "per_param_r": result.get("recovery_per_param", {}),
-                    "simulation_error": result.get("simulation_error"),
-                }
-            if recovery is not None:
-                self.execute(
-                    "INSERT OR REPLACE INTO parameter_recovery "
-                    "(model_id, passed, mean_r, n_successful, per_param_r, simulation_error) "
-                    "VALUES (?,?,?,?,?,?)",
-                    [
-                        model_id,
-                        bool(recovery.get("passed", False)),
-                        recovery.get("mean_r"),
-                        recovery.get("n_successful"),
-                        json.dumps(recovery.get("per_param_r", {})),
-                        recovery.get("simulation_error"),
-                    ],
-                )
-
-            # ---- individual differences (train split) ----
-            id_results = result.get("individual_differences")
-            if id_results:
-                self.execute(
-                    "INSERT OR REPLACE INTO individual_differences "
-                    "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    [
-                        model_id,
-                        id_results.get("mean_r2"),
-                        id_results.get("max_r2"),
-                        id_results.get("best_param"),
-                        json.dumps(id_results.get("per_param_r2", {})),
-                        json.dumps(id_results.get("per_param_detail", {})),
-                        "train",
-                    ],
-                )
-
-            # ---- val split: write second model entry if val metrics present ----
-            val_metric_value = result.get("val_metric_value")
-            val_mean_nll = result.get("val_mean_nll")
-            if val_metric_value is not None:
-                val_model_id = self._insert_model(
-                    iteration_id=iteration_id,
-                    run_idx=run_idx,
-                    iteration=iteration,
-                    name=name,
-                    code=code,
-                    metric_name=metric_name,
-                    metric_value=float(val_metric_value)
-                    if val_metric_value != float("inf")
-                    else None,
-                    param_names=param_names,
-                    status="ok",
-                    mean_nll=val_mean_nll,
-                    split="val",
-                )
-
-                # ---- val individual differences ----
-                val_id_results = result.get("val_individual_differences")
-                if val_id_results:
-                    self.execute(
-                        "INSERT OR REPLACE INTO individual_differences "
-                        "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
-                        "VALUES (?,?,?,?,?,?,?)",
-                        [
-                            val_model_id,
-                            val_id_results.get("mean_r2"),
-                            val_id_results.get("max_r2"),
-                            val_id_results.get("best_param"),
-                            json.dumps(val_id_results.get("per_param_r2", {})),
-                            json.dumps(val_id_results.get("per_param_detail", {})),
-                            "val",
-                        ],
+                    model_id = self._insert_model(
+                        iteration_id=iteration_id,
+                        run_idx=run_idx,
+                        iteration=iteration,
+                        name=name,
+                        code=code,
+                        metric_name=metric_name,
+                        metric_value=metric_value_store,
+                        param_names=param_names,
+                        status=status,
+                        mean_nll=result.get("mean_nll"),
+                        split="train",
                     )
 
-            # ---- validation errors ----
-            if metric_name == "VALIDATION_ERROR":
-                self.execute(
-                    "INSERT INTO validation_errors "
-                    "(model_id, error_type, error_message, error_details) "
-                    "VALUES (?,?,?,?)",
-                    [
-                        model_id,
-                        result.get("error_type"),
-                        result.get("error_message"),
-                        json.dumps(result.get("error_details", {})),
-                    ],
-                )
+                    # ---- per-participant data (train split) - accumulate for batch insert ----
+                    eval_metrics = result.get("eval_metrics") or []
+                    param_values = result.get("parameter_values") or []
+                    n_trials_list = result.get("participant_n_trials") or []
+                    per_participant_nll = result.get("per_participant_nll") or []
 
-            # ---- PPC ----
-            ppc_data = ppc_results.get(name)
-            if ppc_data:
-                self._write_ppc(model_id, ppc_data)
+                    for idx, bic_val in enumerate(eval_metrics):
+                        params_i = param_values[idx] if idx < len(param_values) else []
+                        n_trials_i = n_trials_list[idx] if idx < len(n_trials_list) else None
+                        nll_i = (
+                            per_participant_nll[idx] if idx < len(per_participant_nll) else None
+                        )
+                        params_dict = {}
+                        for pi, pname in enumerate(param_names):
+                            if pi < len(params_i):
+                                params_dict[pname] = float(params_i[pi])
+                        participant_rows.append([
+                            model_id,
+                            idx,
+                            float(bic_val) if bic_val is not None else None,
+                            nll_i,
+                            n_trials_i,
+                            orjson.dumps(params_dict).decode(),
+                        ])
 
-            # ---- block residuals ----
-            block_residuals = result.get("block_residuals")
-            if block_residuals:
-                self._write_block_residuals(model_id, block_residuals)
+                    # ---- parameter recovery ----
+                    recovery = result.get("recovery")
+                    if recovery is None and metric_name == "RECOVERY_FAILED":
+                        # Reconstruct a minimal recovery record from the result dict
+                        recovery = {
+                            "passed": False,
+                            "mean_r": result.get("recovery_r", 0.0),
+                            "n_successful": result.get("recovery_n_successful", 0),
+                            "per_param_r": result.get("recovery_per_param", {}),
+                            "simulation_error": result.get("simulation_error"),
+                        }
+                    if recovery is not None:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO parameter_recovery "
+                            "(model_id, passed, mean_r, n_successful, per_param_r, simulation_error) "
+                            "VALUES (?,?,?,?,?,?)",
+                            [
+                                model_id,
+                                bool(recovery.get("passed", False)),
+                                recovery.get("mean_r"),
+                                recovery.get("n_successful"),
+                                orjson.dumps(recovery.get("per_param_r", {})).decode(),
+                                recovery.get("simulation_error"),
+                            ],
+                        )
 
-    def _write_ppc(self, model_id: int, ppc_data: dict) -> None:
-        """Write PPC rows for a single model.
+                    # ---- individual differences (train split) ----
+                    id_results = result.get("individual_differences")
+                    if id_results:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO individual_differences "
+                            "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            [
+                                model_id,
+                                id_results.get("mean_r2"),
+                                id_results.get("max_r2"),
+                                id_results.get("best_param"),
+                                orjson.dumps(id_results.get("per_param_r2", {})).decode(),
+                                orjson.dumps(id_results.get("per_param_detail", {})).decode(),
+                                "train",
+                            ],
+                        )
 
-        *ppc_data* is the structure returned by
-        :func:`gecco.offline_evaluation.ppc.compute_ppc`:
-        a dict mapping ``(participant_id, statistic_name, condition)`` → stat dict,
-        or a list of flat stat records.
-        """
-        records = (
-            ppc_data if isinstance(ppc_data, list) else ppc_data.get("records", [])
-        )
-        for rec in records:
-            self.execute(
-                "INSERT INTO ppc "
-                "(model_id, participant_id, statistic_name, condition, "
-                " observed, simulated_mean, simulated_q025, simulated_q975, n_sims) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                [
-                    model_id,
-                    str(rec.get("participant_id", "")),
-                    rec.get("statistic_name", ""),
-                    rec.get("condition"),
-                    rec.get("observed"),
-                    rec.get("simulated_mean"),
-                    rec.get("simulated_q025"),
-                    rec.get("simulated_q975"),
-                    rec.get("n_sims"),
-                ],
-            )
+                    # ---- val split: write second model entry if val metrics present ----
+                    val_metric_value = result.get("val_metric_value")
+                    val_mean_nll = result.get("val_mean_nll")
+                    val_model_id = None
+                    if val_metric_value is not None:
+                        val_model_id = self._insert_model(
+                            iteration_id=iteration_id,
+                            run_idx=run_idx,
+                            iteration=iteration,
+                            name=name,
+                            code=code,
+                            metric_name=metric_name,
+                            metric_value=float(val_metric_value)
+                            if val_metric_value != float("inf")
+                            else None,
+                            param_names=param_names,
+                            status="ok",
+                            mean_nll=val_mean_nll,
+                            split="val",
+                        )
 
-    def _write_block_residuals(self, model_id: int, block_data: dict) -> None:
-        """Write block residual rows for a single model."""
-        records = (
-            block_data
-            if isinstance(block_data, list)
-            else block_data.get("records", [])
-        )
-        for rec in records:
-            self.execute(
-                "INSERT INTO block_residuals "
-                "(model_id, participant_id, block_idx, block_start, block_end, "
-                " mean_nll_per_trial, n_trials) "
-                "VALUES (?,?,?,?,?,?,?)",
-                [
-                    model_id,
-                    str(rec.get("participant_id", "")),
-                    rec.get("block_idx"),
-                    rec.get("block_start"),
-                    rec.get("block_end"),
-                    rec.get("mean_nll_per_trial"),
-                    rec.get("n_trials"),
-                ],
-            )
+                        # ---- val individual differences ----
+                        val_id_results = result.get("val_individual_differences")
+                        if val_id_results:
+                            self._conn.execute(
+                                "INSERT OR REPLACE INTO individual_differences "
+                                "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
+                                "VALUES (?,?,?,?,?,?,?)",
+                                [
+                                    val_model_id,
+                                    val_id_results.get("mean_r2"),
+                                    val_id_results.get("max_r2"),
+                                    val_id_results.get("best_param"),
+                                    orjson.dumps(val_id_results.get("per_param_r2", {})).decode(),
+                                    orjson.dumps(val_id_results.get("per_param_detail", {})).decode(),
+                                    "val",
+                                ],
+                            )
+
+                    # ---- validation errors ----
+                    if metric_name == "VALIDATION_ERROR":
+                        self._conn.execute(
+                            "INSERT INTO validation_errors "
+                            "(model_id, error_type, error_message, error_details) "
+                            "VALUES (?,?,?,?)",
+                            [
+                                model_id,
+                                result.get("error_type"),
+                                result.get("error_message"),
+                                orjson.dumps(result.get("error_details", {})).decode(),
+                            ],
+                        )
+
+                    # ---- PPC - accumulate for batch insert ----
+                    ppc_data = ppc_results.get(name)
+                    if ppc_data:
+                        records = (
+                            ppc_data if isinstance(ppc_data, list) else ppc_data.get("records", [])
+                        )
+                        for rec in records:
+                            ppc_rows.append([
+                                model_id,
+                                str(rec.get("participant_id", "")),
+                                rec.get("statistic_name", ""),
+                                rec.get("condition"),
+                                rec.get("observed"),
+                                rec.get("simulated_mean"),
+                                rec.get("simulated_q025"),
+                                rec.get("simulated_q975"),
+                                rec.get("n_sims"),
+                            ])
+
+                    # ---- block residuals - accumulate for batch insert ----
+                    block_residuals = result.get("block_residuals")
+                    if block_residuals:
+                        records = (
+                            block_residuals
+                            if isinstance(block_residuals, list)
+                            else block_residuals.get("records", [])
+                        )
+                        for rec in records:
+                            block_residual_rows.append([
+                                model_id,
+                                str(rec.get("participant_id", "")),
+                                rec.get("block_idx"),
+                                rec.get("block_start"),
+                                rec.get("block_end"),
+                                rec.get("mean_nll_per_trial"),
+                                rec.get("n_trials"),
+                            ])
+
+                # Bulk insert all accumulated rows (Opt-B)
+                # DuckDB evaluates nextval() per row in executemany, so this is safe.
+                if participant_rows:
+                    self._conn.executemany(
+                        "INSERT INTO model_participants "
+                        "(id, model_id, participant_idx, bic, nll, n_trials, params) "
+                        "VALUES (nextval('model_participants_id_seq'),?,?,?,?,?,?)",
+                        participant_rows,
+                    )
+
+                if ppc_rows:
+                    self._conn.executemany(
+                        "INSERT INTO ppc "
+                        "(model_id, participant_id, statistic_name, condition, "
+                        " observed, simulated_mean, simulated_q025, simulated_q975, n_sims) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        ppc_rows,
+                    )
+
+                if block_residual_rows:
+                    self._conn.executemany(
+                        "INSERT INTO block_residuals "
+                        "(model_id, participant_id, block_idx, block_start, block_end, "
+                        " mean_nll_per_trial, n_trials) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        block_residual_rows,
+                    )
+
+                # Commit transaction (Opt-A)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def write_top_model_test(self, entry: dict) -> None:
         """Write a top model test evaluation entry.
@@ -444,7 +505,7 @@ class DiagnosticStore:
                 test_mean_bic,
                 test_mean_nll,
                 "test",
-                json.dumps([]),
+                orjson.dumps([]).decode(),
                 "ok",
             ],
         )
@@ -466,8 +527,8 @@ class DiagnosticStore:
                     test_id_results.get("mean_r2"),
                     test_id_results.get("max_r2"),
                     test_id_results.get("best_param"),
-                    json.dumps(test_id_results.get("per_param_r2", {})),
-                    json.dumps(test_id_results.get("per_param_detail", {})),
+                    orjson.dumps(test_id_results.get("per_param_r2", {})).decode(),
+                    orjson.dumps(test_id_results.get("per_param_detail", {})).decode(),
                     "test",
                 ],
             )

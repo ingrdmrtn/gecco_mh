@@ -167,19 +167,34 @@ def main():
         console.print(f"[green]Iteration {it} complete: {count} clients[/]")
 
         # --- Rebuild unified diagnostic store from all clients' artifacts ---
-        console.print("[cyan]Rebuilding unified diagnostic store...[/]")
+        console.print("[cyan]Updating unified diagnostic store...[/]")
         try:
+            # Use incremental rebuild: only process current iteration, keep existing DB
             unified_store = rebuild_from_artifacts(
                 results_dir=str(results_dir),
                 db_path=str(results_dir / "diagnostics_unified.duckdb"),
-                overwrite=True,
+                overwrite=False,  # Safe on first run and safe after restart
+                iterations=[it],
             )
         except Exception as e:
             console.print(
-                f"[red]Failed to rebuild diagnostic store: {e}[/]\n"
-                f"[yellow]Skipping judge for iteration {it}[/]"
+                f"[red]Failed to update diagnostic store incrementally: {e}[/]\n"
+                f"[yellow]Falling back to full rebuild of all artifacts...[/]"
             )
-            continue
+            # Fallback: delete and rebuild everything
+            try:
+                unified_store = rebuild_from_artifacts(
+                    results_dir=str(results_dir),
+                    db_path=str(results_dir / "diagnostics_unified.duckdb"),
+                    overwrite=True,
+                )
+                console.print("[green]Full rebuild successful[/]")
+            except Exception as fallback_e:
+                console.print(
+                    f"[red]Fallback rebuild also failed: {fallback_e}[/]\n"
+                    f"[yellow]Skipping judge for iteration {it}[/]"
+                )
+                continue
 
         # --- Instantiate and run ToolUsingJudge on unified store ---
         console.print("[cyan]Running centralized judge...[/]")

@@ -14,9 +14,11 @@ Usage::
 
 from __future__ import annotations
 
-import json
 import re
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import orjson
 
 from gecco.diagnostic_store.store import DiagnosticStore
 
@@ -36,10 +38,48 @@ def _detect_split(filename: str) -> str:
     return "train"
 
 
+def _load_json_file(args: tuple[Path, int, str | None, str]) -> dict | None:
+    """Load and parse a single JSON file.
+    
+    Parameters
+    ----------
+    args:
+        Tuple of (json_file_path, iteration, client_id, tag)
+    
+    Returns
+    -------
+    dict with parsed data or None on error
+    """
+    json_file, iteration, client_id, tag = args
+    try:
+        with open(json_file, "rb") as f:
+            iteration_results = orjson.loads(f.read())
+        
+        # Extract PPC data from results
+        ppc_results_map = {
+            r["function_name"]: r["ppc"]
+            for r in iteration_results
+            if r.get("function_name") and r.get("ppc")
+        }
+        
+        return {
+            "json_file": json_file,
+            "iteration": iteration,
+            "client_id": client_id,
+            "tag": tag,
+            "iteration_results": iteration_results,
+            "ppc_results_map": ppc_results_map or None,
+        }
+    except Exception as e:
+        print(f"[rebuild] Error loading {json_file.name}: {e}")
+        return None
+
+
 def rebuild_from_artifacts(
     results_dir: str | Path,
     db_path: str | None = None,
     overwrite: bool = True,
+    iterations: list[int] | None = None,
 ) -> DiagnosticStore:
     """Rebuild the diagnostic store from JSON artifact files.
 
@@ -52,6 +92,9 @@ def rebuild_from_artifacts(
         ``{results_dir}/diagnostics.duckdb``.
     overwrite:
         If True, delete an existing database before rebuilding.
+    iterations:
+        If provided, only process these iteration numbers.
+        If None, process all iterations found (original behavior).
 
     Returns
     -------
@@ -77,8 +120,13 @@ def rebuild_from_artifacts(
         print(f"[rebuild] No iter*.json files found in {bics_dir}")
         return store
 
+    iteration_set = set(iterations) if iterations is not None else None
+    processed_count = 0
+
     print(f"[rebuild] Processing {len(json_files)} artifact files from {bics_dir}")
 
+    # Prepare file list with metadata for parallel parsing
+    files_to_parse = []
     for json_file in json_files:
         m = _ITER_FILENAME_RE.search(json_file.name)
         if not m:
@@ -86,52 +134,78 @@ def rebuild_from_artifacts(
             continue
 
         iteration = int(m.group("iteration"))
+
+        # Skip if not in the requested iterations set
+        if iteration_set is not None and iteration not in iteration_set:
+            continue
+
         run_idx = int(m.group("run_idx"))
         client_id = m.group("client_id") or None
         tag = f"_client{client_id}" if client_id else ""
 
-        with open(json_file) as f:
-            try:
-                iteration_results = json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"[rebuild] JSON parse error in {json_file.name}: {e}")
-                continue
+        files_to_parse.append((json_file, iteration, run_idx, client_id, tag))
 
+    if not files_to_parse:
+        if iteration_set is not None:
+            print(f"[rebuild] Warning: No files found for iterations: {sorted(iteration_set)}")
+        return store
+
+    # Parallel JSON parsing (Opt-E)
+    # Parse JSON files in parallel using ProcessPoolExecutor
+    parse_args = [
+        (json_file, iteration, client_id, tag)
+        for json_file, iteration, run_idx, client_id, tag in files_to_parse
+    ]
+    
+    parsed_results = []
+    if len(parse_args) > 1:
+        # Use parallel parsing for multiple files
+        with ProcessPoolExecutor() as executor:
+            parsed_results = list(executor.map(_load_json_file, parse_args))
+    else:
+        # Single file - parse sequentially
+        parsed_results = [_load_json_file(args) for args in parse_args]
+
+    # Process parsed results sequentially (DuckDB is single-writer)
+    for i, parsed in enumerate(parsed_results):
+        if parsed is None:
+            continue
+
+        json_file, iteration, run_idx, client_id, tag = files_to_parse[i]
         split = _detect_split(json_file.name)
 
-        # Extract PPC data from results (stored inline as result["ppc"])
-        ppc_results_map = {
-            r["function_name"]: r["ppc"]
-            for r in iteration_results
-            if r.get("function_name") and r.get("ppc")
-        }
-
         store.write_iteration(
-            iteration=iteration,
+            iteration=parsed["iteration"],
             run_idx=run_idx,
-            iteration_results=iteration_results,
-            ppc_results=ppc_results_map or None,
-            tag=tag,
-            client_id=client_id,
+            iteration_results=parsed["iteration_results"],
+            ppc_results=parsed["ppc_results_map"],
+            tag=parsed["tag"],
+            client_id=parsed["client_id"],
         )
-        ppc_count = len(ppc_results_map)
+        processed_count += 1
+        ppc_count = len(parsed["ppc_results_map"] or {})
         print(
-            f"[rebuild]   iter={iteration} run={run_idx} client='{client_id}' split='{split}' "
-            f"({len(iteration_results)} models, {ppc_count} with PPC)"
+            f"[rebuild]   iter={parsed['iteration']} run={run_idx} client='{parsed['client_id']}' split='{split}' "
+            f"({len(parsed['iteration_results'])} models, {ppc_count} with PPC)"
         )
 
     top_models_test_file = results_dir / "bics" / "top_models_test.json"
     if top_models_test_file.exists():
         print(f"[rebuild] Processing top_models_test.json")
-        with open(top_models_test_file) as f:
+        with open(top_models_test_file, "rb") as f:
             try:
-                top_models = json.load(f)
-            except json.JSONDecodeError as e:
+                top_models = orjson.loads(f.read())
+            except Exception as e:
                 print(f"[rebuild] JSON parse error in top_models_test.json: {e}")
             else:
                 for entry in top_models:
                     store.write_top_model_test(entry)
                 print(f"[rebuild]   Wrote {len(top_models)} test entries")
 
-    print("[rebuild] Done.")
+    if iteration_set is not None and processed_count == 0:
+        print(
+            f"[rebuild] Warning: No files found for iterations: {sorted(iteration_set)}"
+        )
+    else:
+        print(f"[rebuild] Done. Processed {processed_count} files.")
     return store

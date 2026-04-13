@@ -74,7 +74,9 @@ def _format_tool_result(result) -> str:
     """Compact one-line summary of a tool result."""
     raw = json.dumps(result, default=str)
     n_chars = len(raw)
-    if isinstance(result, dict):
+    if isinstance(result, dict) and "error" in result and len(result) == 1:
+        summary = f"Error: {result['error'][:100]}"
+    elif isinstance(result, dict):
         keys = list(result.keys())
         key_preview = ", ".join(keys[:5])
         if len(keys) > 5:

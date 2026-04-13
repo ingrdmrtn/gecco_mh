@@ -251,33 +251,79 @@ def get_per_participant_fit(store: DiagnosticStore,
     return result
 
 
-def get_recovery(store: DiagnosticStore, model_id: int) -> dict | None:
+class DiagnosticNotAvailableError(RuntimeError):
+    """Raised when a diagnostic tool is called but the data
+    hasn't been computed (typically because the config option
+    is disabled)."""
+
+
+def _check_model_exists(store: DiagnosticStore, model_id: int) -> None:
+    """Raise ValueError if model_id does not exist in the models table."""
+    row = store.fetchone(
+        "SELECT 1 FROM models WHERE model_id = ?", [model_id]
+    )
+    if row is None:
+        raise ValueError(
+            f"model_id={model_id} does not exist in the database. "
+            "Ensure the model ID is valid."
+        )
+
+
+def get_recovery(store: DiagnosticStore, model_id: int) -> dict:
     """Return parameter recovery diagnostics for a model.
 
     ``per_param_r`` is summarised to ``{n_params, mean_r, min_r, max_r,
     worst_params}``.  ``per_param_detail`` (verbose coefficient tables) is
     omitted entirely.
+
+    Raises:
+        ValueError: If model_id does not exist.
+        DiagnosticNotAvailableError: If parameter recovery data has not
+            been computed for this model.  Enable via
+            ``parameter_recovery.enabled: true`` in config.
     """
+    _check_model_exists(store, model_id)
     sql = """
         SELECT * FROM parameter_recovery WHERE model_id = ?
     """
     row = store.fetchone(sql, [model_id])
-    return _hydrate_for_judge(row) if row else None
+    if row is None:
+        raise DiagnosticNotAvailableError(
+            f"Parameter recovery data not found for model_id={model_id}. "
+            "This diagnostic requires 'parameter_recovery.enabled: true' in the "
+            "config. Add this section to enable parameter identifiability checks."
+        )
+    return _hydrate_for_judge(row)
 
 
 def get_individual_differences(store: DiagnosticStore,
-                                model_id: int) -> dict | None:
+                                model_id: int) -> dict:
     """Return individual differences R² and predictor coefficients.
 
     ``per_param_r2`` is summarised to ``{n_params, mean_r2, min_r2, max_r2,
     best_params}``.  ``per_param_detail`` (verbose coefficient tables) is
     omitted entirely.
+
+    Raises:
+        ValueError: If model_id does not exist.
+        DiagnosticNotAvailableError: If individual-differences data has not
+            been computed.  Requires covariates to be configured in the
+            data section.
     """
+    _check_model_exists(store, model_id)
     sql = """
         SELECT * FROM individual_differences WHERE model_id = ?
     """
     row = store.fetchone(sql, [model_id])
-    return _hydrate_for_judge(row) if row else None
+    if row is None:
+        raise DiagnosticNotAvailableError(
+            f"Individual differences data not found for model_id={model_id}. "
+            "This diagnostic requires covariates to be configured in the data "
+            "section (e.g., 'data.covariates: [anxiety_score, age]'). "
+            "Without covariates, individual differences analysis cannot be "
+            "performed."
+        )
+    return _hydrate_for_judge(row)
 
 
 def get_ppc(store: DiagnosticStore, model_id: int,
@@ -296,7 +342,23 @@ def get_ppc(store: DiagnosticStore, model_id: int,
     for the *single worst* (statistic, condition) combination (cap 50 rows).
     ``statistic`` and ``condition`` filters are applied before selecting the
     worst group, so you can use them to pin a specific group.
+
+    Raises:
+        ValueError: If model_id does not exist.
+        DiagnosticNotAvailableError: If PPC data has not been computed for
+            this model.  Enable via ``judge.ppc.enabled: true`` in config.
     """
+    _check_model_exists(store, model_id)
+    # Existence check — needed because aggregate queries silently return []
+    # when no rows exist, giving no signal that the diagnostic wasn't run.
+    check_sql = "SELECT 1 FROM ppc WHERE model_id = ? LIMIT 1"
+    if store.fetchone(check_sql, [model_id]) is None:
+        raise DiagnosticNotAvailableError(
+            f"PPC data not found for model_id={model_id}. "
+            "This diagnostic requires 'judge.ppc.enabled: true' in the config. "
+            "Add this section under 'judge:' to enable posterior predictive checks."
+        )
+
     qparams: list[Any] = [model_id]
     filters = "model_id = ?"
     if statistic:
@@ -359,7 +421,31 @@ def get_ppc(store: DiagnosticStore, model_id: int,
 
 
 def get_block_residuals(store: DiagnosticStore, model_id: int) -> dict:
-    """Return aggregated block-level NLL residual summaries for a model."""
+    """Return aggregated block-level NLL residual summaries for a model.
+
+    Useful for identifying phases of the task where the model's NLL per
+    trial is especially high.
+
+    Raises:
+        ValueError: If model_id does not exist.
+        DiagnosticNotAvailableError: If block residual data has not been
+            computed.  Enable via ``judge.block_residuals.enabled: true``
+            in config (auto-enabled when PPC is enabled).
+    """
+    _check_model_exists(store, model_id)
+    # Existence check — needed because the current implementation returns
+    # {n_participants: 0, blocks: []} for missing data, which could be
+    # confused with a legitimate empty result.
+    check_sql = "SELECT 1 FROM block_residuals WHERE model_id = ? LIMIT 1"
+    if store.fetchone(check_sql, [model_id]) is None:
+        raise DiagnosticNotAvailableError(
+            f"Block residual data not found for model_id={model_id}. "
+            "This diagnostic requires 'judge.block_residuals.enabled: true' "
+            "in the config (or it is auto-enabled when 'judge.ppc.enabled: true'). "
+            "Add this section under 'judge:' to enable block-level residual "
+            "analysis."
+        )
+
     participant_row = store.fetchone(
         "SELECT COUNT(DISTINCT participant_id) AS n_participants "
         "FROM block_residuals WHERE model_id = ?",
@@ -723,7 +809,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "Return parameter recovery diagnostics for a model: overall "
                 "pass/fail, mean Pearson r, and a compact per-parameter r "
                 "summary (n_params, mean_r, min_r, max_r, worst 5 params by r). "
-                "Verbose coefficient tables are omitted."
+                "Verbose coefficient tables are omitted. "
+                "WARNING: Returns an error if parameter recovery is not enabled "
+                "in the config (parameter_recovery.enabled). Only call this tool "
+                "when you know recovery diagnostics have been computed."
             ),
             "parameters": {
                 "type": "object",
@@ -745,7 +834,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "Return individual-differences regression results for a model: "
                 "mean and max R², best parameter, and a compact per-parameter "
                 "R² summary (n_params, mean_r2, min_r2, max_r2, best 5 params "
-                "by R²).  Verbose coefficient tables are omitted."
+                "by R²).  Verbose coefficient tables are omitted. "
+                "WARNING: Returns an error if covariates are not configured "
+                "in the data section. Only call this tool when you know "
+                "individual differences have been computed."
             ),
             "parameters": {
                 "type": "object",
@@ -773,7 +865,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "Set participant_detail=true to get raw per-participant rows "
                 "for the single worst (statistic, condition) group (capped at 50 "
                 "rows); combine with statistic/condition filters to target a "
-                "specific group."
+                "specific group. "
+                "WARNING: Returns an error if PPC is not enabled in the config "
+                "(judge.ppc.enabled). Only call this tool when you know PPC "
+                "diagnostics have been computed."
             ),
             "parameters": {
                 "type": "object",
@@ -811,7 +906,10 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Return block-level residual summaries for a model, aggregated "
                 "across participants. Useful for identifying phases of the task "
-                "where the model's NLL per trial is especially high."
+                "where the model's NLL per trial is especially high. "
+                "WARNING: Returns an error if block residuals are not enabled "
+                "in the config (judge.block_residuals.enabled). Only call this "
+                "tool when you know block residuals have been computed."
             ),
             "parameters": {
                 "type": "object",

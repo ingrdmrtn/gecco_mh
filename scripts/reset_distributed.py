@@ -25,8 +25,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from config.schema import load_config
+from gecco.utils import TimestampedConsole
 
-console = Console()
+console = TimestampedConsole()
 
 # Subdirectories that accumulate during a distributed run
 ARTIFACT_DIRS = ["models", "feedback", "bics", "parameters", "simulation"]

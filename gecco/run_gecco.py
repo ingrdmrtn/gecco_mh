@@ -21,11 +21,11 @@ from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
-from gecco.utils import log as _log
+from gecco.utils import log as _log, TimestampedConsole
 from gecco.sentry_init import capture_fit_error, capture_recovery_failed
 from pathlib import Path
 
-console = Console()
+console = TimestampedConsole()
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):

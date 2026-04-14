@@ -11,8 +11,9 @@ from rich.console import Console
 from gecco.offline_evaluation.utils import build_model_spec
 from gecco.offline_evaluation.evaluation_functions import aic as _aic, bic as _bic
 from gecco.model_fitting.hbi_scipy import run_hbi_scipy
+from gecco.utils import TimestampedConsole
 
-console = Console()
+console = TimestampedConsole()
 
 
 def run_fit_hierarchical(

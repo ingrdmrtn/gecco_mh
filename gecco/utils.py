@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import sentry_sdk
+from rich.console import Console
+from rich.text import Text
 
 
 def log(msg: str, level: str = "info") -> None:
@@ -24,6 +26,26 @@ def log(msg: str, level: str = "info") -> None:
         level=level,
         timestamp=datetime.now(),
     )
+
+
+class TimestampedConsole(Console):
+    """A Rich Console that prepends a dim timestamp to every print() call.
+
+    Usage: exactly the same as Console(), but every non-empty print() call
+    will be prefixed with [HH:MM:SS] in dim style.
+
+    Empty print() calls (used for blank lines) pass through without a timestamp.
+    """
+
+    def print(self, *args, **kwargs):
+        # If no positional args and no 'renderable' keyword arg, this is a
+        # blank-line print() call — skip the timestamp for clean spacing.
+        if not args and "renderable" not in kwargs:
+            super().print(*args, **kwargs)
+            return
+
+        ts = Text(f"[{datetime.now().strftime('%H:%M:%S')}] ", style="dim")
+        super().print(ts, *args, **kwargs)
 
 
 def extract_model_code(text: str, model_num: int) -> Optional[str]:

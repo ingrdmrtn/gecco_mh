@@ -23,8 +23,9 @@ from scipy.stats import pearsonr
 from rich.console import Console
 
 from gecco.offline_evaluation.utils import ModelSpec
+from gecco.utils import TimestampedConsole
 
-console = Console()
+console = TimestampedConsole()
 
 
 # ============================================================

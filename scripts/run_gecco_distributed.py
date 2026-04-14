@@ -19,6 +19,7 @@ from gecco.run_gecco import GeCCoModelSearch
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
 from gecco.coordination import SharedRegistry, apply_client_profile
 from gecco.sentry_init import init_sentry
+from gecco.utils import TimestampedConsole
 import pandas as pd
 import json
 import argparse
@@ -27,7 +28,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-console = Console()
+console = TimestampedConsole()
 
 
 def main():

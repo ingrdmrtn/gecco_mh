@@ -15,9 +15,10 @@ from datetime import datetime
 from typing import Optional
 
 from gecco.sentry_init import capture_coordination_error
+from gecco.utils import TimestampedConsole
 from rich.console import Console
 
-console = Console()
+console = TimestampedConsole()
 
 
 class SharedRegistry:

@@ -25,8 +25,10 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.table import Table
 from rich.panel import Panel
 
+from gecco.utils import TimestampedConsole
+
 logger = logging.getLogger("hbi_scipy")
-console = Console()
+console = TimestampedConsole()
 
 
 # --- Data Structures ---

@@ -32,8 +32,9 @@ from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
 from gecco.sentry_init import init_sentry
+from gecco.utils import TimestampedConsole
 
-console = Console()
+console = TimestampedConsole()
 
 
 def main():

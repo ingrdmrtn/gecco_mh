@@ -13,9 +13,9 @@ from pathlib import Path
 
 from rich.console import Console
 
-from gecco.utils import log as _log
+from gecco.utils import log as _log, TimestampedConsole
 
-console = Console()
+console = TimestampedConsole()
 
 
 def fit_baseline_if_needed(

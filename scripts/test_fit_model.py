@@ -32,12 +32,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.offline_evaluation.fit_generated_models import run_fit, run_fit_hierarchical
+from gecco.utils import TimestampedConsole
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-console = Console()
+console = TimestampedConsole()
 
 
 def load_code_from_file(path: str) -> str:

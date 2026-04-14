@@ -38,8 +38,9 @@ from pydantic import BaseModel
 from rich.console import Console
 
 from gecco.diagnostic_store.tools import TOOL_SCHEMAS, dispatch_tool
+from gecco.utils import TimestampedConsole
 
-_console = Console()
+_console = TimestampedConsole()
 
 # Hard cap on any single tool result fed back into the message history.
 # Prevents an unexpectedly large result from reopening the context-limit wound.

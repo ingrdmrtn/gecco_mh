@@ -667,10 +667,30 @@ def get_parameter_distribution(store: DiagnosticStore, model_id: int,
 def search_models(store: DiagnosticStore, code_contains: str | None = None,
                   param_contains: str | None = None,
                   metric_lt: float | None = None,
+                  status: str | list[str] | None = None,
                   limit: int = 20) -> list[dict]:
-    """Filter models by code substring, parameter name, or metric threshold."""
-    filters = ["m.status = 'ok'"]
+    """Filter models by code substring, parameter name, metric threshold, or status.
+
+    Parameters
+    ----------
+    status:
+        ``None`` (default) — return all statuses.
+        ``"ok"`` — only successfully fit models (previous default behaviour).
+        ``"error"`` / ``"recovery_failed"`` / etc. — only that status.
+        List of strings — return any model whose status is in the list.
+    """
+    filters: list[str] = []
     params: list[Any] = []
+
+    # Status filter
+    if status is not None:
+        if isinstance(status, str):
+            filters.append("m.status = ?")
+            params.append(status)
+        else:
+            placeholders = ",".join(["?"] * len(status))
+            filters.append(f"m.status IN ({placeholders})")
+            params.extend(status)
 
     if code_contains:
         filters.append("m.code LIKE ?")
@@ -684,18 +704,65 @@ def search_models(store: DiagnosticStore, code_contains: str | None = None,
         filters.append("m.metric_value < ?")
         params.append(metric_lt)
 
-    where = " AND ".join(filters)
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
     params.append(limit)
 
     sql = f"""
         SELECT m.model_id, m.run_idx, m.iteration, m.name,
                m.metric_value, m.param_names, m.status
         FROM models m
-        WHERE {where}
+        {where}
         ORDER BY m.metric_value ASC NULLS LAST
         LIMIT ?
     """
     return [_hydrate(r) for r in store.fetchall(sql, params)]
+
+
+def list_failed_models(store: DiagnosticStore,
+                       iteration: int | None = None,
+                       limit: int = 50) -> list[dict]:
+    """Return models with status != 'ok', grouped by error type.
+
+    Useful for the coverage angle: shows what was tried and failed without
+    burning tool-call budget on individual ``get_model`` lookups.
+
+    Returns one row per failed model with: ``model_id``, ``name``,
+    ``iteration``, ``status`` (which encodes the error type, e.g.
+    ``"recovery_failed"``, ``"fit_error"``, ``"validation_error"``), and
+    ``metric_name`` (the raw error label stored at fit time).
+    Results are sorted by status then iteration.
+    """
+    iter_filter = "AND m.iteration = ?" if iteration is not None else ""
+    params: list[Any] = []
+    if iteration is not None:
+        params.append(iteration)
+    params.append(limit)
+
+    sql = f"""
+        SELECT m.model_id, m.run_idx, m.iteration, m.name,
+               m.status, m.metric_name, m.param_names
+        FROM models m
+        WHERE m.status != 'ok'
+          {iter_filter}
+        ORDER BY m.status, m.iteration
+        LIMIT ?
+    """
+    rows = [_hydrate(r) for r in store.fetchall(sql, params)]
+
+    # Group by status for easier scanning
+    by_status: dict[str, list[dict]] = {}
+    for row in rows:
+        key = row.get("status", "unknown")
+        by_status.setdefault(key, []).append(row)
+
+    return [
+        {
+            "error_type": status_key,
+            "count": len(group),
+            "models": group,
+        }
+        for status_key, group in sorted(by_status.items())
+    ]
 
 
 def get_bic_trajectory(store: DiagnosticStore,
@@ -1051,8 +1118,11 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "search_models",
             "description": (
-                "Filter models by code substring, parameter name presence, or "
-                "metric threshold.  Returns model_id, name, iteration, and metric value."
+                "Filter models by code substring, parameter name presence, "
+                "metric threshold, or status.  By default returns ALL statuses "
+                "(ok AND failed).  Pass status='ok' to restrict to successfully "
+                "fit models, or status='recovery_failed' / 'fit_error' / "
+                "'validation_error' to see only failed models of that type."
             ),
             "parameters": {
                 "type": "object",
@@ -1069,10 +1139,48 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "number",
                         "description": "Return only models with metric_value < this threshold."
                     },
+                    "status": {
+                        "description": (
+                            "Filter by status.  null/omit = all statuses (default).  "
+                            "'ok' = only successfully fit models.  "
+                            "'recovery_failed', 'fit_error', 'validation_error' = "
+                            "only that error type.  Pass an array of strings to match "
+                            "multiple statuses."
+                        )
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of results (default 20).",
                         "default": 20
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_failed_models",
+            "description": (
+                "Return all models with status != 'ok', grouped by error type "
+                "(recovery_failed, fit_error, validation_error).  Use this for "
+                "the coverage angle to see what was tried and failed without "
+                "calling get_model for each one.  Each group shows error_type, "
+                "count, and the model rows (model_id, name, iteration, status, "
+                "metric_name, param_names)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iteration": {
+                        "type": "integer",
+                        "description": "Optional: restrict to a single iteration."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum total rows to return (default 50).",
+                        "default": 50
                     }
                 },
                 "required": []
@@ -1124,6 +1232,7 @@ _TOOL_FUNCTIONS = {
     "get_participant_best_models": get_participant_best_models,
     "get_parameter_distribution": get_parameter_distribution,
     "search_models": search_models,
+    "list_failed_models": list_failed_models,
     "get_bic_trajectory": get_bic_trajectory,
 }
 

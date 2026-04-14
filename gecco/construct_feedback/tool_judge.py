@@ -47,14 +47,22 @@ _console = TimestampedConsole()
 _MAX_TOOL_RESULT_CHARS = 40_000
 
 
-def _cap_tool_result(result_str: str) -> str:
-    """Truncate *result_str* if it exceeds _MAX_TOOL_RESULT_CHARS."""
+def _cap_tool_result(result_str: str, raw_result=None) -> str:
+    """Truncate *result_str* if it exceeds _MAX_TOOL_RESULT_CHARS.
+
+    When truncating, includes a row count (if *raw_result* is a list) and
+    a hint about which filters can narrow the query.
+    """
     if len(result_str) <= _MAX_TOOL_RESULT_CHARS:
         return result_str
-    return (
-        result_str[:_MAX_TOOL_RESULT_CHARS]
-        + " ... [truncated: result too large; use more specific filters]"
+    suffix_parts = ["[truncated: result too large"]
+    if isinstance(raw_result, list):
+        suffix_parts.append(f"{len(raw_result)} rows total")
+    suffix_parts.append(
+        "use more specific filters (iteration=, status=, limit=, "
+        "param_contains=, code_contains=) to narrow]"
     )
+    return result_str[:_MAX_TOOL_RESULT_CHARS] + " ... " + "; ".join(suffix_parts)
 
 
 # ======================================================================
@@ -112,6 +120,7 @@ class JudgeVerdict(BaseModel):
     synthesized_feedback: str
     tool_call_count: int
     wall_time_seconds: float
+    best_bic: float | None = None  # persisted so next iteration can load it
 
 
 # ======================================================================
@@ -173,6 +182,20 @@ give a low confidence rating. If the evidence is strong, give a high confidence 
 
 ---
 
+Tool call budgeting: You have a finite tool-call budget per iteration. \
+Plan your allocation across the six angles before calling tools, and prefer \
+fewer high-signal calls over many redundant ones.
+
+---
+
+If a previous iteration's verdict is included below, use it to:
+- Assess whether your prior recommendations were followed
+- Identify whether BIC improved, stagnated, or regressed
+- Avoid repeating suggestions that were already given
+- Focus on what's new or different this iteration
+
+---
+
 AUDIENCE SEPARATION — IMPORTANT: The `synthesized_feedback` you produce will be read by \
 a different LLM that writes Python model code. That LLM knows nothing about "angles", \
 tool calls, or internal model IDs. Models must be described by their mechanisms \
@@ -185,6 +208,11 @@ Current best BIC: {best_bic}
 Total iterations so far: {n_iterations}
 Run index (run_idx) for this client: {run_idx}
 
+Iteration {iteration} summary:
+- Models this iteration: {n_total} total ({n_ok} fit, {n_failed} failed)
+- Best BIC this iteration: {best_iter_bic}
+- BIC trajectory: {trajectory_str}
+
 IMPORTANT — database conventions:
 - "iteration" and "run_idx" are different fields.  "iteration" is the search step \
 (currently {iteration}); "run_idx" is the client/run identifier ({run_idx}).  Do NOT \
@@ -192,6 +220,15 @@ pass the iteration number as run_idx.  Most tools do not require run_idx — omi
 to query across all runs.
 - The best model is identified by its BIC value ({best_bic}).  Use get_best_models() \
 to find it in the database and obtain its model_id.  Do not search by name.
+
+Model naming convention: Each model has a `name` field (e.g., "rwg_alpha_beta") \
+set by the LLM that generated it. Names are NOT guaranteed unique across \
+iterations. When referring to models in your synthesized_feedback, describe \
+them by their mechanism AND include their name + BIC in parentheses, \
+e.g., "the model with separate learning rates for gains and losses \
+(separate_lr_gain_loss, BIC=2847)". The BIC disambiguates models that \
+share a name. Never use the numeric model_id (e.g., "model 5", "ID 11") — \
+the generator LLM cannot look up IDs.
 
 Please query the diagnostic database to analyse this iteration from all six angles, \
 then produce your verdict.
@@ -225,10 +262,14 @@ class _OpenAIToolLoop:
     ) -> tuple[str, list[dict]]:
         """Run the tool loop and return (final_text, tool_call_trace)."""
         planning_instruction = (
-            "Before calling any tools, first write a brief plan (a few sentences): "
-            "outline which of the six angles you will investigate and which tools "
-            "you expect to call. Do not call any tools in this first message — "
-            "you will be able to call them in your next message."
+            f"Before calling any tools, first write a brief plan: "
+            f"You have a hard budget of {max_tool_calls} tool calls. "
+            f"List each of the six angles you will investigate and commit to "
+            f"an approximate call allocation per angle (e.g. 'Stat fit: 2, "
+            f"Identifiability: 3, PPC: 2, Individual diffs: 3, Mechanistic: 5, "
+            f"Coverage: 3, reserve: 2'). Reserve extra for mechanistic coherence "
+            f"(reading model code is expensive). Do not call any tools in this "
+            f"first message — you will be able to call them in your next message."
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -237,6 +278,8 @@ class _OpenAIToolLoop:
         trace: list[dict] = []
         n_calls = 0
         planning_done = False
+        budget_reminder_mid_done = False
+        budget_reminder_late_done = False
 
         while n_calls < max_tool_calls:
             # Force a text-only planning turn before any tool use.
@@ -307,7 +350,9 @@ class _OpenAIToolLoop:
                     args = {}
 
                 result = dispatch_tool(store, tool_name, args)
-                result_str = _cap_tool_result(json.dumps(result, default=str))
+                result_str = _cap_tool_result(
+                    json.dumps(result, default=str), raw_result=result
+                )
 
                 if self.verbose:
                     _console.print(_format_tool_call(tool_name, args))
@@ -328,6 +373,27 @@ class _OpenAIToolLoop:
                     }
                 )
                 n_calls += 1
+
+                # Mid-loop budget reminders (fire at most once each)
+                if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
+                            f"Ensure you still cover the angles you have not yet investigated."
+                        ),
+                    })
+                    budget_reminder_mid_done = True
+                elif n_calls == int(max_tool_calls * 0.8) and not budget_reminder_late_done:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
+                            f"Wrap up remaining angles with focused queries or synthesise now."
+                        ),
+                    })
+                    budget_reminder_late_done = True
+
                 if n_calls >= max_tool_calls:
                     break
 
@@ -401,6 +467,8 @@ class _GeminiToolLoop:
         contents = [{"role": "user", "parts": [{"text": user_message}]}]
         trace: list[dict] = []
         n_calls = 0
+        budget_reminder_mid_done = False
+        budget_reminder_late_done = False
 
         config_kwargs: dict = {
             "system_instruction": system_prompt,
@@ -437,7 +505,9 @@ class _GeminiToolLoop:
                     fc = part.function_call
                     args = dict(fc.args) if fc.args else {}
                     result = dispatch_tool(store, fc.name, args)
-                    result_str = _cap_tool_result(json.dumps(result, default=str))
+                    result_str = _cap_tool_result(
+                        json.dumps(result, default=str), raw_result=result
+                    )
 
                     if self.verbose:
                         _console.print(_format_tool_call(fc.name, args))
@@ -474,6 +544,27 @@ class _GeminiToolLoop:
                         }
                     )
                     n_calls += 1
+
+                    # Mid-loop budget reminders (fire at most once each)
+                    if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
+                        contents.append({
+                            "role": "user",
+                            "parts": [{"text": (
+                                f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
+                                f"Ensure you still cover the angles you have not yet investigated."
+                            )}],
+                        })
+                        budget_reminder_mid_done = True
+                    elif n_calls == int(max_tool_calls * 0.8) and not budget_reminder_late_done:
+                        contents.append({
+                            "role": "user",
+                            "parts": [{"text": (
+                                f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
+                                f"Wrap up remaining angles with focused queries or synthesise now."
+                            )}],
+                        })
+                        budget_reminder_late_done = True
+
                     if n_calls >= max_tool_calls:
                         break
 
@@ -578,7 +669,7 @@ def _parse_verdict_from_text(
                 )
                 for a in data.get("per_angle", [])
             ]
-            return JudgeVerdict(
+            verdict = JudgeVerdict(
                 iteration=iteration,
                 per_angle=per_angle,
                 key_recommendations=data.get("key_recommendations", []),
@@ -586,6 +677,9 @@ def _parse_verdict_from_text(
                 tool_call_count=tool_call_count,
                 wall_time_seconds=wall_time,
             )
+            # Stash cited_models for later validation (not a Pydantic field)
+            object.__setattr__(verdict, "_cited_models_raw", data.get("cited_models", []))
+            return verdict
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
 
@@ -619,7 +713,11 @@ _SYNTHESIS_PROMPT = """Based on your analysis above, please produce a final verd
     "Recommendation 1...",
     "Recommendation 2..."
   ],
-  "synthesized_feedback": "Structured feedback (≤ 500 words) for the model-generating LLM."
+  "synthesized_feedback": "Structured feedback (≤ 500 words) for the model-generating LLM.",
+  "cited_models": [
+    {"name": "rwg_alpha_beta", "bic": 2847.2, "mechanism": "separate lr gain/loss"},
+    {"name": "base_rwg", "bic": 3102.1, "mechanism": "standard RW with single lr"}
+  ]
 }
 ```
 
@@ -633,22 +731,78 @@ Include one entry in per_angle for each of the six angles:
 
 SYNTHESIZED_FEEDBACK FORMAT — The `synthesized_feedback` field must follow this four-section structure:
 
-1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically (not by ID), including BIC values. Example: "The model with separate learning rates for gains and losses (BIC = 2847) performed best..."
+1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically (not by ID), including BIC values. Example: "The model with separate learning rates for gains and losses (separate_lr, BIC=2847) performed best..."
 
 2. **What partially worked** (2-3 sentences) — Describe models that showed promise in some areas but had issues in others. Be specific about strengths and weaknesses. Example: "The model with choice-stickiness had good fit for early trials but poor recovery on the stickiness parameter..."
 
 3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them. Example: "Models with decaying learning rates consistently showed poor parameter recovery..."
 
 4. **What to try next** (2-4 sentences) — Concrete suggestions framed as "try X because Y". Example: "Try combining the separate gain/loss learning rates with a perseveration mechanism because both showed promise independently..."
+If previous verdict context was provided, explicitly note whether prior suggestions were followed and whether they appeared to help.
 
 IMPORTANT PROHIBITIONS — Never reference:
 - "Angles" or analytical perspectives (the generator doesn't know what these are)
 - Tool call names (e.g., "get_best_models", "get_bic_trajectory")
-- Model IDs (e.g., "ID 11", "model_5")
+- Numeric model IDs (e.g., "ID 11", "model 5") — cite models as \
+"mechanistic description (name, BIC=X)" instead. The BIC disambiguates \
+models that share a generated name across iterations.
 - Internal database fields or conventions
 
 Always describe models by their mechanisms and cite actual metric values (BIC, r, R²) from your analysis.
+
+The `cited_models` field must list every model you referenced by name in `synthesized_feedback`. \
+Include the exact `name` string, the BIC value you cited, and a one-line mechanism description. \
+This is used to verify citations against the database — only include models whose names you \
+actually found in tool results.
 """
+
+
+# ======================================================================
+# Iteration-context helpers
+# ======================================================================
+
+
+def _format_trajectory(traj: list[dict]) -> str:
+    """Format a BIC trajectory list as a compact string with a trend label.
+
+    Example: "3102 → 2950 → 2847 (improving)"
+    """
+    if not traj:
+        return "N/A"
+    values = [
+        row.get("best_metric")
+        for row in traj
+        if row.get("best_metric") is not None
+    ]
+    if not values:
+        return "N/A"
+    arrow_str = " → ".join(f"{v:.0f}" for v in values)
+    # Trend label
+    if len(values) >= 2:
+        delta = values[-1] - values[-2]
+        if delta < -1.0:
+            trend = "improving"
+        elif delta > 1.0:
+            trend = "regressed"
+        else:
+            trend = "plateaued"
+        return f"{arrow_str} ({trend})"
+    return arrow_str
+
+
+def _detect_stuck(trajectory: list[dict], tol: float = 1.0, window: int = 3) -> bool:
+    """Return True if the best BIC has not improved by more than *tol*
+    over the last *window* iterations."""
+    if len(trajectory) < window + 1:
+        return False
+    recent = [
+        row["best_metric"]
+        for row in trajectory[-(window + 1):]
+        if row.get("best_metric") is not None
+    ]
+    if len(recent) < window + 1:
+        return False
+    return (max(recent) - min(recent)) < tol
 
 
 # ======================================================================
@@ -775,6 +929,8 @@ class ToolUsingJudge:
         t0 = time.time()
 
         # --- Attempt to short-circuit if previous iteration had only recovery failures ---
+        # NOTE: the short-circuit path returns early and does NOT load prior-verdict context,
+        # which is intentional — the shortcut already reuses a previous verdict's content.
         if recovery_failures and not prev_had_success and self.results_dir:
             shortcut = self._try_shortcut_from_recovery_failure(
                 iteration=iteration,
@@ -790,6 +946,29 @@ class ToolUsingJudge:
                     )
                 return shortcut
 
+        # --- Pre-compute iteration delta context (Change 5) ---
+        from gecco.diagnostic_store.tools import get_bic_trajectory as _get_bic_traj
+
+        iter_row = self.store.fetchone(
+            "SELECT COUNT(*) AS n_total, "
+            "COUNT(CASE WHEN status='ok' THEN 1 END) AS n_ok, "
+            "COUNT(CASE WHEN status!='ok' THEN 1 END) AS n_failed, "
+            "MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
+            "FROM models WHERE iteration = ?",
+            [iteration],
+        )
+        n_total = iter_row.get("n_total", 0) if iter_row else 0
+        n_ok = iter_row.get("n_ok", 0) if iter_row else 0
+        n_failed = iter_row.get("n_failed", 0) if iter_row else 0
+        best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
+        best_iter_bic = f"{best_iter_bic_raw:.2f}" if best_iter_bic_raw is not None else "N/A"
+
+        traj = _get_bic_traj(self.store)
+        trajectory_str = _format_trajectory(traj)
+
+        # --- Stuck-search detection (Change 8) ---
+        is_stuck = _detect_stuck(traj)
+
         # --- Build context ---
         best_bic_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
         n_iterations = iteration + 1  # iterations seen so far (0-indexed)
@@ -799,7 +978,43 @@ class ToolUsingJudge:
             best_bic=best_bic_str,
             n_iterations=n_iterations,
             run_idx=run_idx,
+            n_total=n_total,
+            n_ok=n_ok,
+            n_failed=n_failed,
+            best_iter_bic=best_iter_bic,
+            trajectory_str=trajectory_str,
         )
+
+        # --- Stuck-search directive (Change 8) ---
+        if is_stuck:
+            user_message += (
+                "\n\n\u26a0 Search appears stuck: best BIC has not improved by >1 point over the "
+                "last 3 iterations. In your recommendations, include at least one "
+                "mechanistically-distant pivot (a different model family, learning rule, "
+                "or decision rule — not an incremental variation of recent best models). "
+                "Explain why the pivot addresses a pattern in the data that current "
+                "mechanisms miss."
+            )
+
+        # --- Previous verdict context (Change 2) ---
+        if self.results_dir:
+            prev_verdict = self._load_previous_verdict(iteration, run_idx, tag)
+            if prev_verdict is not None:
+                prev_iter = prev_verdict.get("iteration", "?")
+                prev_bic = prev_verdict.get("best_bic")
+                prev_bic_str = f"{prev_bic:.2f}" if prev_bic is not None else "N/A"
+                prev_recs = prev_verdict.get("key_recommendations", [])
+                prev_feedback = prev_verdict.get("synthesized_feedback", "")
+                rec_bullets = "".join(f"\n  - {r}" for r in prev_recs)
+                user_message += (
+                    f"\n\nPrevious iteration ({prev_iter}) verdict:\n"
+                    f"- Best BIC at that time: {prev_bic_str}\n"
+                    f"- Key recommendations given:{rec_bullets}\n"
+                    f"- Synthesized feedback summary (first 500 chars): "
+                    f"{prev_feedback[:500]}...\n\n"
+                    "Use this to assess whether prior recommendations were followed, "
+                    "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
+                )
 
         # --- Run tool loop ---
         if self.verbose:
@@ -837,12 +1052,79 @@ class ToolUsingJudge:
         verdict = _parse_verdict_from_text(
             structured_text, iteration, len(trace), wall_time
         )
+        verdict.best_bic = best_metric
+
+        # --- Validate cited models (Change 7) ---
+        unverified_citations: list[dict] = []
+        cited_models_raw: list[dict] = []
+        if hasattr(verdict, "_cited_models_raw"):
+            cited_models_raw = verdict._cited_models_raw  # type: ignore[attr-defined]
+            unverified_citations = self._validate_cited_models(cited_models_raw)
+            if unverified_citations and self.verbose:
+                names = [c.get("name", "?") for c in unverified_citations]
+                _console.print(
+                    f"[bold yellow]⚠ Judge: unverifiable citations:[/bold yellow] "
+                    + ", ".join(names)
+                )
 
         # --- Persist audit trace ---
         if self.results_dir:
-            self._save_trace(verdict, trace, iteration, run_idx, tag)
+            self._save_trace(
+                verdict,
+                trace,
+                iteration,
+                run_idx,
+                tag,
+                extra_payload={
+                    "stuck_search": is_stuck,
+                    "cited_models": cited_models_raw,
+                    "unverified_citations": unverified_citations,
+                },
+            )
 
         return verdict
+
+    def _load_previous_verdict(
+        self, iteration: int, run_idx: int, tag: str
+    ) -> dict | None:
+        """Walk backwards through saved verdict files to find the most recent
+        non-short-circuit verdict for this run, or return None.
+
+        Skips short-circuit files (``short_circuit=True``) so that the context
+        block reflects a real analysis, not a recycled one.
+        """
+        if self.results_dir is None:
+            return None
+        for k in range(iteration - 1, -1, -1):
+            verdict_path = (
+                self.results_dir / "judge" / f"iter{k}{tag}_run{run_idx}.json"
+            )
+            if verdict_path.exists():
+                try:
+                    with open(verdict_path) as f:
+                        data = json.load(f)
+                    if not data.get("short_circuit", False):
+                        return data
+                except (json.JSONDecodeError, IOError):
+                    pass
+        return None
+
+    def _validate_cited_models(self, cited_models: list[dict]) -> list[dict]:
+        """Check each cited model's name against the store.
+
+        Returns the subset that could NOT be verified (for audit logging).
+        """
+        unverified = []
+        for cm in cited_models:
+            name = cm.get("name", "")
+            if not name:
+                continue
+            rows = self.store.fetchall(
+                "SELECT metric_value FROM models WHERE name = ? LIMIT 5", [name]
+            )
+            if not rows:
+                unverified.append(cm)
+        return unverified
 
     def _try_shortcut_from_recovery_failure(
         self,
@@ -1078,6 +1360,7 @@ class ToolUsingJudge:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool_call_count": verdict.tool_call_count,
             "wall_time_seconds": verdict.wall_time_seconds,
+            "best_bic": verdict.best_bic,
             "tool_call_trace": trace,
             "per_angle": [a.model_dump() for a in verdict.per_angle],
             "key_recommendations": verdict.key_recommendations,

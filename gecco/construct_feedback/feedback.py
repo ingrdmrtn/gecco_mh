@@ -416,7 +416,7 @@ class FeedbackGenerator:
             )
 
         # Highlight top finding
-        if ranked and ranked[0][1]["best_r2"] > 0.05:
+        if ranked and ranked[0][1]["best_r2"] > 0.03:
             top_param, top_stats = ranked[0]
             top_pred = ""
             top_beta = 0.0

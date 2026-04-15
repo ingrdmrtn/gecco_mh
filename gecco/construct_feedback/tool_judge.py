@@ -159,7 +159,12 @@ residuals to identify where in the task the model systematically underperforms.
 have the strongest individual-differences signal? Examine which parameters predict self-report \
 scores (R²). Also check whether the best-fitting model differs across participants; high \
 heterogeneity can indicate a need for hybrid or mixture mechanisms. Highlight parameters \
-with strong individual-differences signal and suggest building on them.
+with strong individual-differences signal and suggest building on them. \
+IMPORTANT — R² expectations for individual differences: because self-report measures are \
+noisy and only indirectly linked to task behaviour, R² values in this domain are typically \
+very low (0.01–0.10). An R² of 0.05 is a meaningful and promising signal, not a poor result. \
+Do not dismiss low R² values as "no signal" — instead, interpret them relative to this domain's \
+baseline and highlight even modest effects as worth building on.
 
 5. **Mechanistic coherence** — Read the code of the best models AND some that failed. \
 Understand what distinguishes successful from unsuccessful mechanisms. Assess whether \

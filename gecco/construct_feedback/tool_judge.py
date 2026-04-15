@@ -268,8 +268,8 @@ class _OpenAIToolLoop:
 
     def run(
         self, store, system_prompt: str, user_message: str, max_tool_calls: int
-    ) -> tuple[str, list[dict]]:
-        """Run the tool loop and return (final_text, tool_call_trace)."""
+    ) -> tuple[str, list[dict], list[dict]]:
+        """Run the tool loop and return (final_text, tool_call_trace, full_trace)."""
         planning_instruction = (
             f"Before calling any tools, briefly list the 3–6 specific questions "
             f"you most want answered this iteration. Keep it short. These are starting "
@@ -281,6 +281,7 @@ class _OpenAIToolLoop:
             {"role": "user", "content": user_message + "\n\n" + planning_instruction},
         ]
         trace: list[dict] = []
+        full_trace: list[dict] = []
         n_calls = 0
         planning_done = False
         budget_reminder_mid_done = False
@@ -329,6 +330,7 @@ class _OpenAIToolLoop:
             if is_planning_turn:
                 # Planning turn is done; next iteration may call tools.
                 planning_done = True
+                full_trace.append({"type": "planning", "content": msg.content or ""})
                 messages.append(
                     {
                         "role": "user",
@@ -340,9 +342,12 @@ class _OpenAIToolLoop:
                 )
                 continue
 
+            if not is_planning_turn and msg.content:
+                full_trace.append({"type": "reflection", "content": msg.content})
+
             if not msg.tool_calls:
                 # Model finished — return the text content
-                return msg.content or "", trace
+                return msg.content or "", trace, full_trace
 
             # Execute each tool call
             for tc in msg.tool_calls:
@@ -363,6 +368,14 @@ class _OpenAIToolLoop:
 
                 trace.append(
                     {
+                        "tool": tool_name,
+                        "args": args,
+                        "result_summary": result_str[:500],
+                    }
+                )
+                full_trace.append(
+                    {
+                        "type": "tool_call",
                         "tool": tool_name,
                         "args": args,
                         "result_summary": result_str[:500],
@@ -431,7 +444,7 @@ class _OpenAIToolLoop:
         if self.temperature is not None:
             kwargs_final["temperature"] = self.temperature
         final_resp = self.client.chat.completions.create(**kwargs_final)
-        return final_resp.choices[0].message.content or "", trace
+        return final_resp.choices[0].message.content or "", trace, full_trace
 
 
 class _GeminiToolLoop:
@@ -472,7 +485,7 @@ class _GeminiToolLoop:
 
     def run(
         self, store, system_prompt: str, user_message: str, max_tool_calls: int
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict], list[dict]]:
         """Run the Gemini tool loop."""
         try:
             from google.genai import types
@@ -488,6 +501,7 @@ class _GeminiToolLoop:
         )
         contents = [{"role": "user", "parts": [{"text": user_message + "\n\n" + planning_instruction}]}]
         trace: list[dict] = []
+        full_trace: list[dict] = []
         n_calls = 0
         planning_done = False
         budget_reminder_mid_done = False
@@ -525,12 +539,14 @@ class _GeminiToolLoop:
                 for line in "\n".join(text_parts).splitlines():
                     _console.print(f"[dim]│[/dim] {line}")
 
-        # Append planning response
+        # Append planning response and capture it
+        planning_text = planning_resp.text.strip()
+        full_trace.append({"type": "planning", "content": planning_text})
         contents.append(
             {
                 "role": "model",
                 "parts": [
-                    {"text": planning_resp.text.strip()}
+                    {"text": planning_text}
                 ],
             }
         )
@@ -559,16 +575,21 @@ class _GeminiToolLoop:
                 config=types.GenerateContentConfig(**config_kwargs),
             )
 
+            # Extract text parts first (for reflection capture)
+            text_parts = [
+                p.text
+                for p in resp.candidates[0].content.parts
+                if hasattr(p, "text") and p.text
+            ]
+            
             # Verbose: print assistant text (if any)
-            if self.verbose:
-                text_parts = [
-                    p.text
-                    for p in resp.candidates[0].content.parts
-                    if hasattr(p, "text") and p.text
-                ]
-                if text_parts:
-                    for line in "\n".join(text_parts).splitlines():
-                        _console.print(f"[dim]│[/dim] {line}")
+            if self.verbose and text_parts:
+                for line in "\n".join(text_parts).splitlines():
+                    _console.print(f"[dim]│[/dim] {line}")
+
+            # Capture reflection if text is present
+            if text_parts:
+                full_trace.append({"type": "reflection", "content": "\n".join(text_parts)})
 
             # Check for function calls
             has_function_calls = False
@@ -588,6 +609,14 @@ class _GeminiToolLoop:
 
                     trace.append(
                         {
+                            "tool": fc.name,
+                            "args": args,
+                            "result_summary": result_str[:500],
+                        }
+                    )
+                    full_trace.append(
+                        {
+                            "type": "tool_call",
                             "tool": fc.name,
                             "args": args,
                             "result_summary": result_str[:500],
@@ -655,7 +684,7 @@ class _GeminiToolLoop:
                         break
 
             if not has_function_calls:
-                return resp.text.strip(), trace
+                return resp.text.strip(), trace, full_trace
 
         # Final synthesis pass
         contents.append(
@@ -678,7 +707,7 @@ class _GeminiToolLoop:
             contents=contents,
             config=types.GenerateContentConfig(**final_config),
         )
-        return final_resp.text.strip(), trace
+        return final_resp.text.strip(), trace, full_trace
 
 
 # ======================================================================
@@ -1110,7 +1139,7 @@ class ToolUsingJudge:
             )
 
         if self._tool_loop is not None:
-            final_text, trace = self._tool_loop.run(
+            final_text, trace, full_trace = self._tool_loop.run(
                 self.store,
                 _JUDGE_SYSTEM_PROMPT,
                 user_message,
@@ -1120,6 +1149,7 @@ class ToolUsingJudge:
             # Fallback: no tool calling — generate a plain text summary
             final_text = self._fallback_generate(user_message)
             trace = []
+            full_trace = []
 
         # --- Second pass: extract structured verdict ---
         if self._tool_loop is not None:
@@ -1161,6 +1191,7 @@ class ToolUsingJudge:
                 iteration,
                 run_idx,
                 tag,
+                full_trace=full_trace,
                 extra_payload={
                     "stuck_search": is_stuck,
                     "cited_models": cited_models_raw,
@@ -1423,6 +1454,7 @@ class ToolUsingJudge:
         iteration: int,
         run_idx: int,
         tag: str = "",
+        full_trace: list[dict] | None = None,
         extra_payload: dict | None = None,
     ) -> None:
         """Write the judge trace to results/{task}/judge/iterN_runX.json.
@@ -1448,6 +1480,7 @@ class ToolUsingJudge:
             "wall_time_seconds": verdict.wall_time_seconds,
             "best_bic": verdict.best_bic,
             "tool_call_trace": trace,
+            "full_trace": full_trace if full_trace is not None else [],
             "per_angle": [a.model_dump() for a in verdict.per_angle],
             "key_recommendations": verdict.key_recommendations,
             "synthesized_feedback": verdict.synthesized_feedback,

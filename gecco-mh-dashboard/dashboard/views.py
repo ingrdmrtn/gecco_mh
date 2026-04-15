@@ -495,6 +495,45 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
     render_judge_trace_viewer(trace)
 
 
+def render_judge_timeline(full_trace: list[dict]) -> None:
+    """Render the full investigation timeline as a vertical event stream."""
+    for event in full_trace:
+        event_type = event.get("type")
+        
+        if event_type == "planning":
+            with st.container(border=True):
+                st.markdown("**📋 Planning**")
+                content = event.get("content", "")
+                st.markdown(content)
+        
+        elif event_type == "tool_call":
+            with st.container(border=True):
+                tool_name = event.get("tool", "unknown")
+                args = event.get("args", {})
+                # Format args preview
+                args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                if len(args_preview) > 60:
+                    args_preview = args_preview[:57] + "..."
+                st.markdown(f"**🔧 {tool_name}**({args_preview})")
+                
+                result_summary = event.get("result_summary", "")
+                if result_summary:
+                    st.caption(result_summary[:300])
+                
+                # Expander for full args and result
+                with st.expander("Full details"):
+                    st.subheader("Arguments")
+                    st.json(args)
+                    st.subheader("Result")
+                    st.text(result_summary)
+        
+        elif event_type == "reflection":
+            with st.container(border=True):
+                st.markdown("*💭 **Reflection***")
+                content = event.get("content", "")
+                st.markdown(content)
+
+
 def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
     """Render a single judge trace with all sections."""
     is_short_circuit = trace.get("short_circuit", False)
@@ -541,8 +580,13 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
     c2.metric("Wall time", f"{wall_time:.1f}s")
     c3.metric("Timestamp", ts_display)
 
+    full_trace = trace.get("full_trace", [])
     tool_calls = trace.get("tool_call_trace", [])
-    if tool_calls:
+
+    if full_trace:
+        with st.expander("**Investigation Timeline**", expanded=True):
+            render_judge_timeline(full_trace)
+    elif tool_calls:
         with st.expander(f"**Tool Calls** ({len(tool_calls)} calls)", expanded=False):
             rows = []
             for i, tc in enumerate(tool_calls):

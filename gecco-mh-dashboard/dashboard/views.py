@@ -426,19 +426,14 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
         st.info("No iteration data available.")
         return
 
-    clients = sorted({str(it["client_id"]) for it in iterations})
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if len(clients) == 1:
-            selected_client = clients[0]
-            st.markdown(f"**Client:** {selected_client}")
-        else:
-            selected_client = st.selectbox(
-                "Client", clients, index=0, key="judge_client"
-            )
-
-    client_iters = [it for it in iterations if str(it["client_id"]) == selected_client]
+    # Judge runs once per iteration for all clients — deduplicate by (iteration, run).
+    seen_iter_keys: set[tuple] = set()
+    unique_iters: list[dict] = []
+    for it in iterations:
+        key = (it["iteration"], it["run"])
+        if key not in seen_iter_keys:
+            seen_iter_keys.add(key)
+            unique_iters.append(it)
 
     available_trace_keys = {
         (t["iteration"], t["run_idx"], t["tag"]) for t in traces
@@ -446,7 +441,7 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
 
     iter_labels: list[str] = []
     iter_trace_map: list[tuple | None] = []
-    for it in client_iters:
+    for it in unique_iters:
         label = str(it["iteration"])
         if it["run"] > 0:
             label += f" (run {it['run'] + 1})"
@@ -467,11 +462,10 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
         iter_labels.append(label)
         iter_trace_map.append(key if has_trace else None)
 
-    with col2:
-        sel_idx = len(iter_labels) - 1 if iter_labels else 0
-        selected_label = st.selectbox(
-            "Iteration", iter_labels, index=sel_idx, key="judge_iter"
-        )
+    sel_idx = len(iter_labels) - 1 if iter_labels else 0
+    selected_label = st.selectbox(
+        "Iteration", iter_labels, index=sel_idx, key="judge_iter"
+    )
 
     if not selected_label or not iter_labels:
         return

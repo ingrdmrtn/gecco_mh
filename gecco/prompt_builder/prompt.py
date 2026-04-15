@@ -155,9 +155,9 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 
 {structured_output_section}
 
-Your function:
-
 {feedback_section}
+
+Your function:
         """.strip()
 
     return prompt

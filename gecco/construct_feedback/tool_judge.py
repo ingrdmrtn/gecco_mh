@@ -1125,8 +1125,7 @@ class ToolUsingJudge:
                     f"\n\nPrevious iteration ({prev_iter}) verdict:\n"
                     f"- Best BIC at that time: {prev_bic_str}\n"
                     f"- Key recommendations given:{rec_bullets}\n"
-                    f"- Synthesized feedback summary (first 500 chars): "
-                    f"{prev_feedback[:500]}...\n\n"
+                    f"- Synthesized feedback:\n{prev_feedback}\n\n"
                     "Use this to assess whether prior recommendations were followed, "
                     "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
                 )
@@ -1169,6 +1168,13 @@ class ToolUsingJudge:
             structured_text, iteration, len(trace), wall_time
         )
         verdict.best_bic = best_metric
+
+        # --- Append best model code to synthesized feedback ---
+        if best_model:
+            verdict.synthesized_feedback += (
+                f"\n\n---\nBest model code so far (BIC={best_bic_str}):\n"
+                f"```python\n{best_model}\n```"
+            )
 
         # --- Validate cited models (Change 7) ---
         unverified_citations: list[dict] = []

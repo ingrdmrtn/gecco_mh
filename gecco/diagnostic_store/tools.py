@@ -668,6 +668,7 @@ def search_models(store: DiagnosticStore, code_contains: str | None = None,
                   param_contains: str | None = None,
                   metric_lt: float | None = None,
                   status: str | list[str] | None = None,
+                  split: str | None = "train",
                   limit: int = 20) -> list[dict]:
     """Filter models by code substring, parameter name, metric threshold, or status.
 
@@ -678,9 +679,19 @@ def search_models(store: DiagnosticStore, code_contains: str | None = None,
         ``"ok"`` — only successfully fit models (previous default behaviour).
         ``"error"`` / ``"recovery_failed"`` / etc. — only that status.
         List of strings — return any model whose status is in the list.
+    split:
+        Which data split to consider.  Defaults to ``'train'`` so that
+        metric values are comparable with those returned by ``get_best_models``.
+        Pass ``'val'`` to search held-out results or ``None`` to include all
+        splits.
     """
     filters: list[str] = []
     params: list[Any] = []
+
+    # Split filter — default 'train' to match get_best_models behaviour
+    if split is not None:
+        filters.append("m.split = ?")
+        params.append(split)
 
     # Status filter
     if status is not None:
@@ -709,7 +720,7 @@ def search_models(store: DiagnosticStore, code_contains: str | None = None,
 
     sql = f"""
         SELECT m.model_id, m.run_idx, m.iteration, m.name,
-               m.metric_value, m.param_names, m.status
+               m.metric_value, m.split, m.param_names, m.status
         FROM models m
         {where}
         ORDER BY m.metric_value ASC NULLS LAST
@@ -1120,9 +1131,11 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "Filter models by code substring, parameter name presence, "
                 "metric threshold, or status.  By default returns ALL statuses "
-                "(ok AND failed).  Pass status='ok' to restrict to successfully "
-                "fit models, or status='recovery_failed' / 'fit_error' / "
-                "'validation_error' to see only failed models of that type."
+                "(ok AND failed) from the TRAIN split only, so metric values are "
+                "comparable with get_best_models.  Pass status='ok' to restrict "
+                "to successfully fit models, or status='recovery_failed' / "
+                "'fit_error' / 'validation_error' to see only failed models of "
+                "that type.  Pass split='val' or split=null to search other splits."
             ),
             "parameters": {
                 "type": "object",
@@ -1147,6 +1160,15 @@ TOOL_SCHEMAS: list[dict] = [
                             "only that error type.  Pass an array of strings to match "
                             "multiple statuses."
                         )
+                    },
+                    "split": {
+                        "type": "string",
+                        "description": (
+                            "Data split to search.  Defaults to 'train' so that "
+                            "BIC values match those from get_best_models.  "
+                            "Pass 'val' for held-out results or null for all splits."
+                        ),
+                        "default": "train"
                     },
                     "limit": {
                         "type": "integer",

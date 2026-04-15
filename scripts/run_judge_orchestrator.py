@@ -208,8 +208,8 @@ def main():
                 results_dir=results_dir,
             )
 
-            # Run judge on unified data
-            verdict = judge.get_feedback(
+            # R2: Run analysis once, then synthesize for each persona
+            analysis_data = judge.get_feedback_analysis(
                 iteration=it,
                 run_idx=0,
                 tag="_orchestrator",
@@ -219,13 +219,51 @@ def main():
                 prev_had_success=True,
             )
 
+            # Check for short-circuit
+            if analysis_data.get("short_circuit"):
+                # Short-circuit: reuse previous verdict for all personas
+                synthesized_feedback = {"default": analysis_data["analysis_text"]}
+            else:
+                # R2: Synthesize for each persona in cfg.clients
+                synthesized_feedback = {}
+                clients = getattr(cfg, "clients", {})
+
+                if clients:
+                    # Enumerate personas from config
+                    for persona_name in vars(clients).keys():
+                        if persona_name.startswith("_"):
+                            continue  # Skip private attributes
+
+                        persona_config = getattr(clients, persona_name, None)
+                        persona_suffix = ""
+
+                        if persona_config and hasattr(persona_config, "llm"):
+                            persona_suffix = getattr(
+                                persona_config.llm,
+                                "system_prompt_suffix",
+                                ""
+                            )
+
+                        feedback_text, _ = judge.synthesize_for_persona(
+                            analysis_data,
+                            persona_name=persona_name,
+                            persona_suffix=persona_suffix,
+                        )
+                        synthesized_feedback[persona_name] = feedback_text
+                else:
+                    # No clients defined; use default persona
+                    feedback_text, _ = judge.synthesize_for_persona(
+                        analysis_data,
+                        persona_name="default",
+                        persona_suffix="",
+                    )
+                    synthesized_feedback["default"] = feedback_text
+
             # --- Write shared feedback to registry ---
-            synthesized_feedback = verdict.synthesized_feedback
             verdict_payload = {
                 "iteration": it,
                 "n_clients": count,
                 "timestamp": time.time(),
-                "verbose_output": getattr(verdict, "verbose_output", None),
             }
 
             registry.set_judge_feedback(

@@ -27,6 +27,7 @@ class LLMConfig(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 4096
     guardrails: List[str]
+    show_best_model_code: bool = False  # R1: Gate best-model code append per-client
 
 
 class EvaluationConfig(BaseModel):
@@ -61,12 +62,22 @@ class BarrierConfig(BaseModel):
     client_wait_seconds: float = 1800  # Clients wait for orchestrator
 
 
+class JudgeStuckSearchConfig(BaseModel):
+    tolerance: float = (
+        10.0  # R3: Δ BIC threshold over window to trigger stuck detection
+    )
+    window: int = 2  # R3: Number of iterations to look back
+
+
 class JudgeConfig(BaseModel):
     mode: str = "manual"  # "manual" or "tool_using"
     orchestrated: bool = False  # Enable centralized judge orchestration
     barrier: Optional[BarrierConfig] = BarrierConfig()
     max_tool_calls: Optional[int] = None
     verbose: Optional[bool] = False
+    stuck_search: Optional[JudgeStuckSearchConfig] = (
+        JudgeStuckSearchConfig()
+    )  # R3: Configurable stuck detection
 
 
 class SentryConfig(BaseModel):

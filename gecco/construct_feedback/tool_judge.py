@@ -905,9 +905,12 @@ def _format_trajectory(traj: list[dict]) -> str:
     return arrow_str
 
 
-def _detect_stuck(trajectory: list[dict], tol: float = 1.0, window: int = 3) -> bool:
+def _detect_stuck(trajectory: list[dict], tol: float = 10.0, window: int = 2) -> bool:
     """Return True if the best BIC has not improved by more than *tol*
-    over the last *window* iterations."""
+    over the last *window* iterations.
+    
+    R3: Updated defaults from tol=1.0, window=3 to tol=10.0, window=2 per plan.
+    """
     if len(trajectory) < window + 1:
         return False
     recent = [
@@ -963,6 +966,15 @@ class ToolUsingJudge:
         self.verbose: bool = (
             bool(getattr(judge_cfg, "verbose", False)) if judge_cfg else False
         )
+        # R3: Load configurable stuck search thresholds
+        self.stuck_search_cfg = (
+            getattr(judge_cfg, "stuck_search", None) if judge_cfg else None
+        )
+        if self.stuck_search_cfg is None:
+            # Default values per config schema
+            from types import SimpleNamespace
+            self.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+        
         self.model_name: str = getattr(cfg.llm, "base_model", "unknown")
         self.provider: str = getattr(cfg.llm, "provider", "").lower()
         self.max_tokens: int = getattr(
@@ -1017,6 +1029,10 @@ class ToolUsingJudge:
     ) -> JudgeVerdict:
         """Run the tool-using judge and return a :class:`JudgeVerdict`.
 
+        For backward compatibility, this method runs both analysis and synthesis.
+        In orchestrated mode, orchestrators should call get_feedback_analysis()
+        and synthesize_for_persona() separately.
+
         Parameters
         ----------
         iteration:
@@ -1030,9 +1046,7 @@ class ToolUsingJudge:
         best_metric:
             Current best BIC/metric value.
         recovery_failures:
-            List of recovery failures from the previous iteration. If non-empty and
-            prev_had_success is False, the judge will attempt to short-circuit and
-            reuse the previous verdict with a failure note appended.
+            List of recovery failures from the previous iteration.
         prev_had_success:
             Whether the previous iteration had any successful model fits.
 
@@ -1041,11 +1055,98 @@ class ToolUsingJudge:
         JudgeVerdict
             Contains ``synthesized_feedback`` ready for prompt injection.
         """
+        # R2: Run analysis phase once
+        analysis_data = self.get_feedback_analysis(
+            iteration=iteration,
+            run_idx=run_idx,
+            tag=tag,
+            best_model=best_model,
+            best_metric=best_metric,
+            recovery_failures=recovery_failures,
+            prev_had_success=prev_had_success,
+            **kwargs,
+        )
+
+        # Check for short-circuit
+        if analysis_data.get("short_circuit"):
+            return JudgeVerdict(
+                iteration=iteration,
+                synthesized_feedback=analysis_data["analysis_text"],
+                best_bic=best_metric,
+                key_recommendations=[],
+                time_seconds=0,
+            )
+
+        # R2: Run synthesis for default persona (backward compatibility)
+        # In orchestrated mode, the orchestrator will call synthesize_for_persona multiple times
+        synthesized_feedback, verdict_dict = self.synthesize_for_persona(
+            analysis_data, persona_name="default", persona_suffix=""
+        )
+
+        # --- Validate cited models ---
+        unverified_citations: list[dict] = []
+        cited_models_raw: list[dict] = []
+        verdict_obj = JudgeVerdict(**verdict_dict)
+        if hasattr(verdict_obj, "_cited_models_raw"):
+            cited_models_raw = verdict_obj._cited_models_raw  # type: ignore[attr-defined]
+            unverified_citations = self._validate_cited_models(cited_models_raw)
+            if unverified_citations and self.verbose:
+                names = [c.get("name", "?") for c in unverified_citations]
+                _console.print(
+                    f"[bold yellow]⚠ Judge: unverifiable citations:[/bold yellow] "
+                    + ", ".join(names)
+                )
+
+        # --- Persist audit trace ---
+        if self.results_dir:
+            self._save_trace(
+                verdict_obj,
+                analysis_data["trace"],
+                iteration,
+                run_idx,
+                tag,
+                full_trace=analysis_data["full_trace"],
+                extra_payload={
+                    "stuck_search": analysis_data["is_stuck"],
+                    "cited_models": cited_models_raw,
+                    "unverified_citations": unverified_citations,
+                },
+            )
+
+        return verdict_obj
+
+    def get_feedback_analysis(
+        self,
+        iteration: int,
+        run_idx: int = 0,
+        tag: str = "",
+        best_model: str | None = None,
+        best_metric: float | None = None,
+        recovery_failures: list[dict] | None = None,
+        prev_had_success: bool = True,
+        **kwargs,
+    ) -> dict:
+        """R2: Run analysis phase only, return analysis text and trace.
+        
+        This is called once per iteration by the orchestrator, then the trace
+        is reused for all persona-specific synthesis passes.
+        
+        Returns
+        -------
+        dict
+            {
+                'iteration': int,
+                'analysis_text': str,
+                'trace': list[dict],
+                'full_trace': list[dict],
+                'best_bic': float,
+                'is_stuck': bool,
+                'trajectory': list[dict],
+            }
+        """
         t0 = time.time()
 
         # --- Attempt to short-circuit if previous iteration had only recovery failures ---
-        # NOTE: the short-circuit path returns early and does NOT load prior-verdict context,
-        # which is intentional — the shortcut already reuses a previous verdict's content.
         if recovery_failures and not prev_had_success and self.results_dir:
             shortcut = self._try_shortcut_from_recovery_failure(
                 iteration=iteration,
@@ -1059,9 +1160,19 @@ class ToolUsingJudge:
                         f"[bold magenta]◆ Judge (iter {iteration})[/bold magenta]"
                         f" — short-circuit: reusing verdict from earlier iteration"
                     )
-                return shortcut
+                # For short-circuit, we still need to return analysis structure
+                return {
+                    "iteration": iteration,
+                    "analysis_text": shortcut.synthesized_feedback,
+                    "trace": [],
+                    "full_trace": [],
+                    "best_bic": best_metric,
+                    "is_stuck": False,
+                    "trajectory": [],
+                    "short_circuit": True,  # Flag to skip re-synthesis
+                }
 
-        # --- Pre-compute iteration delta context (Change 5) ---
+        # --- Pre-compute iteration delta context ---
         from gecco.diagnostic_store.tools import get_bic_trajectory as _get_bic_traj
 
         iter_row = self.store.fetchone(
@@ -1081,10 +1192,14 @@ class ToolUsingJudge:
         traj = _get_bic_traj(self.store)
         trajectory_str = _format_trajectory(traj)
 
-        # --- Stuck-search detection (Change 8) ---
-        is_stuck = _detect_stuck(traj)
+        # --- Stuck-search detection (R3: use configurable thresholds) ---
+        is_stuck = _detect_stuck(
+            traj,
+            tol=self.stuck_search_cfg.tolerance,
+            window=self.stuck_search_cfg.window,
+        )
 
-        # --- Build context ---
+        # --- Build analysis context ---
         best_bic_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
         n_iterations = iteration + 1  # iterations seen so far (0-indexed)
 
@@ -1100,18 +1215,17 @@ class ToolUsingJudge:
             trajectory_str=trajectory_str,
         )
 
-        # --- Stuck-search directive (Change 8) ---
+        # --- Stuck-search directive (R3: generic form for reuse across personas) ---
         if is_stuck:
             user_message += (
-                "\n\n\u26a0 Search appears stuck: best BIC has not improved by >1 point over the "
-                "last 3 iterations. In your recommendations, include at least one "
-                "mechanistically-distant pivot (a different model family, learning rule, "
-                "or decision rule — not an incremental variation of recent best models). "
-                "Explain why the pivot addresses a pattern in the data that current "
-                "mechanisms miss."
+                f"\n\n\u26a0 Search appears stuck: best BIC has not improved by >{self.stuck_search_cfg.tolerance} "
+                f"points over the last {self.stuck_search_cfg.window} iterations. "
+                "Consider mechanistically-distant pivots: different model families, learning rules, "
+                "or decision rules — not incremental tweaks. Explain why the pivot addresses a pattern "
+                "in the data that current mechanisms miss."
             )
 
-        # --- Previous verdict context (Change 2) ---
+        # --- Previous verdict context (R8: truncate to avoid compounding bias) ---
         if self.results_dir:
             prev_verdict = self._load_previous_verdict(iteration, run_idx, tag)
             if prev_verdict is not None:
@@ -1119,18 +1233,17 @@ class ToolUsingJudge:
                 prev_bic = prev_verdict.get("best_bic")
                 prev_bic_str = f"{prev_bic:.2f}" if prev_bic is not None else "N/A"
                 prev_recs = prev_verdict.get("key_recommendations", [])
-                prev_feedback = prev_verdict.get("synthesized_feedback", "")
+                # R8: Drop synthesized_feedback to avoid rhetorical carryover bias
                 rec_bullets = "".join(f"\n  - {r}" for r in prev_recs)
                 user_message += (
                     f"\n\nPrevious iteration ({prev_iter}) verdict:\n"
                     f"- Best BIC at that time: {prev_bic_str}\n"
-                    f"- Key recommendations given:{rec_bullets}\n"
-                    f"- Synthesized feedback:\n{prev_feedback}\n\n"
+                    f"- Key recommendations given:{rec_bullets}\n\n"
                     "Use this to assess whether prior recommendations were followed, "
                     "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
                 )
 
-        # --- Run tool loop ---
+        # --- Run tool loop (analysis phase) ---
         if self.verbose:
             _console.print(
                 f"[bold magenta]◆ Judge (iter {iteration})[/bold magenta]"
@@ -1150,62 +1263,151 @@ class ToolUsingJudge:
             trace = []
             full_trace = []
 
-        # --- Second pass: extract structured verdict ---
-        if self._tool_loop is not None:
-            structured_text = self._request_structured_verdict(final_text, trace)
-        else:
-            structured_text = final_text
-
         wall_time = time.time() - t0
 
         if self.verbose:
             _console.print(
-                f"[bold magenta]◆ Judge verdict[/bold magenta]"
+                f"[bold magenta]◆ Judge analysis[/bold magenta]"
                 f" ({len(trace)} tool calls, {wall_time:.1f}s wall time)"
             )
 
+        return {
+            "iteration": iteration,
+            "analysis_text": final_text,
+            "trace": trace,
+            "full_trace": full_trace,
+            "best_bic": best_metric,
+            "is_stuck": is_stuck,
+            "trajectory": traj,
+            "best_bic_str": best_bic_str,
+        }
+
+    def synthesize_for_persona(
+        self,
+        analysis_data: dict,
+        persona_name: str,
+        persona_suffix: str = "",
+    ) -> tuple[str, dict]:
+        """R2: Synthesize structured verdict for a specific persona.
+        
+        Parameters
+        ----------
+        analysis_data : dict
+            Output from get_feedback_analysis()
+        persona_name : str
+            Name of the persona (e.g., 'exploit', 'explore')
+        persona_suffix : str
+            System prompt suffix for this persona
+        
+        Returns
+        -------
+        tuple[str, dict]
+            (synthesized_feedback, verdict_dict)
+        """
+        analysis_text = analysis_data["analysis_text"]
+        trace = analysis_data["trace"]
+        iteration = analysis_data["iteration"]
+        best_bic = analysis_data["best_bic"]
+        is_stuck = analysis_data["is_stuck"]
+
+        # R2: Inject persona suffix into synthesis prompt
+        synthesis_prompt = _SYNTHESIS_PROMPT
+        if persona_suffix:
+            synthesis_prompt += (
+                f"\n\nPersona guidance for {persona_name}:\n{persona_suffix}"
+            )
+
+        # R3: If stuck, strengthen pivot directive for personas other than exploit
+        if is_stuck and persona_name != "exploit":
+            synthesis_prompt += (
+                "\n\nBecause search is stuck, your synthesized feedback MUST include "
+                "a directive to abandon the current best model and implement from scratch "
+                "with a mechanistically-novel approach."
+            )
+
+        # Second pass: extract structured verdict
+        if self.verbose:
+            _console.print(
+                f"[bold magenta]◆ Judge synthesis[/bold magenta]"
+                f" for persona '{persona_name}'"
+            )
+
+        structured_text = self._request_structured_verdict_with_suffix(
+            analysis_text, trace, synthesis_prompt
+        )
+
+        wall_time = analysis_data.get("wall_time", 0)
         verdict = _parse_verdict_from_text(
             structured_text, iteration, len(trace), wall_time
         )
-        verdict.best_bic = best_metric
+        verdict.best_bic = best_bic
 
-        # --- Append best model code to synthesized feedback ---
-        if best_model:
-            verdict.synthesized_feedback += (
-                f"\n\n---\nBest model code so far (BIC={best_bic_str}):\n"
-                f"```python\n{best_model}\n```"
+        if self.verbose:
+            _console.print(
+                f"[bold magenta]◆ Judge verdict[/bold magenta]"
+                f" ({persona_name}): {len(verdict.synthesized_feedback)} chars"
             )
 
-        # --- Validate cited models (Change 7) ---
-        unverified_citations: list[dict] = []
-        cited_models_raw: list[dict] = []
-        if hasattr(verdict, "_cited_models_raw"):
-            cited_models_raw = verdict._cited_models_raw  # type: ignore[attr-defined]
-            unverified_citations = self._validate_cited_models(cited_models_raw)
-            if unverified_citations and self.verbose:
-                names = [c.get("name", "?") for c in unverified_citations]
+        return verdict.synthesized_feedback, verdict.__dict__
+
+    def _request_structured_verdict_with_suffix(
+        self, analysis_text: str, trace: list[dict], synthesis_prompt: str
+    ) -> str:
+        """R2: Ask the LLM to format analysis as structured JSON with custom synthesis prompt."""
+        if self.verbose:
+            _console.print(
+                "[bold magenta]◆ Extracting structured verdict...[/bold magenta]"
+            )
+
+        messages = [
+            {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+            {"role": "assistant", "content": analysis_text},
+            {"role": "user", "content": synthesis_prompt},
+        ]
+        p = self.provider
+        if any(
+            x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
+        ):
+            kwargs: dict = {
+                "model": self.model_name,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+            }
+            if self.temperature is not None:
+                kwargs["temperature"] = self.temperature
+            resp = self.model.chat.completions.create(**kwargs)
+            result = resp.choices[0].message.content or analysis_text
+            if self.verbose:
                 _console.print(
-                    f"[bold yellow]⚠ Judge: unverifiable citations:[/bold yellow] "
-                    + ", ".join(names)
+                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
                 )
-
-        # --- Persist audit trace ---
-        if self.results_dir:
-            self._save_trace(
-                verdict,
-                trace,
-                iteration,
-                run_idx,
-                tag,
-                full_trace=full_trace,
-                extra_payload={
-                    "stuck_search": is_stuck,
-                    "cited_models": cited_models_raw,
-                    "unverified_citations": unverified_citations,
-                },
+            return result
+        elif "gemini" in p:
+            try:
+                from google.genai import types
+            except ImportError:
+                from google.generativeai import types  # type: ignore
+            config_kwargs: dict = {"system_instruction": _JUDGE_SYSTEM_PROMPT}
+            if self.max_tokens:
+                config_kwargs["max_output_tokens"] = self.max_tokens
+            if self.temperature is not None:
+                config_kwargs["temperature"] = self.temperature
+            contents = [
+                {"role": "model", "parts": [{"text": analysis_text}]},
+                {"role": "user", "parts": [{"text": synthesis_prompt}]},
+            ]
+            resp = self.model.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
             )
-
-        return verdict
+            result = resp.text.strip()
+            if self.verbose:
+                _console.print(
+                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
+                )
+            return result
+        return analysis_text
 
     def _load_previous_verdict(
         self, iteration: int, run_idx: int, tag: str

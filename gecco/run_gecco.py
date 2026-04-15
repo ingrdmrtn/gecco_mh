@@ -939,7 +939,15 @@ class GeCCoModelSearch:
 
                     if shared_feedback_dict is not None:
                         # Got feedback from orchestrator
-                        feedback = shared_feedback_dict.get("synthesized_feedback", "")
+                        # R2: Get persona-specific feedback if available
+                        synthesized_feedback = shared_feedback_dict.get("synthesized_feedback", "")
+                        if isinstance(synthesized_feedback, dict):
+                            # R2: Per-persona feedback storage
+                            persona_name = self.client_id or "default"
+                            feedback = synthesized_feedback.get(persona_name, synthesized_feedback.get("default", ""))
+                        else:
+                            # Backward compatibility: old string format
+                            feedback = synthesized_feedback
                         console.print(
                             f"  [green]Using centralized judge feedback for iteration {it}[/]"
                         )
@@ -1007,6 +1015,15 @@ class GeCCoModelSearch:
                         self.best_model,
                         self.tried_param_sets,
                         id_results=self.best_id_results,
+                    )
+
+                # R1: Conditionally append best model code based on show_best_model_code flag
+                show_best_model_code = getattr(self.cfg.llm, "show_best_model_code", True)
+                if show_best_model_code and self.best_model is not None:
+                    best_metric_str = f"{self.best_metric:.2f}" if self.best_metric is not None else "N/A"
+                    feedback += (
+                        f"\n\n---\nBest model code so far (BIC={best_metric_str}):\n"
+                        f"```python\n{self.best_model}\n```"
                     )
 
                 # Save feedback for inspection

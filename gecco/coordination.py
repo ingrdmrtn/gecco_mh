@@ -385,11 +385,21 @@ class SharedRegistry:
     def set_judge_feedback(
         self,
         iteration: int,
-        synthesized_feedback: str,
+        synthesized_feedback: str | dict,  # R2: dict keyed by persona name
         verdict_payload: dict,
     ) -> None:
         """
         Store the shared judge verdict for an iteration.
+
+        Parameters
+        ----------
+        iteration : int
+            Iteration number
+        synthesized_feedback : str or dict
+            If str: single global feedback (backward compat)
+            If dict: per-persona feedback {persona_name: feedback_str, ...}
+        verdict_payload : dict
+            Metadata about the verdict
 
         The verdict is stored in a new top-level 'judge_iterations' dict keyed by iteration.
         """
@@ -407,9 +417,15 @@ class SharedRegistry:
                 if "judge_iterations" not in data:
                     data["judge_iterations"] = {}
 
+                # R2: Normalize feedback to dict format
+                if isinstance(synthesized_feedback, str):
+                    feedback_dict = {"default": synthesized_feedback}
+                else:
+                    feedback_dict = synthesized_feedback
+
                 # Store the verdict with timestamp
                 data["judge_iterations"][str(iteration)] = {
-                    "synthesized_feedback": synthesized_feedback,
+                    "synthesized_feedback": feedback_dict,
                     "verdict": verdict_payload,
                     "timestamp": datetime.now().isoformat(),
                 }
@@ -420,14 +436,50 @@ class SharedRegistry:
 
     def get_judge_feedback(self, iteration: int) -> Optional[dict]:
         """
-        Retrieve the stored judge verdict for an iteration.
+        Retrieve the stored judge verdict for an iteration (full dict with per-persona feedback).
 
-        Returns the verdict dict (with 'synthesized_feedback' and 'verdict' keys)
+        Returns the verdict dict (with 'synthesized_feedback' dict and 'verdict' keys)
         or None if not yet written.
         """
         data = self.read()
         judge_iterations = data.get("judge_iterations", {})
         return judge_iterations.get(str(iteration))
+
+    def get_judge_feedback_for_persona(
+        self, iteration: int, persona_name: str, fallback: str = "default"
+    ) -> Optional[dict]:
+        """
+        R2: Retrieve persona-specific judge feedback for an iteration.
+
+        Parameters
+        ----------
+        iteration : int
+            Iteration number
+        persona_name : str
+            Name of the persona (e.g. 'exploit', 'explore', 'diverse')
+        fallback : str
+            Fallback key if persona not found; defaults to 'default'
+
+        Returns the full verdict dict but with synthesized_feedback narrowed to the
+        persona-specific text (or fallback if persona not found).
+        """
+        verdict_dict = self.get_judge_feedback(iteration)
+        if verdict_dict is None:
+            return None
+
+        feedback_dict = verdict_dict.get("synthesized_feedback", {})
+        # Ensure feedback is dict format (backward compat with old str-based storage)
+        if isinstance(feedback_dict, str):
+            feedback_dict = {"default": feedback_dict}
+
+        # Get persona-specific feedback or fall back
+        persona_feedback = feedback_dict.get(persona_name, feedback_dict.get(fallback, ""))
+
+        return {
+            "synthesized_feedback": persona_feedback,
+            "verdict": verdict_dict.get("verdict", {}),
+            "timestamp": verdict_dict.get("timestamp"),
+        }
 
     def wait_for_judge_feedback(
         self,

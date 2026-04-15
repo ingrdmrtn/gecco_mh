@@ -182,9 +182,13 @@ give a low confidence rating. If the evidence is strong, give a high confidence 
 
 ---
 
-Tool call budgeting: You have a finite tool-call budget per iteration. \
-Plan your allocation across the six angles before calling tools, and prefer \
-fewer high-signal calls over many redundant ones.
+Tool-call strategy: You have a finite tool-call budget per iteration. Rather than \
+pre-allocating calls across angles, take an adaptive investigative approach: after each \
+tool result, reflect briefly on what was learned and whether it raises new questions. \
+Follow surprising or contradictory findings deeper, even at the cost of other angles — \
+surprising evidence is higher-signal than a perfectly balanced sweep. Think of the six \
+angles as a *checklist of coverage*, not a rigid allocation. The overall call budget is \
+a soft cap; prefer depth on load-bearing findings over breadth for its own sake.
 
 ---
 
@@ -262,14 +266,10 @@ class _OpenAIToolLoop:
     ) -> tuple[str, list[dict]]:
         """Run the tool loop and return (final_text, tool_call_trace)."""
         planning_instruction = (
-            f"Before calling any tools, first write a brief plan: "
-            f"You have a hard budget of {max_tool_calls} tool calls. "
-            f"List each of the six angles you will investigate and commit to "
-            f"an approximate call allocation per angle (e.g. 'Stat fit: 2, "
-            f"Identifiability: 3, PPC: 2, Individual diffs: 3, Mechanistic: 5, "
-            f"Coverage: 3, reserve: 2'). Reserve extra for mechanistic coherence "
-            f"(reading model code is expensive). Do not call any tools in this "
-            f"first message — you will be able to call them in your next message."
+            f"Before calling any tools, briefly list the 3–6 specific questions "
+            f"you most want answered this iteration. Keep it short. These are starting "
+            f"points — you are free to adapt as results come in. You have a soft budget "
+            f"of {max_tool_calls} tool calls total. Do not call tools in this message."
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -328,10 +328,8 @@ class _OpenAIToolLoop:
                     {
                         "role": "user",
                         "content": (
-                            "Good. Now proceed: call the diagnostic tools one at a "
-                            "time to gather the evidence you need. After each tool "
-                            "result, briefly reflect on what you learned before "
-                            "deciding on the next call."
+                            "Good. Now proceed: call the diagnostic tools one at a time "
+                            "to gather the evidence you need."
                         ),
                     }
                 )
@@ -374,13 +372,25 @@ class _OpenAIToolLoop:
                 )
                 n_calls += 1
 
+                # Interleaved reflection nudge after each tool call
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Briefly reflect: what did this tell you, and does it change what "
+                        "you want to investigate next? Then make your next tool call (or "
+                        "produce your verdict if you have enough evidence)."
+                    ),
+                })
+
                 # Mid-loop budget reminders (fire at most once each)
                 if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
                     messages.append({
                         "role": "user",
                         "content": (
                             f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
-                            f"Ensure you still cover the angles you have not yet investigated."
+                            f"You still have room to investigate further if results so far "
+                            f"raise open questions. If you have enough evidence to synthesise "
+                            f"a verdict, you can do so now; otherwise keep going."
                         ),
                     })
                     budget_reminder_mid_done = True
@@ -389,7 +399,8 @@ class _OpenAIToolLoop:
                         "role": "user",
                         "content": (
                             f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
-                            f"Wrap up remaining angles with focused queries or synthesise now."
+                            f"Wrap up any final high-priority investigations or synthesise "
+                            f"your findings now."
                         ),
                     })
                     budget_reminder_late_done = True
@@ -464,12 +475,20 @@ class _GeminiToolLoop:
             from google.generativeai import types  # type: ignore
 
         tools = self._build_gemini_tools()
-        contents = [{"role": "user", "parts": [{"text": user_message}]}]
+        planning_instruction = (
+            f"Before calling any tools, briefly list the 3–6 specific questions "
+            f"you most want answered this iteration. Keep it short. These are starting "
+            f"points — you are free to adapt as results come in. You have a soft budget "
+            f"of {max_tool_calls} tool calls total. Do not call tools in this message."
+        )
+        contents = [{"role": "user", "parts": [{"text": user_message + "\n\n" + planning_instruction}]}]
         trace: list[dict] = []
         n_calls = 0
+        planning_done = False
         budget_reminder_mid_done = False
         budget_reminder_late_done = False
 
+        # Initial config for planning turn (no tool calls)
         config_kwargs: dict = {
             "system_instruction": system_prompt,
             "tools": tools,
@@ -478,6 +497,55 @@ class _GeminiToolLoop:
             config_kwargs["max_output_tokens"] = self.max_tokens
         if self.temperature is not None:
             config_kwargs["temperature"] = self.temperature
+
+        # Planning turn
+        planning_resp = self.client.models.generate_content(
+            model=self.model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=self.max_tokens or None,
+                temperature=self.temperature,
+            ),
+        )
+
+        # Verbose: print planning response
+        if self.verbose:
+            text_parts = [
+                p.text
+                for p in planning_resp.candidates[0].content.parts
+                if hasattr(p, "text") and p.text
+            ]
+            if text_parts:
+                for line in "\n".join(text_parts).splitlines():
+                    _console.print(f"[dim]│[/dim] {line}")
+
+        # Append planning response
+        contents.append(
+            {
+                "role": "model",
+                "parts": [
+                    {"text": planning_resp.text.strip()}
+                ],
+            }
+        )
+
+        # Add proceed instruction
+        contents.append(
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            "Good. Now proceed: call the diagnostic tools one at a time "
+                            "to gather the evidence you need."
+                        )
+                    }
+                ],
+            }
+        )
+
+        planning_done = True
 
         while n_calls < max_tool_calls:
             resp = self.client.models.generate_content(
@@ -545,13 +613,25 @@ class _GeminiToolLoop:
                     )
                     n_calls += 1
 
+                    # Interleaved reflection nudge after each tool call
+                    contents.append({
+                        "role": "user",
+                        "parts": [{"text": (
+                            "Briefly reflect: what did this tell you, and does it change what "
+                            "you want to investigate next? Then make your next tool call (or "
+                            "produce your verdict if you have enough evidence)."
+                        )}],
+                    })
+
                     # Mid-loop budget reminders (fire at most once each)
                     if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
                         contents.append({
                             "role": "user",
                             "parts": [{"text": (
                                 f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
-                                f"Ensure you still cover the angles you have not yet investigated."
+                                f"You still have room to investigate further if results so far "
+                                f"raise open questions. If you have enough evidence to synthesise "
+                                f"a verdict, you can do so now; otherwise keep going."
                             )}],
                         })
                         budget_reminder_mid_done = True
@@ -560,7 +640,8 @@ class _GeminiToolLoop:
                             "role": "user",
                             "parts": [{"text": (
                                 f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
-                                f"Wrap up remaining angles with focused queries or synthesise now."
+                                f"Wrap up any final high-priority investigations or synthesise "
+                                f"your findings now."
                             )}],
                         })
                         budget_reminder_late_done = True

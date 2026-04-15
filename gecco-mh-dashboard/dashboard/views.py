@@ -408,6 +408,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
     with st.expander("Raw shared registry JSON"):
         st.json(data)
 
+
 _CONFIDENCE_ICONS = {"high": "🟢", "medium": "🟡", "low": "🔴"}
 
 
@@ -435,9 +436,7 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
             seen_iter_keys.add(key)
             unique_iters.append(it)
 
-    available_trace_keys = {
-        (t["iteration"], t["run_idx"], t["tag"]) for t in traces
-    }
+    available_trace_keys = {(t["iteration"], t["run_idx"], t["tag"]) for t in traces}
 
     iter_labels: list[str] = []
     iter_trace_map: list[tuple | None] = []
@@ -449,7 +448,8 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
         has_trace = key in available_trace_keys
         if not has_trace:
             tag_matches = [
-                k for k in available_trace_keys
+                k
+                for k in available_trace_keys
                 if k[0] == it["iteration"] and k[1] == it["run"]
             ]
             if tag_matches:
@@ -470,7 +470,9 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
     if not selected_label or not iter_labels:
         return
 
-    label_idx = iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    label_idx = (
+        iter_labels.index(selected_label) if selected_label in iter_labels else 0
+    )
     trace_key = iter_trace_map[label_idx]
 
     if trace_key is None:
@@ -493,13 +495,13 @@ def render_judge_timeline(full_trace: list[dict]) -> None:
     """Render the full investigation timeline as a vertical event stream."""
     for event in full_trace:
         event_type = event.get("type")
-        
+
         if event_type == "planning":
             with st.container(border=True):
                 st.markdown("**📋 Planning**")
                 content = event.get("content", "")
                 st.markdown(content)
-        
+
         elif event_type == "tool_call":
             with st.container(border=True):
                 tool_name = event.get("tool", "unknown")
@@ -509,18 +511,18 @@ def render_judge_timeline(full_trace: list[dict]) -> None:
                 if len(args_preview) > 60:
                     args_preview = args_preview[:57] + "..."
                 st.markdown(f"**🔧 {tool_name}**({args_preview})")
-                
+
                 result_summary = event.get("result_summary", "")
                 if result_summary:
                     st.caption(result_summary[:300])
-                
+
                 # Expander for full args and result
                 with st.expander("Full details"):
                     st.subheader("Arguments")
                     st.json(args)
                     st.subheader("Result")
                     st.text(result_summary)
-        
+
         elif event_type == "reflection":
             with st.container(border=True):
                 st.markdown("*💭 **Reflection***")
@@ -545,16 +547,39 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
             for rf in recovery_failures:
                 name = rf.get("model", rf.get("function_name", "?"))
                 mean_r = rf.get("mean_r", "N/A")
-                mean_r_str = f"{mean_r:.2f}" if isinstance(mean_r, (int, float)) else str(mean_r)
+                mean_r_str = (
+                    f"{mean_r:.2f}" if isinstance(mean_r, (int, float)) else str(mean_r)
+                )
                 per_param = rf.get("recovery_per_param", {})
                 if per_param:
-                    worst = min(per_param, key=lambda k: per_param[k] if isinstance(per_param[k], (int, float)) else 0)
-                    worst_str = f"{worst} r={per_param[worst]:.2f}" if isinstance(per_param[worst], (int, float)) else ""
-                    worst_params = [f"{k} r={v:.2f}" for k, v in sorted(per_param.items(), key=lambda kv: kv[1] if isinstance(kv[1], (int, float)) else 0)][:3]
+                    worst = min(
+                        per_param,
+                        key=lambda k: (
+                            per_param[k]
+                            if isinstance(per_param[k], (int, float))
+                            else 0
+                        ),
+                    )
+                    worst_str = (
+                        f"{worst} r={per_param[worst]:.2f}"
+                        if isinstance(per_param[worst], (int, float))
+                        else ""
+                    )
+                    worst_params = [
+                        f"{k} r={v:.2f}"
+                        for k, v in sorted(
+                            per_param.items(),
+                            key=lambda kv: (
+                                kv[1] if isinstance(kv[1], (int, float)) else 0
+                            ),
+                        )
+                    ][:3]
                     worst_str = ", ".join(worst_params)
                 else:
                     worst_str = "-"
-                rows.append({"Model": name, "Mean r": mean_r_str, "Worst parameters": worst_str})
+                rows.append(
+                    {"Model": name, "Mean r": mean_r_str, "Worst parameters": worst_str}
+                )
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
     tool_call_count = trace.get("tool_call_count", 0)
@@ -563,6 +588,7 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
     if timestamp:
         try:
             from datetime import datetime as _dt
+
             ts_display = _dt.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
         except (ValueError, TypeError):
             ts_display = timestamp[:19] if len(timestamp) >= 19 else timestamp
@@ -589,12 +615,14 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
                 if len(args_str) > 80:
                     args_str = args_str[:77] + "..."
                 result_preview = tc.get("result_summary", "")[:200]
-                rows.append({
-                    "#": i + 1,
-                    "Tool": tc.get("tool", ""),
-                    "Args": args_str,
-                    "Result Preview": result_preview,
-                })
+                rows.append(
+                    {
+                        "#": i + 1,
+                        "Tool": tc.get("tool", ""),
+                        "Args": args_str,
+                        "Result Preview": result_preview,
+                    }
+                )
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
             for i, tc in enumerate(tool_calls):
@@ -624,11 +652,17 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
                         confidence = angle_data.get("confidence", "")
                         icon = _CONFIDENCE_ICONS.get(confidence, "⚪")
                         st.markdown(f"**{angle_name}**")
-                        st.markdown(f"{icon} **{confidence.upper()}**" if confidence else "⚪ Analysis pending")
+                        st.markdown(
+                            f"{icon} **{confidence.upper()}**"
+                            if confidence
+                            else "⚪ Analysis pending"
+                        )
                         supporting = angle_data.get("supporting_tool_calls", [])
                         if supporting:
                             pills = " ".join(f"`{t}`" for t in supporting)
-                            st.markdown(f"<small>📎 {pills}</small>", unsafe_allow_html=True)
+                            st.markdown(
+                                f"<small>📎 {pills}</small>", unsafe_allow_html=True
+                            )
                         findings = angle_data.get("findings", "")
                         if findings:
                             lines = findings.split("\n")
@@ -649,10 +683,31 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
         for i, rec in enumerate(recommendations[:5], 1):
             st.markdown(f"{i}. {rec}")
 
+    # Display personas and stuck_search as metadata badges
+    personas = trace.get("personas", [])
+    stuck_search = trace.get("stuck_search", False)
+
+    if personas or stuck_search:
+        badge_cols = st.columns([1, 1, 4])
+        with badge_cols[0]:
+            if personas:
+                st.markdown(f"**Personas:** {', '.join(personas)}")
+        with badge_cols[1]:
+            if stuck_search:
+                st.markdown("🔴 **Stuck Search**")
+
     feedback = trace.get("synthesized_feedback", "")
     if feedback:
         with st.expander("**Synthesized Feedback**"):
             st.caption(
                 "Feedback is written for the model code generator — not for human interpretation."
             )
-            st.markdown(feedback)
+            # Handle dict-format (orchestrator) vs string-format (legacy)
+            if isinstance(feedback, dict):
+                for persona_name, persona_feedback in feedback.items():
+                    with st.expander(
+                        f"Persona: {persona_name}", expanded=(persona_name == "exploit")
+                    ):
+                        st.markdown(persona_feedback)
+            else:
+                st.markdown(feedback)

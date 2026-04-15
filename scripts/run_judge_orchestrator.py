@@ -15,6 +15,8 @@ This reduces total judge cost from N × cost to 1 × cost per iteration.
 import os
 import sys
 import time
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 from rich.console import Console
@@ -209,6 +211,9 @@ def main():
             )
 
             # R2: Run analysis once, then synthesize for each persona
+            # Start timer for wall time tracking
+            judge_start_time = time.time()
+
             analysis_data = judge.get_feedback_analysis(
                 iteration=it,
                 run_idx=0,
@@ -223,9 +228,13 @@ def main():
             if analysis_data.get("short_circuit"):
                 # Short-circuit: reuse previous verdict for all personas
                 synthesized_feedback = {"default": analysis_data["analysis_text"]}
+                last_verdict_dict = {}
+                all_recommendations = []
             else:
                 # R2: Synthesize for each persona in cfg.clients
                 synthesized_feedback = {}
+                last_verdict_dict = {}
+                all_recommendations = []
                 clients = getattr(cfg, "clients", {})
 
                 if clients:
@@ -239,25 +248,79 @@ def main():
 
                         if persona_config and hasattr(persona_config, "llm"):
                             persona_suffix = getattr(
-                                persona_config.llm,
-                                "system_prompt_suffix",
-                                ""
+                                persona_config.llm, "system_prompt_suffix", ""
                             )
 
-                        feedback_text, _ = judge.synthesize_for_persona(
+                        feedback_text, verdict_dict = judge.synthesize_for_persona(
                             analysis_data,
                             persona_name=persona_name,
                             persona_suffix=persona_suffix,
                         )
                         synthesized_feedback[persona_name] = feedback_text
+                        last_verdict_dict = verdict_dict
+                        # Collect recommendations from this persona
+                        if verdict_dict.get("key_recommendations"):
+                            all_recommendations.extend(
+                                verdict_dict["key_recommendations"]
+                            )
                 else:
                     # No clients defined; use default persona
-                    feedback_text, _ = judge.synthesize_for_persona(
+                    feedback_text, verdict_dict = judge.synthesize_for_persona(
                         analysis_data,
                         persona_name="default",
                         persona_suffix="",
                     )
                     synthesized_feedback["default"] = feedback_text
+                    last_verdict_dict = verdict_dict
+                    if verdict_dict.get("key_recommendations"):
+                        all_recommendations = verdict_dict["key_recommendations"]
+
+            # Calculate total wall time
+            total_wall_time = time.time() - judge_start_time
+
+            # --- Write trace file to results/<task>/judge/ ---
+            judge_dir = results_dir / "judge"
+            judge_dir.mkdir(parents=True, exist_ok=True)
+
+            # Deduplicate recommendations across personas
+            seen_recs = set()
+            unique_recommendations = []
+            for rec in all_recommendations:
+                if rec not in seen_recs:
+                    seen_recs.add(rec)
+                    unique_recommendations.append(rec)
+
+            # Get per_angle from last verdict (they're similar across personas)
+            per_angle = (
+                last_verdict_dict.get("per_angle", []) if last_verdict_dict else []
+            )
+
+            trace_payload = {
+                "iteration": it,
+                "run_idx": 0,
+                "tag": "_orchestrator",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tool_call_count": len(analysis_data.get("trace", [])),
+                "wall_time_seconds": total_wall_time,
+                "best_bic": analysis_data.get("best_bic"),
+                "tool_call_trace": analysis_data.get("trace", []),
+                "full_trace": analysis_data.get("full_trace", []),
+                "per_angle": per_angle,
+                "key_recommendations": unique_recommendations[:5],  # Top 5 deduplicated
+                "synthesized_feedback": synthesized_feedback,  # Dict keyed by persona name
+                "stuck_search": analysis_data.get("is_stuck", False),
+                "personas": list(synthesized_feedback.keys()),
+            }
+
+            # Add short_circuit flag if present
+            if analysis_data.get("short_circuit"):
+                trace_payload["short_circuit"] = True
+
+            trace_file = judge_dir / f"iter{it}_orchestrator_run0.json"
+            with open(trace_file, "w") as f:
+                json.dump(trace_payload, f, indent=2, default=str)
+
+            console.print(f"[cyan]Trace saved to {trace_file}[/]")
 
             # --- Write shared feedback to registry ---
             verdict_payload = {

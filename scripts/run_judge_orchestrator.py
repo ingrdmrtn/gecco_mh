@@ -291,9 +291,13 @@ def main():
                     unique_recommendations.append(rec)
 
             # Get per_angle from last verdict (they're similar across personas)
-            per_angle = (
+            raw_per_angle = (
                 last_verdict_dict.get("per_angle", []) if last_verdict_dict else []
             )
+            # Ensure per_angle entries are plain dicts (Pydantic models need .model_dump())
+            per_angle = [
+                a.model_dump() if hasattr(a, "model_dump") else a for a in raw_per_angle
+            ]
 
             trace_payload = {
                 "iteration": it,

@@ -646,6 +646,8 @@ def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
                 if angle_idx >= len(per_angle):
                     break
                 angle_data = per_angle[angle_idx]
+                if not isinstance(angle_data, dict):
+                    continue
                 with cols[col_idx]:
                     with st.container(border=True):
                         angle_name = angle_data.get("angle", "Unknown")

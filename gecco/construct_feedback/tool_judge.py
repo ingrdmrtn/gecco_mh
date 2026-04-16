@@ -1180,7 +1180,7 @@ class ToolUsingJudge:
             "COUNT(CASE WHEN status='ok' THEN 1 END) AS n_ok, "
             "COUNT(CASE WHEN status!='ok' THEN 1 END) AS n_failed, "
             "MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
-            "FROM models WHERE iteration = ?",
+            "FROM models WHERE iteration = ? AND split = 'train'",
             [iteration],
         )
         n_total = iter_row.get("n_total", 0) if iter_row else 0

@@ -97,6 +97,8 @@ def list_iterations(store: DiagnosticStore, run_idx: int | None = None,
     """Enumerate iterations with summary counts.
 
     Returns one row per iteration ordered by iteration index.
+    Only considers train-split models so that BIC values are comparable
+    with those returned by get_best_models().
     """
     if run_idx is not None:
         sql = """
@@ -106,6 +108,7 @@ def list_iterations(store: DiagnosticStore, run_idx: int | None = None,
                    MIN(CASE WHEN m.status = 'ok' THEN m.metric_value END) AS best_metric
             FROM iterations i
             LEFT JOIN models m ON m.iteration_id = i.iteration_id
+                               AND m.split = 'train'
             WHERE i.run_idx = ?
             GROUP BY i.iteration, i.run_idx, i.tag, i.timestamp, i.n_models_proposed
             ORDER BY i.iteration
@@ -120,6 +123,7 @@ def list_iterations(store: DiagnosticStore, run_idx: int | None = None,
                    MIN(CASE WHEN m.status = 'ok' THEN m.metric_value END) AS best_metric
             FROM iterations i
             LEFT JOIN models m ON m.iteration_id = i.iteration_id
+                               AND m.split = 'train'
             GROUP BY i.iteration, i.run_idx, i.tag, i.timestamp, i.n_models_proposed
             ORDER BY i.iteration
             LIMIT ?
@@ -778,7 +782,11 @@ def list_failed_models(store: DiagnosticStore,
 
 def get_bic_trajectory(store: DiagnosticStore,
                        run_idx: int | None = None) -> list[dict]:
-    """Return the best metric value per iteration (time series)."""
+    """Return the best metric value per iteration (time series).
+
+    Only considers train-split models so that values are comparable with
+    those returned by get_best_models().
+    """
     if run_idx is not None:
         sql = """
             SELECT m.iteration, MIN(m.metric_value) AS best_metric,
@@ -786,6 +794,7 @@ def get_bic_trajectory(store: DiagnosticStore,
                    COUNT(CASE WHEN m.status = 'ok' THEN 1 END) AS n_ok
             FROM models m
             WHERE m.run_idx = ?
+              AND m.split = 'train'
             GROUP BY m.iteration
             ORDER BY m.iteration
         """
@@ -796,6 +805,7 @@ def get_bic_trajectory(store: DiagnosticStore,
                    COUNT(*) AS n_models_total,
                    COUNT(CASE WHEN m.status = 'ok' THEN 1 END) AS n_ok
             FROM models m
+            WHERE m.split = 'train'
             GROUP BY m.iteration
             ORDER BY m.iteration
         """

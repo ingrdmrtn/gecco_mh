@@ -3,6 +3,8 @@ import os
 import json
 import math
 import time
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -199,31 +201,43 @@ class GeCCoModelSearch:
             else 10
         )
 
-    def generate(self, model, tokenizer=None, prompt=None, response_schema=None):
+    def generate(
+        self,
+        model,
+        tokenizer=None,
+        prompt=None,
+        response_schema=None,
+        system_prompt: Optional[str] = None,
+    ):
         """
-        Unified text generation function for any supported backend.
-        Handles both OpenAI GPT and Hugging Face-style models cleanly.
+                Unified text generation function for any supported backend.
+                Handles both OpenAI GPT and Hugging Face-style models cleanly.
 
-        Parameters
-        ----------
-        model : object
-            The model object (OpenAI client, HF model, etc.)
-        tokenizer : object, optional
-            Tokenizer for HuggingFace models.
-        prompt : str, optional
-            The prompt text to send to the model.
-        response_schema : dict, optional
-            JSON schema for structured output. If None, no schema enforcement
-            is applied (free-form text response).
+                Parameters
+                ----------
+                model : object
+                    The model object (OpenAI client, HF model, etc.)
+                tokenizer : object, optional
+                    Tokenizer for HuggingFace models.
+                prompt : str, optional
+                    The prompt text to send to the model.
+                response_schema : dict, optional
+                    JSON schema for structured output. If None, no schema enforcement
+                    is applied (free-form text response).
+                system_prompt : str, optional
+                    Explicit system prompt to use. If None, falls back to cfg.llm.system_prompt.
 
-        Returns
+                Returns
         -------
-        str
-            The generated text response.
+                str
+                    The generated text response.
         """
         if model is None:
             raise ValueError("Model not initialized correctly.")
         provider = self.cfg.llm.provider.lower()
+        active_system_prompt = (
+            system_prompt if system_prompt is not None else self.cfg.llm.system_prompt
+        )
 
         # -----------------------------
         # OpenAI / GPT-style generation
@@ -244,7 +258,7 @@ class GeCCoModelSearch:
             create_kwargs = {
                 "model": self.cfg.llm.base_model,
                 "input": [
-                    {"role": "developer", "content": self.cfg.llm.system_prompt},
+                    {"role": "developer", "content": active_system_prompt},
                     {"role": "user", "content": prompt},
                 ],
             }
@@ -280,7 +294,7 @@ class GeCCoModelSearch:
 
             config_args = {
                 "temperature": self.cfg.llm.temperature,
-                "system_instruction": self.cfg.llm.system_prompt,
+                "system_instruction": active_system_prompt,
             }
 
             use_thinking = False
@@ -363,7 +377,7 @@ class GeCCoModelSearch:
             create_kwargs = {
                 "model": self.cfg.llm.base_model,
                 "messages": [
-                    {"role": "system", "content": self.cfg.llm.system_prompt},
+                    {"role": "system", "content": active_system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": max_out,
@@ -770,6 +784,64 @@ class GeCCoModelSearch:
 
         return raw_text, models
 
+    def generate_models_naive(self, feedback_text):
+        """
+        Two-phase generation:
+        1. Phase 1: Naive ideation (psychologist persona)
+        2. Phase 2: Computational translation (neuroscientist persona)
+        """
+        # 1. Read naive ideation config
+        client_config = (
+            getattr(self.cfg.clients, self.client_id, None) if self.client_id else None
+        )
+        naive_cfg = (
+            getattr(client_config, "naive_ideation", None) if client_config else None
+        )
+
+        if not naive_cfg or not getattr(naive_cfg, "enabled", False):
+            # Fallback to standard generation if misconfigured
+            prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback_text)
+            return self.generate_models(prompt)
+
+        persona = naive_cfg.persona
+        translation_preamble = getattr(naive_cfg, "translation_preamble", None)
+
+        if "hf" in self.cfg.llm.provider or "huggingface" in self.cfg.llm.provider:
+            console.print(
+                "[yellow]Warning: HuggingFace backend does not support system prompts. "
+                "Phase 1 persona will have no effect.[/]"
+            )
+
+        # 2. Phase 1 — ideation call
+        console.print("  [dim]Phase 1: Naive psychological ideation...[/]")
+        naive_prompt = self.prompt_builder.build_naive_prompt(feedback_text)
+
+        naive_idea = self.generate(
+            self.model,
+            self.tokenizer,
+            naive_prompt,
+            response_schema=None,  # Plain text
+            system_prompt=persona,
+        )
+
+        if not naive_idea:
+            console.print(
+                "  [yellow]Phase 1 ideation failed to return an idea — using empty idea.[/]"
+            )
+            naive_idea = ""
+        else:
+            console.print(f"  [dim]Naive hypothesis:[/] {naive_idea[:200]}...")
+
+        # 3. Phase 2 — translation call
+        console.print("  [dim]Phase 2: Computational translation...[/]")
+        prompt = self.prompt_builder.build_input_prompt(
+            feedback_text=feedback_text,
+            naive_idea=naive_idea,
+            translation_preamble=translation_preamble,
+        )
+
+        return self.generate_models(prompt)
+
     def _save_review(self, review: dict):
         """
         Save review comments to disk for debugging.
@@ -940,11 +1012,15 @@ class GeCCoModelSearch:
                     if shared_feedback_dict is not None:
                         # Got feedback from orchestrator
                         # R2: Get persona-specific feedback if available
-                        synthesized_feedback = shared_feedback_dict.get("synthesized_feedback", "")
+                        synthesized_feedback = shared_feedback_dict.get(
+                            "synthesized_feedback", ""
+                        )
                         if isinstance(synthesized_feedback, dict):
                             # R2: Per-persona feedback storage
                             persona_name = self.client_id or "default"
-                            feedback = synthesized_feedback.get(persona_name, synthesized_feedback.get("default", ""))
+                            feedback = synthesized_feedback.get(
+                                persona_name, synthesized_feedback.get("default", "")
+                            )
                         else:
                             # Backward compatibility: old string format
                             feedback = synthesized_feedback
@@ -1018,9 +1094,15 @@ class GeCCoModelSearch:
                     )
 
                 # R1: Conditionally append best model code based on show_best_model_code flag
-                show_best_model_code = getattr(self.cfg.llm, "show_best_model_code", True)
+                show_best_model_code = getattr(
+                    self.cfg.llm, "show_best_model_code", True
+                )
                 if show_best_model_code and self.best_model is not None:
-                    best_metric_str = f"{self.best_metric:.2f}" if self.best_metric is not None else "N/A"
+                    best_metric_str = (
+                        f"{self.best_metric:.2f}"
+                        if self.best_metric is not None
+                        else "N/A"
+                    )
                     feedback += (
                         f"\n\n---\nBest model code so far (BIC={best_metric_str}):\n"
                         f"```python\n{self.best_model}\n```"
@@ -1038,8 +1120,22 @@ class GeCCoModelSearch:
                     f.write(feedback)
 
             self._set_activity(f"generating models (iter {it})")
-            prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
-            code_text, parsed_models = self.generate_models(prompt)
+
+            # Check for naive ideation
+            client_config = (
+                getattr(self.cfg.clients, self.client_id, None)
+                if self.client_id
+                else None
+            )
+            naive_enabled = False
+            if client_config and hasattr(client_config, "naive_ideation"):
+                naive_enabled = getattr(client_config.naive_ideation, "enabled", False)
+
+            if naive_enabled:
+                code_text, parsed_models = self.generate_models_naive(feedback)
+            else:
+                prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
+                code_text, parsed_models = self.generate_models(prompt)
 
             tag = self._file_tag()
             model_file = (

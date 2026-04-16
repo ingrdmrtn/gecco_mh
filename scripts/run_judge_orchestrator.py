@@ -245,11 +245,13 @@ def main():
 
                         persona_config = getattr(clients, persona_name, None)
                         persona_suffix = ""
-
                         if persona_config and hasattr(persona_config, "llm"):
-                            persona_suffix = getattr(
-                                persona_config.llm, "system_prompt_suffix", ""
+                            # Prefer feedback_guidance if present; fall back to system_prompt_suffix
+                            persona_suffix = (
+                                getattr(persona_config.llm, "feedback_guidance", None)
+                                or getattr(persona_config.llm, "system_prompt_suffix", "")
                             )
+
 
                         feedback_text, verdict_dict = judge.synthesize_for_persona(
                             analysis_data,

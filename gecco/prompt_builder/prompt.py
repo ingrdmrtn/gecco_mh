@@ -1,7 +1,15 @@
 import numpy as np
+from typing import Optional
 
 
-def build_prompt(cfg, data_text, data, feedback_text=None):
+def build_prompt(
+    cfg,
+    data_text,
+    data,
+    feedback_text=None,
+    naive_idea: Optional[str] = None,
+    translation_preamble: Optional[str] = None,
+):
     """
     Construct the structured LLM prompt for cognitive model generation.
     Order:
@@ -95,6 +103,34 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
         else """Here is the data from several participants: """
     )
 
+    # Naive ideation preamble
+    naive_preamble_section = ""
+    if naive_idea:
+        if not translation_preamble:
+            # Fallback default — used only when no translation_preamble is set in the config.
+            # If editing this, also update naive_ideation.translation_preamble in the YAML
+            # config(s) to keep them in sync.
+            translation_preamble = (
+                "A psychologist — without any knowledge of computational modeling or "
+                "reinforcement learning — observed participant behavior and proposed "
+                "the following psychological explanation:\n\n"
+                "---\n{naive_idea}\n---\n\n"
+                "Your task is to implement this idea faithfully as a cognitive model. "
+                "Important:\n"
+                "- Treat the above as the authoritative specification. Do NOT "
+                "reinterpret it through existing RL or computational frameworks "
+                "unless they genuinely capture the idea.\n"
+                "- If the idea does not map cleanly onto standard Q-learning, Bayesian "
+                "inference, or any other known formalism, invent a new mathematical "
+                "form that directly expresses the psychological mechanism described.\n"
+                "- The goal is a direct computational implementation of this specific "
+                "theory, not a standard model that vaguely resembles it."
+            )
+        naive_preamble_section = (
+            f"### Psychological Hypothesis\n"
+            f"{translation_preamble.replace('{naive_idea}', naive_idea)}\n\n"
+        )
+
     if cfg.llm.provider in ["openai", "claude", "gemini", "kcl"]:
         # --- prompt layout for closed models ---
 
@@ -113,7 +149,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {introduce_data}
 {data_text.strip()}
 
-
+{naive_preamble_section}
 {"### Base Class (DO NOT MODIFY) " + abstract_base_model.strip() if abstract_base_model else ""}
 
 ### Template Model
@@ -143,6 +179,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
 {introduce_data}
 {data_text.strip()}
 
+{naive_preamble_section}### Your Task
 {goal_text.strip()}
 
 ### Implementation Guidelines
@@ -169,7 +206,51 @@ class PromptBuilderWrapper:
         self._data_text = data_text
         self.data = data
 
-    def build_input_prompt(self, feedback_text: str = ""):
+    def build_naive_prompt(self, feedback_text: Optional[str] = "") -> str:
+        """
+        Construct a minimal prompt for naive psychological ideation.
+        Includes task description and plain-language feedback, but NO
+        code or modeling formalisms.
+        """
+        task = self.cfg.task
+        feedback_text = feedback_text or ""
+
+        # Take first 5 trials from data_text as a short narrative excerpt
+        data_excerpt = "\n".join(self._data_text.strip().split("\n")[:5])
+
+        prompt = f"""
+### Task Description
+{task.description.strip()}
+
+### Example Participant Behavior
+{data_excerpt}
+
+### Observations and Feedback
+{feedback_text.strip()}
+
+### Your Task
+Based on the task description and the observations above, propose a clear 
+psychological hypothesis about how people behave in this task. 
+Describe the hypothesis in plain language only, focusing on processes 
+like habits, attention, emotion, memory, motivation, fatigue, or 
+frustration. 
+
+DO NOT propose equations, code, or computational formalisms. 
+Just describe your theory of human behavior.
+""".strip()
+        return prompt
+
+    def build_input_prompt(
+        self,
+        feedback_text: str = "",
+        naive_idea: Optional[str] = None,
+        translation_preamble: Optional[str] = None,
+    ):
         return build_prompt(
-            self.cfg, self._data_text, self.data, feedback_text=feedback_text
+            self.cfg,
+            self._data_text,
+            self.data,
+            feedback_text=feedback_text,
+            naive_idea=naive_idea,
+            translation_preamble=translation_preamble,
         )

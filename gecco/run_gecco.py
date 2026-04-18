@@ -157,8 +157,15 @@ class GeCCoModelSearch:
 
         # --- Tool-using judge (optional) ---
         self.tool_judge = None
+        _orchestrated = (
+            shared_registry is not None
+            and judge_cfg
+            and getattr(judge_cfg, "orchestrated", False)
+        )
         if judge_cfg and getattr(judge_cfg, "mode", "manual") == "tool_using":
-            if self.diagnostic_store is None:
+            if _orchestrated:
+                console.print("[dim]Orchestrated mode: per-client tool judge skipped.[/]")
+            elif self.diagnostic_store is None:
                 console.print(
                     "[yellow]tool_using judge requires diagnostic_store.enabled=true — "
                     "falling back to standard feedback.[/]"
@@ -1009,8 +1016,15 @@ class GeCCoModelSearch:
                         poll_seconds=2.0,
                     )
 
-                    if shared_feedback_dict is not None:
-                        # Got feedback from orchestrator
+                    if shared_feedback_dict is not None and shared_feedback_dict.get("failed"):
+                        # Orchestrator tried but failed after retries
+                        error_msg = shared_feedback_dict.get("error", "unknown")
+                        raise RuntimeError(
+                            f"Orchestrated judge failed for iteration {it}: {error_msg}. "
+                            f"Cannot continue without judge feedback."
+                        )
+                    elif shared_feedback_dict is not None:
+                        # Got successful feedback from orchestrator
                         # R2: Get persona-specific feedback if available
                         synthesized_feedback = shared_feedback_dict.get(
                             "synthesized_feedback", ""
@@ -1028,40 +1042,11 @@ class GeCCoModelSearch:
                             f"  [green]Using centralized judge feedback for iteration {it}[/]"
                         )
                     else:
-                        # Orchestrator didn't deliver in time; fall back to local judge
-                        console.print(
-                            f"  [yellow]Orchestrator timeout; falling back to local judge[/]"
+                        # Orchestrator never responded — genuine timeout
+                        raise RuntimeError(
+                            f"Orchestrated judge timed out for iteration {it} "
+                            f"(waited {barrier_timeout}s). Cannot continue without judge feedback."
                         )
-                        if self.tool_judge is not None:
-                            try:
-                                self._set_activity(f"tool judge (iter {it})")
-                                verdict = self.tool_judge.get_feedback(
-                                    iteration=it,
-                                    run_idx=run_idx,
-                                    tag=tag,
-                                    best_model=self.best_model,
-                                    best_metric=self.best_metric,
-                                    recovery_failures=recovery_failures
-                                    if recovery_failures
-                                    else None,
-                                    prev_had_success=prev_had_success,
-                                )
-                                feedback = verdict.synthesized_feedback
-                            except Exception as e:
-                                console.print(
-                                    f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
-                                )
-                                feedback = self.feedback.get_feedback(
-                                    self.best_model,
-                                    self.tried_param_sets,
-                                    id_results=self.best_id_results,
-                                )
-                        else:
-                            feedback = self.feedback.get_feedback(
-                                self.best_model,
-                                self.tried_param_sets,
-                                id_results=self.best_id_results,
-                            )
                 elif self.tool_judge is not None:
                     try:
                         self._set_activity(f"tool judge (iter {it})")

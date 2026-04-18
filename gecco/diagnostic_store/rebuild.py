@@ -183,7 +183,6 @@ def rebuild_from_artifacts(
             continue
 
         json_file, iteration, run_idx, client_id, tag = files_to_parse[i]
-        split = _detect_split(json_file.name)
 
         store.write_iteration(
             iteration=parsed["iteration"],
@@ -196,7 +195,7 @@ def rebuild_from_artifacts(
         processed_count += 1
         ppc_count = len(parsed["ppc_results_map"] or {})
         print(
-            f"[rebuild]   iter={parsed['iteration']} run={run_idx} client='{parsed['client_id']}' split='{split}' "
+            f"[rebuild]   iter={parsed['iteration']} run={run_idx} client='{parsed['client_id']}' "
             f"({len(parsed['iteration_results'])} models, {ppc_count} with PPC)"
         )
 

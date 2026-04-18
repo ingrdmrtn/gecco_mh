@@ -434,6 +434,31 @@ class SharedRegistry:
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+    def set_judge_failure(self, iteration: int, error: str) -> None:
+        """Write an explicit failure entry for an iteration so clients can detect it."""
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                if "judge_iterations" not in data:
+                    data["judge_iterations"] = {}
+
+                data["judge_iterations"][str(iteration)] = {
+                    "failed": True,
+                    "error": error,
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+                self._atomic_write(data)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
     def get_judge_feedback(self, iteration: int) -> Optional[dict]:
         """
         Retrieve the stored judge verdict for an iteration (full dict with per-persona feedback).
@@ -501,10 +526,16 @@ class SharedRegistry:
             feedback = self.get_judge_feedback(iteration)
             if feedback is not None:
                 elapsed = time.time() - start_time
-                console.print(
-                    f"[green]Received judge feedback for iteration {iteration} "
-                    f"in {elapsed:.1f}s[/]"
-                )
+                if feedback.get("failed"):
+                    console.print(
+                        f"[red]Orchestrated judge reported failure for iteration {iteration} "
+                        f"after {elapsed:.1f}s: {feedback.get('error', 'unknown')}[/]"
+                    )
+                else:
+                    console.print(
+                        f"[green]Received judge feedback for iteration {iteration} "
+                        f"in {elapsed:.1f}s[/]"
+                    )
                 return feedback
 
             elapsed = time.time() - start_time

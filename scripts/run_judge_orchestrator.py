@@ -142,6 +142,12 @@ def main():
         if hasattr(cfg, "judge")
         else 1800
     )
+    # Extra timeout buffer to account for client retries
+    retry_buffer = (
+        getattr(getattr(cfg.judge, "barrier", None), "retry_wait_seconds", 300)
+        if hasattr(cfg, "judge")
+        else 300
+    )
 
     console.print(
         Panel(
@@ -161,13 +167,31 @@ def main():
         console.print(
             f"[cyan]Waiting for {n_clients} clients to complete iteration {it}...[/]"
         )
-        count = registry.wait_for_iteration(
+        # Use wait_for_clients_complete to account for retry scenarios
+        count = registry.wait_for_clients_complete(
             iteration=it,
             n_expected=n_clients,
-            timeout_seconds=barrier_timeout,
+            timeout_seconds=barrier_timeout + retry_buffer,
             poll_seconds=5.0,
         )
         console.print(f"[green]Iteration {it} complete: {count} clients[/]")
+
+        # --- Check if any clients produced runnable models ---
+        clients_with_models = registry.count_clients_with_models(it)
+        console.print(f"[dim]Clients with runnable models: {clients_with_models}[/]")
+        if clients_with_models == 0:
+            console.print(
+                "[yellow]No clients produced runnable models, skipping judge[/]"
+            )
+            registry.set_judge_feedback(
+                iteration=it,
+                synthesized_feedback={
+                    "default": "All models failed syntax validation after retries. "
+                    "Review error messages and try a different approach."
+                },
+                verdict_payload={"skipped": True, "reason": "all_syntax_failures"},
+            )
+            continue
 
         # --- Rebuild unified diagnostic store from all clients' artifacts ---
         console.print("[cyan]Updating unified diagnostic store...[/]")

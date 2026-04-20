@@ -164,7 +164,9 @@ class GeCCoModelSearch:
         )
         if judge_cfg and getattr(judge_cfg, "mode", "manual") == "tool_using":
             if _orchestrated:
-                console.print("[dim]Orchestrated mode: per-client tool judge skipped.[/]")
+                console.print(
+                    "[dim]Orchestrated mode: per-client tool judge skipped.[/]"
+                )
             elif self.diagnostic_store is None:
                 console.print(
                     "[yellow]tool_using judge requires diagnostic_store.enabled=true — "
@@ -931,7 +933,9 @@ class GeCCoModelSearch:
             return
         self.shared_registry.set_activity(self.client_id, activity)
 
-    def _update_registry(self, iteration, results):
+    def _update_registry(
+        self, iteration, results, status="running", had_runnable_model=None
+    ):
         """Push this iteration's results to the shared registry."""
         if self.shared_registry is None:
             return
@@ -944,7 +948,43 @@ class GeCCoModelSearch:
             best_metric=self.best_metric,
             param_names=self.best_params,
             tried_param_sets=self.tried_param_sets,
+            status=status,
+            had_runnable_model=had_runnable_model,
         )
+
+    def _build_syntax_error_feedback(self, iteration_results):
+        """
+        Build feedback text from syntax/validation errors for regeneration.
+
+        This is used when all models fail syntax validation to help the LLM
+        understand what went wrong and how to fix it.
+        """
+        error_messages = []
+        for i, result in enumerate(iteration_results):
+            model_name = result.get("function_name", f"model_{i}")
+            error_type = result.get("metric_name", "ERROR")
+
+            if error_type == "VALIDATION_ERROR":
+                msg = result.get("error_message", "Unknown validation error")
+                error_messages.append(f"- {model_name}: {msg}")
+            elif error_type == "FIT_ERROR":
+                error_msg = result.get("error", "Unknown fit error")
+                # Truncate very long error messages
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                error_messages.append(f"- {model_name}: {error_msg}")
+
+        if not error_messages:
+            return "All models failed validation. Please review and fix syntax errors."
+
+        feedback = "The following models failed syntax/validation:\n"
+        feedback += "\n".join(error_messages)
+        feedback += (
+            "\n\nPlease regenerate the models with correct Python syntax. "
+            "Ensure all functions are properly defined, parentheses match, "
+            "and all required imports are handled."
+        )
+        return feedback
 
     def run_n_shots(self, run_idx, baseline_bic):
         # Resume from the next iteration after what's already in the registry
@@ -1016,12 +1056,21 @@ class GeCCoModelSearch:
                         poll_seconds=2.0,
                     )
 
-                    if shared_feedback_dict is not None and shared_feedback_dict.get("failed"):
+                    if shared_feedback_dict is not None and shared_feedback_dict.get(
+                        "failed"
+                    ):
                         # Orchestrator tried but failed after retries
+                        # Instead of halting, use the failure as feedback for regeneration
                         error_msg = shared_feedback_dict.get("error", "unknown")
-                        raise RuntimeError(
-                            f"Orchestrated judge failed for iteration {it}: {error_msg}. "
-                            f"Cannot continue without judge feedback."
+                        console.print(
+                            f"  [yellow]Orchestrated judge failed for iteration {it}: "
+                            f"{error_msg}. Using failure as feedback for regeneration.[/]"
+                        )
+                        feedback = (
+                            f"The judge failed to analyze the previous iteration: {error_msg}. "
+                            f"Please try a different approach or simplify your models. "
+                            f"Consider: 1) Checking model syntax, 2) Ensuring models are "
+                            f"identifiable, 3) Using simpler parameterizations."
                         )
                     elif shared_feedback_dict is not None:
                         # Got successful feedback from orchestrator
@@ -1043,9 +1092,15 @@ class GeCCoModelSearch:
                         )
                     else:
                         # Orchestrator never responded — genuine timeout
-                        raise RuntimeError(
-                            f"Orchestrated judge timed out for iteration {it} "
-                            f"(waited {barrier_timeout}s). Cannot continue without judge feedback."
+                        # Instead of halting, provide timeout feedback for regeneration
+                        console.print(
+                            f"  [yellow]Orchestrated judge timed out for iteration {it} "
+                            f"(waited {barrier_timeout}s). Using timeout as feedback.[/]"
+                        )
+                        feedback = (
+                            f"The judge timed out while analyzing the previous iteration. "
+                            f"This may indicate the models were too complex to evaluate. "
+                            f"Please try simpler models or ensure they can be evaluated efficiently."
                         )
                 elif self.tool_judge is not None:
                     try:
@@ -1104,524 +1159,587 @@ class GeCCoModelSearch:
                 with open(feedback_file, "w") as f:
                     f.write(feedback)
 
-            self._set_activity(f"generating models (iter {it})")
-
-            # Check for naive ideation
-            client_config = (
-                getattr(self.cfg.clients, self.client_id, None)
-                if self.client_id
-                else None
-            )
-            naive_enabled = False
-            if client_config and hasattr(client_config, "naive_ideation"):
-                naive_enabled = getattr(client_config.naive_ideation, "enabled", False)
-
-            if naive_enabled:
-                code_text, parsed_models = self.generate_models_naive(feedback)
-            else:
-                prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback)
-                code_text, parsed_models = self.generate_models(prompt)
-
-            tag = self._file_tag()
-            model_file = (
-                self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
-                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir
-                / "models"
-                / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+            # --- Syntax retry loop ---
+            # Track retries for syntax/validation failures
+            syntax_retry_count = 0
+            max_syntax_retries = getattr(
+                getattr(self.cfg, "validation", None), "max_syntax_retries", 2
             )
 
-            with open(model_file, "w") as f:
-                f.write(code_text)
+            while syntax_retry_count <= max_syntax_retries:
+                self._set_activity(
+                    f"generating models (iter {it}, attempt {syntax_retry_count + 1})"
+                )
 
-            # Save structured output (analysis, names, rationale) for inspection
-            if parsed_models:
-                structured_file = model_file.with_suffix(".json")
-                with open(structured_file, "w") as f:
-                    json.dump(
-                        [
-                            {
-                                "name": m["name"],
-                                "rationale": m.get("rationale", ""),
-                                "analysis": m.get("analysis", ""),
-                                "parameters": m.get("parameters", []),
-                            }
-                            for m in parsed_models
-                        ],
-                        f,
-                        indent=2,
+                # Update registry with retrying status if not first attempt
+                if syntax_retry_count > 0 and self.shared_registry is not None:
+                    self._update_registry(it, [], status="retrying")
+
+                # Check for naive ideation
+                client_config = (
+                    getattr(self.cfg.clients, self.client_id, None)
+                    if self.client_id
+                    else None
+                )
+                naive_enabled = False
+                if client_config and hasattr(client_config, "naive_ideation"):
+                    naive_enabled = getattr(
+                        client_config.naive_ideation, "enabled", False
                     )
 
-            iteration_results = []
+                if naive_enabled:
+                    code_text, parsed_models = self.generate_models_naive(feedback)
+                else:
+                    prompt = self.prompt_builder.build_input_prompt(
+                        feedback_text=feedback
+                    )
+                    code_text, parsed_models = self.generate_models(prompt)
 
-            n_models = len(parsed_models)
-            for i, model_dict in enumerate(parsed_models):
-                func_name = f"cognitive_model{i + 1}"
-                display_name = model_dict.get("name", func_name)
-                func_code = model_dict["code"]
-                structured_params = model_dict.get("parameters")
+                tag = self._file_tag()
+                model_file = (
+                    self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
+                    if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
+                    else self.results_dir
+                    / "models"
+                    / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                )
 
-                if not func_code:
-                    continue
+                with open(model_file, "w") as f:
+                    f.write(code_text)
 
-                try:
-                    from gecco.offline_evaluation.exceptions import ModelValidationError  # noqa: F811
-
-                    # --- Parameter recovery check (optional) ---
-                    if self.recovery_checker is not None:
-                        self._set_activity(
-                            f"parameter recovery {i + 1}/{n_models}: {display_name} (iter {it})"
+                # Save structured output (analysis, names, rationale) for inspection
+                if parsed_models:
+                    structured_file = model_file.with_suffix(".json")
+                    with open(structured_file, "w") as f:
+                        json.dump(
+                            [
+                                {
+                                    "name": m["name"],
+                                    "rationale": m.get("rationale", ""),
+                                    "analysis": m.get("analysis", ""),
+                                    "parameters": m.get("parameters", []),
+                                }
+                                for m in parsed_models
+                            ],
+                            f,
+                            indent=2,
                         )
-                        from gecco.offline_evaluation.utils import build_model_spec
-                        from gecco.offline_evaluation.exceptions import (
-                            ModelValidationError,
-                        )
 
-                        try:
-                            spec = build_model_spec(
-                                func_code,
-                                expected_func_name=func_name,
-                                cfg=self.cfg,
-                                structured_params=structured_params,
+                iteration_results = []
+
+                n_models = len(parsed_models)
+                for i, model_dict in enumerate(parsed_models):
+                    func_name = f"cognitive_model{i + 1}"
+                    display_name = model_dict.get("name", func_name)
+                    func_code = model_dict["code"]
+                    structured_params = model_dict.get("parameters")
+
+                    if not func_code:
+                        continue
+
+                    try:
+                        from gecco.offline_evaluation.exceptions import ModelValidationError  # noqa: F811
+
+                        # --- Parameter recovery check (optional) ---
+                        if self.recovery_checker is not None:
+                            self._set_activity(
+                                f"parameter recovery {i + 1}/{n_models}: {display_name} (iter {it})"
                             )
-                            console.print(
-                                f"  [dim]Running parameter recovery check for {display_name} "
-                                f"({self.recovery_checker.n_subjects} subjects, "
-                                f"{self.recovery_checker.n_trials} trials)...[/]"
+                            from gecco.offline_evaluation.utils import build_model_spec
+                            from gecco.offline_evaluation.exceptions import (
+                                ModelValidationError,
                             )
-                            recovery = self.recovery_checker.check(spec)
-                            if not recovery["passed"]:
-                                sim_err = recovery.get("simulation_error")
-                                if sim_err and recovery["n_successful"] == 0:
-                                    console.print(
-                                        f"  [yellow]{display_name} failed parameter recovery "
-                                        f"— simulation error: {sim_err}[/]"
+
+                            try:
+                                spec = build_model_spec(
+                                    func_code,
+                                    expected_func_name=func_name,
+                                    cfg=self.cfg,
+                                    structured_params=structured_params,
+                                )
+                                console.print(
+                                    f"  [dim]Running parameter recovery check for {display_name} "
+                                    f"({self.recovery_checker.n_subjects} subjects, "
+                                    f"{self.recovery_checker.n_trials} trials)...[/]"
+                                )
+                                recovery = self.recovery_checker.check(spec)
+                                if not recovery["passed"]:
+                                    sim_err = recovery.get("simulation_error")
+                                    if sim_err and recovery["n_successful"] == 0:
+                                        console.print(
+                                            f"  [yellow]{display_name} failed parameter recovery "
+                                            f"— simulation error: {sim_err}[/]"
+                                        )
+                                    else:
+                                        console.print(
+                                            f"  [yellow]{display_name} failed parameter recovery "
+                                            f"(mean r={recovery['mean_r']:.2f}, "
+                                            f"threshold={self.recovery_checker.threshold})[/]"
+                                        )
+                                    iteration_results.append(
+                                        {
+                                            "function_name": display_name,
+                                            "metric_name": "RECOVERY_FAILED",
+                                            "metric_value": float("inf"),
+                                            "param_names": spec.param_names,
+                                            "code": func_code,
+                                            "recovery_r": recovery["mean_r"],
+                                            "recovery_per_param": recovery["per_param_r"],
+                                            "recovery_n_successful": recovery[
+                                                "n_successful"
+                                            ],
+                                            "simulation_error": sim_err,
+                                        }
                                     )
-                                else:
-                                    console.print(
-                                        f"  [yellow]{display_name} failed parameter recovery "
-                                        f"(mean r={recovery['mean_r']:.2f}, "
-                                        f"threshold={self.recovery_checker.threshold})[/]"
+                                    capture_recovery_failed(
+                                        iteration=it,
+                                        model_name=display_name,
+                                        error=Exception(
+                                            f"Parameter recovery failed (mean r={recovery['mean_r']:.2f})"
+                                        ),
                                     )
+                                    continue
+                            except ModelValidationError as e:
+                                console.print(
+                                    f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
+                                )
+                                if e.details:
+                                    for k, v in e.details.items():
+                                        console.print(f"    [dim]{k}: {v}[/]")
+                                safe_details = {}
+                                for k, v in e.details.items():
+                                    try:
+                                        json.dumps(v)
+                                        safe_details[k] = v
+                                    except (TypeError, ValueError):
+                                        safe_details[k] = str(v)
                                 iteration_results.append(
                                     {
                                         "function_name": display_name,
-                                        "metric_name": "RECOVERY_FAILED",
+                                        "metric_name": "VALIDATION_ERROR",
                                         "metric_value": float("inf"),
-                                        "param_names": spec.param_names,
+                                        "param_names": [],
                                         "code": func_code,
-                                        "recovery_r": recovery["mean_r"],
-                                        "recovery_per_param": recovery["per_param_r"],
-                                        "recovery_n_successful": recovery[
-                                            "n_successful"
-                                        ],
-                                        "simulation_error": sim_err,
+                                        "error_type": e.error_type,
+                                        "error_message": e.message,
+                                        "error_details": safe_details,
                                     }
                                 )
-                                capture_recovery_failed(
+                                continue
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]{display_name} recovery check error: {e}[/]"
+                                )
+                                iteration_results.append(
+                                    {
+                                        "function_name": display_name,
+                                        "metric_name": "FIT_ERROR",
+                                        "metric_value": float("inf"),
+                                        "param_names": [],
+                                        "code": func_code,
+                                        "error": str(e),
+                                    }
+                                )
+                                capture_fit_error(
                                     iteration=it,
                                     model_name=display_name,
-                                    error=Exception(
-                                        f"Parameter recovery failed (mean r={recovery['mean_r']:.2f})"
-                                    ),
+                                    error=e,
+                                    run=run_idx,
                                 )
                                 continue
-                        except ModelValidationError as e:
-                            console.print(
-                                f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
-                            )
-                            if e.details:
-                                for k, v in e.details.items():
-                                    console.print(f"    [dim]{k}: {v}[/]")
-                            safe_details = {}
-                            for k, v in e.details.items():
-                                try:
-                                    json.dumps(v)
-                                    safe_details[k] = v
-                                except (TypeError, ValueError):
-                                    safe_details[k] = str(v)
-                            iteration_results.append(
-                                {
-                                    "function_name": display_name,
-                                    "metric_name": "VALIDATION_ERROR",
-                                    "metric_value": float("inf"),
-                                    "param_names": [],
-                                    "code": func_code,
-                                    "error_type": e.error_type,
-                                    "error_message": e.message,
-                                    "error_details": safe_details,
-                                }
-                            )
-                            continue
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]{display_name} recovery check error: {e}[/]"
-                            )
-                            iteration_results.append(
-                                {
-                                    "function_name": display_name,
-                                    "metric_name": "FIT_ERROR",
-                                    "metric_value": float("inf"),
-                                    "param_names": [],
-                                    "code": func_code,
-                                    "error": str(e),
-                                }
-                            )
-                            capture_fit_error(
-                                iteration=it,
-                                model_name=display_name,
-                                error=e,
-                                run=run_idx,
-                            )
-                            continue
 
-                    self._set_activity(
-                        f"fitting model {i + 1}/{n_models}: {display_name} (iter {it})"
-                    )
-                    fit_res = run_fit(
-                        self.df,
-                        func_code,
-                        cfg=self.cfg,
-                        expected_func_name=func_name,
-                        structured_params=structured_params,
-                    )
-
-                    mean_metric = float(fit_res["metric_value"])
-                    metric_name = fit_res["metric_name"]
-                    params = fit_res["param_names"]
-                    self.tried_param_sets.append(params)
-
-                    console.print(
-                        f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
-                    )
-
-                    # --- Individual differences evaluation (optional) ---
-                    id_results = None
-                    if self.id_eval_data is not None:
-                        try:
-                            from gecco.offline_evaluation.individual_differences import (
-                                evaluate_individual_differences,
-                            )
-
-                            id_results = evaluate_individual_differences(
-                                fit_res, self.df, self.cfg, id_data=self.id_eval_data
-                            )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
-                            )
-
-                    # --- Validation on val split (if provided) ---
-                    val_fit_res = None
-                    val_id_results = None
-                    if self.df_val is not None:
-                        try:
-                            val_fit_res = run_fit(
-                                self.df_val,
-                                func_code,
-                                cfg=self.cfg,
-                                expected_func_name=func_name,
-                                structured_params=structured_params,
-                            )
-                            console.print(
-                                f"    [dim]val {metric_name} = [cyan]{val_fit_res['metric_value']:.2f}[/]"
-                            )
-                            if self.id_eval_data is not None:
-                                try:
-                                    val_id_results = evaluate_individual_differences(
-                                        val_fit_res,
-                                        self.df_val,
-                                        self.cfg,
-                                        id_data=self.id_eval_data,
-                                    )
-                                except Exception as e:
-                                    console.print(
-                                        f"  [yellow]Individual differences eval failed for {display_name} on val:[/] {e}"
-                                    )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Val fitting failed for {display_name}:[/] {e}"
-                            )
-
-                    # --- Posterior predictive checks (optional) ---
-                    ppc_result = None
-                    block_residuals_result = None
-                    needs_diagnostic_spec = bool(
-                        fit_res.get("parameter_values")
-                        and (
-                            (self.ppc_enabled and self._ppc_simulator is not None)
-                            or self.block_residuals_enabled
+                        self._set_activity(
+                            f"fitting model {i + 1}/{n_models}: {display_name} (iter {it})"
                         )
-                    )
-                    diagnostic_spec = None
-                    if needs_diagnostic_spec:
-                        try:
-                            from gecco.offline_evaluation.utils import build_model_spec
+                        fit_res = run_fit(
+                            self.df,
+                            func_code,
+                            cfg=self.cfg,
+                            expected_func_name=func_name,
+                            structured_params=structured_params,
+                        )
 
-                            diagnostic_spec = build_model_spec(
-                                func_code,
-                                expected_func_name=func_name,
-                                cfg=self.cfg,
-                                structured_params=structured_params,
-                            )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Diagnostic spec build failed for {display_name}:[/] {e}"
-                            )
+                        mean_metric = float(fit_res["metric_value"])
+                        metric_name = fit_res["metric_name"]
+                        params = fit_res["param_names"]
+                        self.tried_param_sets.append(params)
 
-                    if (
-                        self.ppc_enabled
-                        and self._ppc_simulator is not None
-                        and fit_res.get("parameter_values")
-                        and diagnostic_spec is not None
-                    ):
-                        try:
-                            from gecco.offline_evaluation.ppc import compute_ppc
+                        console.print(
+                            f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
+                        )
 
-                            console.print(
-                                f"  [dim]Computing PPC for {display_name} "
-                                f"(n_sims={self.ppc_n_sims})...[/]"
-                            )
-
-                            # Count participants for progress bar
-                            from gecco.offline_evaluation.ppc import _get_participants
-
-                            _, participants = _get_participants(self.df)
-                            n_participants = len(participants)
-
-                            # Create progress bar for PPC
-                            ppc_progress = Progress(
-                                TextColumn("[progress.description]{task.description}"),
-                                BarColumn(),
-                                MofNCompleteColumn(),
-                                TimeElapsedColumn(),
-                            )
-
-                            with ppc_progress:
-                                task_id = ppc_progress.add_task(
-                                    f"  [dim]PPC {display_name}[/]",
-                                    total=n_participants,
+                        # --- Individual differences evaluation (optional) ---
+                        id_results = None
+                        if self.id_eval_data is not None:
+                            try:
+                                from gecco.offline_evaluation.individual_differences import (
+                                    evaluate_individual_differences,
                                 )
-                                ppc_result = compute_ppc(
+
+                                id_results = evaluate_individual_differences(
+                                    fit_res, self.df, self.cfg, id_data=self.id_eval_data
+                                )
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
+                                )
+
+                        # --- Validation on val split (if provided) ---
+                        val_fit_res = None
+                        val_id_results = None
+                        if self.df_val is not None:
+                            try:
+                                val_fit_res = run_fit(
+                                    self.df_val,
+                                    func_code,
+                                    cfg=self.cfg,
+                                    expected_func_name=func_name,
+                                    structured_params=structured_params,
+                                )
+                                console.print(
+                                    f"    [dim]val {metric_name} = [cyan]{val_fit_res['metric_value']:.2f}[/]"
+                                )
+                                if self.id_eval_data is not None:
+                                    try:
+                                        val_id_results = evaluate_individual_differences(
+                                            val_fit_res,
+                                            self.df_val,
+                                            self.cfg,
+                                            id_data=self.id_eval_data,
+                                        )
+                                    except Exception as e:
+                                        console.print(
+                                            f"  [yellow]Individual differences eval failed for {display_name} on val:[/] {e}"
+                                        )
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]Val fitting failed for {display_name}:[/] {e}"
+                                )
+
+                        # --- Posterior predictive checks (optional) ---
+                        ppc_result = None
+                        block_residuals_result = None
+                        needs_diagnostic_spec = bool(
+                            fit_res.get("parameter_values")
+                            and (
+                                (self.ppc_enabled and self._ppc_simulator is not None)
+                                or self.block_residuals_enabled
+                            )
+                        )
+                        diagnostic_spec = None
+                        if needs_diagnostic_spec:
+                            try:
+                                from gecco.offline_evaluation.utils import build_model_spec
+
+                                diagnostic_spec = build_model_spec(
+                                    func_code,
+                                    expected_func_name=func_name,
+                                    cfg=self.cfg,
+                                    structured_params=structured_params,
+                                )
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]Diagnostic spec build failed for {display_name}:[/] {e}"
+                                )
+
+                        if (
+                            self.ppc_enabled
+                            and self._ppc_simulator is not None
+                            and fit_res.get("parameter_values")
+                            and diagnostic_spec is not None
+                        ):
+                            try:
+                                from gecco.offline_evaluation.ppc import compute_ppc
+
+                                console.print(
+                                    f"  [dim]Computing PPC for {display_name} "
+                                    f"(n_sims={self.ppc_n_sims})...[/]"
+                                )
+
+                                # Count participants for progress bar
+                                from gecco.offline_evaluation.ppc import _get_participants
+
+                                _, participants = _get_participants(self.df)
+                                n_participants = len(participants)
+
+                                # Create progress bar for PPC
+                                ppc_progress = Progress(
+                                    TextColumn("[progress.description]{task.description}"),
+                                    BarColumn(),
+                                    MofNCompleteColumn(),
+                                    TimeElapsedColumn(),
+                                )
+
+                                with ppc_progress:
+                                    task_id = ppc_progress.add_task(
+                                        f"  [dim]PPC {display_name}[/]",
+                                        total=n_participants,
+                                    )
+                                    ppc_result = compute_ppc(
+                                        spec=diagnostic_spec,
+                                        df=self.df,
+                                        fitted_params_list=fit_res["parameter_values"],
+                                        simulator=self._ppc_simulator,
+                                        n_sims=self.ppc_n_sims,
+                                        input_columns=list(self.cfg.data.input_columns),
+                                        n_jobs=-1,
+                                        progress_callback=lambda: ppc_progress.advance(
+                                            task_id
+                                        ),
+                                    )
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]PPC failed for {display_name}:[/] {e}"
+                                )
+
+                        if (
+                            self.block_residuals_enabled
+                            and fit_res.get("parameter_values")
+                            and diagnostic_spec is not None
+                        ):
+                            try:
+                                from gecco.offline_evaluation.ppc import (
+                                    compute_block_residuals,
+                                )
+
+                                console.print(
+                                    f"  [dim]Computing block residuals for {display_name} "
+                                    f"(n_blocks={self.block_residuals_n_blocks})...[/]"
+                                )
+                                block_residuals_result = compute_block_residuals(
                                     spec=diagnostic_spec,
                                     df=self.df,
                                     fitted_params_list=fit_res["parameter_values"],
-                                    simulator=self._ppc_simulator,
-                                    n_sims=self.ppc_n_sims,
+                                    n_blocks=self.block_residuals_n_blocks,
                                     input_columns=list(self.cfg.data.input_columns),
-                                    n_jobs=-1,
-                                    progress_callback=lambda: ppc_progress.advance(
-                                        task_id
-                                    ),
                                 )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]PPC failed for {display_name}:[/] {e}"
-                            )
+                            except Exception as e:
+                                console.print(
+                                    f"  [yellow]Block residuals failed for {display_name}:[/] {e}"
+                                )
 
-                    if (
-                        self.block_residuals_enabled
-                        and fit_res.get("parameter_values")
-                        and diagnostic_spec is not None
-                    ):
-                        try:
-                            from gecco.offline_evaluation.ppc import (
-                                compute_block_residuals,
-                            )
-
-                            console.print(
-                                f"  [dim]Computing block residuals for {display_name} "
-                                f"(n_blocks={self.block_residuals_n_blocks})...[/]"
-                            )
-                            block_residuals_result = compute_block_residuals(
-                                spec=diagnostic_spec,
-                                df=self.df,
-                                fitted_params_list=fit_res["parameter_values"],
-                                n_blocks=self.block_residuals_n_blocks,
-                                input_columns=list(self.cfg.data.input_columns),
-                            )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Block residuals failed for {display_name}:[/] {e}"
-                            )
-
-                    result_dict = {
-                        "function_name": display_name,
-                        "metric_name": metric_name,
-                        "metric_value": mean_metric,
-                        "param_names": params,
-                        "code_file": str(model_file),
-                        "recovery": recovery
-                        if self.recovery_checker is not None
-                        else None,
-                        "individual_differences": id_results,
-                        "code": func_code,
-                        "eval_metrics": fit_res.get("eval_metrics", []),
-                        "participant_n_trials": fit_res.get("participant_n_trials", []),
-                        "parameter_values": fit_res.get("parameter_values", []),
-                        "mean_nll": fit_res.get("mean_nll"),
-                        "per_participant_nll": fit_res.get("per_participant_nll"),
-                    }
-                    if val_fit_res is not None:
-                        result_dict["val_metric_value"] = val_fit_res["metric_value"]
-                        result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
-                        result_dict["val_eval_metrics"] = val_fit_res["eval_metrics"]
-                        result_dict["val_per_participant_nll"] = val_fit_res[
-                            "per_participant_nll"
-                        ]
-                        result_dict["val_individual_differences"] = val_id_results
-                    if ppc_result is not None:
-                        result_dict["ppc"] = ppc_result
-                    if block_residuals_result is not None:
-                        result_dict["block_residuals"] = block_residuals_result
-                    iteration_results.append(result_dict)
-
-                    if mean_metric < self.best_metric:
-                        self.best_metric = mean_metric
-                        self.best_model = func_code
-                        self.best_iter = it
-                        self.best_params = params
-                        self.best_param_names = fit_res["param_names"]
-                        self.best_param_values = fit_res["parameter_values"]
-                        self.best_id_results = id_results
-                        console.print(
-                            f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})"
-                        )
-
-                        best_model_file = (
-                            self.results_dir
-                            / "models"
-                            / f"best_model{tag}_{run_idx}.txt"
-                            if getattr(self.cfg.evaluation, "fit_type", "group")
-                            != "individual"
-                            else self.results_dir
-                            / "models"
-                            / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
-                        )
-                        with open(best_model_file, "w") as f:
-                            f.write(func_code)
-
-                        # save best model bic
-                        best_bic_file = (
-                            self.results_dir / "bics" / f"best_bic{tag}_{run_idx}.json"
-                            if getattr(self.cfg.evaluation, "fit_type", "group")
-                            != "individual"
-                            else self.results_dir
-                            / "bics"
-                            / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
-                        )
-                        with open(best_bic_file, "w") as f:
-                            json.dump({"bic": mean_metric}, f, cls=_NumpyJSONEncoder)
-
-                        # save best model val metrics
+                        result_dict = {
+                            "function_name": display_name,
+                            "metric_name": metric_name,
+                            "metric_value": mean_metric,
+                            "param_names": params,
+                            "code_file": str(model_file),
+                            "recovery": recovery
+                            if self.recovery_checker is not None
+                            else None,
+                            "individual_differences": id_results,
+                            "code": func_code,
+                            "eval_metrics": fit_res.get("eval_metrics", []),
+                            "participant_n_trials": fit_res.get("participant_n_trials", []),
+                            "parameter_values": fit_res.get("parameter_values", []),
+                            "mean_nll": fit_res.get("mean_nll"),
+                            "per_participant_nll": fit_res.get("per_participant_nll"),
+                        }
                         if val_fit_res is not None:
-                            best_bic_val_file = (
+                            result_dict["val_metric_value"] = val_fit_res["metric_value"]
+                            result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
+                            result_dict["val_eval_metrics"] = val_fit_res["eval_metrics"]
+                            result_dict["val_per_participant_nll"] = val_fit_res[
+                                "per_participant_nll"
+                            ]
+                            result_dict["val_individual_differences"] = val_id_results
+                        if ppc_result is not None:
+                            result_dict["ppc"] = ppc_result
+                        if block_residuals_result is not None:
+                            result_dict["block_residuals"] = block_residuals_result
+                        iteration_results.append(result_dict)
+
+                        if mean_metric < self.best_metric:
+                            self.best_metric = mean_metric
+                            self.best_model = func_code
+                            self.best_iter = it
+                            self.best_params = params
+                            self.best_param_names = fit_res["param_names"]
+                            self.best_param_values = fit_res["parameter_values"]
+                            self.best_id_results = id_results
+                            console.print(
+                                f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})"
+                            )
+
+                            best_model_file = (
                                 self.results_dir
-                                / "bics"
-                                / f"best_bic_val{tag}_{run_idx}.json"
+                                / "models"
+                                / f"best_model{tag}_{run_idx}.txt"
+                                if getattr(self.cfg.evaluation, "fit_type", "group")
+                                != "individual"
+                                else self.results_dir
+                                / "models"
+                                / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
+                            )
+                            with open(best_model_file, "w") as f:
+                                f.write(func_code)
+
+                            # save best model bic
+                            best_bic_file = (
+                                self.results_dir / "bics" / f"best_bic{tag}_{run_idx}.json"
                                 if getattr(self.cfg.evaluation, "fit_type", "group")
                                 != "individual"
                                 else self.results_dir
                                 / "bics"
-                                / f"best_bic_val{tag}_{run_idx}_participant{self.df.participant[0]}.json"
+                                / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                             )
-                            with open(best_bic_val_file, "w") as f:
-                                json.dump(
-                                    {
-                                        "mean_BIC": val_fit_res["metric_value"],
-                                        "mean_NLL": val_fit_res["mean_nll"],
-                                        "individual_BIC": val_fit_res["eval_metrics"],
-                                        "individual_NLL": val_fit_res[
-                                            "per_participant_nll"
-                                        ],
-                                    },
-                                    f,
-                                    cls=_NumpyJSONEncoder,
+                            with open(best_bic_file, "w") as f:
+                                json.dump({"bic": mean_metric}, f, cls=_NumpyJSONEncoder)
+
+                            # save best model val metrics
+                            if val_fit_res is not None:
+                                best_bic_val_file = (
+                                    self.results_dir
+                                    / "bics"
+                                    / f"best_bic_val{tag}_{run_idx}.json"
+                                    if getattr(self.cfg.evaluation, "fit_type", "group")
+                                    != "individual"
+                                    else self.results_dir
+                                    / "bics"
+                                    / f"best_bic_val{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                                 )
+                                with open(best_bic_val_file, "w") as f:
+                                    json.dump(
+                                        {
+                                            "mean_BIC": val_fit_res["metric_value"],
+                                            "mean_NLL": val_fit_res["mean_nll"],
+                                            "individual_BIC": val_fit_res["eval_metrics"],
+                                            "individual_NLL": val_fit_res[
+                                                "per_participant_nll"
+                                            ],
+                                        },
+                                        f,
+                                        cls=_NumpyJSONEncoder,
+                                    )
 
-                    # ✅ stop if ANY model beats baseline
-                    if baseline_bic is not None and mean_metric < baseline_bic:
-                        stop_iterations = True
-                        # optional: break here to save compute evaluating remaining models
-                        break
+                        # ✅ stop if ANY model beats baseline
+                        if baseline_bic is not None and mean_metric < baseline_bic:
+                            stop_iterations = True
+                            # optional: break here to save compute evaluating remaining models
+                            break
 
-                except ModelValidationError as e:
+                    except ModelValidationError as e:
+                        console.print(
+                            f"  [bold red]Validation error in {display_name}:[/] {e.message}"
+                        )
+                        safe_details = {}
+                        for k, v in e.details.items():
+                            try:
+                                json.dumps(v)
+                                safe_details[k] = v
+                            except (TypeError, ValueError):
+                                safe_details[k] = str(v)
+                        iteration_results.append(
+                            {
+                                "function_name": display_name,
+                                "metric_name": "VALIDATION_ERROR",
+                                "metric_value": float("inf"),
+                                "param_names": [],
+                                "code": func_code,
+                                "error_type": e.error_type,
+                                "error_message": e.message,
+                                "error_details": safe_details,
+                            }
+                        )
+                    except Exception as e:
+                        console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
+                        iteration_results.append(
+                            {
+                                "function_name": display_name,
+                                "metric_name": "FIT_ERROR",
+                                "metric_value": float("inf"),
+                                "param_names": [],
+                                "code": func_code,
+                                "error": str(e),
+                            }
+                        )
+                        capture_fit_error(
+                            iteration=it,
+                            model_name=display_name,
+                            error=e,
+                            run=run_idx,
+                        )
+
+                self._set_activity(f"saving results (iter {it})")
+
+                # ✅ always save what happened this iteration (even if stopping)
+                bic_file = (
+                    self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}.json"
+                    if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
+                    else self.results_dir
+                    / "bics"
+                    / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
+                )
+                with open(bic_file, "w") as f:
+                    json.dump(iteration_results, f, indent=2, cls=_NumpyJSONEncoder)
+
+                self.feedback.record_iteration(it, iteration_results)
+
+                # --- Write to diagnostic store (optional) ---
+                if self.diagnostic_store is not None:
+                    try:
+                        ppc_results_map = {}
+                        for r in iteration_results:
+                            if "ppc" in r:
+                                ppc_results_map[r["function_name"]] = r["ppc"]
+                        self.diagnostic_store.write_iteration(
+                            iteration=it,
+                            run_idx=run_idx,
+                            iteration_results=iteration_results,
+                            ppc_results=ppc_results_map if ppc_results_map else None,
+                            tag=tag,
+                            client_id=self.client_id,
+                        )
+                    except Exception as e:
+                        console.print(f"  [yellow]Diagnostic store write failed:[/] {e}")
+
+                # --- Check for syntax retry ---
+                # Determine if we had any runnable models
+                had_runnable_model = (
+                    any(
+                        r.get("metric_name") not in ("VALIDATION_ERROR", "FIT_ERROR", None)
+                        for r in iteration_results
+                    )
+                    if iteration_results
+                    else False
+                )
+
+                # Check if ALL models failed with syntax/validation errors
+                all_syntax_errors = (
+                    all(
+                        r.get("metric_name") in ("VALIDATION_ERROR", "FIT_ERROR")
+                        for r in iteration_results
+                    )
+                    and iteration_results
+                )
+
+                if all_syntax_errors and syntax_retry_count < max_syntax_retries:
+                    # Build error feedback for regeneration
+                    error_feedback = self._build_syntax_error_feedback(iteration_results)
+                    feedback = error_feedback
+                    syntax_retry_count += 1
                     console.print(
-                        f"  [bold red]Validation error in {display_name}:[/] {e.message}"
+                        f"[yellow]All models failed syntax validation, retrying "
+                        f"({syntax_retry_count}/{max_syntax_retries})[/]"
                     )
-                    safe_details = {}
-                    for k, v in e.details.items():
-                        try:
-                            json.dumps(v)
-                            safe_details[k] = v
-                        except (TypeError, ValueError):
-                            safe_details[k] = str(v)
-                    iteration_results.append(
-                        {
-                            "function_name": display_name,
-                            "metric_name": "VALIDATION_ERROR",
-                            "metric_value": float("inf"),
-                            "param_names": [],
-                            "code": func_code,
-                            "error_type": e.error_type,
-                            "error_message": e.message,
-                            "error_details": safe_details,
-                        }
-                    )
-                except Exception as e:
-                    console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
-                    iteration_results.append(
-                        {
-                            "function_name": display_name,
-                            "metric_name": "FIT_ERROR",
-                            "metric_value": float("inf"),
-                            "param_names": [],
-                            "code": func_code,
-                            "error": str(e),
-                        }
-                    )
-                    capture_fit_error(
-                        iteration=it,
-                        model_name=display_name,
-                        error=e,
-                        run=run_idx,
-                    )
+                    # Continue the while loop to regenerate
+                    continue
 
-            self._set_activity(f"saving results (iter {it})")
+                # --- Push results to shared registry (distributed mode) ---
+                # Determine completion status
+                if had_runnable_model:
+                    completion_status = "complete"
+                else:
+                    completion_status = "complete_no_success"
+                self._update_registry(
+                    it,
+                    iteration_results,
+                    status=completion_status,
+                    had_runnable_model=had_runnable_model,
+                )
 
-            # ✅ always save what happened this iteration (even if stopping)
-            bic_file = (
-                self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}.json"
-                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir
-                / "bics"
-                / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
-            )
-            with open(bic_file, "w") as f:
-                json.dump(iteration_results, f, indent=2, cls=_NumpyJSONEncoder)
-
-            self.feedback.record_iteration(it, iteration_results)
-
-            # --- Write to diagnostic store (optional) ---
-            if self.diagnostic_store is not None:
-                try:
-                    ppc_results_map = {}
-                    for r in iteration_results:
-                        if "ppc" in r:
-                            ppc_results_map[r["function_name"]] = r["ppc"]
-                    self.diagnostic_store.write_iteration(
-                        iteration=it,
-                        run_idx=run_idx,
-                        iteration_results=iteration_results,
-                        ppc_results=ppc_results_map if ppc_results_map else None,
-                        tag=tag,
-                        client_id=self.client_id,
-                    )
-                except Exception as e:
-                    console.print(f"  [yellow]Diagnostic store write failed:[/] {e}")
-
-            # --- Push results to shared registry (distributed mode) ---
-            self._update_registry(it, iteration_results)
+                # Break out of retry loop - we're done with this iteration
+                break
 
         console.print(
             f"\n[bold]Search complete.[/] "

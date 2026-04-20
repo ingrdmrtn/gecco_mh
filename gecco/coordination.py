@@ -115,11 +115,19 @@ class SharedRegistry:
         param_names=None,
         tried_param_sets=None,
         status="running",
+        had_runnable_model=None,
     ):
         """
         Atomically merge this client's iteration results into the registry.
 
         Uses an exclusive lock around read-modify-write.
+
+        Parameters
+        ----------
+        status : str
+            One of: "running" | "retrying" | "complete" | "complete_no_success"
+        had_runnable_model : bool, optional
+            Whether the client produced at least one runnable model in this iteration.
         """
         with open(self.registry_path, "a+") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -133,12 +141,16 @@ class SharedRegistry:
 
                 # Update client entry (preserve existing fields like activity)
                 existing_entry = data["client_entries"].get(str(client_id), {})
-                existing_entry.update({
-                    "last_iteration": iteration,
-                    "best_metric": best_metric,
-                    "status": status,
-                    "updated_at": datetime.now().isoformat(),
-                })
+                existing_entry.update(
+                    {
+                        "last_iteration": iteration,
+                        "best_metric": best_metric,
+                        "status": status,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                )
+                if had_runnable_model is not None:
+                    existing_entry["had_runnable_model"] = had_runnable_model
                 data["client_entries"][str(client_id)] = existing_entry
 
                 # Append iteration history (strip non-serializable fields)
@@ -384,6 +396,88 @@ class SharedRegistry:
 
             time.sleep(poll_seconds)
 
+    def count_clients_complete(self, iteration: int) -> int:
+        """
+        Count clients who completed an iteration (not retrying).
+
+        Returns the count of clients with status in ("complete", "complete_no_success").
+        """
+        data = self.read()
+        count = 0
+        for entry in data.get("iteration_history", []):
+            if entry.get("iteration") == iteration:
+                client_id = entry.get("client_id")
+                client_entry = data.get("client_entries", {}).get(str(client_id), {})
+                if client_entry.get("status") in ("complete", "complete_no_success"):
+                    count += 1
+        return count
+
+    def count_clients_with_models(self, iteration: int) -> int:
+        """
+        Count clients who produced at least one runnable model.
+
+        Returns the count of clients where had_runnable_model is True.
+        """
+        data = self.read()
+        count = 0
+        for entry in data.get("iteration_history", []):
+            if entry.get("iteration") == iteration:
+                client_id = entry.get("client_id")
+                client_entry = data.get("client_entries", {}).get(str(client_id), {})
+                if client_entry.get("had_runnable_model", False):
+                    count += 1
+        return count
+
+    def wait_for_clients_complete(
+        self,
+        iteration: int,
+        n_expected: int,
+        timeout_seconds: float,
+        poll_seconds: float = 5.0,
+    ) -> int:
+        """
+        Poll until n_expected clients have completed an iteration (not retrying).
+
+        This is different from wait_for_iteration which counts clients who wrote
+        ANY results. This method waits for clients to mark themselves as complete,
+        accounting for retry scenarios where clients may regenerate models.
+
+        Parameters
+        ----------
+        iteration : int
+            Iteration number to wait for
+        n_expected : int
+            Number of clients expected to complete
+        timeout_seconds : float
+            Maximum time to wait
+        poll_seconds : float
+            Polling interval
+
+        Returns
+        -------
+        int
+            Number of clients who completed
+        """
+        start_time = time.time()
+        while True:
+            count = self.count_clients_complete(iteration)
+            if count >= n_expected:
+                console.print(
+                    f"[green]Iteration {iteration} complete: {count}/{n_expected} clients "
+                    f"in {time.time() - start_time:.1f}s[/]"
+                )
+                return count
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                console.print(
+                    f"[yellow]Iteration {iteration} timeout: got {count}/{n_expected} complete clients "
+                    f"after {elapsed:.1f}s, proceeding with available results[/]"
+                )
+                return count
+
+            time.sleep(poll_seconds)
+
     def set_judge_feedback(
         self,
         iteration: int,
@@ -500,7 +594,9 @@ class SharedRegistry:
             feedback_dict = {"default": feedback_dict}
 
         # Get persona-specific feedback or fall back
-        persona_feedback = feedback_dict.get(persona_name, feedback_dict.get(fallback, ""))
+        persona_feedback = feedback_dict.get(
+            persona_name, feedback_dict.get(fallback, "")
+        )
 
         return {
             "synthesized_feedback": persona_feedback,

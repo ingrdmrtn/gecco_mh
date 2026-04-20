@@ -57,9 +57,15 @@ class LoopConfig(BaseModel):
     n_clients: Optional[int] = None  # Number of clients for barrier synchronization
 
 
+class ValidationConfig(BaseModel):
+    retry_limit: int = 3
+    max_syntax_retries: int = 2  # NEW: retries for syntax/validation failures
+
+
 class BarrierConfig(BaseModel):
     orchestrator_wait_seconds: float = 1800  # Orchestrator waits for clients
     client_wait_seconds: float = 1800  # Clients wait for orchestrator
+    retry_wait_seconds: float = 300  # NEW: extra time for client retries
 
 
 class JudgeStuckSearchConfig(BaseModel):
@@ -95,6 +101,7 @@ class GeCCoConfig(BaseModel):
     loop: Optional[LoopConfig] = None
     judge: Optional[JudgeConfig] = None
     sentry: Optional[SentryConfig] = None
+    validation: Optional[ValidationConfig] = None
 
 
 def load_data_from_config(cfg):

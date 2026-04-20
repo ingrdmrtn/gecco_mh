@@ -131,13 +131,15 @@ class SharedRegistry:
                 else:
                     data = self._empty_registry()
 
-                # Update client entry
-                data["client_entries"][str(client_id)] = {
+                # Update client entry (preserve existing fields like activity)
+                existing_entry = data["client_entries"].get(str(client_id), {})
+                existing_entry.update({
                     "last_iteration": iteration,
                     "best_metric": best_metric,
                     "status": status,
                     "updated_at": datetime.now().isoformat(),
-                }
+                })
+                data["client_entries"][str(client_id)] = existing_entry
 
                 # Append iteration history (strip non-serializable fields)
                 serializable_results = []

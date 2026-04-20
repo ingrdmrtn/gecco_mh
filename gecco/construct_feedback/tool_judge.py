@@ -391,36 +391,45 @@ class _OpenAIToolLoop:
                 n_calls += 1
 
                 # Interleaved reflection nudge after each tool call
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Briefly reflect: what did this tell you, and does it change what "
-                        "you want to investigate next? Then make your next tool call (or "
-                        "produce your verdict if you have enough evidence)."
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Briefly reflect: what did this tell you, and does it change what "
+                            "you want to investigate next? Then make your next tool call (or "
+                            "produce your verdict if you have enough evidence)."
+                        ),
+                    }
+                )
 
                 # Mid-loop budget reminders (fire at most once each)
                 if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
-                            f"You still have room to investigate further if results so far "
-                            f"raise open questions. If you have enough evidence to synthesise "
-                            f"a verdict, you can do so now; otherwise keep going."
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
+                                f"You still have room to investigate further if results so far "
+                                f"raise open questions. If you have enough evidence to synthesise "
+                                f"a verdict, you can do so now; otherwise keep going."
+                            ),
+                        }
+                    )
                     budget_reminder_mid_done = True
-                elif n_calls == int(max_tool_calls * 0.8) and not budget_reminder_late_done:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
-                            f"Wrap up any final high-priority investigations or synthesise "
-                            f"your findings now."
-                        ),
-                    })
+                elif (
+                    n_calls == int(max_tool_calls * 0.8)
+                    and not budget_reminder_late_done
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
+                                f"Wrap up any final high-priority investigations or synthesise "
+                                f"your findings now."
+                            ),
+                        }
+                    )
                     budget_reminder_late_done = True
 
                 if n_calls >= max_tool_calls:
@@ -499,7 +508,12 @@ class _GeminiToolLoop:
             f"points — you are free to adapt as results come in. You have a soft budget "
             f"of {max_tool_calls} tool calls total. Do not call tools in this message."
         )
-        contents = [{"role": "user", "parts": [{"text": user_message + "\n\n" + planning_instruction}]}]
+        contents = [
+            {
+                "role": "user",
+                "parts": [{"text": user_message + "\n\n" + planning_instruction}],
+            }
+        ]
         trace: list[dict] = []
         full_trace: list[dict] = []
         n_calls = 0
@@ -545,9 +559,7 @@ class _GeminiToolLoop:
         contents.append(
             {
                 "role": "model",
-                "parts": [
-                    {"text": planning_text}
-                ],
+                "parts": [{"text": planning_text}],
             }
         )
 
@@ -581,7 +593,7 @@ class _GeminiToolLoop:
                 for p in resp.candidates[0].content.parts
                 if hasattr(p, "text") and p.text
             ]
-            
+
             # Verbose: print assistant text (if any)
             if self.verbose and text_parts:
                 for line in "\n".join(text_parts).splitlines():
@@ -589,7 +601,9 @@ class _GeminiToolLoop:
 
             # Capture reflection if text is present
             if text_parts:
-                full_trace.append({"type": "reflection", "content": "\n".join(text_parts)})
+                full_trace.append(
+                    {"type": "reflection", "content": "\n".join(text_parts)}
+                )
 
             # Check for function calls
             has_function_calls = False
@@ -648,36 +662,57 @@ class _GeminiToolLoop:
                     n_calls += 1
 
                     # Interleaved reflection nudge after each tool call
-                    contents.append({
-                        "role": "user",
-                        "parts": [{"text": (
-                            "Briefly reflect: what did this tell you, and does it change what "
-                            "you want to investigate next? Then make your next tool call (or "
-                            "produce your verdict if you have enough evidence)."
-                        )}],
-                    })
+                    contents.append(
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "text": (
+                                        "Briefly reflect: what did this tell you, and does it change what "
+                                        "you want to investigate next? Then make your next tool call (or "
+                                        "produce your verdict if you have enough evidence)."
+                                    )
+                                }
+                            ],
+                        }
+                    )
 
                     # Mid-loop budget reminders (fire at most once each)
                     if n_calls == max_tool_calls // 2 and not budget_reminder_mid_done:
-                        contents.append({
-                            "role": "user",
-                            "parts": [{"text": (
-                                f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
-                                f"You still have room to investigate further if results so far "
-                                f"raise open questions. If you have enough evidence to synthesise "
-                                f"a verdict, you can do so now; otherwise keep going."
-                            )}],
-                        })
+                        contents.append(
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {
+                                        "text": (
+                                            f"Budget check: {n_calls}/{max_tool_calls} tool calls used. "
+                                            f"You still have room to investigate further if results so far "
+                                            f"raise open questions. If you have enough evidence to synthesise "
+                                            f"a verdict, you can do so now; otherwise keep going."
+                                        )
+                                    }
+                                ],
+                            }
+                        )
                         budget_reminder_mid_done = True
-                    elif n_calls == int(max_tool_calls * 0.8) and not budget_reminder_late_done:
-                        contents.append({
-                            "role": "user",
-                            "parts": [{"text": (
-                                f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
-                                f"Wrap up any final high-priority investigations or synthesise "
-                                f"your findings now."
-                            )}],
-                        })
+                    elif (
+                        n_calls == int(max_tool_calls * 0.8)
+                        and not budget_reminder_late_done
+                    ):
+                        contents.append(
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {
+                                        "text": (
+                                            f"Budget warning: {n_calls}/{max_tool_calls} tool calls used. "
+                                            f"Wrap up any final high-priority investigations or synthesise "
+                                            f"your findings now."
+                                        )
+                                    }
+                                ],
+                            }
+                        )
                         budget_reminder_late_done = True
 
                     if n_calls >= max_tool_calls:
@@ -793,7 +828,9 @@ def _parse_verdict_from_text(
                 wall_time_seconds=wall_time,
             )
             # Stash cited_models for later validation (not a Pydantic field)
-            object.__setattr__(verdict, "_cited_models_raw", data.get("cited_models", []))
+            object.__setattr__(
+                verdict, "_cited_models_raw", data.get("cited_models", [])
+            )
             return verdict
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
@@ -813,16 +850,16 @@ def _parse_verdict_from_text(
 # Synthesis prompt — second-pass structured extraction
 # ======================================================================
 
-_SYNTHESIS_PROMPT = """Based on your analysis above, please produce a final verdict as a JSON object with this exact structure:
+_SYNTHESIS_PROMPT_TEMPLATE = """Based on your analysis above, please produce a final verdict as a JSON object with this exact structure:
 
 ```json
-{
+{{
   "per_angle": [
-    {
-      "angle": "Statistical fit quality",
+    {{
+      "angle": "<angle name>",
       "findings": "...",
       "confidence": "high"
-    }
+    }}
   ],
   "key_recommendations": [
     "Recommendation 1...",
@@ -830,46 +867,310 @@ _SYNTHESIS_PROMPT = """Based on your analysis above, please produce a final verd
   ],
   "synthesized_feedback": "Structured feedback (≤ 500 words) for the model-generating LLM.",
   "cited_models": [
-    {"name": "rwg_alpha_beta", "bic": 2847.2, "mechanism": "separate lr gain/loss"},
-    {"name": "base_rwg", "bic": 3102.1, "mechanism": "standard RW with single lr"}
+    {{"name": "rwg_alpha_beta", "bic": 2847.2, "mechanism": "separate lr gain/loss"}},
+    {{"name": "base_rwg", "bic": 3102.1, "mechanism": "standard RW with single lr"}}
   ]
-}
+}}
 ```
 
-Include one entry in per_angle for each of the six angles:
-1. Statistical fit quality
-2. Parameter identifiability
-3. Predictive adequacy
-4. Individual differences
-5. Mechanistic / theoretical coherence
-6. Coverage
+Include one entry in per_angle for each of the following {num_angles} analytical perspectives:
+{angles_list}
 
-SYNTHESIZED_FEEDBACK FORMAT — The `synthesized_feedback` field must follow this four-section structure:
+SYNTHESIZED_FEEDBACK FORMAT — The `synthesized_feedback` field must follow this structure:
 
-1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically (not by ID), including BIC values. Example: "The model with separate learning rates for gains and losses (separate_lr, BIC=2847) performed best..."
-
-2. **What partially worked** (2-3 sentences) — Describe models that showed promise in some areas but had issues in others. Be specific about strengths and weaknesses. Example: "The model with choice-stickiness had good fit for early trials but poor recovery on the stickiness parameter..."
-
-3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them. Example: "Models with decaying learning rates consistently showed poor parameter recovery..."
-
-4. **What to try next** (2-4 sentences) — Concrete suggestions framed as "try X because Y". Example: "Try combining the separate gain/loss learning rates with a perseveration mechanism because both showed promise independently..."
+{feedback_format_instructions}
 If previous verdict context was provided, explicitly note whether prior suggestions were followed and whether they appeared to help.
 
 IMPORTANT PROHIBITIONS — Never reference:
-- "Angles" or analytical perspectives (the generator doesn't know what these are)
-- Tool call names (e.g., "get_best_models", "get_bic_trajectory")
-- Numeric model IDs (e.g., "ID 11", "model 5") — cite models as \
-"mechanistic description (name, BIC=X)" instead. The BIC disambiguates \
-models that share a generated name across iterations.
-- Internal database fields or conventions
+{prohibitions}
 
-Always describe models by their mechanisms and cite actual metric values (BIC, r, R²) from your analysis.
+{always_cite}
 
 The `cited_models` field must list every model you referenced by name in `synthesized_feedback`. \
-Include the exact `name` string, the BIC value you cited, and a one-line mechanism description. \
+{cited_models_format} \
 This is used to verify citations against the database — only include models whose names you \
 actually found in tool results.
 """
+
+# ===== Persona-specific synthesis profiles =====
+# Each profile customizes the analytical angles, terminology, and format for a specific persona.
+# Personas not listed here fall back to _DEFAULT_PROFILE.
+
+_DEFAULT_PROFILE = {
+    "angles": [
+        ("Statistical fit quality", "Which model(s) fit best and by how much"),
+        ("Parameter identifiability", "Whether key parameters can be recovered"),
+        ("Predictive adequacy", "How well models predict held-out data"),
+        (
+            "Individual differences",
+            "Whether models capture between-subject variability",
+        ),
+        ("Mechanistic / theoretical coherence", "Alignment with underlying theory"),
+        ("Coverage", "How much of the data the model explains"),
+    ],
+    "metric_language": "BIC values, parameter recovery correlations (r), and R²",
+    "model_description_style": "mechanistic description (name, BIC=X)",
+    "feedback_format_instructions": (
+        "1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically "
+        '(not by ID), including BIC values. Example: "The model with separate learning rates '
+        'for gains and losses (separate_lr, BIC=2847) performed best..."\n\n'
+        "2. **What partially worked** (2-3 sentences) — Describe models that showed promise "
+        "in some areas but had issues in others. Be specific about strengths and weaknesses.\n\n"
+        "3. **What didn't work** (1-2 sentences) — Describe failed approaches so the "
+        "generator avoids repeating them.\n\n"
+        "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as "
+        '"try X because Y".'
+    ),
+    "cited_models_format": (
+        "Include the exact `name` string, the BIC value you cited, and a one-line "
+        "mechanism description."
+    ),
+    "prohibitions": (
+        '- "Angles" or analytical perspectives\n'
+        '- Tool call names (e.g., "get_best_models", "get_bic_trajectory")\n'
+        '- Numeric model IDs (e.g., "ID 11", "model 5")\n'
+        "- Internal database fields or conventions"
+    ),
+    "always_cite": "Always describe models by their mechanisms and cite actual metric values from your analysis.",
+}
+
+_PERSONA_PROFILES: dict[str, dict] = {
+    "naive_psychologist": {
+        "angles": [
+            (
+                "Behavioural patterns",
+                "Which psychological processes the models captured well",
+            ),
+            (
+                "Learning and adaptation",
+                "How well models track changes in behaviour over time",
+            ),
+            (
+                "Consistency and habits",
+                "Whether models explain repetitive or habitual choices",
+            ),
+            (
+                "Individual differences",
+                "Whether models capture how different people behave differently",
+            ),
+            (
+                "Psychological coherence",
+                "How well models align with everyday psychological intuition",
+            ),
+            ("Coverage", "How much of the observed behaviour the models explain"),
+        ],
+        "metric_language": "plain descriptions of how well models captured behaviour",
+        "model_description_style": "psychological intuition (e.g., 'the model that tracks how quickly people forget old information')",
+        "feedback_format_instructions": (
+            "1. **What worked** (1-2 sentences) — Describe the best approach in plain "
+            "psychological terms. Describe models by what they capture about human behaviour, "
+            'not by name or BIC. Example: "The approach that models how people gradually '
+            'forget previous outcomes captured behaviour best..."\n\n'
+            "2. **What partially worked** (2-3 sentences) — Describe approaches that captured "
+            "some patterns but missed others, in everyday language.\n\n"
+            "3. **What didn't work** (1-2 sentences) — Describe approaches that failed to "
+            "capture behaviour, so the generator avoids repeating them.\n\n"
+            "4. **What to try next** (2-4 sentences) — Concrete suggestions framed in "
+            "psychological terms, e.g. \"Try modelling how people's attention shifts over time "
+            'because the data suggests...".'
+        ),
+        "cited_models_format": (
+            "Describe each model by the psychological process it captures. "
+            "Do NOT include BIC values, parameter names, or code names."
+        ),
+        "prohibitions": (
+            '- "Angles" or analytical perspectives\n'
+            "- Tool call names\n"
+            "- Numeric model IDs\n"
+            "- BIC values, parameter names, model code names\n"
+            '- Equations, computational jargon, or terms like "model-based", '
+            '"model-free", "Q-value", "reinforcement learning"\n'
+            "- Internal database fields or conventions"
+        ),
+        "always_cite": (
+            "Always describe models by their psychological intuition and cite "
+            "plain-language observations about behaviour. Do NOT include equations, "
+            "parameter names, or statistical jargon."
+        ),
+    },
+    "bayesian": {
+        "angles": [
+            ("Model evidence", "Which models have the strongest Bayesian evidence"),
+            ("Prior sensitivity", "How results depend on prior specifications"),
+            ("Posterior convergence", "Whether posteriors are well-constrained"),
+            (
+                "Uncertainty calibration",
+                "How well uncertainty estimates match observed variability",
+            ),
+            ("Belief updating", "Whether models capture how beliefs evolve over time"),
+            ("Coverage", "How much of the data the models explain"),
+        ],
+        "metric_language": "BIC values (as an approximation to model evidence), prior-posterior comparisons, and parameter recovery",
+        "model_description_style": "mechanistic description (name, BIC=X), emphasizing uncertainty representation",
+        "feedback_format_instructions": (
+            "1. **What worked** (1-2 sentences) — Describe the best model(s) in terms of "
+            "their uncertainty representation and belief updating, including BIC values. "
+            'Example: "The model that tracks uncertainty about reward probabilities '
+            '(bayesian_beta_decay, BIC=2847) performed best..."\n\n'
+            "2. **What partially worked** (2-3 sentences) — Describe models with promising "
+            "uncertainty representations but issues in other areas.\n\n"
+            "3. **What didn't work** (1-2 sentences) — Describe approaches that failed to "
+            "adequately represent uncertainty or update beliefs appropriately.\n\n"
+            "4. **What to try next** (2-4 sentences) — Concrete suggestions for improving "
+            "uncertainty tracking, prior specification, or belief updating."
+        ),
+        "cited_models_format": (
+            "Include the exact `name` string, the BIC value, and a description of how "
+            "the model represents and updates uncertainty."
+        ),
+        "prohibitions": _DEFAULT_PROFILE["prohibitions"],
+        "always_cite": (
+            "Always describe models by how they represent and update uncertainty, "
+            "and cite BIC values and prior-posterior comparisons from your analysis."
+        ),
+    },
+    "latent_mixture": {
+        "angles": [
+            ("Model evidence", "Which mixture models fit best and by how much"),
+            (
+                "Component separation",
+                "How well mixture components distinguish participant subgroups",
+            ),
+            (
+                "Class identifiability",
+                "Whether class-specific parameters are recoverable",
+            ),
+            (
+                "Mixing proportion recoverability",
+                "Whether the proportion of each class is well-estimated",
+            ),
+            (
+                "Mechanistic coherence",
+                "Whether each class represents a coherent computational strategy",
+            ),
+            (
+                "Coverage",
+                "How much of the between-subject variability the mixture explains",
+            ),
+        ],
+        "metric_language": "BIC values, class separation metrics, and parameter recovery by class",
+        "model_description_style": "mechanistic description (name, BIC=X), emphasizing class structure",
+        "feedback_format_instructions": (
+            "1. **What worked** (1-2 sentences) — Describe the best mixture model, including "
+            "BIC values and how well it separated participant subgroups. "
+            'Example: "The two-class model distinguishing explorers from exploiters '
+            '(latent_mixture_v2, BIC=2847) performed best..."\n\n'
+            "2. **What partially worked** (2-3 sentences) — Describe mixture models with good "
+            "fit but poor class separation or identifiability issues.\n\n"
+            "3. **What didn't work** (1-2 sentences) — Describe approaches where classes "
+            "collapsed or mixing proportions were unidentifiable.\n\n"
+            "4. **What to try next** (2-4 sentences) — Concrete suggestions for improving "
+            "class separation, trying different numbers of components, or alternative "
+            "mechanisms per class."
+        ),
+        "cited_models_format": (
+            "Include the exact `name` string, the BIC value, the number of classes, "
+            "and a description of what each class represents."
+        ),
+        "prohibitions": _DEFAULT_PROFILE["prohibitions"],
+        "always_cite": (
+            "Always describe models by their class structure and cite BIC values, "
+            "class separation quality, and mixing proportion estimates from your analysis."
+        ),
+    },
+    "latent_state_inference": {
+        "angles": [
+            ("Model evidence", "Which latent state models fit best and by how much"),
+            (
+                "Belief state quality",
+                "How well belief states track hidden task structure",
+            ),
+            (
+                "Belief updating",
+                "Whether belief-updating schemes match observed behaviour",
+            ),
+            (
+                "State identifiability",
+                "Whether latent states are recoverable from data",
+            ),
+            ("Choice influence", "How well belief states predict first-stage choices"),
+            ("Coverage", "How much of the data the models explain"),
+        ],
+        "metric_language": "BIC values, belief state recovery correlations, and prediction accuracy",
+        "model_description_style": "mechanistic description (name, BIC=X), emphasizing belief state structure",
+        "feedback_format_instructions": (
+            "1. **What worked** (1-2 sentences) — Describe the best latent state model, "
+            "including BIC values and how well belief states tracked task structure. "
+            'Example: "The model that infers hidden context states '
+            '(latent_state_v3, BIC=2847) performed best..."\n\n'
+            "2. **What partially worked** (2-3 sentences) — Describe models with good "
+            "belief states but poor updating or choice prediction.\n\n"
+            "3. **What didn't work** (1-2 sentences) — Describe approaches where belief "
+            "states were unidentifiable or failed to influence choices.\n\n"
+            "4. **What to try next** (2-4 sentences) — Concrete suggestions for improving "
+            "belief updating, state representation, or the influence of beliefs on choices."
+        ),
+        "cited_models_format": (
+            "Include the exact `name` string, the BIC value, and a description of "
+            "what latent states the model infers and how beliefs are updated."
+        ),
+        "prohibitions": _DEFAULT_PROFILE["prohibitions"],
+        "always_cite": (
+            "Always describe models by their belief state structure and cite BIC values, "
+            "belief recovery quality, and state-choice correlations from your analysis."
+        ),
+    },
+}
+
+_PROFILE_KEYS = frozenset(_DEFAULT_PROFILE.keys())
+
+
+def _profile_from_config(config_profile, fallback_profile: dict) -> dict:
+    """Build a profile dict from config, filling missing keys from fallback.
+
+    The config can specify any subset of profile keys (angles, metric_language,
+    feedback_format_instructions, etc.). Missing keys are filled from the fallback
+    profile (usually _DEFAULT_PROFILE).
+
+    The 'angles' key in config can be:
+    - A list of strings (just angle names, descriptions auto-generated)
+    - A list of [name, description] pairs
+    - A dict mapping angle names to descriptions
+    """
+    result = {}
+    cfg_dict = (
+        config_profile if isinstance(config_profile, dict) else vars(config_profile)
+    )
+
+    for key in _PROFILE_KEYS:
+        if key in cfg_dict:
+            value = cfg_dict[key]
+            if key == "angles":
+                value = _parse_angles(value)
+            result[key] = value
+        else:
+            result[key] = fallback_profile[key]
+
+    return result
+
+
+def _parse_angles(value) -> list[tuple[str, str]]:
+    """Normalize angles from various config formats to list of (name, desc) tuples."""
+    if isinstance(value, dict):
+        return list(value.items())
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                result.append((str(item[0]), str(item[1])))
+            elif isinstance(item, dict):
+                name = item.get("name", item.get("angle", ""))
+                desc = item.get("description", item.get("desc", ""))
+                result.append((name, desc))
+            else:
+                result.append((str(item), ""))
+        return result
+    raise ValueError(f"Cannot parse angles from: {value!r}")
 
 
 # ======================================================================
@@ -885,9 +1186,7 @@ def _format_trajectory(traj: list[dict]) -> str:
     if not traj:
         return "N/A"
     values = [
-        row.get("best_metric")
-        for row in traj
-        if row.get("best_metric") is not None
+        row.get("best_metric") for row in traj if row.get("best_metric") is not None
     ]
     if not values:
         return "N/A"
@@ -908,14 +1207,14 @@ def _format_trajectory(traj: list[dict]) -> str:
 def _detect_stuck(trajectory: list[dict], tol: float = 10.0, window: int = 2) -> bool:
     """Return True if the best BIC has not improved by more than *tol*
     over the last *window* iterations.
-    
+
     R3: Updated defaults from tol=1.0, window=3 to tol=10.0, window=2 per plan.
     """
     if len(trajectory) < window + 1:
         return False
     recent = [
         row["best_metric"]
-        for row in trajectory[-(window + 1):]
+        for row in trajectory[-(window + 1) :]
         if row.get("best_metric") is not None
     ]
     if len(recent) < window + 1:
@@ -973,8 +1272,9 @@ class ToolUsingJudge:
         if self.stuck_search_cfg is None:
             # Default values per config schema
             from types import SimpleNamespace
+
             self.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
-        
+
         self.model_name: str = getattr(cfg.llm, "base_model", "unknown")
         self.provider: str = getattr(cfg.llm, "provider", "").lower()
         self.max_tokens: int = getattr(
@@ -1127,10 +1427,10 @@ class ToolUsingJudge:
         **kwargs,
     ) -> dict:
         """R2: Run analysis phase only, return analysis text and trace.
-        
+
         This is called once per iteration by the orchestrator, then the trace
         is reused for all persona-specific synthesis passes.
-        
+
         Returns
         -------
         dict
@@ -1187,7 +1487,9 @@ class ToolUsingJudge:
         n_ok = iter_row.get("n_ok", 0) if iter_row else 0
         n_failed = iter_row.get("n_failed", 0) if iter_row else 0
         best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
-        best_iter_bic = f"{best_iter_bic_raw:.2f}" if best_iter_bic_raw is not None else "N/A"
+        best_iter_bic = (
+            f"{best_iter_bic_raw:.2f}" if best_iter_bic_raw is not None else "N/A"
+        )
 
         traj = _get_bic_traj(self.store)
         trajectory_str = _format_trajectory(traj)
@@ -1287,9 +1589,10 @@ class ToolUsingJudge:
         analysis_data: dict,
         persona_name: str,
         persona_suffix: str = "",
+        persona_config=None,
     ) -> tuple[str, dict]:
         """R2: Synthesize structured verdict for a specific persona.
-        
+
         Parameters
         ----------
         analysis_data : dict
@@ -1298,7 +1601,10 @@ class ToolUsingJudge:
             Name of the persona (e.g., 'exploit', 'explore')
         persona_suffix : str
             System prompt suffix for this persona
-        
+        persona_config : optional
+            Full persona config section (from cfg.clients.<name>). If it contains
+            a 'profile' key, those values override the default profile for this persona.
+
         Returns
         -------
         tuple[str, dict]
@@ -1310,8 +1616,27 @@ class ToolUsingJudge:
         best_bic = analysis_data["best_bic"]
         is_stuck = analysis_data["is_stuck"]
 
-        # R2: Inject persona suffix into synthesis prompt
-        synthesis_prompt = _SYNTHESIS_PROMPT
+        # Build persona-specific synthesis prompt from profile
+        profile = _PERSONA_PROFILES.get(persona_name, _DEFAULT_PROFILE).copy()
+        # Allow config to override profile values
+        if persona_config is not None:
+            config_profile = getattr(persona_config, "profile", None)
+            if config_profile is not None:
+                profile.update(_profile_from_config(config_profile, profile))
+        angles_list = "\n".join(
+            f"{i + 1}. {name} — {desc}"
+            for i, (name, desc) in enumerate(profile["angles"])
+        )
+        synthesis_prompt = _SYNTHESIS_PROMPT_TEMPLATE.format(
+            num_angles=len(profile["angles"]),
+            angles_list=angles_list,
+            metric_language=profile["metric_language"],
+            model_description_style=profile["model_description_style"],
+            feedback_format_instructions=profile["feedback_format_instructions"],
+            cited_models_format=profile["cited_models_format"],
+            prohibitions=profile["prohibitions"],
+            always_cite=profile["always_cite"],
+        )
         if persona_suffix:
             synthesis_prompt += (
                 f"\n\nPersona guidance for {persona_name}:\n{persona_suffix}"
@@ -1566,63 +1891,6 @@ class ToolUsingJudge:
             )
 
         return verdict
-
-    def _request_structured_verdict(self, analysis_text: str, trace: list[dict]) -> str:
-        """Ask the LLM to format its analysis as structured JSON."""
-        if self.verbose:
-            _console.print(
-                "[bold magenta]◆ Extracting structured verdict...[/bold magenta]"
-            )
-
-        messages = [
-            {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-            {"role": "assistant", "content": analysis_text},
-            {"role": "user", "content": _SYNTHESIS_PROMPT},
-        ]
-        p = self.provider
-        if any(
-            x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
-        ):
-            kwargs: dict = {
-                "model": self.model_name,
-                "messages": messages,
-                "max_tokens": self.max_tokens,
-            }
-            if self.temperature is not None:
-                kwargs["temperature"] = self.temperature
-            resp = self.model.chat.completions.create(**kwargs)
-            result = resp.choices[0].message.content or analysis_text
-            if self.verbose:
-                _console.print(
-                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
-                )
-            return result
-        elif "gemini" in p:
-            try:
-                from google.genai import types
-            except ImportError:
-                from google.generativeai import types  # type: ignore
-            config_kwargs: dict = {"system_instruction": _JUDGE_SYSTEM_PROMPT}
-            if self.max_tokens:
-                config_kwargs["max_output_tokens"] = self.max_tokens
-            if self.temperature is not None:
-                config_kwargs["temperature"] = self.temperature
-            contents = [
-                {"role": "model", "parts": [{"text": analysis_text}]},
-                {"role": "user", "parts": [{"text": _SYNTHESIS_PROMPT}]},
-            ]
-            resp = self.model.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-            result = resp.text.strip()
-            if self.verbose:
-                _console.print(
-                    f"[dim]  └─ structured verdict: {len(result)} chars[/dim]"
-                )
-            return result
-        return analysis_text
 
     def _fallback_generate(self, user_message: str) -> str:
         """Simple one-shot generation for backends without tool calling."""

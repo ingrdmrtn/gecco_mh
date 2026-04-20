@@ -254,16 +254,17 @@ def main():
                             persona_suffix = ""
                             if persona_config and hasattr(persona_config, "llm"):
                                 # Prefer feedback_guidance if present; fall back to system_prompt_suffix
-                                persona_suffix = (
-                                    getattr(persona_config.llm, "feedback_guidance", None)
-                                    or getattr(persona_config.llm, "system_prompt_suffix", "")
+                                persona_suffix = getattr(
+                                    persona_config.llm, "feedback_guidance", None
+                                ) or getattr(
+                                    persona_config.llm, "system_prompt_suffix", ""
                                 )
-
 
                             feedback_text, verdict_dict = judge.synthesize_for_persona(
                                 analysis_data,
                                 persona_name=persona_name,
                                 persona_suffix=persona_suffix,
+                                persona_config=persona_config,
                             )
                             synthesized_feedback[persona_name] = feedback_text
                             last_verdict_dict = verdict_dict
@@ -305,7 +306,8 @@ def main():
                 )
                 # Ensure per_angle entries are plain dicts (Pydantic models need .model_dump())
                 per_angle = [
-                    a.model_dump() if hasattr(a, "model_dump") else a for a in raw_per_angle
+                    a.model_dump() if hasattr(a, "model_dump") else a
+                    for a in raw_per_angle
                 ]
 
                 trace_payload = {
@@ -319,7 +321,9 @@ def main():
                     "tool_call_trace": analysis_data.get("trace", []),
                     "full_trace": analysis_data.get("full_trace", []),
                     "per_angle": per_angle,
-                    "key_recommendations": unique_recommendations[:5],  # Top 5 deduplicated
+                    "key_recommendations": unique_recommendations[
+                        :5
+                    ],  # Top 5 deduplicated
                     "synthesized_feedback": synthesized_feedback,  # Dict keyed by persona name
                     "stuck_search": analysis_data.get("is_stuck", False),
                     "personas": list(synthesized_feedback.keys()),

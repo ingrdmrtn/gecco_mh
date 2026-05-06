@@ -36,10 +36,13 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
     captured = capsys.readouterr()
     output = captured.out
 
-    # Generator should be a non-array sbatch job with --client-profile generator
+    # Generator should be a non-array sbatch job using the shell wrapper
     assert "sbatch" in output
-    assert "--client-profile generator" in output
     assert "gecco-cmg-generator" in output
+    assert "run_cmg_generator.sh" in output
+    # Profile is passed as a positional arg to the shell script, not --client-profile
+    gen_lines = [line for line in output.splitlines() if "gecco-cmg-generator" in line]
+    assert any('"generator"' in line for line in gen_lines)
 
     # Evaluator array should be 0-(n_models-1) = 0-1
     assert "--array=0-1" in output

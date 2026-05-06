@@ -199,25 +199,14 @@ def main():
         return
 
     if not args.local:
-        # Build conda prefix for --wrap commands
-        conda_prefix = (
-            f"conda run -n {args.conda_env} "
-            if args.conda_env
-            else ""
-        )
+        conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
 
         # --------------------------------------------------------
         # 1. Submit generator as a single non-array job
-        #    Uses --wrap to call Python directly (no shell wrapper),
-        #    passing --client-profile (NOT --client-id).
+        #    Uses bash/run_cmg_generator.sh for consistent
+        #    logging, conda activation, and provider detection.
         # --------------------------------------------------------
         print("Submitting generator job...")
-        gen_python_cmd = (
-            f"python {script_dir / 'run_gecco_distributed.py'} "
-            f"--config {config_name} "
-            f"--client-profile {generator_client} "
-            f"{vllm_url_arg}"
-        )
         gen_job_cmd = (
             f"sbatch "
             f"--job-name=gecco-cmg-generator "
@@ -226,7 +215,8 @@ def main():
             f"{mem_flag} "
             f"--output=logs/gecco-cmg-generator-%j.out "
             f"--error=logs/gecco-cmg-generator-%j.err "
-            f'--wrap="{conda_prefix}{gen_python_cmd}"'
+            f'{project_root / "bash/run_cmg_generator.sh"} '
+            f'"{config_name}" "{generator_client}" "{vllm_url}" {conda_arg}'
         )
         gen_job_id = run_cmd(gen_job_cmd, dry_run=args.dry_run)
 
@@ -237,7 +227,6 @@ def main():
         #    Empty profiles_csv means no profile → numeric ID.
         # --------------------------------------------------------
         print("Submitting evaluator array job...")
-        conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
         eval_job_cmd = (
             f"sbatch "
             f"--array=0-{n_models - 1} "

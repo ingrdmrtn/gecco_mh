@@ -26,6 +26,20 @@ from config.schema import load_config
 from rich.console import Console
 from rich.panel import Panel
 
+
+def _get_slurm_defaults(config_path):
+    """Read slurm.cpus_per_task, slurm.partition, and slurm.mem_per_task from config."""
+    import yaml
+
+    with open(config_path, "r") as f:
+        raw = yaml.safe_load(f)
+    slurm = raw.get("slurm", {})
+    return {
+        "cpus_per_task": slurm.get("cpus_per_task"),
+        "partition": slurm.get("partition"),
+        "mem_per_task": slurm.get("mem_per_task"),
+    }
+
 console = Console()
 
 
@@ -87,8 +101,14 @@ def main():
     parser.add_argument(
         "--cpus-per-task",
         type=int,
-        default=48,
-        help="CPUs per evaluator task (SLURM)",
+        default=None,
+        help="CPUs per evaluator task (SLURM; overrides config slurm.cpus_per_task, default: 48)",
+    )
+    parser.add_argument(
+        "--mem",
+        type=str,
+        default=None,
+        help="Memory per node, e.g. 64G (overrides config slurm.mem_per_task)",
     )
     args = parser.parse_args()
 
@@ -119,6 +139,14 @@ def main():
     if not isinstance(n_models, int) or n_models <= 0:
         print("ERROR: centralized_model_generation.n_models must be a positive integer")
         sys.exit(1)
+
+    # Resolve SLURM defaults from config (CLI overrides)
+    slurm_defaults = _get_slurm_defaults(config_path)
+    cpus_per_task = args.cpus_per_task or slurm_defaults.get("cpus_per_task") or 48
+    partition = args.partition or slurm_defaults.get("partition")
+    partition_flag = f"--partition={partition}" if partition else ""
+    mem = args.mem or slurm_defaults.get("mem_per_task")
+    mem_flag = f"--mem={mem}" if mem else ""
 
     task_name = getattr(cfg.task, "name", "unknown")
     config_name = args.config
@@ -170,9 +198,6 @@ def main():
         return
 
     if args.slurm:
-        partition = args.partition or ""
-        partition_flag = f"--partition={partition}" if partition else ""
-
         # Build conda prefix for --wrap commands
         conda_prefix = (
             f"conda run -n {args.conda_env} "
@@ -195,8 +220,9 @@ def main():
         gen_job_cmd = (
             f"sbatch "
             f"--job-name=gecco-cmg-generator "
-            f"--cpus-per-task={args.cpus_per_task} "
+            f"--cpus-per-task={cpus_per_task} "
             f"{partition_flag} "
+            f"{mem_flag} "
             f"--output=logs/gecco-cmg-generator-%j.out "
             f"--error=logs/gecco-cmg-generator-%j.err "
             f'--wrap="{conda_prefix}{gen_python_cmd}"'
@@ -215,8 +241,9 @@ def main():
             f"sbatch "
             f"--array=0-{n_models - 1} "
             f"--job-name=gecco-cmg-evaluator "
-            f"--cpus-per-task={args.cpus_per_task} "
+            f"--cpus-per-task={cpus_per_task} "
             f"{partition_flag} "
+            f"{mem_flag} "
             f"--output=logs/gecco-cmg-evaluator-%A_%a.out "
             f"--error=logs/gecco-cmg-evaluator-%A_%a.err "
             f'{project_root / "bash/run_gecco_distributed.sh"} '

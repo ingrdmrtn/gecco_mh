@@ -183,6 +183,17 @@ def main():
         config_name=args.config,
     )
 
+    # Guard against CMG configs — they require launch_cmg_distributed.py
+    cmg_cfg = cfg_raw.get("centralized_model_generation", {})
+    if cmg_cfg and cmg_cfg.get("enabled", False):
+        print(
+            "ERROR: This config has centralized_model_generation.enabled: true.\n"
+            "       Use the CMG launcher instead:\n"
+            "       python scripts/launch_cmg_distributed.py "
+            f"--config {args.config} --slurm"
+        )
+        sys.exit(1)
+
     provider = cfg_raw.get("llm", {}).get("provider", "vllm")
     slurm_cfg = cfg_raw.get("slurm", {})
 

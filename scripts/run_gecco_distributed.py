@@ -99,6 +99,15 @@ def main():
     if args.client_profile:
         apply_client_profile(cfg, args.client_profile)
 
+    # --- Detect CMG generator role ---
+    cmg_cfg = getattr(cfg, "centralized_model_generation", None)
+    cmg_enabled = cmg_cfg is not None and getattr(cmg_cfg, "enabled", False)
+    is_cmg_generator = (
+        cmg_enabled
+        and args.client_profile is not None
+        and str(args.client_profile) == str(getattr(cmg_cfg, "generator_client", ""))
+    )
+
     # --- Test mode ---
     if args.test:
         # Keep provider and model from config, only override loop settings for quick testing
@@ -241,6 +250,15 @@ def main():
             r, baseline_bic=baseline_bic
         )
         best_iter = search.best_iter
+
+        # The CMG generator only generates candidates and does not fit models,
+        # so skip evaluator-only post-processing (simulation, test fitting).
+        if is_cmg_generator:
+            console.print(
+                "[green]CMG generator run complete; "
+                "skipping evaluator-only simulation and test fitting.[/]"
+            )
+            continue
 
         console.print(
             Panel(

@@ -72,6 +72,8 @@ class SharedRegistry:
             "tried_param_sets": [],
             "client_entries": {},
             "iteration_history": [],
+            "candidate_generations": {},
+            "generator_status": {},
         }
 
     def read(self):
@@ -265,6 +267,46 @@ class SharedRegistry:
         for entry in data.get("iteration_history", []):
             it = entry.get("iteration")
             if it is not None and it > max_iter:
+                max_iter = it
+        return max_iter
+
+    def get_max_iteration_for_client(self, client_id):
+        """Return highest fully completed iteration for this client, or -1 if none."""
+        data = self.read()
+        target = str(client_id)
+        client_entry = data.get("client_entries", {}).get(target, {})
+        status = client_entry.get("status")
+        last_iteration = client_entry.get("last_iteration", -1)
+
+        max_iter = -1
+        for entry in data.get("iteration_history", []):
+            it = entry.get("iteration")
+            if it is not None and str(entry.get("client_id")) == target:
+                # If currently retrying, don't count the retrying iteration itself
+                if status == "retrying" and last_iteration >= 0 and it == last_iteration:
+                    continue
+                if it > max_iter:
+                    max_iter = it
+        return max_iter
+
+    def get_max_generator_iteration(self, client_id):
+        """Return highest completed CMG generator iteration for this client, or -1."""
+        data = self.read()
+        target = str(client_id)
+        generations = data.get("candidate_generations", {})
+        max_iter = -1
+        for key, entry in data.get("generator_status", {}).items():
+            try:
+                it = int(key)
+            except (TypeError, ValueError):
+                continue
+            if str(entry.get("client_id")) != target:
+                continue
+            if entry.get("status") != "complete":
+                continue
+            if key not in generations:
+                continue
+            if it > max_iter:
                 max_iter = it
         return max_iter
 
@@ -645,6 +687,151 @@ class SharedRegistry:
                 return None
 
             time.sleep(poll_seconds)
+
+
+    def set_candidate_models(self, iteration, candidates, generated_by):
+        """Publish generated candidates for one iteration.
+
+        Idempotent for restarts: if candidates already exist for this iteration,
+        do not overwrite them.
+        """
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                generations = data.setdefault("candidate_generations", {})
+                if str(iteration) in generations:
+                    console.print(
+                        f"[yellow]Candidates already exist for iteration {iteration}, "
+                        f"not overwriting[/]"
+                    )
+                    return generations[str(iteration)]
+
+                entry = {
+                    "candidates": candidates,
+                    "generated_by": generated_by,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                generations[str(iteration)] = entry
+                self._atomic_write(data)
+                return entry
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def get_candidate_models(self, iteration) -> Optional[dict]:
+        """Return published candidates for iteration, or None."""
+        data = self.read()
+        return data.get("candidate_generations", {}).get(str(iteration))
+
+    def wait_for_candidate_models(
+        self,
+        iteration,
+        timeout_seconds: float,
+        poll_seconds: float = 2.0,
+    ) -> Optional[dict]:
+        """Poll until candidate models are available or timeout."""
+        start_time = time.time()
+        while True:
+            result = self.get_candidate_models(iteration)
+            if result is not None:
+                elapsed = time.time() - start_time
+                console.print(
+                    f"[green]Received candidate models for iteration {iteration} "
+                    f"in {elapsed:.1f}s[/]"
+                )
+                return result
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                console.print(
+                    f"[yellow]Timeout waiting for candidate models (iteration {iteration}) "
+                    f"after {elapsed:.1f}s[/]"
+                )
+                return None
+
+            time.sleep(poll_seconds)
+
+    def update_candidate_model(self, iteration, index, candidate):
+        """Overwrite one candidate after evaluator repair.
+
+        Raises ValueError if generation or candidate index is missing.
+        """
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                generations = data.get("candidate_generations", {})
+                gen_entry = generations.get(str(iteration))
+                if gen_entry is None:
+                    raise ValueError(
+                        f"No candidate generation entry for iteration {iteration}"
+                    )
+
+                candidates = gen_entry.get("candidates", [])
+                for i, c in enumerate(candidates):
+                    if c.get("index") == index:
+                        candidates[i] = candidate
+                        gen_entry["candidates"] = candidates
+                        self._atomic_write(data)
+                        return True
+
+                raise ValueError(
+                    f"No candidate with index {index} in iteration {iteration}"
+                )
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def set_generator_status(self, iteration, client_id, status, n_candidates=None, error=None):
+        """Record generator progress separately from evaluator results.
+
+        Parameters
+        ----------
+        iteration : int
+            Iteration number.
+        client_id : str or int
+            Generator client identifier.
+        status : str
+            One of "complete", "failed", or other status string.
+        n_candidates : int, optional
+            Number of candidates published (0 if failure).
+        error : str, optional
+            Error message if status is "failed".
+        """
+        with open(self.registry_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+                else:
+                    data = self._empty_registry()
+
+                gen_status = data.setdefault("generator_status", {})
+                entry = {
+                    "client_id": client_id,
+                    "status": status,
+                    "n_candidates": n_candidates,
+                    "updated_at": datetime.now().isoformat(),
+                }
+                if error is not None:
+                    entry["error"] = error
+                gen_status[str(iteration)] = entry
+                self._atomic_write(data)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def apply_client_profile(cfg, profile_name):

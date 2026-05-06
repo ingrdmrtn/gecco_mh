@@ -9,6 +9,8 @@ def build_prompt(
     feedback_text=None,
     naive_idea: Optional[str] = None,
     translation_preamble: Optional[str] = None,
+    n_models: Optional[int] = None,
+    force_include_feedback: bool = False,
 ):
     """
     Construct the structured LLM prompt for cognitive model generation.
@@ -33,9 +35,10 @@ def build_prompt(
     diversity_requirement = getattr(llm, "diversity_requirement", None)
 
     # Format goal section dynamically
-    names = [f"`cognitive_model{i + 1}`" for i in range(llm.models_per_iteration)]
+    model_count = n_models if n_models is not None else llm.models_per_iteration
+    names = [f"`cognitive_model{i + 1}`" for i in range(model_count)]
     goal_text = task.goal.format(
-        models_per_iteration=llm.models_per_iteration,
+        models_per_iteration=model_count,
         model_names=", ".join(names),
     )
 
@@ -76,9 +79,10 @@ def build_prompt(
             "individual variation that could relate to these measures."
         )
 
+    feedback_enabled = include_feedback or force_include_feedback
     feedback_section = (
         f"\n\n### Feedback from previous iterations\n{feedback_text.strip()}"
-        if (feedback_text and include_feedback)
+        if (feedback_text and feedback_enabled)
         else ""
     )
 
@@ -89,7 +93,7 @@ def build_prompt(
 
         include_analysis = getattr(llm, "analysis_scratchpad", True)
         structured_output_section = get_schema_instructions(
-            llm.models_per_iteration,
+            model_count,
             include_analysis=include_analysis,
         )
 
@@ -245,6 +249,8 @@ Just describe your theory of human behavior.
         feedback_text: str = "",
         naive_idea: Optional[str] = None,
         translation_preamble: Optional[str] = None,
+        n_models: Optional[int] = None,
+        force_include_feedback: bool = False,
     ):
         return build_prompt(
             self.cfg,
@@ -253,4 +259,6 @@ Just describe your theory of human behavior.
             feedback_text=feedback_text,
             naive_idea=naive_idea,
             translation_preamble=translation_preamble,
+            n_models=n_models,
+            force_include_feedback=force_include_feedback,
         )

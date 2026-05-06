@@ -57,6 +57,18 @@ class LoopConfig(BaseModel):
     n_clients: Optional[int] = None  # Number of clients for barrier synchronization
 
 
+class CentralizedModelGenerationConfig(BaseModel):
+    """Configuration for centralized model generation (CMG) mode.
+
+    When enabled, one designated generator proposes all candidate models
+    and a pool of numeric evaluator clients fits those candidates in parallel.
+    """
+
+    enabled: bool = False
+    generator_client: str = ""
+    n_models: int = 0
+
+
 class ValidationConfig(BaseModel):
     retry_limit: int = 3
     max_syntax_retries: int = 2  # NEW: retries for syntax/validation failures
@@ -75,6 +87,14 @@ class JudgeStuckSearchConfig(BaseModel):
     window: int = 2  # R3: Number of iterations to look back
 
 
+class JudgeLesionConfig(BaseModel):
+    """Configuration for systematic judge lesion experiments."""
+
+    enabled: bool = False
+    lesion_type: str = "complete"
+    noise_text: str = "Try different parameters and see if you can improve."
+
+
 class JudgeConfig(BaseModel):
     mode: str = "manual"  # "manual" or "tool_using"
     orchestrated: bool = False  # Enable centralized judge orchestration
@@ -84,6 +104,7 @@ class JudgeConfig(BaseModel):
     stuck_search: Optional[JudgeStuckSearchConfig] = (
         JudgeStuckSearchConfig()
     )  # R3: Configurable stuck detection
+    lesion: Optional[JudgeLesionConfig] = JudgeLesionConfig()
 
 
 class SentryConfig(BaseModel):
@@ -102,6 +123,7 @@ class GeCCoConfig(BaseModel):
     judge: Optional[JudgeConfig] = None
     sentry: Optional[SentryConfig] = None
     validation: Optional[ValidationConfig] = None
+    centralized_model_generation: Optional[CentralizedModelGenerationConfig] = None
 
 
 def load_data_from_config(cfg):

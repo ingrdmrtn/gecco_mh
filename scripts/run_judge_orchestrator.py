@@ -97,7 +97,29 @@ def main():
         results_dir = Path("results") / cfg.task.name
 
     # --- Determine number of clients ---
-    if args.n_clients:
+    cmg_cfg = getattr(cfg, "centralized_model_generation", None)
+    cmg_enabled = cmg_cfg is not None and getattr(cmg_cfg, "enabled", False)
+
+    if cmg_enabled:
+        generator_client = str(getattr(cmg_cfg, "generator_client", ""))
+        if not generator_client:
+            console.print(
+                "[red]Error: centralized_model_generation.generator_client is required[/]"
+            )
+            sys.exit(1)
+        if generator_client.isdigit() or generator_client.lstrip("-").isdigit():
+            console.print(
+                "[red]Error: centralized_model_generation.generator_client must be "
+                "a named profile, not a numeric evaluator ID[/]"
+            )
+            sys.exit(1)
+        n_clients = getattr(cmg_cfg, "n_models", None)
+        if not isinstance(n_clients, int) or n_clients <= 0:
+            console.print(
+                "[red]Error: centralized_model_generation.n_models must be a positive integer[/]"
+            )
+            sys.exit(1)
+    elif args.n_clients:
         n_clients = args.n_clients
     elif hasattr(cfg, "loop") and hasattr(cfg.loop, "n_clients") and cfg.loop.n_clients:
         n_clients = cfg.loop.n_clients
@@ -183,12 +205,20 @@ def main():
             console.print(
                 "[yellow]No clients produced runnable models, skipping judge[/]"
             )
-            registry.set_judge_feedback(
-                iteration=it,
-                synthesized_feedback={
+            if cmg_enabled:
+                generator_name = getattr(cmg_cfg, "generator_client", "generator")
+                fallback_feedback = {
+                    generator_name: "All evaluator-assigned models failed syntax validation "
+                    "after retries. Review error messages and try a different approach."
+                }
+            else:
+                fallback_feedback = {
                     "default": "All models failed syntax validation after retries. "
                     "Review error messages and try a different approach."
-                },
+                }
+            registry.set_judge_feedback(
+                iteration=it,
+                synthesized_feedback=fallback_feedback,
                 verdict_payload={"skipped": True, "reason": "all_syntax_failures"},
             )
             continue
@@ -227,6 +257,14 @@ def main():
                 )
                 continue
 
+        # --- Check if no_tools lesion is active ---
+        no_tools_lesion_active = (
+            getattr(cfg, "judge", None) is not None
+            and getattr(cfg.judge, "lesion", None) is not None
+            and getattr(cfg.judge.lesion, "enabled", False)
+            and getattr(cfg.judge.lesion, "lesion_type", None) == "no_tools"
+        )
+
         # --- Instantiate and run ToolUsingJudge on unified store ---
         console.print("[cyan]Running centralized judge...[/]")
         MAX_JUDGE_RETRIES = 2
@@ -240,6 +278,14 @@ def main():
                     tokenizer=tokenizer,
                     results_dir=results_dir,
                 )
+
+                # Disable tool loop when no_tools lesion is active
+                if no_tools_lesion_active:
+                    console.print(
+                        "[cyan]no_tools lesion active — disabling tool loop, "
+                        "using pre-computed context only[/]"
+                    )
+                    judge._tool_loop = None
 
                 # R2: Run analysis once, then synthesize for each persona
                 # Start timer for wall time tracking
@@ -258,7 +304,11 @@ def main():
                 # Check for short-circuit
                 if analysis_data.get("short_circuit"):
                     # Short-circuit: reuse previous verdict for all personas
-                    synthesized_feedback = {"default": analysis_data["analysis_text"]}
+                    if cmg_enabled:
+                        generator_name = getattr(cmg_cfg, "generator_client", "generator")
+                        synthesized_feedback = {generator_name: analysis_data["analysis_text"]}
+                    else:
+                        synthesized_feedback = {"default": analysis_data["analysis_text"]}
                     last_verdict_dict = {}
                     all_recommendations = []
                 else:
@@ -268,7 +318,28 @@ def main():
                     all_recommendations = []
                     clients = getattr(cfg, "clients", {})
 
-                    if clients:
+                    if cmg_enabled:
+                        # CMG mode: synthesize for the generator persona only
+                        generator_name = getattr(cmg_cfg, "generator_client", "generator")
+                        persona_config = getattr(clients, generator_name, None) if clients else None
+                        persona_suffix = ""
+                        if persona_config and hasattr(persona_config, "llm"):
+                            persona_suffix = getattr(
+                                persona_config.llm, "feedback_guidance", None
+                            ) or getattr(
+                                persona_config.llm, "system_prompt_suffix", ""
+                            )
+                        feedback_text, verdict_dict = judge.synthesize_for_persona(
+                            analysis_data,
+                            persona_name=generator_name,
+                            persona_suffix=persona_suffix,
+                            persona_config=persona_config,
+                        )
+                        synthesized_feedback[generator_name] = feedback_text
+                        last_verdict_dict = verdict_dict
+                        if verdict_dict.get("key_recommendations"):
+                            all_recommendations = verdict_dict["key_recommendations"]
+                    elif clients:
                         # Enumerate personas from config
                         for persona_name in vars(clients).keys():
                             if persona_name.startswith("_"):

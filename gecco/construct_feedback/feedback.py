@@ -124,6 +124,8 @@ class FeedbackGenerator:
                         {
                             "name": r["function_name"],
                             "recovery_r": r.get("recovery_r", 0.0),
+                            "recovery_per_param": r.get("recovery_per_param", {}),
+                            "recovery_n_successful": r.get("recovery_n_successful"),
                             "params": r.get("param_names", []),
                             "iter": entry["iteration"],
                         }
@@ -136,10 +138,13 @@ class FeedbackGenerator:
                         "params": r["param_names"],
                         "iter": entry["iteration"],
                         "client_id": entry.get("client_id"),
+                        "recovery_r": r.get("recovery_r"),
+                        "recovery_per_param": r.get("recovery_per_param", {}),
+                        "recovery_n_successful": r.get("recovery_n_successful"),
                     }
                 )
 
-        if not all_models:
+        if not all_models and not recovery_failures:
             return ""
 
         all_models.sort(key=lambda x: x["bic"])
@@ -152,17 +157,32 @@ class FeedbackGenerator:
         lines = [
             f"Model landscape ({len(all_models)} models across all iterations{client_note}, ranked by BIC):"
         ]
-        if len(all_models) < 10:
+        if all_models and len(all_models) < 10:
             lines.append(
                 "(Few models evaluated so far — rankings may shift substantially.)"
             )
-        lines.append(f"{'Model':<22} {'BIC':>8}  {'Params':<45}  Iter")
-        lines.append("-" * 82)
-        for m in all_models[:10]:
-            param_str = "[" + ", ".join(m["params"]) + "]"
-            lines.append(
-                f"{m['name']:<22} {m['bic']:>8.1f}  {param_str:<45}  {m['iter']}"
-            )
+        if all_models:
+            has_recovery = any(m.get("recovery_r") is not None for m in all_models)
+            if has_recovery:
+                lines.append(
+                    f"{'Model':<22} {'BIC':>8}  {'Rec r':>6}  {'Params':<45}  Iter"
+                )
+                lines.append("-" * 91)
+            else:
+                lines.append(f"{'Model':<22} {'BIC':>8}  {'Params':<45}  Iter")
+                lines.append("-" * 82)
+            for m in all_models[:10]:
+                param_str = "[" + ", ".join(m["params"]) + "]"
+                if has_recovery:
+                    rec = m.get("recovery_r")
+                    rec_str = f"{rec:.2f}" if rec is not None else "n/a"
+                    lines.append(
+                        f"{m['name']:<22} {m['bic']:>8.1f}  {rec_str:>6}  {param_str:<45}  {m['iter']}"
+                    )
+                else:
+                    lines.append(
+                        f"{m['name']:<22} {m['bic']:>8.1f}  {param_str:<45}  {m['iter']}"
+                    )
 
         # --- Convergence zones ---
         # Pairs of top-6 models with similar BIC but different parameter sets
@@ -200,13 +220,53 @@ class FeedbackGenerator:
             )
             for rf in recovery_failures[:5]:
                 param_str = "[" + ", ".join(rf["params"]) + "]"
+                weak_params = [
+                    f"{name}={value:.2f}"
+                    for name, value in sorted(
+                        rf.get("recovery_per_param", {}).items(),
+                        key=lambda item: item[1],
+                    )[:3]
+                ]
+                weak_note = (
+                    f", weakest params: {', '.join(weak_params)}"
+                    if weak_params
+                    else ""
+                )
                 lines.append(
-                    f"  • {rf['name']} (r={rf['recovery_r']:.2f}, params={param_str}, iter {rf['iter']})"
+                    f"  • {rf['name']} (mean r={rf['recovery_r']:.2f}{weak_note}, params={param_str}, iter {rf['iter']})"
                 )
             lines.append(
                 "  Avoid similar parameter structures — these models have redundant "
                 "or unidentifiable parameters."
             )
+
+        recovered_models = [
+            m for m in all_models if m.get("recovery_r") is not None
+        ]
+        if recovered_models:
+            weak_recovery = sorted(
+                recovered_models, key=lambda m: m.get("recovery_r", 1.0)
+            )[:5]
+            lines.append(
+                "\nParameter recovery among fitted models "
+                "(higher mean r indicates more identifiable parameters):"
+            )
+            for m in weak_recovery:
+                per_param = m.get("recovery_per_param") or {}
+                weak_params = [
+                    f"{name}={value:.2f}"
+                    for name, value in sorted(
+                        per_param.items(), key=lambda item: item[1]
+                    )[:3]
+                ]
+                weak_note = (
+                    f"; weakest params: {', '.join(weak_params)}"
+                    if weak_params
+                    else ""
+                )
+                lines.append(
+                    f"  • {m['name']}: mean recovery r={m['recovery_r']:.2f}{weak_note}"
+                )
 
         # --- Parameter importance ---
         # Which params appear more often in the top half vs bottom half?

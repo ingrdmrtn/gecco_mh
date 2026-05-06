@@ -145,6 +145,8 @@ class SharedRegistry:
                         entry["recovery_r"] = r["recovery_r"]
                     if r.get("recovery_per_param"):
                         entry["recovery_per_param"] = r["recovery_per_param"]
+                    if r.get("recovery_n_successful") is not None:
+                        entry["recovery_n_successful"] = r["recovery_n_successful"]
                     # Include per-participant eval metrics for fit quality analysis
                     eval_metrics = r.get("eval_metrics")
                     if eval_metrics:

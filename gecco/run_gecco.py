@@ -846,6 +846,7 @@ class GeCCoModelSearch:
                 display_name = model_dict.get("name", func_name)
                 func_code = model_dict["code"]
                 structured_params = model_dict.get("parameters")
+                recovery_result = None
 
                 if not func_code:
                     continue
@@ -876,6 +877,7 @@ class GeCCoModelSearch:
                                 f"{self.recovery_checker.n_trials} trials)...[/]"
                             )
                             recovery = self.recovery_checker.check(spec)
+                            recovery_result = recovery
                             if not recovery["passed"]:
                                 sim_err = recovery.get("simulation_error")
                                 if sim_err and recovery["n_successful"] == 0:
@@ -995,6 +997,17 @@ class GeCCoModelSearch:
                             "participant_n_trials": fit_res.get(
                                 "participant_n_trials", []
                             ),
+                            "recovery_r": recovery_result.get("mean_r")
+                            if recovery_result
+                            else None,
+                            "recovery_per_param": recovery_result.get("per_param_r")
+                            if recovery_result
+                            else None,
+                            "recovery_n_successful": recovery_result.get(
+                                "n_successful"
+                            )
+                            if recovery_result
+                            else None,
                         }
                     )
 

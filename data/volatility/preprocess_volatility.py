@@ -106,6 +106,11 @@ def build_dataset(
     df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["choice"]).copy()
     df["choice"] = df["choice"].astype(int)
+    # Recompute reset: first remaining trial of each participant_task gets reset=1,
+    # in case the original first trial was dropped due to NaN choice.
+    df["reset"] = 0.0
+    first_idx = df.groupby("participant_task").head(1).index
+    df.loc[first_idx, "reset"] = 1.0
     df = df.sort_values(["participant", "task_order", "trial_in_task"]).reset_index(
         drop=True
     )

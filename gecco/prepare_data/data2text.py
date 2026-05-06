@@ -44,6 +44,23 @@ def narrative(
 
 def get_data2text_function(name):
     if name == "narrative":
+        def apply_value_mappings(vals, mappings):
+            if not mappings:
+                return vals
+            if not isinstance(mappings, dict):
+                mappings = vars(mappings)
+            for col, mapping in mappings.items():
+                if not isinstance(mapping, dict):
+                    mapping = vars(mapping)
+                if col in vals:
+                    key = (
+                        str(int(vals[col]))
+                        if isinstance(vals[col], (int, float))
+                        else str(vals[col])
+                    )
+                    vals[col] = mapping.get(key, vals[col])
+            return vals
+
         def data2text(df, id_col, template, fit_type,
                       metadata=None, max_trials=None, max_blocks=None,
                       value_mappings=None):
@@ -67,21 +84,7 @@ def get_data2text_function(name):
 
                         for _, row in block_df.iterrows():
                             vals = dict(row)
-
-                            if value_mappings:
-                                if not isinstance(value_mappings, dict):
-                                    value_mappings = vars(value_mappings)
-
-                                for col, mapping in value_mappings.items():
-                                    if not isinstance(mapping, dict):
-                                        mapping = vars(mapping)
-                                    if col in vals:
-                                        key = (
-                                            str(int(vals[col]))
-                                            if isinstance(vals[col], (int, float))
-                                            else str(vals[col])
-                                        )
-                                        vals[col] = mapping.get(key, vals[col])
+                            vals = apply_value_mappings(vals, value_mappings)
 
                             try:
                                 trial_lines.append(template.format(**vals))
@@ -98,6 +101,7 @@ def get_data2text_function(name):
                         vals = dict(row)
                         if 'trial' in vals.keys():
                             vals['trial'] = str(int(vals['trial'])+1)
+                        vals = apply_value_mappings(vals, value_mappings)
                         try:   
                             trial_lines.append(template.format(**vals))
                         except KeyError:

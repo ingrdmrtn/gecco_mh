@@ -237,7 +237,11 @@ def get_model_schema(n_models: int, include_analysis: bool = True) -> dict:
     }
 
 
-def get_schema_instructions(n_models: int, include_analysis: bool = True) -> str:
+def get_schema_instructions(
+    n_models: int,
+    include_analysis: bool = True,
+    function_signature: Optional[str] = None,
+) -> str:
     """
     Build prompt instructions describing the expected JSON output format.
 
@@ -257,6 +261,18 @@ def get_schema_instructions(n_models: int, include_analysis: bool = True) -> str
             "Think step by step before writing code.\n"
         )
 
+    if function_signature is None:
+        function_signature = (
+            "cognitive_model1(action_1, state, action_2, reward, model_parameters)"
+        )
+    example_signature = function_signature
+    if "cognitive_model" in example_signature:
+        example_signature = re.sub(
+            r"\bcognitive_model\d*\b", "cognitive_model1", example_signature, count=1
+        )
+    else:
+        example_signature = f"cognitive_model1({example_signature})"
+
     return f"""### Output Format
 You MUST respond with valid JSON in exactly this format (no markdown, no extra text):
 
@@ -269,7 +285,7 @@ You MUST respond with valid JSON in exactly this format (no markdown, no extra t
         {{"name": "alpha", "lower_bound": 0, "upper_bound": 1}},
         {{"name": "beta", "lower_bound": 0, "upper_bound": 10}}
       ],
-      "code": "@njit\\ndef cognitive_model1(action_1, state, action_2, reward, model_parameters):\\n    ..."
+      "code": "@njit\\ndef {example_signature}:\\n    ..."
     }}
   ]
 }}

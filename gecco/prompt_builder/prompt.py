@@ -70,6 +70,7 @@ def build_prompt(cfg, data_text, data, feedback_text=None):
         structured_output_section = get_schema_instructions(
             llm.models_per_iteration,
             include_analysis=include_analysis,
+            function_signature=getattr(llm, "function_signature", None),
         )
 
     metadata_section = (

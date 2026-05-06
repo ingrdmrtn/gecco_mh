@@ -534,7 +534,13 @@ class GeCCoModelSearch:
                     f"(attempt {retry_attempt + 1}/{max_retries}):[/]\n{error_trace}"
                 )
 
-                schema_instructions = get_schema_instructions(1, include_analysis=False)
+                schema_instructions = get_schema_instructions(
+                    1,
+                    include_analysis=False,
+                    function_signature=getattr(
+                        self.cfg.llm, "function_signature", None
+                    ),
+                )
                 correction_prompt = build_correction_prompt(
                     model=validated_model,
                     model_index=i + 1,

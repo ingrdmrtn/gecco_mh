@@ -4,6 +4,7 @@ import json
 import math
 import time
 from typing import Optional
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -1008,6 +1009,74 @@ class GeCCoModelSearch:
 
             tag = self._file_tag()
             feedback = ""
+
+            orchestrated_judge_enabled = (
+                self.shared_registry is not None
+                and getattr(self.cfg, "judge", None) is not None
+                and getattr(self.cfg.judge, "orchestrated", False)
+            )
+
+            if orchestrated_judge_enabled and it > 0:
+                barrier_timeout = getattr(
+                    getattr(self.cfg.judge, "barrier", None),
+                    "client_wait_seconds",
+                    1800,
+                )
+                self._set_activity(f"waiting for centralized judge (iter {it})")
+                shared_feedback_dict = self.shared_registry.wait_for_judge_feedback(
+                    iteration=it - 1,
+                    timeout_seconds=barrier_timeout,
+                    poll_seconds=2.0,
+                )
+
+                verdict = SimpleNamespace(
+                    synthesized_feedback="", key_recommendations=[]
+                )
+                if shared_feedback_dict is not None and shared_feedback_dict.get(
+                    "failed"
+                ):
+                    error_msg = shared_feedback_dict.get("error", "unknown")
+                    console.print(
+                        f"  [yellow]Orchestrated judge failed for iteration {it}: "
+                        f"{error_msg}. Using failure as feedback for regeneration.[/]"
+                    )
+                    feedback = (
+                        f"The judge failed to analyze the previous iteration: {error_msg}. "
+                        f"Please try a different approach or simplify your models. "
+                        f"Consider: 1) Checking model syntax, 2) Ensuring models are "
+                        f"identifiable, 3) Using simpler parameterizations."
+                    )
+                elif shared_feedback_dict is not None:
+                    synthesized_feedback = shared_feedback_dict.get(
+                        "synthesized_feedback", ""
+                    )
+                    if isinstance(synthesized_feedback, dict):
+                        persona_name = self.client_id or "default"
+                        feedback = synthesized_feedback.get(
+                            persona_name, synthesized_feedback.get("default", "")
+                        )
+                    else:
+                        feedback = synthesized_feedback
+                    console.print(
+                        f"  [green]Using centralized judge feedback for iteration {it}[/]"
+                    )
+                    verdict = SimpleNamespace(
+                        synthesized_feedback=feedback,
+                        key_recommendations=shared_feedback_dict.get(
+                            "key_recommendations", []
+                        ),
+                    )
+                else:
+                    console.print(
+                        f"  [yellow]Orchestrated judge timed out for iteration {it} "
+                        f"(waited {barrier_timeout}s). Using timeout as feedback.[/]"
+                    )
+                    feedback = (
+                        f"The judge timed out while analyzing the previous iteration. "
+                        f"This may indicate the models were too complex to evaluate. "
+                        f"Please try simpler models or ensure they can be evaluated efficiently."
+                    )
+
             if self.best_model is not None:
                 # --- Detect recovery failures from previous iteration ---
                 recovery_failures = []
@@ -1034,104 +1103,65 @@ class GeCCoModelSearch:
                             if r.get("metric_name") == "RECOVERY_FAILED"
                         ]
 
-                # --- Dispatch judge ---
-                # Check if orchestrated judge is enabled
-                orchestrated_judge_enabled = (
-                    self.shared_registry is not None
-                    and getattr(self.cfg, "judge", None) is not None
-                    and getattr(self.cfg.judge, "orchestrated", False)
-                )
+                # --- Dispatch judge (non-orchestrated path only) ---
+                if not orchestrated_judge_enabled:
+                    if self.tool_judge is not None:
+                        try:
+                            self._set_activity(f"tool judge (iter {it})")
 
-                if orchestrated_judge_enabled:
-                    # Wait for centralized judge feedback from orchestrator
-                    barrier_timeout = getattr(
-                        getattr(self.cfg.judge, "barrier", None),
-                        "client_wait_seconds",
-                        1800,
-                    )
-                    self._set_activity(f"waiting for centralized judge (iter {it})")
-                    shared_feedback_dict = self.shared_registry.wait_for_judge_feedback(
-                        iteration=it - 1,
-                        timeout_seconds=barrier_timeout,
-                        poll_seconds=2.0,
-                    )
-
-                    if shared_feedback_dict is not None and shared_feedback_dict.get(
-                        "failed"
-                    ):
-                        # Orchestrator tried but failed after retries
-                        # Instead of halting, use the failure as feedback for regeneration
-                        error_msg = shared_feedback_dict.get("error", "unknown")
-                        console.print(
-                            f"  [yellow]Orchestrated judge failed for iteration {it}: "
-                            f"{error_msg}. Using failure as feedback for regeneration.[/]"
-                        )
-                        feedback = (
-                            f"The judge failed to analyze the previous iteration: {error_msg}. "
-                            f"Please try a different approach or simplify your models. "
-                            f"Consider: 1) Checking model syntax, 2) Ensuring models are "
-                            f"identifiable, 3) Using simpler parameterizations."
-                        )
-                    elif shared_feedback_dict is not None:
-                        # Got successful feedback from orchestrator
-                        # R2: Get persona-specific feedback if available
-                        synthesized_feedback = shared_feedback_dict.get(
-                            "synthesized_feedback", ""
-                        )
-                        if isinstance(synthesized_feedback, dict):
-                            # R2: Per-persona feedback storage
-                            persona_name = self.client_id or "default"
-                            feedback = synthesized_feedback.get(
-                                persona_name, synthesized_feedback.get("default", "")
+                            no_tools_lesion_active = (
+                                getattr(self.cfg.judge, "lesion", None) is not None
+                                and getattr(self.cfg.judge.lesion, "enabled", False)
+                                and getattr(self.cfg.judge.lesion, "lesion_type", None)
+                                == "no_tools"
                             )
-                        else:
-                            # Backward compatibility: old string format
-                            feedback = synthesized_feedback
-                        console.print(
-                            f"  [green]Using centralized judge feedback for iteration {it}[/]"
-                        )
+                            if no_tools_lesion_active:
+                                self.tool_judge._tool_loop = None
+
+                            verdict = self.tool_judge.get_feedback(
+                                iteration=it,
+                                run_idx=run_idx,
+                                tag=tag,
+                                best_model=self.best_model,
+                                best_metric=self.best_metric,
+                                recovery_failures=recovery_failures
+                                if recovery_failures
+                                else None,
+                                prev_had_success=prev_had_success,
+                            )
+                            feedback = verdict.synthesized_feedback
+                        except Exception as e:
+                            console.print(
+                                f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
+                            )
+                            feedback = self.feedback.get_feedback(
+                                self.best_model,
+                                self.tried_param_sets,
+                                id_results=self.best_id_results,
+                            )
+                            verdict = SimpleNamespace(
+                                synthesized_feedback=feedback,
+                                key_recommendations=[],
+                            )
                     else:
-                        # Orchestrator never responded — genuine timeout
-                        # Instead of halting, provide timeout feedback for regeneration
-                        console.print(
-                            f"  [yellow]Orchestrated judge timed out for iteration {it} "
-                            f"(waited {barrier_timeout}s). Using timeout as feedback.[/]"
-                        )
-                        feedback = (
-                            f"The judge timed out while analyzing the previous iteration. "
-                            f"This may indicate the models were too complex to evaluate. "
-                            f"Please try simpler models or ensure they can be evaluated efficiently."
-                        )
-                elif self.tool_judge is not None:
-                    try:
-                        self._set_activity(f"tool judge (iter {it})")
-                        verdict = self.tool_judge.get_feedback(
-                            iteration=it,
-                            run_idx=run_idx,
-                            tag=tag,
-                            best_model=self.best_model,
-                            best_metric=self.best_metric,
-                            recovery_failures=recovery_failures
-                            if recovery_failures
-                            else None,
-                            prev_had_success=prev_had_success,
-                        )
-                        feedback = verdict.synthesized_feedback
-                    except Exception as e:
-                        console.print(
-                            f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
-                        )
                         feedback = self.feedback.get_feedback(
                             self.best_model,
                             self.tried_param_sets,
                             id_results=self.best_id_results,
                         )
-                else:
-                    feedback = self.feedback.get_feedback(
-                        self.best_model,
-                        self.tried_param_sets,
-                        id_results=self.best_id_results,
-                    )
+                        verdict = SimpleNamespace(
+                            synthesized_feedback=feedback,
+                            key_recommendations=[],
+                        )
+
+                # Apply lesion if configured
+                lesion_cfg = getattr(self.cfg.judge, "lesion", None)
+                if lesion_cfg and getattr(lesion_cfg, "enabled", False):
+                    from gecco.construct_feedback.judge_lesion import JudgeLesion
+
+                    if not hasattr(self, "_lesion"):
+                        self._lesion = JudgeLesion(self.cfg.judge)
+                    feedback = self._lesion.apply(verdict, it, feedback)
 
                 # R1: Conditionally append best model code based on show_best_model_code flag
                 show_best_model_code = getattr(
@@ -1148,7 +1178,8 @@ class GeCCoModelSearch:
                         f"```python\n{self.best_model}\n```"
                     )
 
-                # Save feedback for inspection
+            # Save feedback for inspection (runs whenever feedback was populated)
+            if feedback:
                 feedback_file = (
                     self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}.txt"
                     if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
@@ -1238,7 +1269,9 @@ class GeCCoModelSearch:
                         continue
 
                     try:
-                        from gecco.offline_evaluation.exceptions import ModelValidationError  # noqa: F811
+                        from gecco.offline_evaluation.exceptions import (
+                            ModelValidationError,
+                        )  # noqa: F811
 
                         # --- Parameter recovery check (optional) ---
                         if self.recovery_checker is not None:
@@ -1284,7 +1317,9 @@ class GeCCoModelSearch:
                                             "param_names": spec.param_names,
                                             "code": func_code,
                                             "recovery_r": recovery["mean_r"],
-                                            "recovery_per_param": recovery["per_param_r"],
+                                            "recovery_per_param": recovery[
+                                                "per_param_r"
+                                            ],
                                             "recovery_n_successful": recovery[
                                                 "n_successful"
                                             ],
@@ -1377,7 +1412,10 @@ class GeCCoModelSearch:
                                 )
 
                                 id_results = evaluate_individual_differences(
-                                    fit_res, self.df, self.cfg, id_data=self.id_eval_data
+                                    fit_res,
+                                    self.df,
+                                    self.cfg,
+                                    id_data=self.id_eval_data,
                                 )
                             except Exception as e:
                                 console.print(
@@ -1401,11 +1439,13 @@ class GeCCoModelSearch:
                                 )
                                 if self.id_eval_data is not None:
                                     try:
-                                        val_id_results = evaluate_individual_differences(
-                                            val_fit_res,
-                                            self.df_val,
-                                            self.cfg,
-                                            id_data=self.id_eval_data,
+                                        val_id_results = (
+                                            evaluate_individual_differences(
+                                                val_fit_res,
+                                                self.df_val,
+                                                self.cfg,
+                                                id_data=self.id_eval_data,
+                                            )
                                         )
                                     except Exception as e:
                                         console.print(
@@ -1429,7 +1469,9 @@ class GeCCoModelSearch:
                         diagnostic_spec = None
                         if needs_diagnostic_spec:
                             try:
-                                from gecco.offline_evaluation.utils import build_model_spec
+                                from gecco.offline_evaluation.utils import (
+                                    build_model_spec,
+                                )
 
                                 diagnostic_spec = build_model_spec(
                                     func_code,
@@ -1457,14 +1499,18 @@ class GeCCoModelSearch:
                                 )
 
                                 # Count participants for progress bar
-                                from gecco.offline_evaluation.ppc import _get_participants
+                                from gecco.offline_evaluation.ppc import (
+                                    _get_participants,
+                                )
 
                                 _, participants = _get_participants(self.df)
                                 n_participants = len(participants)
 
                                 # Create progress bar for PPC
                                 ppc_progress = Progress(
-                                    TextColumn("[progress.description]{task.description}"),
+                                    TextColumn(
+                                        "[progress.description]{task.description}"
+                                    ),
                                     BarColumn(),
                                     MofNCompleteColumn(),
                                     TimeElapsedColumn(),
@@ -1530,15 +1576,21 @@ class GeCCoModelSearch:
                             "individual_differences": id_results,
                             "code": func_code,
                             "eval_metrics": fit_res.get("eval_metrics", []),
-                            "participant_n_trials": fit_res.get("participant_n_trials", []),
+                            "participant_n_trials": fit_res.get(
+                                "participant_n_trials", []
+                            ),
                             "parameter_values": fit_res.get("parameter_values", []),
                             "mean_nll": fit_res.get("mean_nll"),
                             "per_participant_nll": fit_res.get("per_participant_nll"),
                         }
                         if val_fit_res is not None:
-                            result_dict["val_metric_value"] = val_fit_res["metric_value"]
+                            result_dict["val_metric_value"] = val_fit_res[
+                                "metric_value"
+                            ]
                             result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
-                            result_dict["val_eval_metrics"] = val_fit_res["eval_metrics"]
+                            result_dict["val_eval_metrics"] = val_fit_res[
+                                "eval_metrics"
+                            ]
                             result_dict["val_per_participant_nll"] = val_fit_res[
                                 "per_participant_nll"
                             ]
@@ -1576,7 +1628,9 @@ class GeCCoModelSearch:
 
                             # save best model bic
                             best_bic_file = (
-                                self.results_dir / "bics" / f"best_bic{tag}_{run_idx}.json"
+                                self.results_dir
+                                / "bics"
+                                / f"best_bic{tag}_{run_idx}.json"
                                 if getattr(self.cfg.evaluation, "fit_type", "group")
                                 != "individual"
                                 else self.results_dir
@@ -1584,7 +1638,9 @@ class GeCCoModelSearch:
                                 / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
                             )
                             with open(best_bic_file, "w") as f:
-                                json.dump({"bic": mean_metric}, f, cls=_NumpyJSONEncoder)
+                                json.dump(
+                                    {"bic": mean_metric}, f, cls=_NumpyJSONEncoder
+                                )
 
                             # save best model val metrics
                             if val_fit_res is not None:
@@ -1603,7 +1659,9 @@ class GeCCoModelSearch:
                                         {
                                             "mean_BIC": val_fit_res["metric_value"],
                                             "mean_NLL": val_fit_res["mean_nll"],
-                                            "individual_BIC": val_fit_res["eval_metrics"],
+                                            "individual_BIC": val_fit_res[
+                                                "eval_metrics"
+                                            ],
                                             "individual_NLL": val_fit_res[
                                                 "per_participant_nll"
                                             ],
@@ -1642,7 +1700,9 @@ class GeCCoModelSearch:
                             }
                         )
                     except Exception as e:
-                        console.print(f"  [bold red]Error fitting {display_name}:[/] {e}")
+                        console.print(
+                            f"  [bold red]Error fitting {display_name}:[/] {e}"
+                        )
                         iteration_results.append(
                             {
                                 "function_name": display_name,
@@ -1691,13 +1751,16 @@ class GeCCoModelSearch:
                             client_id=self.client_id,
                         )
                     except Exception as e:
-                        console.print(f"  [yellow]Diagnostic store write failed:[/] {e}")
+                        console.print(
+                            f"  [yellow]Diagnostic store write failed:[/] {e}"
+                        )
 
                 # --- Check for syntax retry ---
                 # Determine if we had any runnable models
                 had_runnable_model = (
                     any(
-                        r.get("metric_name") not in ("VALIDATION_ERROR", "FIT_ERROR", None)
+                        r.get("metric_name")
+                        not in ("VALIDATION_ERROR", "FIT_ERROR", "RECOVERY_FAILED", None)
                         for r in iteration_results
                     )
                     if iteration_results
@@ -1715,7 +1778,9 @@ class GeCCoModelSearch:
 
                 if all_syntax_errors and syntax_retry_count < max_syntax_retries:
                     # Build error feedback for regeneration
-                    error_feedback = self._build_syntax_error_feedback(iteration_results)
+                    error_feedback = self._build_syntax_error_feedback(
+                        iteration_results
+                    )
                     feedback = error_feedback
                     syntax_retry_count += 1
                     console.print(

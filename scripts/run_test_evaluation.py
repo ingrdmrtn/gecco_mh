@@ -21,9 +21,14 @@ import json
 import argparse
 import numpy as np
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+from gecco.tempdirs import configure_temp_dirs
+
+configure_temp_dirs(project_root, prefix="test-eval")
+
 from config.schema import load_config
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,

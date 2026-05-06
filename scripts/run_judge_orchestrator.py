@@ -23,7 +23,11 @@ from rich.console import Console
 from rich.panel import Panel
 
 # Add project root to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+from gecco.tempdirs import configure_temp_dirs
+
+configure_temp_dirs(project_root, prefix="Orchestrator")
 
 from config.schema import load_config
 from gecco.coordination import SharedRegistry

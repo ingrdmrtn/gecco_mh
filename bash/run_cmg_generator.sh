@@ -24,6 +24,15 @@ mkdir -p logs
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
 
+# Keep joblib/loky temp files off generic /tmp and within this run directory.
+export GECCO_TMPDIR="${GECCO_TMPDIR:-${PWD}/tmp}"
+export TMPDIR="${TMPDIR:-$GECCO_TMPDIR}"
+export JOBLIB_TEMP_FOLDER="${JOBLIB_TEMP_FOLDER:-${GECCO_TMPDIR}/joblib}"
+export LOKY_TEMP_FOLDER="${LOKY_TEMP_FOLDER:-$JOBLIB_TEMP_FOLDER}"
+mkdir -p "$JOBLIB_TEMP_FOLDER"
+echo "[Generator] Temp dir: $TMPDIR"
+echo "[Generator] Joblib/loky temp dir: $JOBLIB_TEMP_FOLDER"
+
 # Activate conda environment if specified
 if [ -n "$CONDA_ENV" ]; then
     echo "[Generator] Activating conda env: $CONDA_ENV"

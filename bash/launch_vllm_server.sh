@@ -6,7 +6,7 @@
 #SBATCH -t 4:00:00
 #SBATCH --output=logs/vllm-server-%j.out
 #SBATCH --error=logs/vllm-server-%j.err
-#SBATCH --constraints="a100|h200|b200"
+#SBATCH --constraint="a100|h200|b200"
 
 # Usage: sbatch bash/launch_vllm_server.sh [MODEL] [PORT] [TP_SIZE]
 #

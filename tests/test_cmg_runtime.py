@@ -516,3 +516,130 @@ def test_run_n_shots_respects_max_iterations_on_resume():
 
     # max_iterations=2, completed iteration 0, so should only process iteration 1
     assert processed_iterations == [1]
+
+
+# --- _is_cmg_repairable_error (Chunk 2) ---
+
+def _make_search_with_repairable():
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=["action_1", "state", "action_2", "reward"]),
+    )
+    search = MagicMock(spec=GeCCoModelSearch)
+    search.cfg = cfg
+    search._is_cmg_repairable_error = GeCCoModelSearch._is_cmg_repairable_error.__get__(
+        search, GeCCoModelSearch
+    )
+    search._smoke_test_model_return_value = GeCCoModelSearch._smoke_test_model_return_value.__get__(
+        search, GeCCoModelSearch
+    )
+    return search
+
+
+def test_recovery_simulation_failure_is_repairable():
+    """RECOVERY_FAILED with simulation_error and 0 successes should be repairable."""
+    search = _make_search_with_repairable()
+    result = {
+        "metric_name": "RECOVERY_FAILED",
+        "simulation_error": "TypeError: bad operand type for unary -: 'NoneType'",
+        "recovery_n_successful": 0,
+    }
+    assert search._is_cmg_repairable_error(result) is True
+
+
+def test_poor_recovery_is_not_repairable():
+    """RECOVERY_FAILED without simulation_error and with some successes is not repairable."""
+    search = _make_search_with_repairable()
+    result = {
+        "metric_name": "RECOVERY_FAILED",
+        "simulation_error": None,
+        "recovery_n_successful": 50,
+        "recovery_r": 0.1,
+    }
+    assert search._is_cmg_repairable_error(result) is False
+
+
+def test_validation_error_is_repairable():
+    """VALIDATION_ERROR should still be repairable."""
+    search = _make_search_with_repairable()
+    assert search._is_cmg_repairable_error({"metric_name": "VALIDATION_ERROR"}) is True
+
+
+def test_fit_error_is_repairable():
+    """FIT_ERROR should still be repairable."""
+    search = _make_search_with_repairable()
+    assert search._is_cmg_repairable_error({"metric_name": "FIT_ERROR"}) is True
+
+
+def test_none_result_is_not_repairable():
+    """None result should not be repairable."""
+    search = _make_search_with_repairable()
+    assert search._is_cmg_repairable_error(None) is False
+
+
+# --- _smoke_test_model_return_value (Chunk 4) ---
+
+def test_smoke_test_catches_none():
+    """A model returning None should produce an error string."""
+    search = _make_search_with_repairable()
+
+    def bad_model(action_1, state, action_2, reward, model_parameters):
+        return None
+
+    spec = SimpleNamespace(
+        func=bad_model,
+        param_names=["alpha"],
+        bounds={"alpha": [0, 1]},
+    )
+    error = search._smoke_test_model_return_value(spec)
+    assert error is not None
+    assert "returned None" in error
+
+
+def test_smoke_test_catches_non_numeric():
+    """A model returning a non-numeric string should produce an error string."""
+    search = _make_search_with_repairable()
+
+    def bad_model(action_1, state, action_2, reward, model_parameters):
+        return "not a number"
+
+    spec = SimpleNamespace(
+        func=bad_model,
+        param_names=["alpha"],
+        bounds={"alpha": [0, 1]},
+    )
+    error = search._smoke_test_model_return_value(spec)
+    assert error is not None
+    assert "non-numeric" in error
+
+
+def test_smoke_test_catches_non_finite():
+    """A model returning inf should produce an error string."""
+    search = _make_search_with_repairable()
+
+    def bad_model(action_1, state, action_2, reward, model_parameters):
+        return float("inf")
+
+    spec = SimpleNamespace(
+        func=bad_model,
+        param_names=["alpha"],
+        bounds={"alpha": [0, 1]},
+    )
+    error = search._smoke_test_model_return_value(spec)
+    assert error is not None
+    assert "non-finite" in error
+
+
+def test_smoke_test_accepts_numeric_return():
+    """A model returning a finite numeric value should pass the smoke test."""
+    search = _make_search_with_repairable()
+
+    def good_model(action_1, state, action_2, reward, model_parameters):
+        return 1.23
+
+    spec = SimpleNamespace(
+        func=good_model,
+        param_names=["alpha"],
+        bounds={"alpha": [0, 1]},
+    )
+    error = search._smoke_test_model_return_value(spec)
+    assert error is None

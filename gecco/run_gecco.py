@@ -218,6 +218,20 @@ class GeCCoModelSearch:
             return None
         return cmg_cfg
 
+    def _is_cmg_repairable_error(self, result: dict | None) -> bool:
+        """Return True if a CMG candidate result should trigger the repair loop."""
+        if result is None:
+            return False
+
+        metric_name = result.get("metric_name")
+        if metric_name in ("VALIDATION_ERROR", "FIT_ERROR"):
+            return True
+
+        if metric_name == "RECOVERY_FAILED":
+            return bool(result.get("simulation_error")) and result.get("recovery_n_successful", 0) == 0
+
+        return False
+
     def _cmg_is_generator(self, cmg_cfg):
         """Return True if this client is the CMG generator."""
         return str(self.client_id) == str(getattr(cmg_cfg, "generator_client", ""))
@@ -1023,6 +1037,18 @@ class GeCCoModelSearch:
                 if len(error_msg) > 200:
                     error_msg = error_msg[:200] + "..."
                 error_messages.append(f"- {model_name}: {error_msg}")
+            elif error_type == "RECOVERY_FAILED":
+                sim_err = result.get("simulation_error")
+                if sim_err:
+                    error_messages.append(
+                        f"- {model_name}: parameter recovery simulation failed: {sim_err}. "
+                        "The model must always return a finite numeric negative log-likelihood, "
+                        "including when called on short prefix trial arrays during simulation."
+                    )
+                else:
+                    error_messages.append(
+                        f"- {model_name}: parameter recovery failed."
+                    )
 
         if not error_messages:
             return "All models failed validation. Please review and fix syntax errors."
@@ -1035,6 +1061,41 @@ class GeCCoModelSearch:
             "and all required imports are handled."
         )
         return feedback
+
+    def _smoke_test_model_return_value(self, spec) -> str | None:
+        """Run a lightweight smoke test on a compiled model spec.
+
+        Returns an error string if the model returns None, a non-numeric value,
+        or a non-finite value when called with dummy inputs; otherwise None.
+        """
+        n = 3
+        dummy_arrays = []
+        for _ in getattr(self.cfg.data, "input_columns", []):
+            dummy_arrays.append(np.zeros(n, dtype=np.int64))
+
+        params = []
+        for p in spec.param_names:
+            lb, ub = spec.bounds[p]
+            params.append((float(lb) + float(ub)) / 2.0)
+        params = np.asarray(params, dtype=float)
+
+        try:
+            value = spec.func(*dummy_arrays, params)
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+
+        if value is None:
+            return "Model returned None instead of a numeric negative log-likelihood."
+
+        try:
+            value = float(value)
+        except Exception:
+            return f"Model returned non-numeric value of type {type(value).__name__}."
+
+        if not np.isfinite(value):
+            return f"Model returned non-finite value: {value}."
+
+        return None
 
     def _fit_candidate_model(
         self,
@@ -1090,6 +1151,16 @@ class GeCCoModelSearch:
                         cfg=self.cfg,
                         structured_params=structured_params,
                     )
+                    smoke_error = self._smoke_test_model_return_value(spec)
+                    if smoke_error:
+                        return {
+                            "function_name": display_name,
+                            "metric_name": "FIT_ERROR",
+                            "metric_value": float("inf"),
+                            "param_names": spec.param_names,
+                            "code": func_code,
+                            "error": smoke_error,
+                        }, False
                     console.print(
                         f"  [dim]Running parameter recovery check for {display_name} "
                         f"({self.recovery_checker.n_subjects} subjects, "
@@ -1617,9 +1688,13 @@ class GeCCoModelSearch:
             raise ValueError(f"No CMG candidate {idx} for iteration {it}")
 
         func_name = candidate.get("func_name", f"cognitive_model{idx + 1}")
+        display_name = candidate.get("name", func_name)
+        console.print(
+            f"CMG evaluator {idx} fitting candidate index {idx}: {func_name} ({display_name})"
+        )
         model_dict = {
             "func_name": func_name,
-            "name": candidate.get("name", func_name),
+            "name": display_name,
             "code": candidate.get("code", ""),
             "parameters": candidate.get("parameters", []),
         }
@@ -1656,10 +1731,7 @@ class GeCCoModelSearch:
                 baseline_bic=baseline_bic,
             )
 
-            is_repairable_error = (
-                result is not None
-                and result.get("metric_name") in ("VALIDATION_ERROR", "FIT_ERROR")
-            )
+            is_repairable_error = self._is_cmg_repairable_error(result)
 
             if not is_repairable_error or syntax_retry_count >= max_syntax_retries:
                 if result is not None:
@@ -1684,6 +1756,10 @@ class GeCCoModelSearch:
             with open(model_file, "w") as f:
                 f.write(current_model_dict.get("code", ""))
 
+        if result is not None:
+            result.setdefault("candidate_index", idx)
+            result.setdefault("expected_func_name", func_name)
+            result.setdefault("display_name", display_name)
         self._finalize_iteration_results(
             it=it,
             run_idx=run_idx,

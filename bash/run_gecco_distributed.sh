@@ -43,6 +43,7 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 # Activate conda environment if specified
 if [ -n "$CONDA_ENV" ]; then
     echo "[GeCCo] Activating conda env: $CONDA_ENV"
+    source "$(conda info --base)/etc/profile.d/conda.sh"
     conda activate "$CONDA_ENV"
 fi
 

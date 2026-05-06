@@ -6,13 +6,14 @@ Launches one generator client, N evaluator clients (numeric client IDs 0..N-1),
 and the orchestrated judge.
 
 Usage:
+    # SLURM mode (default — submits generator + evaluator array + orchestrator)
     python scripts/launch_cmg_distributed.py --config two_step_factors_cmg.yaml
 
-    # Dry run (show commands without executing)
+    # Dry run (show commands without submitting)
     python scripts/launch_cmg_distributed.py --config two_step_factors_cmg.yaml --dry-run
 
-    # SLURM mode (generator + evaluator array + orchestrator)
-    python scripts/launch_cmg_distributed.py --config two_step_factors_cmg.yaml --slurm
+    # Local mode (print commands for manual execution)
+    python scripts/launch_cmg_distributed.py --config two_step_factors_cmg.yaml --local
 """
 
 import argparse
@@ -76,9 +77,9 @@ def main():
         help="Print commands without executing",
     )
     parser.add_argument(
-        "--slurm",
+        "--local",
         action="store_true",
-        help="Submit SLURM jobs instead of running locally",
+        help="Print commands for local execution instead of submitting SLURM jobs",
     )
     parser.add_argument(
         "--vllm-url",
@@ -161,7 +162,7 @@ def main():
             f"[bold]Generator Client:[/] {generator_client}\n"
             f"[bold]Evaluators:[/] {n_models} (IDs 0..{n_models - 1})\n"
             f"[bold]vLLM URL:[/] {vllm_url or '(not set)'}\n"
-            f"[bold]Mode:[/] {'SLURM' if args.slurm else 'local process'}",
+            f"[bold]Mode:[/] {'local process' if args.local else 'SLURM'}",
             title="CMG Distributed Launch Plan",
             style="green",
         )
@@ -193,11 +194,11 @@ def main():
 
     print()
 
-    if args.dry_run and not args.slurm:
+    if args.dry_run and args.local:
         print("[Dry run] Commands printed above — not executing.")
         return
 
-    if args.slurm:
+    if not args.local:
         # Build conda prefix for --wrap commands
         conda_prefix = (
             f"conda run -n {args.conda_env} "

@@ -22,13 +22,12 @@ def mock_cmg_cfg():
 
 
 def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
-    """--slurm --dry-run should print actual sbatch commands without submitting."""
+    """Default (SLURM) with --dry-run should print actual sbatch commands without submitting."""
     from scripts.launch_cmg_distributed import main
 
     with patch.object(sys, "argv", [
         "launch_cmg_distributed.py",
         "--config", "two_step_factors_cmg.yaml",
-        "--slurm",
         "--dry-run",
     ]):
         with patch("scripts.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):

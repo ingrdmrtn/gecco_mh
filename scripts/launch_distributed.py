@@ -190,7 +190,7 @@ def main():
             "ERROR: This config has centralized_model_generation.enabled: true.\n"
             "       Use the CMG launcher instead:\n"
             "       python scripts/launch_cmg_distributed.py "
-            f"--config {args.config} --slurm"
+            f"--config {args.config}"
         )
         sys.exit(1)
 

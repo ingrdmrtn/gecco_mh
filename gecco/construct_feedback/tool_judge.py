@@ -29,6 +29,7 @@ LLM backend support
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from typing import Literal
 from pydantic import BaseModel
 from rich.console import Console
 
+from config.schema import get_judge_capabilities, judge_has_capability
 from gecco.diagnostic_store.tools import TOOL_SCHEMAS, dispatch_tool
 from gecco.utils import TimestampedConsole
 
@@ -45,6 +47,10 @@ _console = TimestampedConsole()
 # Hard cap on any single tool result fed back into the message history.
 # Prevents an unexpectedly large result from reopening the context-limit wound.
 _MAX_TOOL_RESULT_CHARS = 40_000
+_RANDOM_FEEDBACK_TEXT = (
+    "Provide a fresh alternative model idea and a small implementation change for "
+    "the next iteration. Do not assume that the current best approach should be kept."
+)
 
 
 def _cap_tool_result(result_str: str, raw_result=None) -> str:
@@ -63,6 +69,121 @@ def _cap_tool_result(result_str: str, raw_result=None) -> str:
         "param_contains=, code_contains=) to narrow]"
     )
     return result_str[:_MAX_TOOL_RESULT_CHARS] + " ... " + "; ".join(suffix_parts)
+
+
+def _normalise_feedback_text(text: str) -> str:
+    """Normalise spacing after deterministic feedback edits."""
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _remove_recommendation_sections(text: str) -> str:
+    """Remove recommendation or next-step sections from feedback text."""
+    patterns = [
+        r"(?is)(?:^|\n\n)(?:key recommendations?|recommendations?|next steps?|suggestions?)\s*:\s*.*?(?=\n\n|\Z)",
+        r"(?im)^\s*(?:[-*]\s*)?(?:recommend|next step)\b.*$",
+    ]
+    result = text
+    for pattern in patterns:
+        result = re.sub(pattern, "", result)
+    return _normalise_feedback_text(result)
+
+
+def _scrub_feedback_citations(text: str) -> str:
+    """Remove model-name and iteration-specific citation details."""
+    result = text
+    result = re.sub(r"\([^\n()]*\bBIC\s*=\s*[^\n()]*\)", "", result)
+    result = re.sub(
+        r"(?i)\b(?:model[_\s-]*id|id)\s*[:#-]?\s*\d+\b", "a previous model", result
+    )
+    result = re.sub(
+        r"(?i)\biter(?:ation)?\s*\d+(?:\s*run\s*\d+)?\b",
+        "an earlier iteration",
+        result,
+    )
+    result = re.sub(r"(?i)\bparticipant\s*\d+\b", "a participant", result)
+    result = re.sub(
+        r"(?i)\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b(?=\s*(?:improved|worsened|regressed|outperformed|underperformed|failed|succeeded))",
+        "that model",
+        result,
+    )
+    return _normalise_feedback_text(result)
+
+
+def _suppress_diagnostic_sections(text: str) -> str:
+    """Remove PPC, residual, and diagnostic-detail sections."""
+    result = text
+    section_patterns = [
+        r"(?is)(?:^|\n\n)[^\n]*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery)[^\n]*(?:\n(?!\n).*)*",
+    ]
+    line_patterns = [
+        r"(?im)^\s*[-*]?\s*.*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery).*$",
+    ]
+    for pattern in section_patterns:
+        result = re.sub(pattern, "", result)
+    for pattern in line_patterns:
+        result = re.sub(pattern, "", result)
+    return _normalise_feedback_text(result)
+
+
+def _build_random_feedback_verdict(
+    iteration: int, best_metric: float | None
+) -> JudgeVerdict:
+    """Return deterministic generic feedback for noise-only mode."""
+    return JudgeVerdict(
+        iteration=iteration,
+        per_angle=[],
+        key_recommendations=[],
+        synthesized_feedback=_RANDOM_FEEDBACK_TEXT,
+        tool_call_count=0,
+        wall_time_seconds=0.0,
+        best_bic=best_metric,
+    )
+
+
+def _is_summary_only_capability_set(capabilities: list[str]) -> bool:
+    """Return whether the capability set matches summary-only mode."""
+    return set(capabilities) == {"attempted_models_overview", "performance_summary"}
+
+
+def _build_summary_only_feedback(analysis_data: dict) -> str:
+    """Build concise deterministic quantitative feedback for summary-only mode."""
+    n_total = analysis_data.get("n_total", 0)
+    n_ok = analysis_data.get("n_ok", 0)
+    n_failed = analysis_data.get("n_failed", 0)
+    best_iter_bic = analysis_data.get("best_iter_bic")
+    best_bic = analysis_data.get("best_bic")
+    trajectory_str = analysis_data.get("trajectory_str", "no BIC trajectory available")
+
+    best_iter_text = f"{best_iter_bic:.2f}" if best_iter_bic is not None else "N/A"
+    best_overall_text = f"{best_bic:.2f}" if best_bic is not None else "N/A"
+
+    return (
+        "Iteration summary:\n"
+        f"- Models evaluated this iteration: {n_total} total, {n_ok} successful, {n_failed} failed.\n"
+        f"- Best BIC this iteration: {best_iter_text}.\n"
+        f"- Best overall BIC so far: {best_overall_text}.\n"
+        f"- BIC trajectory so far: {trajectory_str}."
+    )
+
+
+def _apply_capability_postprocessing(verdict: JudgeVerdict, capabilities: list[str]) -> JudgeVerdict:
+    """Apply deterministic capability-specific feedback shaping."""
+    if "recommendations" not in capabilities:
+        verdict.key_recommendations = []
+        verdict.synthesized_feedback = _remove_recommendation_sections(
+            verdict.synthesized_feedback
+        )
+    if "citations" not in capabilities:
+        verdict.synthesized_feedback = _scrub_feedback_citations(
+            verdict.synthesized_feedback
+        )
+    if "coverage" not in capabilities:
+        verdict.synthesized_feedback = _suppress_diagnostic_sections(
+            verdict.synthesized_feedback
+        )
+    return verdict
 
 
 # ======================================================================
@@ -1259,6 +1380,7 @@ class ToolUsingJudge:
         self.results_dir = Path(results_dir) if results_dir else None
 
         judge_cfg = getattr(cfg, "judge", None)
+        self.capabilities: list[str] = get_judge_capabilities(cfg)
         self.max_tool_calls: int = (
             getattr(judge_cfg, "max_tool_calls", 20) if judge_cfg else 20
         )
@@ -1289,6 +1411,8 @@ class ToolUsingJudge:
             self.model_name = judge_cfg.model
 
         self._tool_loop = self._build_tool_loop()
+        if not judge_has_capability(cfg, "tools"):
+            self._tool_loop = None
 
     def _build_tool_loop(self):
         """Instantiate the right backend tool loop."""
@@ -1315,6 +1439,22 @@ class ToolUsingJudge:
             # HuggingFace / unknown: fall back to OpenAI-compatible if possible,
             # otherwise return None and we'll do a simple text generation.
             return None
+
+    def _capabilities_enabled(self) -> bool:
+        """Return whether any judge capabilities are enabled."""
+        return bool(self.capabilities)
+
+    def _empty_verdict(self, iteration: int, best_metric: float | None) -> JudgeVerdict:
+        """Build an explicit empty-feedback verdict."""
+        return JudgeVerdict(
+            iteration=iteration,
+            per_angle=[],
+            key_recommendations=[],
+            synthesized_feedback="",
+            tool_call_count=0,
+            wall_time_seconds=0.0,
+            best_bic=best_metric,
+        )
 
     def get_feedback(
         self,
@@ -1355,6 +1495,23 @@ class ToolUsingJudge:
         JudgeVerdict
             Contains ``synthesized_feedback`` ready for prompt injection.
         """
+        if not self._capabilities_enabled():
+            verdict = self._empty_verdict(iteration=iteration, best_metric=best_metric)
+            if self.results_dir:
+                self._save_trace(
+                    verdict,
+                    [],
+                    iteration,
+                    run_idx,
+                    tag,
+                    full_trace=[],
+                    extra_payload={
+                        "capabilities": self.capabilities,
+                        "no_substantive_feedback": True,
+                    },
+                )
+            return verdict
+
         # R2: Run analysis phase once
         analysis_data = self.get_feedback_analysis(
             iteration=iteration,
@@ -1369,13 +1526,29 @@ class ToolUsingJudge:
 
         # Check for short-circuit
         if analysis_data.get("short_circuit"):
-            return JudgeVerdict(
+            verdict = JudgeVerdict(
                 iteration=iteration,
+                per_angle=[],
                 synthesized_feedback=analysis_data["analysis_text"],
                 best_bic=best_metric,
                 key_recommendations=[],
-                time_seconds=0,
+                tool_call_count=0,
+                wall_time_seconds=0.0,
             )
+            if self.results_dir:
+                extra_payload = {"capabilities": self.capabilities, "short_circuit": True}
+                if analysis_data.get("random_feedback_only"):
+                    extra_payload["random_feedback_only"] = True
+                self._save_trace(
+                    verdict,
+                    analysis_data.get("trace", []),
+                    iteration,
+                    run_idx,
+                    tag,
+                    full_trace=analysis_data.get("full_trace", []),
+                    extra_payload=extra_payload,
+                )
+            return verdict
 
         # R2: Run synthesis for default persona (backward compatibility)
         # In orchestrated mode, the orchestrator will call synthesize_for_persona multiple times
@@ -1444,6 +1617,38 @@ class ToolUsingJudge:
                 'trajectory': list[dict],
             }
         """
+        if not self._capabilities_enabled():
+            return {
+                "iteration": iteration,
+                "analysis_text": "",
+                "trace": [],
+                "full_trace": [],
+                "best_bic": best_metric,
+                "is_stuck": False,
+                "trajectory": [],
+                "best_bic_str": (
+                    f"{best_metric:.2f}" if best_metric is not None else "N/A"
+                ),
+                "short_circuit": True,
+                "no_capabilities": True,
+            }
+
+        if self.capabilities == ["random_feedback"]:
+            return {
+                "iteration": iteration,
+                "analysis_text": _RANDOM_FEEDBACK_TEXT,
+                "trace": [],
+                "full_trace": [],
+                "best_bic": best_metric,
+                "is_stuck": False,
+                "trajectory": [],
+                "best_bic_str": (
+                    f"{best_metric:.2f}" if best_metric is not None else "N/A"
+                ),
+                "short_circuit": True,
+                "random_feedback_only": True,
+            }
+
         t0 = time.time()
 
         # --- Attempt to short-circuit if previous iteration had only recovery failures ---
@@ -1545,6 +1750,33 @@ class ToolUsingJudge:
                     "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
                 )
 
+        if _is_summary_only_capability_set(self.capabilities):
+            return {
+                "iteration": iteration,
+                "analysis_text": _build_summary_only_feedback(
+                    {
+                        "n_total": n_total,
+                        "n_ok": n_ok,
+                        "n_failed": n_failed,
+                        "best_iter_bic": best_iter_bic_raw,
+                        "best_bic": best_metric,
+                        "trajectory_str": trajectory_str,
+                    }
+                ),
+                "trace": [],
+                "full_trace": [],
+                "best_bic": best_metric,
+                "best_iter_bic": best_iter_bic_raw,
+                "is_stuck": is_stuck,
+                "trajectory": traj,
+                "best_bic_str": best_bic_str,
+                "trajectory_str": trajectory_str,
+                "n_total": n_total,
+                "n_ok": n_ok,
+                "n_failed": n_failed,
+                "summary_only": True,
+            }
+
         # --- Run tool loop (analysis phase) ---
         if self.verbose:
             _console.print(
@@ -1579,9 +1811,14 @@ class ToolUsingJudge:
             "trace": trace,
             "full_trace": full_trace,
             "best_bic": best_metric,
+            "best_iter_bic": best_iter_bic_raw,
             "is_stuck": is_stuck,
             "trajectory": traj,
             "best_bic_str": best_bic_str,
+            "trajectory_str": trajectory_str,
+            "n_total": n_total,
+            "n_ok": n_ok,
+            "n_failed": n_failed,
         }
 
     def synthesize_for_persona(
@@ -1615,6 +1852,18 @@ class ToolUsingJudge:
         iteration = analysis_data["iteration"]
         best_bic = analysis_data["best_bic"]
         is_stuck = analysis_data["is_stuck"]
+
+        if _is_summary_only_capability_set(self.capabilities):
+            verdict = JudgeVerdict(
+                iteration=iteration,
+                per_angle=[],
+                key_recommendations=[],
+                synthesized_feedback=_build_summary_only_feedback(analysis_data),
+                tool_call_count=len(trace),
+                wall_time_seconds=analysis_data.get("wall_time", 0.0),
+                best_bic=best_bic,
+            )
+            return verdict.synthesized_feedback, verdict.__dict__
 
         # Build persona-specific synthesis prompt from profile
         profile = _PERSONA_PROFILES.get(persona_name, _DEFAULT_PROFILE).copy()
@@ -1666,6 +1915,7 @@ class ToolUsingJudge:
             structured_text, iteration, len(trace), wall_time
         )
         verdict.best_bic = best_bic
+        verdict = _apply_capability_postprocessing(verdict, self.capabilities)
 
         if self.verbose:
             _console.print(

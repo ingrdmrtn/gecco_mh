@@ -26,6 +26,7 @@ from gecco.offline_evaluation.fit_generated_models import (
 from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from gecco.utils import log as _log, TimestampedConsole
 from gecco.sentry_init import capture_fit_error, capture_recovery_failed
+from config.schema import get_judge_capabilities, judge_has_capability
 from pathlib import Path
 
 console = TimestampedConsole()
@@ -2115,19 +2116,32 @@ class GeCCoModelSearch:
                         ]
 
                 # --- Dispatch judge (non-orchestrated path only) ---
-                if not orchestrated_judge_enabled:
+                judge_capabilities = get_judge_capabilities(self.cfg)
+
+                if not judge_capabilities:
+                    if self.tool_judge is not None:
+                        verdict = self.tool_judge.get_feedback(
+                            iteration=it,
+                            run_idx=run_idx,
+                            tag=tag,
+                            best_model=self.best_model,
+                            best_metric=self.best_metric,
+                            recovery_failures=recovery_failures
+                            if recovery_failures
+                            else None,
+                            prev_had_success=prev_had_success,
+                        )
+                        feedback = verdict.synthesized_feedback
+                    else:
+                        feedback = ""
+                        verdict = SimpleNamespace(
+                            synthesized_feedback="",
+                            key_recommendations=[],
+                        )
+                elif not orchestrated_judge_enabled:
                     if self.tool_judge is not None:
                         try:
                             self._set_activity(f"tool judge (iter {it})")
-
-                            no_tools_lesion_active = (
-                                getattr(self.cfg.judge, "lesion", None) is not None
-                                and getattr(self.cfg.judge.lesion, "enabled", False)
-                                and getattr(self.cfg.judge.lesion, "lesion_type", None)
-                                == "no_tools"
-                            )
-                            if no_tools_lesion_active:
-                                self.tool_judge._tool_loop = None
 
                             verdict = self.tool_judge.get_feedback(
                                 iteration=it,
@@ -2165,20 +2179,7 @@ class GeCCoModelSearch:
                             key_recommendations=[],
                         )
 
-                # Apply lesion if configured
-                lesion_cfg = getattr(self.cfg.judge, "lesion", None)
-                if lesion_cfg and getattr(lesion_cfg, "enabled", False):
-                    from gecco.construct_feedback.judge_lesion import JudgeLesion
-
-                    if not hasattr(self, "_lesion"):
-                        self._lesion = JudgeLesion(self.cfg.judge)
-                    feedback = self._lesion.apply(verdict, it, feedback)
-
-                # R1: Conditionally append best model code based on show_best_model_code flag
-                show_best_model_code = getattr(
-                    self.cfg.llm, "show_best_model_code", True
-                )
-                if show_best_model_code and self.best_model is not None:
+                if judge_has_capability(self.cfg, "best_model_code") and self.best_model is not None:
                     best_metric_str = (
                         f"{self.best_metric:.2f}"
                         if self.best_metric is not None

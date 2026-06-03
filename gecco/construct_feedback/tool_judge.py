@@ -1921,6 +1921,60 @@ class ToolUsingJudge:
                 **inputs, max_new_tokens=max_new, do_sample=True
             )
             return self.tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Rewrite tool-dependent instructions in the user message for the
+        # no-tools case so the LLM doesn't attempt queries it can't make.
+        user_message_no_tools = user_message.replace(
+            "Please query the diagnostic database to analyse this iteration "
+            "from all six angles, then produce your verdict.",
+            "You do NOT have access to diagnostic tool calls.  Use the "
+            "pre-computed statistics and trajectory printed above to "
+            "analyse this iteration, then produce your verdict.",
+        )
+
+        p = self.provider
+        if any(
+            x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
+        ):
+            messages = [
+                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message_no_tools},
+            ]
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+            }
+            if self.temperature is not None:
+                kwargs["temperature"] = self.temperature
+            resp = self.model.chat.completions.create(**kwargs)
+            content = (
+                resp.choices[0].message.content
+                if resp.choices and resp.choices[0].message
+                else None
+            )
+            if self.verbose:
+                _console.print(
+                    f"[dim]  └─ fallback analysis: "
+                    f"{len(content) if content else 0} chars[/dim]"
+                )
+            return content or ""
+        elif "gemini" in p:
+            try:
+                from google.genai import types
+            except ImportError:
+                from google.generativeai import types
+            contents = [{"role": "user", "parts": [{"text": user_message_no_tools}]}]
+            resp = self.model.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=_JUDGE_SYSTEM_PROMPT,
+                    max_output_tokens=self.max_tokens or None,
+                    temperature=self.temperature,
+                ),
+            )
+            return resp.text
         return "Judge feedback unavailable (no tool-calling backend configured)."
 
     def _save_trace(

@@ -93,8 +93,15 @@ class TestBarrierPrimitives:
             # Retrieve it
             result = registry.get_judge_feedback(iteration=0)
             assert result is not None
-            assert result["synthesized_feedback"] == feedback_text
+            assert result["synthesized_feedback"] == {"default": feedback_text}
             assert result["verdict"]["model_count"] == 5
+
+            default_feedback = registry.get_judge_feedback_for_persona(
+                iteration=0,
+                persona_name="default",
+            )
+            assert default_feedback is not None
+            assert default_feedback["synthesized_feedback"] == feedback_text
 
     def test_wait_for_judge_feedback_immediate(self):
         """Test wait_for_judge_feedback returns immediately when ready."""
@@ -117,7 +124,7 @@ class TestBarrierPrimitives:
             elapsed = time.time() - start
 
             assert result is not None
-            assert result["synthesized_feedback"] == feedback_text
+            assert result["synthesized_feedback"] == {"default": feedback_text}
             assert elapsed < 1.0
 
     def test_wait_for_judge_feedback_timeout(self):
@@ -154,7 +161,9 @@ class TestBarrierPrimitives:
             data = registry.read()
             assert "judge_iterations" in data
             assert "0" in data["judge_iterations"]  # Keyed by iteration string
-            assert data["judge_iterations"]["0"]["synthesized_feedback"] == "Test feedback"
+            assert data["judge_iterations"]["0"]["synthesized_feedback"] == {
+                "default": "Test feedback"
+            }
 
 
 class TestOrchestratorIntegration:

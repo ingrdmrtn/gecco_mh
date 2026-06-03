@@ -41,6 +41,19 @@ def _get_slurm_defaults(config_path):
         "mem_per_task": slurm.get("mem_per_task"),
     }
 
+
+def _get_results_dir(project_root, cfg):
+    task_name = getattr(cfg.task, "name", "unknown")
+    fit_type = getattr(cfg.evaluation, "fit_type", "group")
+    if fit_type == "individual":
+        return project_root / "results" / f"{task_name}_individual"
+    return project_root / "results" / task_name
+
+
+def _format_dependency(job_ids):
+    ids = [str(job_id) for job_id in job_ids if job_id]
+    return f"--dependency=afterok:{':'.join(ids)}" if ids else ""
+
 console = Console()
 
 
@@ -111,6 +124,13 @@ def main():
         default=None,
         help="Memory per node, e.g. 64G (overrides config slurm.mem_per_task)",
     )
+    parser.add_argument(
+        "--run-final-eval",
+        dest="run_final_eval",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run the final test-set evaluation after CMG completes (default: from config, on)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
@@ -141,6 +161,12 @@ def main():
         print("ERROR: centralized_model_generation.n_models must be a positive integer")
         sys.exit(1)
 
+    final_eval_enabled = getattr(cmg_cfg, "run_final_evaluation", True)
+    if args.run_final_eval is not None:
+        final_eval_enabled = args.run_final_eval
+
+    conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
+
     # Resolve SLURM defaults from config (CLI overrides)
     slurm_defaults = _get_slurm_defaults(config_path)
     cpus_per_task = args.cpus_per_task or slurm_defaults.get("cpus_per_task") or 48
@@ -151,6 +177,8 @@ def main():
 
     task_name = getattr(cfg.task, "name", "unknown")
     config_name = args.config
+    results_dir = _get_results_dir(project_root, cfg)
+    results_dir_rel = results_dir.relative_to(project_root)
 
     vllm_url = args.vllm_url or os.environ.get("VLLM_BASE_URL", "")
     vllm_url_arg = f'--vllm-url "{vllm_url}"' if vllm_url else ""
@@ -161,6 +189,7 @@ def main():
             f"[bold]Task:[/] {task_name}\n"
             f"[bold]Generator Client:[/] {generator_client}\n"
             f"[bold]Evaluators:[/] {n_models} (IDs 0..{n_models - 1})\n"
+            f"[bold]Final Eval:[/] {'enabled' if final_eval_enabled else 'disabled'}\n"
             f"[bold]vLLM URL:[/] {vllm_url or '(not set)'}\n"
             f"[bold]Mode:[/] {'local process' if args.local else 'SLURM'}",
             title="CMG Distributed Launch Plan",
@@ -192,6 +221,18 @@ def main():
     print(f"\n[Judge Orchestrator]:")
     print(f"  {orch_cmd}")
 
+    if final_eval_enabled:
+        final_eval_cmd = (
+            f'sbatch --job-name=gecco-cmg-test-eval --cpus-per-task=8 '
+            f'{partition_flag} --mem=16G '
+            f'--output=logs/gecco-cmg-test-eval-%j.out '
+            f'--error=logs/gecco-cmg-test-eval-%j.err '
+            f'{project_root / "bash/run_test_evaluation.sh"} '
+            f'"{config_name}" "{results_dir_rel}" {conda_arg}'
+        )
+        print(f"\n[Final Test Evaluation]:")
+        print(f"  {final_eval_cmd}")
+
     print()
 
     if args.dry_run and args.local:
@@ -199,8 +240,6 @@ def main():
         return
 
     if not args.local:
-        conda_arg = f'"{args.conda_env}"' if args.conda_env else '""'
-
         # --------------------------------------------------------
         # 1. Submit generator as a single non-array job
         #    Uses bash/run_cmg_generator.sh for consistent
@@ -239,7 +278,7 @@ def main():
             f'{project_root / "bash/run_gecco_distributed.sh"} '
             f'"{config_name}" "" "{vllm_url}" {conda_arg}'
         )
-        run_cmd(eval_job_cmd, dry_run=args.dry_run)
+        eval_job_id = run_cmd(eval_job_cmd, dry_run=args.dry_run)
 
         # --------------------------------------------------------
         # 3. Submit orchestrator
@@ -256,7 +295,26 @@ def main():
             f'{project_root / "bash/run_judge_orchestrator.sh"} '
             f'"{config_name}" "{vllm_url}" "{n_models}" {conda_arg}'
         )
-        run_cmd(orch_job_cmd, dry_run=args.dry_run)
+        orch_job_id = run_cmd(orch_job_cmd, dry_run=args.dry_run)
+
+        # --------------------------------------------------------
+        # 4. Submit final test evaluation (post-processing)
+        # --------------------------------------------------------
+        if final_eval_enabled:
+            print("Scheduling final test evaluation (post-processing)...")
+            if args.dry_run:
+                dep_flag = "--dependency=afterok:<generator_job_id>:<evaluator_job_id>:<orchestrator_job_id>"
+            else:
+                dep_flag = _format_dependency([gen_job_id, eval_job_id, orch_job_id])
+            final_eval_job_cmd = (
+                f"sbatch {dep_flag} --cpus-per-task=8 {partition_flag} --mem=16G "
+                f'{project_root / "bash/run_test_evaluation.sh"} '
+                f'"{config_name}" "{results_dir_rel}" {conda_arg}'
+            )
+            final_eval_job_id = run_cmd(final_eval_job_cmd, dry_run=args.dry_run)
+            if final_eval_job_id:
+                print(f"  Final evaluation job ID: {final_eval_job_id}")
+            print()
 
         if not args.dry_run:
             print(f"\nGenerator job ID: {gen_job_id}")
@@ -270,6 +328,13 @@ def main():
             eval_cmd = f'{base_cmd} --client-id {i} {vllm_url_arg}'
             print(f"  tmux new-window -t gen -n eval{i} '{eval_cmd}'")
         print(f"  tmux new-window -t gen -n judge '{orch_cmd}'")
+        if final_eval_enabled:
+            final_eval_cmd = (
+                f'python {script_dir / "run_test_evaluation.py"} '
+                f'--config {config_name} --results-dir {results_dir_rel} --write-store'
+            )
+            print(f"  # Run after generator/evaluators/orchestrator finish:")
+            print(f"  {final_eval_cmd}")
 
 
 if __name__ == "__main__":

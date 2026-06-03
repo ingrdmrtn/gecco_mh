@@ -67,6 +67,7 @@ class CentralizedModelGenerationConfig(BaseModel):
     enabled: bool = False
     generator_client: str = ""
     n_models: int = 0
+    run_final_evaluation: bool = True
 
 
 class ValidationConfig(BaseModel):

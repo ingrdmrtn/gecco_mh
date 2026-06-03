@@ -13,10 +13,12 @@ def mock_cmg_cfg():
     """Return a minimal CMG-enabled config for launcher tests."""
     return SimpleNamespace(
         task=SimpleNamespace(name="test_cmg"),
+        evaluation=SimpleNamespace(fit_type="group"),
         centralized_model_generation=SimpleNamespace(
             enabled=True,
             generator_client="generator",
             n_models=2,
+            run_final_evaluation=True,
         ),
     )
 
@@ -59,6 +61,11 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
     # Orchestrator job should be present
     assert "gecco-cmg-orchestrator" in output
 
+    # Final evaluation job should be scheduled by default
+    assert "gecco-cmg-test-eval" in output
+    assert "run_test_evaluation.sh" in output
+    assert "results/test_cmg" in output
+
     # Dry-run marker
     assert "[Dry run] No jobs were submitted." in output
 
@@ -68,3 +75,23 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
     # Readable panel fields should be present
     assert "Generator Client" in output
     assert "Evaluators" in output
+
+
+def test_slurm_dry_run_can_disable_final_eval(mock_cmg_cfg, capsys):
+    """CLI override should suppress the final evaluation job."""
+    from scripts.launch_cmg_distributed import main
+
+    with patch.object(sys, "argv", [
+        "launch_cmg_distributed.py",
+        "--config", "two_step_factors_cmg.yaml",
+        "--dry-run",
+        "--no-run-final-eval",
+    ]):
+        with patch("scripts.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
+            main()
+
+    captured = capsys.readouterr()
+    output = captured.out
+
+    assert "Final Eval: disabled" in output
+    assert "gecco-cmg-test-eval" not in output

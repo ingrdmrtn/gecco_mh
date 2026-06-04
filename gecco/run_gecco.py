@@ -23,6 +23,12 @@ from rich.table import Table
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
+from gecco.artifacts import ArtifactStore
+from gecco.candidate_evaluation import CandidateEvaluator
+from gecco.candidate_generation import CandidateGenerator
+from gecco.distributed_coordinator import DistributedCoordinator
+from gecco.feedback_coordinator import FeedbackCoordinator
+from gecco.run_context import RunContext
 from gecco.utils import log as _log, TimestampedConsole
 from gecco.sentry_init import capture_fit_error, capture_recovery_failed
 from config.schema import get_judge_capabilities
@@ -89,20 +95,10 @@ class GeCCoModelSearch:
         # --- Local iteration history for judge/runtime state ---
         self.feedback = _IterationFeedbackState()
 
-        # --- Set project root ---
-        self.project_root = Path(__file__).resolve().parents[1]
-
-        # --- Results directory (absolute path) ---
-        fit_type = getattr(self.cfg.evaluation, "fit_type", "group")
-        self.results_dir = (
-            self.project_root / "results" / self.cfg.task.name
-            if fit_type != "individual"
-            else self.project_root / "results" / f"{self.cfg.task.name}_individual"
-        )
-
-        (self.results_dir / "models").mkdir(parents=True, exist_ok=True)
-        (self.results_dir / "bics").mkdir(parents=True, exist_ok=True)
-        (self.results_dir / "feedback").mkdir(parents=True, exist_ok=True)
+        # --- Run context / resolved paths ---
+        self.run_context = RunContext.from_cfg(cfg, client_id=client_id)
+        self.project_root = self.run_context.project_root
+        self.results_dir = self.run_context.results_dir
 
         # --- Individual differences evaluation (optional) ---
         self.id_eval_data = None
@@ -153,8 +149,7 @@ class GeCCoModelSearch:
             try:
                 from gecco.diagnostic_store import DiagnosticStore
 
-                shard = f"_{self.client_id}" if self.client_id else ""
-                db_path = self.results_dir / f"diagnostics{shard}.duckdb"
+                db_path = self.run_context.default_diagnostics_path()
                 self.diagnostic_store = DiagnosticStore(db_path)
                 console.print(f"[dim]Diagnostic store: {db_path}[/]")
             except ImportError:
@@ -186,6 +181,12 @@ class GeCCoModelSearch:
                     results_dir=self.results_dir,
                 )
                 console.print("[dim]Unified judge pipeline initialised.[/]")
+
+        self.artifact_store = ArtifactStore(self.results_dir, self.diagnostic_store)
+        self.candidate_generator = CandidateGenerator(self.artifact_store)
+        self.candidate_evaluator = CandidateEvaluator(self.artifact_store)
+        self.feedback_coordinator = FeedbackCoordinator()
+        self.distributed_coordinator = DistributedCoordinator()
 
         # --- PPC config ---
         ppc_cfg = getattr(judge_cfg, "ppc", None) if judge_cfg else None
@@ -950,70 +951,23 @@ class GeCCoModelSearch:
         self.feedback.history so all feedback analysis methods see
         cross-client data.
         """
-        if self.shared_registry is None:
-            return
-
-        data = self.shared_registry.read()
-
-        # Update best model if global best is better
-        global_best = data.get("global_best")
-        if global_best and global_best["metric_value"] < self.best_metric:
-            self.best_metric = global_best["metric_value"]
-            self.best_model = global_best["model_code"]
-            self.best_params = global_best["param_names"]
-            console.print(
-                f"  [bold magenta]Synced global best from client {global_best['client_id']}:[/] "
-                f"BIC = {global_best['metric_value']:.2f}"
-            )
-
-        # Merge tried param sets (deduplicate)
-        existing = {tuple(s) for s in self.tried_param_sets}
-        for ps in data.get("tried_param_sets", []):
-            key = tuple(ps)
-            if key not in existing:
-                self.tried_param_sets.append(ps)
-                existing.add(key)
-
-        # Merge cross-client iteration history into feedback.history
-        all_history = data.get("iteration_history", [])
-        new_entries = all_history[self._merged_history_count :]
-
-        for entry in new_entries:
-            # Skip our own entries (already in feedback.history)
-            if entry.get("client_id") == self.client_id:
-                continue
-
-            self.feedback.history.append(
-                {
-                    "iteration": entry["iteration"],
-                    "results": entry["results"],
-                    "client_id": entry.get("client_id"),
-                }
-            )
-
-        self._merged_history_count = len(all_history)
+        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator.sync_from_registry(search=self)
 
     def _set_activity(self, activity):
         """Update current activity in the shared registry."""
-        if self.shared_registry is None:
-            return
-        self.shared_registry.set_activity(self.client_id, activity)
+        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator.set_activity(search=self, activity=activity)
 
     def _update_registry(
         self, iteration, results, status="running", had_runnable_model=None
     ):
         """Push this iteration's results to the shared registry."""
-        if self.shared_registry is None:
-            return
-
-        self.shared_registry.update(
-            client_id=self.client_id,
+        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator.update_registry(
+            search=self,
             iteration=iteration,
             results=results,
-            best_model=self.best_model,
-            best_metric=self.best_metric,
-            param_names=self.best_params,
-            tried_param_sets=self.tried_param_sets,
             status=status,
             had_runnable_model=had_runnable_model,
         )
@@ -1577,196 +1531,31 @@ class GeCCoModelSearch:
 
     def _run_cmg_generator_iteration(self, it, run_idx, feedback, cmg_cfg):
         """Generator path: generate candidates and publish to registry."""
-        n_models = cmg_cfg.n_models
-        tag = self._file_tag()
-        self._set_activity(f"generating centralized candidates (iter {it})")
-
-        client_config = (
-            getattr(self.cfg.clients, self.client_id, None) if self.client_id else None
+        generator = getattr(self, "candidate_generator", None) or CandidateGenerator(
+            getattr(self, "artifact_store", None)
+            or ArtifactStore(self.results_dir, getattr(self, "diagnostic_store", None))
         )
-        naive_enabled = bool(
-            client_config
-            and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
+        generator.generate_iteration(
+            search=self,
+            iteration=it,
+            run_idx=run_idx,
+            feedback=feedback,
+            cmg_cfg=cmg_cfg,
         )
-
-        try:
-            if naive_enabled:
-                code_text, parsed_models = self.generate_models_naive(feedback, n_models=n_models)
-            else:
-                prompt = self.prompt_builder.build_input_prompt(
-                    feedback_text=feedback, n_models=n_models
-                )
-                code_text, parsed_models = self.generate_models(prompt, n_models=n_models)
-
-            model_file = (
-                self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
-                if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                else self.results_dir
-                / "models"
-                / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
-            )
-            with open(model_file, "w") as f:
-                f.write(code_text)
-
-            if parsed_models:
-                structured_file = model_file.with_suffix(".json")
-                with open(structured_file, "w") as f:
-                    json.dump(
-                        [
-                            {
-                                "name": m["name"],
-                                "rationale": m.get("rationale", ""),
-                                "analysis": m.get("analysis", ""),
-                                "parameters": m.get("parameters", []),
-                            }
-                            for m in parsed_models
-                        ],
-                        f,
-                        indent=2,
-                    )
-
-            candidates = []
-            for i, model in enumerate(parsed_models):
-                func_name = f"cognitive_model{i + 1}"
-                candidates.append({
-                    "index": i,
-                    "func_name": func_name,
-                    "name": model.get("name", func_name),
-                    "code": model.get("code", ""),
-                    "rationale": model.get("rationale", ""),
-                    "analysis": model.get("analysis", ""),
-                    "parameters": model.get("parameters", []),
-                    "validation_failed": model.get("validation_failed", False),
-                    "validation_errors": model.get("validation_errors", []),
-                })
-
-            if len(candidates) != n_models:
-                raise ValueError(
-                    f"CMG generator produced {len(candidates)} candidates, expected {n_models}"
-                )
-
-            self.shared_registry.set_candidate_models(it, candidates, self.client_id)
-            self.shared_registry.set_generator_status(
-                iteration=it,
-                client_id=self.client_id,
-                status="complete",
-                n_candidates=len(candidates),
-            )
-            console.print(
-                f"[green]Generator published {len(candidates)} candidates for iteration {it}[/]"
-            )
-        except Exception as e:
-            self.shared_registry.set_generator_status(
-                iteration=it,
-                client_id=self.client_id,
-                status="failed",
-                n_candidates=0,
-                error=str(e),
-            )
-            raise
 
     def _run_cmg_evaluator_iteration(self, it, run_idx, feedback, cmg_cfg, baseline_bic):
         """Evaluator path: fit assigned candidate with repair loop."""
-        idx = self._cmg_evaluator_index(cmg_cfg)
-        if idx is None:
-            raise ValueError(
-                f"CMG evaluator client_id must be numeric in range 0..{cmg_cfg.n_models - 1}; "
-                f"got {self.client_id!r}"
-            )
-
-        barrier_timeout = getattr(
-            getattr(self.cfg.judge, "barrier", None), "client_wait_seconds", 1800
+        evaluator = getattr(self, "candidate_evaluator", None) or CandidateEvaluator(
+            getattr(self, "artifact_store", None)
+            or ArtifactStore(self.results_dir, getattr(self, "diagnostic_store", None))
         )
-        gen_data = self.shared_registry.wait_for_candidate_models(
-            it,
-            timeout_seconds=barrier_timeout,
-        )
-        if gen_data is None:
-            raise TimeoutError(f"Timed out waiting for CMG candidates for iteration {it}")
-
-        candidates = gen_data.get("candidates", [])
-        candidate = next((c for c in candidates if c.get("index") == idx), None)
-        if candidate is None:
-            raise ValueError(f"No CMG candidate {idx} for iteration {it}")
-
-        func_name = candidate.get("func_name", f"cognitive_model{idx + 1}")
-        display_name = candidate.get("name", func_name)
-        console.print(
-            f"CMG evaluator {idx} fitting candidate index {idx}: {func_name} ({display_name})"
-        )
-        model_dict = {
-            "func_name": func_name,
-            "name": display_name,
-            "code": candidate.get("code", ""),
-            "parameters": candidate.get("parameters", []),
-        }
-
-        tag = self._file_tag()
-        model_file = (
-            self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
-            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-            else self.results_dir
-            / "models"
-            / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
-        )
-
-        with open(model_file, "w") as f:
-            f.write(model_dict.get("code", ""))
-
-        iteration_results = []
-        syntax_retry_count = 0
-        max_syntax_retries = getattr(
-            getattr(self.cfg, "validation", None), "max_syntax_retries", 2
-        )
-
-        current_model_dict = model_dict
-
-        while syntax_retry_count <= max_syntax_retries:
-            result, should_stop = self._fit_candidate_model(
-                model_dict=current_model_dict,
-                model_idx=idx,
-                n_models=cmg_cfg.n_models,
-                it=it,
-                run_idx=run_idx,
-                tag=tag,
-                model_file=model_file,
-                baseline_bic=baseline_bic,
-            )
-
-            is_repairable_error = self._is_cmg_repairable_error(result)
-
-            if not is_repairable_error or syntax_retry_count >= max_syntax_retries:
-                if result is not None:
-                    iteration_results = [result]
-                break
-
-            syntax_retry_count += 1
-            self._update_registry(it, [], status="retrying")
-            console.print(
-                f"[yellow]CMG evaluator {idx}: repairing candidate "
-                f"(attempt {syntax_retry_count}/{max_syntax_retries})[/]"
-            )
-            current_model_dict = self._repair_cmg_candidate(
-                candidate=candidate,
-                current_model_dict=current_model_dict,
-                error_result=result,
-                expected_func_name=func_name,
-                iteration=it,
-                candidate_index=idx,
-            )
-            # Keep artifact file in sync with repaired code
-            with open(model_file, "w") as f:
-                f.write(current_model_dict.get("code", ""))
-
-        if result is not None:
-            result.setdefault("candidate_index", idx)
-            result.setdefault("expected_func_name", func_name)
-            result.setdefault("display_name", display_name)
-        self._finalize_iteration_results(
-            it=it,
+        evaluator.evaluate_iteration(
+            search=self,
+            iteration=it,
             run_idx=run_idx,
-            tag=tag,
-            iteration_results=iteration_results,
+            feedback=feedback,
+            cmg_cfg=cmg_cfg,
+            baseline_bic=baseline_bic,
         )
 
     def _repair_cmg_candidate(
@@ -1933,52 +1722,22 @@ class GeCCoModelSearch:
         """
         self._set_activity(f"saving results (iter {it})")
 
-        bic_file = (
-            self.results_dir / "bics" / f"iter{it}{tag}_run{run_idx}.json"
-            if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-            else self.results_dir
-            / "bics"
-            / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.json"
+        artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
+            self.results_dir, getattr(self, "diagnostic_store", None)
         )
-        with open(bic_file, "w") as f:
-            json.dump(iteration_results, f, indent=2, cls=_NumpyJSONEncoder)
+
+        had_runnable_model = artifact_store.write_iteration_results(
+            iteration=it,
+            run_idx=run_idx,
+            tag=tag,
+            iteration_results=iteration_results,
+            client_id=self.client_id,
+            results_source=self.df,
+        )
 
         self.feedback.record_iteration(it, iteration_results)
 
-        # --- Write to diagnostic store (optional) ---
-        if self.diagnostic_store is not None:
-            try:
-                ppc_results_map = {}
-                for r in iteration_results:
-                    if "ppc" in r:
-                        ppc_results_map[r["function_name"]] = r["ppc"]
-                self.diagnostic_store.write_iteration(
-                    iteration=it,
-                    run_idx=run_idx,
-                    iteration_results=iteration_results,
-                    ppc_results=ppc_results_map if ppc_results_map else None,
-                    tag=tag,
-                    client_id=self.client_id,
-                )
-            except Exception as e:
-                console.print(
-                    f"  [yellow]Diagnostic store write failed:[/] {e}"
-                )
-
-        had_runnable_model = (
-            any(
-                r.get("metric_name")
-                not in ("VALIDATION_ERROR", "FIT_ERROR", "RECOVERY_FAILED", None)
-                for r in iteration_results
-            )
-            if iteration_results
-            else False
-        )
-
-        if had_runnable_model:
-            completion_status = "complete"
-        else:
-            completion_status = "complete_no_success"
+        completion_status = "complete" if had_runnable_model else "complete_no_success"
         self._update_registry(
             it,
             iteration_results,
@@ -1990,23 +1749,11 @@ class GeCCoModelSearch:
 
     def run_n_shots(self, run_idx, baseline_bic):
         # Resume from the next iteration after what's already in the registry
-        start_iter = 0
         cmg_cfg = self._cmg_config()
-        if (
-            self.shared_registry is not None
-            and self.client_id is not None
-            and cmg_cfg is not None
-            and self._cmg_is_generator(cmg_cfg)
-        ):
-            max_existing = self.shared_registry.get_max_generator_iteration(self.client_id)
-        elif self.shared_registry is not None and self.client_id is not None:
-            max_existing = self.shared_registry.get_max_iteration_for_client(self.client_id)
-        elif self.shared_registry is not None:
-            max_existing = self.shared_registry.get_max_iteration()
-        else:
-            max_existing = -1
+        distributed_coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        start_iter = distributed_coordinator.start_iteration(search=self, cmg_cfg=cmg_cfg)
+        max_existing = start_iter - 1
         if max_existing >= 0:
-            start_iter = max_existing + 1
             console.print(
                 f"[dim]Resuming from iteration {start_iter} (registry has up to {max_existing})[/]"
             )
@@ -2115,26 +1862,16 @@ class GeCCoModelSearch:
                         ]
 
                 if self.tool_judge is not None:
-                    self._set_activity(f"judge synthesis (iter {it})")
-                    artifact = run_orchestrated_judge_pipeline(
-                        judge=self.tool_judge,
-                        cfg=self.cfg,
-                        results_dir=self.results_dir,
+                    feedback_coordinator = getattr(self, "feedback_coordinator", None) or FeedbackCoordinator()
+                    feedback, verdict = feedback_coordinator.resolve_feedback(
+                        search=self,
                         iteration=it,
                         run_idx=run_idx,
                         tag=tag,
                         best_model=self.best_model,
                         best_metric=self.best_metric,
-                        recovery_failures=recovery_failures
-                        if recovery_failures
-                        else None,
+                        recovery_failures=recovery_failures,
                         prev_had_success=prev_had_success,
-                    )
-                    persona_name = self.client_id or "default"
-                    feedback = artifact.feedback_for_persona(persona_name)
-                    verdict = SimpleNamespace(
-                        synthesized_feedback=feedback,
-                        key_recommendations=artifact.key_recommendations,
                     )
                 else:
                     feedback = ""
@@ -2145,15 +1882,17 @@ class GeCCoModelSearch:
 
             # Save feedback for inspection (runs whenever feedback was populated)
             if feedback:
-                feedback_file = (
-                    self.results_dir / "feedback" / f"iter{it}{tag}_run{run_idx}.txt"
-                    if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                    else self.results_dir
-                    / "feedback"
-                    / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                participant = self.df.participant[0] if hasattr(self.df, "participant") else None
+                artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
+                    self.results_dir, getattr(self, "diagnostic_store", None)
                 )
-                with open(feedback_file, "w") as f:
-                    f.write(feedback)
+                artifact_store.write_feedback_text(
+                    iteration=it,
+                    run_idx=run_idx,
+                    tag=tag,
+                    feedback=feedback,
+                    participant=participant,
+                )
 
             # --- Centralized Model Generation (CMG) branch ---
             cmg_cfg = self._cmg_config()

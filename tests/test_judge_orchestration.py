@@ -183,12 +183,25 @@ task:
   goal: "Test goal"
   instructions: "Test"
 
+data:
+  path: "data.csv"
+  id_column: "participant"
+  input_columns: ["choice"]
+
+llm:
+  provider: "openai"
+  base_model: "gpt-test"
+  guardrails: []
+
+evaluation:
+  metric: "bic"
+  fit_type: "group"
+
 loop:
   max_iterations: 2
   n_clients: 2
 
 judge:
-  mode: "tool_using"
   orchestrated: true
   barrier:
     orchestrator_wait_seconds: 120

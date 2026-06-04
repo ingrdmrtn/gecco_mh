@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.panel import Panel
 
 from config.schema import load_config
+from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
 from gecco.coordination import SharedRegistry
 from gecco.diagnostic_store.rebuild import rebuild_from_artifacts
@@ -215,6 +214,8 @@ def run_orchestrator(
 
         console.print("[cyan]Running centralized judge...[/]")
         max_judge_retries = 2
+        registry_snapshot = registry.read()
+        global_best = registry_snapshot.get("global_best") or {}
         for attempt in range(max_judge_retries + 1):
             try:
                 judge = ToolUsingJudge(
@@ -225,131 +226,23 @@ def run_orchestrator(
                     results_dir=resolved_results_dir,
                 )
 
-                judge_start_time = time.time()
-                analysis_data = judge.get_feedback_analysis(
+                artifact = run_orchestrated_judge_pipeline(
+                    judge=judge,
+                    cfg=cfg,
+                    results_dir=resolved_results_dir,
                     iteration=iteration,
                     run_idx=0,
                     tag="_orchestrator",
-                    best_model=None,
-                    best_metric=None,
+                    best_model=global_best.get("model_code"),
+                    best_metric=global_best.get("metric_value"),
                     recovery_failures=None,
                     prev_had_success=True,
                 )
-
-                if analysis_data.get("short_circuit"):
-                    if cmg_enabled:
-                        generator_name = getattr(cmg_cfg, "generator_client", "generator")
-                        synthesized_feedback = {
-                            generator_name: analysis_data["analysis_text"]
-                        }
-                    else:
-                        synthesized_feedback = {"default": analysis_data["analysis_text"]}
-                    last_verdict_dict = {}
-                    all_recommendations = []
-                else:
-                    synthesized_feedback = {}
-                    last_verdict_dict = {}
-                    all_recommendations = []
-                    clients = getattr(cfg, "clients", {}) or {}
-                    if not isinstance(clients, dict):
-                        clients = {
-                            name: getattr(clients, name)
-                            for name in vars(clients).keys()
-                            if not name.startswith("_")
-                        }
-
-                    if cmg_enabled:
-                        generator_name = getattr(cmg_cfg, "generator_client", "generator")
-                        persona_config = clients.get(generator_name) if clients else None
-                        persona_suffix = ""
-                        if persona_config and hasattr(persona_config, "llm"):
-                            persona_suffix = getattr(
-                                persona_config.llm, "feedback_guidance", None
-                            ) or getattr(persona_config.llm, "system_prompt_suffix", "")
-                        feedback_text, verdict_dict = judge.synthesize_for_persona(
-                            analysis_data,
-                            persona_name=generator_name,
-                            persona_suffix=persona_suffix,
-                            persona_config=persona_config,
-                        )
-                        synthesized_feedback[generator_name] = feedback_text
-                        last_verdict_dict = verdict_dict
-                        if verdict_dict.get("key_recommendations"):
-                            all_recommendations = verdict_dict["key_recommendations"]
-                    elif clients:
-                        for persona_name, persona_config in clients.items():
-                            persona_suffix = ""
-                            if persona_config and hasattr(persona_config, "llm"):
-                                persona_suffix = getattr(
-                                    persona_config.llm, "feedback_guidance", None
-                                ) or getattr(persona_config.llm, "system_prompt_suffix", "")
-
-                            feedback_text, verdict_dict = judge.synthesize_for_persona(
-                                analysis_data,
-                                persona_name=persona_name,
-                                persona_suffix=persona_suffix,
-                                persona_config=persona_config,
-                            )
-                            synthesized_feedback[persona_name] = feedback_text
-                            last_verdict_dict = verdict_dict
-                            if verdict_dict.get("key_recommendations"):
-                                all_recommendations.extend(
-                                    verdict_dict["key_recommendations"]
-                                )
-                    else:
-                        feedback_text, verdict_dict = judge.synthesize_for_persona(
-                            analysis_data,
-                            persona_name="default",
-                            persona_suffix="",
-                        )
-                        synthesized_feedback["default"] = feedback_text
-                        last_verdict_dict = verdict_dict
-                        if verdict_dict.get("key_recommendations"):
-                            all_recommendations = verdict_dict["key_recommendations"]
-
-                total_wall_time = time.time() - judge_start_time
-
-                judge_dir = resolved_results_dir / "judge"
-                judge_dir.mkdir(parents=True, exist_ok=True)
-
-                seen_recs = set()
-                unique_recommendations = []
-                for recommendation in all_recommendations:
-                    if recommendation not in seen_recs:
-                        seen_recs.add(recommendation)
-                        unique_recommendations.append(recommendation)
-
-                raw_per_angle = (
-                    last_verdict_dict.get("per_angle", []) if last_verdict_dict else []
+                trace_file = (
+                    resolved_results_dir
+                    / "judge"
+                    / f"iter{iteration}_orchestrator_run0.json"
                 )
-                per_angle = [
-                    angle.model_dump() if hasattr(angle, "model_dump") else angle
-                    for angle in raw_per_angle
-                ]
-
-                trace_payload = {
-                    "iteration": iteration,
-                    "run_idx": 0,
-                    "tag": "_orchestrator",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "tool_call_count": len(analysis_data.get("trace", [])),
-                    "wall_time_seconds": total_wall_time,
-                    "best_bic": analysis_data.get("best_bic"),
-                    "tool_call_trace": analysis_data.get("trace", []),
-                    "full_trace": analysis_data.get("full_trace", []),
-                    "per_angle": per_angle,
-                    "key_recommendations": unique_recommendations[:5],
-                    "synthesized_feedback": synthesized_feedback,
-                    "stuck_search": analysis_data.get("is_stuck", False),
-                    "personas": list(synthesized_feedback.keys()),
-                }
-                if analysis_data.get("short_circuit"):
-                    trace_payload["short_circuit"] = True
-
-                trace_file = judge_dir / f"iter{iteration}_orchestrator_run0.json"
-                with trace_file.open("w", encoding="utf-8") as file_obj:
-                    json.dump(trace_payload, file_obj, indent=2, default=str)
-
                 console.print(f"[cyan]Trace saved to {trace_file}[/]")
 
                 verdict_payload = {
@@ -359,7 +252,7 @@ def run_orchestrator(
                 }
                 registry.set_judge_feedback(
                     iteration=iteration,
-                    synthesized_feedback=synthesized_feedback,
+                    synthesized_feedback=artifact.synthesized_feedback,
                     verdict_payload=verdict_payload,
                 )
 

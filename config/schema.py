@@ -153,8 +153,7 @@ class JudgeProfileConfig(GeCCoBaseModel):
 class JudgeConfig(GeCCoBaseModel):
     """Judge runtime configuration."""
 
-    mode: Literal["manual", "tool_using"] = "manual"
-    orchestrated: bool = False
+    orchestrated: bool = True
     barrier: BarrierConfig = Field(default_factory=BarrierConfig)
     max_tool_calls: int | None = None
     verbose: bool = False
@@ -169,6 +168,17 @@ class JudgeConfig(GeCCoBaseModel):
     )
     persona_profiles: dict[str, JudgeProfileConfig] = Field(default_factory=dict)
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_mode_field(cls, data: Any) -> Any:
+        """Reject the retired ``judge.mode`` runtime field with a clear message."""
+        if isinstance(data, dict) and "mode" in data:
+            raise ValueError(
+                "judge.mode has been retired; remove the field. "
+                "The judge now always uses the orchestrated pipeline."
+            )
+        return data
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "JudgeConfig":

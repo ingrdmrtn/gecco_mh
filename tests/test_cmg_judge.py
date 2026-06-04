@@ -23,7 +23,6 @@ def _make_cfg(cmg_enabled=True):
                 orchestrator_wait_seconds=1,
                 retry_wait_seconds=1,
             ),
-            mode="tool_using",
             diagnostic_store=SimpleNamespace(enabled=True),
             ppc=SimpleNamespace(enabled=False),
             lesion=None,

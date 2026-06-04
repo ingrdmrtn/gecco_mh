@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from config.schema import GeCCoConfig, load_config
+from config.schema import GeCCoConfig, JudgeConfig, load_config
 from gecco.construct_feedback.tool_judge import (
     JudgeVerdict,
     ToolUsingJudge,
@@ -119,7 +119,7 @@ def test_load_config_returns_validated_model_with_explicit_capabilities(tmp_path
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  mode: \"tool_using\"
+            """  orchestrated: true
   capabilities:
     - tools
     - performance_summary
@@ -167,12 +167,20 @@ def test_cmg_config_declares_explicit_full_capability_set():
     assert cfg.judge.capabilities == FULL_CAPABILITIES
 
 
+def test_example_judge_fragment_is_not_treated_as_runtime_config():
+    """Example judge fragments should stay separate from full runtime configs."""
+    assert "judge_tool_example.yaml" not in PRODUCTION_CONFIGS
+
+    with pytest.raises(ValidationError):
+        load_config(CONFIG_DIR / "judge_tool_example.yaml")
+
+
 def test_load_config_rejects_legacy_lesion_block(tmp_path):
     """Legacy lesion-first judge settings should fail validation."""
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  mode: \"tool_using\"
+            """  orchestrated: true
   capabilities:
     - tools
   lesion:
@@ -191,7 +199,8 @@ def test_load_config_rejects_unknown_judge_capability(tmp_path):
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  capabilities:
+            """  orchestrated: true
+  capabilities:
     - tools
     - definitely_not_real
 """
@@ -207,7 +216,8 @@ def test_load_config_rejects_duplicate_judge_capabilities(tmp_path):
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  capabilities:
+            """  orchestrated: true
+  capabilities:
     - tools
     - tools
 """
@@ -223,7 +233,8 @@ def test_load_config_rejects_invalid_random_feedback_combination(tmp_path):
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  capabilities:
+            """  orchestrated: true
+  capabilities:
     - random_feedback
     - performance_summary
 """
@@ -239,7 +250,8 @@ def test_load_config_rejects_persona_synthesis_without_personas(tmp_path):
     config_path = _write_config(
         tmp_path,
         _minimal_config(
-            """  capabilities:
+            """  orchestrated: true
+  capabilities:
     - persona_synthesis
 """
         ),
@@ -247,6 +259,52 @@ def test_load_config_rejects_persona_synthesis_without_personas(tmp_path):
 
     with pytest.raises(ValidationError, match="persona_synthesis"):
         load_config(str(config_path))
+
+
+def test_load_config_rejects_retired_judge_mode_manual(tmp_path):
+    """judge.mode=manual should fail with a clear retirement message."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  mode: "manual"
+  orchestrated: true
+"""
+        ),
+    )
+
+    with pytest.raises(ValidationError, match=r"judge\.mode has been retired"):
+        load_config(str(config_path))
+
+
+def test_load_config_rejects_retired_judge_mode_tool_using(tmp_path):
+    """judge.mode=tool_using should also fail with the retirement message."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  mode: "tool_using"
+  orchestrated: true
+"""
+        ),
+    )
+
+    with pytest.raises(ValidationError, match=r"judge\.mode has been retired"):
+        load_config(str(config_path))
+
+
+def test_judge_config_public_contract_no_longer_exposes_mode_field():
+    """The validated judge schema should no longer advertise judge.mode."""
+    assert "mode" not in JudgeConfig.model_fields
+
+
+def test_runtime_yaml_configs_do_not_set_retired_judge_mode():
+    """Repository runtime configs should not keep stale judge.mode keys."""
+    config_files = sorted(CONFIG_DIR.glob("*.yaml"))
+    assert config_files
+
+    for config_path in config_files:
+        text = config_path.read_text(encoding="utf-8")
+        assert 'mode: "tool_using"' not in text
+        assert 'mode: "manual"' not in text
 
 
 def test_load_config_allows_persona_synthesis_with_explicit_profiles(tmp_path):
@@ -296,7 +354,8 @@ def test_empty_capabilities_yield_explicit_empty_feedback_trace(tmp_path):
     trace_path = tmp_path / "judge" / "iter1_run0.json"
     assert trace_path.exists()
     trace_payload = trace_path.read_text(encoding="utf-8")
-    assert '"synthesized_feedback": ""' in trace_payload
+    assert '"synthesized_feedback": {' in trace_payload
+    assert '"default": ""' in trace_payload
     assert '"tool_call_trace": []' in trace_payload
     assert '"no_substantive_feedback": true' in trace_payload
 

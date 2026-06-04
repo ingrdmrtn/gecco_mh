@@ -3,9 +3,8 @@ Tool-using judge for GeCCo.
 
 The :class:`ToolUsingJudge` queries the diagnostic store through a set of
 read-only tools, analyses the iteration from multiple analytical angles, and
-returns a :class:`JudgeVerdict` whose ``synthesized_feedback`` field is
-drop-in compatible with the text returned by
-:class:`gecco.construct_feedback.feedback.FeedbackGenerator`.
+returns a :class:`JudgeVerdict` whose ``synthesized_feedback`` field is ready
+for prompt injection into the next generation step.
 
 Analytical angles (prompt-level, not separate agents)
 ------------------------------------------------------
@@ -1495,25 +1494,12 @@ class ToolUsingJudge:
         JudgeVerdict
             Contains ``synthesized_feedback`` ready for prompt injection.
         """
-        if not self._capabilities_enabled():
-            verdict = self._empty_verdict(iteration=iteration, best_metric=best_metric)
-            if self.results_dir:
-                self._save_trace(
-                    verdict,
-                    [],
-                    iteration,
-                    run_idx,
-                    tag,
-                    full_trace=[],
-                    extra_payload={
-                        "capabilities": self.capabilities,
-                        "no_substantive_feedback": True,
-                    },
-                )
-            return verdict
+        from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 
-        # R2: Run analysis phase once
-        analysis_data = self.get_feedback_analysis(
+        artifact = run_orchestrated_judge_pipeline(
+            judge=self,
+            cfg=self.cfg,
+            results_dir=self.results_dir,
             iteration=iteration,
             run_idx=run_idx,
             tag=tag,
@@ -1521,72 +1507,17 @@ class ToolUsingJudge:
             best_metric=best_metric,
             recovery_failures=recovery_failures,
             prev_had_success=prev_had_success,
-            **kwargs,
         )
 
-        # Check for short-circuit
-        if analysis_data.get("short_circuit"):
-            verdict = JudgeVerdict(
-                iteration=iteration,
-                per_angle=[],
-                synthesized_feedback=analysis_data["analysis_text"],
-                best_bic=best_metric,
-                key_recommendations=[],
-                tool_call_count=0,
-                wall_time_seconds=0.0,
-            )
-            if self.results_dir:
-                extra_payload = {"capabilities": self.capabilities, "short_circuit": True}
-                if analysis_data.get("random_feedback_only"):
-                    extra_payload["random_feedback_only"] = True
-                self._save_trace(
-                    verdict,
-                    analysis_data.get("trace", []),
-                    iteration,
-                    run_idx,
-                    tag,
-                    full_trace=analysis_data.get("full_trace", []),
-                    extra_payload=extra_payload,
-                )
-            return verdict
-
-        # R2: Run synthesis for default persona (backward compatibility)
-        # In orchestrated mode, the orchestrator will call synthesize_for_persona multiple times
-        synthesized_feedback, verdict_dict = self.synthesize_for_persona(
-            analysis_data, persona_name="default", persona_suffix=""
+        return JudgeVerdict(
+            iteration=artifact.iteration,
+            per_angle=[AngleAnalysis.model_validate(angle) for angle in artifact.per_angle],
+            synthesized_feedback=artifact.feedback_for_persona("default"),
+            best_bic=artifact.best_bic,
+            key_recommendations=artifact.key_recommendations,
+            tool_call_count=artifact.tool_call_count,
+            wall_time_seconds=artifact.wall_time_seconds,
         )
-
-        # --- Validate cited models ---
-        unverified_citations: list[dict] = []
-        cited_models_raw: list[dict] = []
-        verdict_obj = JudgeVerdict(**verdict_dict)
-        if hasattr(verdict_obj, "_cited_models_raw"):
-            cited_models_raw = verdict_obj._cited_models_raw  # type: ignore[attr-defined]
-            unverified_citations = self._validate_cited_models(cited_models_raw)
-            if unverified_citations and self.verbose:
-                names = [c.get("name", "?") for c in unverified_citations]
-                _console.print(
-                    f"[bold yellow]⚠ Judge: unverifiable citations:[/bold yellow] "
-                    + ", ".join(names)
-                )
-
-        # --- Persist audit trace ---
-        if self.results_dir:
-            self._save_trace(
-                verdict_obj,
-                analysis_data["trace"],
-                iteration,
-                run_idx,
-                tag,
-                full_trace=analysis_data["full_trace"],
-                extra_payload={
-                    "stuck_search": analysis_data["is_stuck"],
-                    "cited_models": cited_models_raw,
-                    "unverified_citations": unverified_citations,
-                },
-            )
-
-        return verdict_obj
 
     def get_feedback_analysis(
         self,
@@ -1629,6 +1560,7 @@ class ToolUsingJudge:
                 "best_bic_str": (
                     f"{best_metric:.2f}" if best_metric is not None else "N/A"
                 ),
+                "wall_time": 0.0,
                 "short_circuit": True,
                 "no_capabilities": True,
             }
@@ -1645,6 +1577,7 @@ class ToolUsingJudge:
                 "best_bic_str": (
                     f"{best_metric:.2f}" if best_metric is not None else "N/A"
                 ),
+                "wall_time": 0.0,
                 "short_circuit": True,
                 "random_feedback_only": True,
             }
@@ -1674,6 +1607,7 @@ class ToolUsingJudge:
                     "best_bic": best_metric,
                     "is_stuck": False,
                     "trajectory": [],
+                    "wall_time": 0.0,
                     "short_circuit": True,  # Flag to skip re-synthesis
                 }
 
@@ -1774,6 +1708,7 @@ class ToolUsingJudge:
                 "n_total": n_total,
                 "n_ok": n_ok,
                 "n_failed": n_failed,
+                "wall_time": 0.0,
                 "summary_only": True,
             }
 
@@ -1819,6 +1754,7 @@ class ToolUsingJudge:
             "n_total": n_total,
             "n_ok": n_ok,
             "n_failed": n_failed,
+            "wall_time": wall_time,
         }
 
     def synthesize_for_persona(

@@ -417,8 +417,8 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
     traces = list_judge_traces(results_dir)
     if not traces:
         st.info(
-            "No judge traces available. Judge traces appear when tool-using judge "
-            "mode is enabled (`judge.mode: tool_using` in config)."
+            "No judge traces available. Judge traces appear once the orchestrated "
+            "judge pipeline has produced a feedback artifact for this run."
         )
         return
 
@@ -477,8 +477,8 @@ def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
 
     if trace_key is None:
         st.info(
-            "No judge trace for this iteration — the tool-using judge may be "
-            "disabled or this is a legacy feedback run."
+            "No judge trace for this iteration — the orchestrated judge may not "
+            "have run yet for this iteration."
         )
         return
 

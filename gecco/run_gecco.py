@@ -23,10 +23,10 @@ from rich.table import Table
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
-from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGenerator
 from gecco.utils import log as _log, TimestampedConsole
 from gecco.sentry_init import capture_fit_error, capture_recovery_failed
-from config.schema import get_judge_capabilities, judge_has_capability
+from config.schema import get_judge_capabilities
+from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 from pathlib import Path
 
 console = TimestampedConsole()
@@ -54,6 +54,17 @@ class _NumpyJSONEncoder(json.JSONEncoder):
         return o
 
 
+class _IterationFeedbackState:
+    """Track per-iteration search history for judge context building."""
+
+    def __init__(self):
+        self.history: list[dict] = []
+
+    def record_iteration(self, iteration: int, results: list[dict]) -> None:
+        """Append one iteration's results to the local history."""
+        self.history.append({"iteration": iteration, "results": results})
+
+
 class GeCCoModelSearch:
     def __init__(
         self,
@@ -75,14 +86,8 @@ class GeCCoModelSearch:
         self.client_id = client_id
         self.shared_registry = shared_registry
 
-        # --- Choose feedback generator based on config ---
-        if (
-            hasattr(cfg, "feedback")
-            and getattr(cfg.feedback, "type", "manual") == "llm"
-        ):
-            self.feedback = LLMFeedbackGenerator(cfg, model, tokenizer)
-        else:
-            self.feedback = FeedbackGenerator(cfg)
+        # --- Local iteration history for judge/runtime state ---
+        self.feedback = _IterationFeedbackState()
 
         # --- Set project root ---
         self.project_root = Path(__file__).resolve().parents[1]
@@ -157,22 +162,18 @@ class GeCCoModelSearch:
                     "[yellow]duckdb not installed — diagnostic store disabled.[/]"
                 )
 
-        # --- Tool-using judge (optional) ---
+        # --- Unified judge pipeline ---
         self.tool_judge = None
-        _orchestrated = (
-            shared_registry is not None
-            and judge_cfg
-            and getattr(judge_cfg, "orchestrated", False)
-        )
-        if judge_cfg and getattr(judge_cfg, "mode", "manual") == "tool_using":
-            if _orchestrated:
+        self.judge_orchestrated = bool(judge_cfg is not None)
+        judge_capabilities = get_judge_capabilities(cfg)
+        if judge_cfg:
+            if shared_registry is not None:
                 console.print(
                     "[dim]Orchestrated mode: per-client tool judge skipped.[/]"
                 )
-            elif self.diagnostic_store is None:
-                console.print(
-                    "[yellow]tool_using judge requires diagnostic_store.enabled=true — "
-                    "falling back to standard feedback.[/]"
+            elif self.diagnostic_store is None and judge_capabilities:
+                raise ValueError(
+                    "Judge capabilities require judge.diagnostic_store.enabled=true"
                 )
             else:
                 from gecco.construct_feedback.tool_judge import ToolUsingJudge
@@ -184,7 +185,7 @@ class GeCCoModelSearch:
                     tokenizer=tokenizer,
                     results_dir=self.results_dir,
                 )
-                console.print("[dim]Tool-using judge initialised.[/]")
+                console.print("[dim]Unified judge pipeline initialised.[/]")
 
         # --- PPC config ---
         ppc_cfg = getattr(judge_cfg, "ppc", None) if judge_cfg else None
@@ -2022,10 +2023,8 @@ class GeCCoModelSearch:
             tag = self._file_tag()
             feedback = ""
 
-            orchestrated_judge_enabled = (
-                self.shared_registry is not None
-                and getattr(self.cfg, "judge", None) is not None
-                and getattr(self.cfg.judge, "orchestrated", False)
+            orchestrated_judge_enabled = self.shared_registry is not None and bool(
+                getattr(self, "judge_orchestrated", False)
             )
 
             if orchestrated_judge_enabled and it > 0:
@@ -2115,79 +2114,33 @@ class GeCCoModelSearch:
                             if r.get("metric_name") == "RECOVERY_FAILED"
                         ]
 
-                # --- Dispatch judge (non-orchestrated path only) ---
-                judge_capabilities = get_judge_capabilities(self.cfg)
-
-                if not judge_capabilities:
-                    if self.tool_judge is not None:
-                        verdict = self.tool_judge.get_feedback(
-                            iteration=it,
-                            run_idx=run_idx,
-                            tag=tag,
-                            best_model=self.best_model,
-                            best_metric=self.best_metric,
-                            recovery_failures=recovery_failures
-                            if recovery_failures
-                            else None,
-                            prev_had_success=prev_had_success,
-                        )
-                        feedback = verdict.synthesized_feedback
-                    else:
-                        feedback = ""
-                        verdict = SimpleNamespace(
-                            synthesized_feedback="",
-                            key_recommendations=[],
-                        )
-                elif not orchestrated_judge_enabled:
-                    if self.tool_judge is not None:
-                        try:
-                            self._set_activity(f"tool judge (iter {it})")
-
-                            verdict = self.tool_judge.get_feedback(
-                                iteration=it,
-                                run_idx=run_idx,
-                                tag=tag,
-                                best_model=self.best_model,
-                                best_metric=self.best_metric,
-                                recovery_failures=recovery_failures
-                                if recovery_failures
-                                else None,
-                                prev_had_success=prev_had_success,
-                            )
-                            feedback = verdict.synthesized_feedback
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Tool judge failed, falling back to standard feedback:[/] {e}"
-                            )
-                            feedback = self.feedback.get_feedback(
-                                self.best_model,
-                                self.tried_param_sets,
-                                id_results=self.best_id_results,
-                            )
-                            verdict = SimpleNamespace(
-                                synthesized_feedback=feedback,
-                                key_recommendations=[],
-                            )
-                    else:
-                        feedback = self.feedback.get_feedback(
-                            self.best_model,
-                            self.tried_param_sets,
-                            id_results=self.best_id_results,
-                        )
-                        verdict = SimpleNamespace(
-                            synthesized_feedback=feedback,
-                            key_recommendations=[],
-                        )
-
-                if judge_has_capability(self.cfg, "best_model_code") and self.best_model is not None:
-                    best_metric_str = (
-                        f"{self.best_metric:.2f}"
-                        if self.best_metric is not None
-                        else "N/A"
+                if self.tool_judge is not None:
+                    self._set_activity(f"judge synthesis (iter {it})")
+                    artifact = run_orchestrated_judge_pipeline(
+                        judge=self.tool_judge,
+                        cfg=self.cfg,
+                        results_dir=self.results_dir,
+                        iteration=it,
+                        run_idx=run_idx,
+                        tag=tag,
+                        best_model=self.best_model,
+                        best_metric=self.best_metric,
+                        recovery_failures=recovery_failures
+                        if recovery_failures
+                        else None,
+                        prev_had_success=prev_had_success,
                     )
-                    feedback += (
-                        f"\n\n---\nBest model code so far (BIC={best_metric_str}):\n"
-                        f"```python\n{self.best_model}\n```"
+                    persona_name = self.client_id or "default"
+                    feedback = artifact.feedback_for_persona(persona_name)
+                    verdict = SimpleNamespace(
+                        synthesized_feedback=feedback,
+                        key_recommendations=artifact.key_recommendations,
+                    )
+                else:
+                    feedback = ""
+                    verdict = SimpleNamespace(
+                        synthesized_feedback="",
+                        key_recommendations=[],
                     )
 
             # Save feedback for inspection (runs whenever feedback was populated)

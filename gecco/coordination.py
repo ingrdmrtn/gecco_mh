@@ -1,71 +1,54 @@
 """
 Distributed coordination for parallel GeCCo search clients.
 
-Uses a shared JSON registry file on the filesystem for coordination.
-Advisory file locking (fcntl.flock) ensures safe concurrent access.
+Runtime coordination state is stored canonically in DuckDB. A lightweight
+advisory lock file enforces a single-writer strategy across client processes,
+and every mutation runs inside an explicit transaction.
 """
+
+from __future__ import annotations
 
 import fcntl
 import json
-import os
-import tempfile
 import time
-from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
+try:
+    import duckdb
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "duckdb is required for distributed coordination. "
+        "Install it with: pip install duckdb"
+    ) from exc
+
+from gecco.diagnostic_store.schema import create_schema
 from gecco.sentry_init import capture_coordination_error
 from gecco.utils import TimestampedConsole
-from rich.console import Console
 
 console = TimestampedConsole()
 
 
 class SharedRegistry:
-    """
-    Filesystem-based coordination registry for distributed GeCCo clients.
+    """DuckDB-backed coordination registry for distributed GeCCo clients."""
 
-    Each client reads/writes a shared JSON file. File locking prevents
-    corruption from concurrent access.
-
-    Registry format:
-    {
-        "global_best": {
-            "metric_value": float,
-            "model_code": str,
-            "param_names": [...],
-            "client_id": int,
-            "iteration": int
-        },
-        "tried_param_sets": [[...], ...],
-        "client_entries": {
-            "0": {"last_iteration": int, "best_metric": float, "status": str},
-            ...
-        },
-        "iteration_history": [
-            {
-                "client_id": int,
-                "iteration": int,
-                "results": [
-                    {"function_name": str, "metric_value": float,
-                     "param_names": [...], "code": str}
-                ]
-            },
-            ...
-        ]
-    }
-    """
-
-    def __init__(self, registry_path):
+    def __init__(self, registry_path: str | Path):
         self.registry_path = Path(registry_path)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Initialize empty registry if it doesn't exist
-        if not self.registry_path.exists():
-            self._atomic_write(self._empty_registry())
+        self.db_path = self.db_path_for_registry(self.registry_path)
+        self.lock_path = Path(f"{self.db_path}.lock")
+        self.lock_path.touch(exist_ok=True)
+        self._initialise_store()
 
     @staticmethod
-    def _empty_registry():
+    def db_path_for_registry(registry_path: str | Path) -> Path:
+        """Return the canonical DuckDB path for a registry path."""
+        path = Path(registry_path)
+        return path.with_suffix(".duckdb")
+
+    @staticmethod
+    def _empty_registry() -> dict[str, Any]:
         return {
             "global_best": None,
             "baseline": None,
@@ -74,38 +57,198 @@ class SharedRegistry:
             "iteration_history": [],
             "candidate_generations": {},
             "generator_status": {},
+            "judge_iterations": {},
         }
 
-    def read(self):
-        """Read the current registry state with shared (read) lock."""
-        try:
-            with open(self.registry_path, "r") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    data = json.load(f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            return data
-        except (json.JSONDecodeError, FileNotFoundError):
-            return self._empty_registry()
+    @staticmethod
+    def _client_key(client_id: Any) -> str:
+        return str(client_id)
 
-    def _atomic_write(self, data):
-        """Write data atomically using a temp file + os.replace."""
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.registry_path.parent),
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp_path, str(self.registry_path))
-        except Exception as e:
-            capture_coordination_error(error=e, operation="atomic-write")
+    @staticmethod
+    def _restore_client_id(value: Any) -> Any:
+        if isinstance(value, str) and value.lstrip("-").isdigit():
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                return int(value)
+            except ValueError:
+                return value
+        return value
+
+    @staticmethod
+    def _to_json_text(value: Any) -> str:
+        return json.dumps(value)
+
+    @staticmethod
+    def _from_json_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def _initialise_store(self) -> None:
+        def _create(conn):
+            create_schema(conn)
+
+        self._with_connection(write=True, operation="initialise", callback=_create)
+
+    def _with_connection(self, *, write: bool, operation: str, callback):
+        lock_mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
+        with open(self.lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), lock_mode)
+            conn = duckdb.connect(str(self.db_path))
+            try:
+                create_schema(conn)
+                if write:
+                    conn.execute("BEGIN TRANSACTION")
+                result = callback(conn)
+                if write:
+                    conn.execute("COMMIT")
+                return result
+            except Exception as exc:
+                if write:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                capture_coordination_error(error=exc, operation=operation)
+                raise
+            finally:
+                conn.close()
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _fetchone(self, sql: str, params: list[Any] | None = None) -> dict[str, Any] | None:
+        def _query(conn):
+            cursor = conn.execute(sql, params or [])
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+        return self._with_connection(write=False, operation="fetchone", callback=_query)
+
+    def _fetchall(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
+        def _query(conn):
+            cursor = conn.execute(sql, params or [])
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        return self._with_connection(write=False, operation="fetchall", callback=_query)
+
+    def read(self) -> dict[str, Any]:
+        """Read the current registry state from DuckDB."""
+
+        def _read(conn):
+            data = self._empty_registry()
+
+            global_best = conn.execute(
+                "SELECT metric_value, model_code, param_names, client_id, iteration "
+                "FROM runtime_global_best WHERE singleton = 1"
+            ).fetchone()
+            if global_best is not None:
+                data["global_best"] = {
+                    "metric_value": global_best[0],
+                    "model_code": global_best[1],
+                    "param_names": self._from_json_value(global_best[2]) or [],
+                    "client_id": self._restore_client_id(global_best[3]),
+                    "iteration": global_best[4],
+                }
+
+            baseline = conn.execute(
+                "SELECT function_name, metric_name, metric_value, param_names, eval_metrics, "
+                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll "
+                "FROM runtime_baseline WHERE singleton = 1"
+            ).fetchone()
+            if baseline is not None:
+                data["baseline"] = {
+                    "function_name": baseline[0],
+                    "metric_name": baseline[1],
+                    "metric_value": baseline[2],
+                    "param_names": self._from_json_value(baseline[3]) or [],
+                    "eval_metrics": self._from_json_value(baseline[4]) or [],
+                    "mean_r2": baseline[5],
+                    "max_r2": baseline[6],
+                    "best_param": baseline[7],
+                    "per_param_r2": self._from_json_value(baseline[8]) or {},
+                    "code": baseline[9],
+                    "val_mean_nll": baseline[10],
+                }
+
+            for row in conn.execute(
+                "SELECT param_set FROM runtime_tried_param_sets ORDER BY param_key"
+            ).fetchall():
+                data["tried_param_sets"].append(self._from_json_value(row[0]))
+
+            for row in conn.execute(
+                "SELECT client_id, last_iteration, best_metric, status, updated_at, "
+                "had_runnable_model, activity "
+                "FROM runtime_client_entries ORDER BY client_id"
+            ).fetchall():
+                data["client_entries"][row[0]] = {
+                    "last_iteration": row[1],
+                    "best_metric": row[2],
+                    "status": row[3],
+                    "updated_at": row[4],
+                    "had_runnable_model": row[5],
+                    "activity": row[6],
+                }
+
+            for row in conn.execute(
+                "SELECT client_id, iteration, results "
+                "FROM runtime_iteration_history ORDER BY created_at, client_id"
+            ).fetchall():
+                data["iteration_history"].append(
+                    {
+                        "client_id": self._restore_client_id(row[0]),
+                        "iteration": row[1],
+                        "results": self._from_json_value(row[2]) or [],
+                    }
+                )
+
+            for row in conn.execute(
+                "SELECT iteration, candidates, generated_by, timestamp "
+                "FROM runtime_candidate_generations ORDER BY iteration"
+            ).fetchall():
+                data["candidate_generations"][str(row[0])] = {
+                    "candidates": self._from_json_value(row[1]) or [],
+                    "generated_by": self._restore_client_id(row[2]),
+                    "timestamp": row[3],
+                }
+
+            for row in conn.execute(
+                "SELECT iteration, client_id, status, n_candidates, error, updated_at "
+                "FROM runtime_generator_status ORDER BY iteration"
+            ).fetchall():
+                entry = {
+                    "client_id": self._restore_client_id(row[1]),
+                    "status": row[2],
+                    "n_candidates": row[3],
+                    "updated_at": row[5],
+                }
+                if row[4] is not None:
+                    entry["error"] = row[4]
+                data["generator_status"][str(row[0])] = entry
+
+            for row in conn.execute(
+                "SELECT iteration, synthesized_feedback, verdict, failed, error, timestamp "
+                "FROM runtime_judge_iterations ORDER BY iteration"
+            ).fetchall():
+                entry = {
+                    "synthesized_feedback": self._from_json_value(row[1]) or {},
+                    "verdict": self._from_json_value(row[2]) or {},
+                    "timestamp": row[5],
+                }
+                if row[3]:
+                    entry["failed"] = True
+                    entry["error"] = row[4]
+                data["judge_iterations"][str(row[0])] = entry
+
+            return data
+
+        return self._with_connection(write=False, operation="read", callback=_read)
 
     def update(
         self,
@@ -119,288 +262,249 @@ class SharedRegistry:
         status="running",
         had_runnable_model=None,
     ):
-        """
-        Atomically merge this client's iteration results into the registry.
+        """Atomically merge this client's iteration results into DuckDB."""
 
-        Uses an exclusive lock around read-modify-write.
+        client_key = self._client_key(client_id)
+        timestamp = datetime.now().isoformat()
+        tried_param_sets = tried_param_sets or []
 
-        Parameters
-        ----------
-        status : str
-            One of: "running" | "retrying" | "complete" | "complete_no_success"
-        had_runnable_model : bool, optional
-            Whether the client produced at least one runnable model in this iteration.
-        """
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
-
-                # Update client entry (preserve existing fields like activity)
-                existing_entry = data["client_entries"].get(str(client_id), {})
-                existing_entry.update(
-                    {
-                        "last_iteration": iteration,
-                        "best_metric": best_metric,
-                        "status": status,
-                        "updated_at": datetime.now().isoformat(),
-                    }
-                )
-                if had_runnable_model is not None:
-                    existing_entry["had_runnable_model"] = had_runnable_model
-                data["client_entries"][str(client_id)] = existing_entry
-
-                # Append iteration history (strip non-serializable fields)
-                serializable_results = []
-                for r in results:
-                    entry = {
-                        "function_name": r.get("function_name", ""),
-                        "metric_name": r.get("metric_name", "BIC"),
-                        "metric_value": r.get("metric_value", float("inf")),
-                        "param_names": r.get("param_names", []),
-                        "code": r.get("code", ""),
-                    }
-                    # Include error message for failed models
-                    if r.get("error"):
-                        entry["error"] = r["error"]
-                    # Include recovery stats for failed recovery checks
-                    if r.get("recovery_r") is not None:
-                        entry["recovery_r"] = r["recovery_r"]
-                    if r.get("recovery_per_param"):
-                        entry["recovery_per_param"] = r["recovery_per_param"]
-                    # Include per-participant eval metrics for fit quality analysis
-                    eval_metrics = r.get("eval_metrics")
-                    if eval_metrics:
-                        entry["eval_metrics"] = eval_metrics
-                    # Include per-participant trial counts for chance-level detection
-                    participant_n_trials = r.get("participant_n_trials")
-                    if participant_n_trials:
-                        entry["participant_n_trials"] = participant_n_trials
-                    # Include individual differences R² if available
-                    id_res = r.get("individual_differences")
-                    if id_res and isinstance(id_res, dict):
-                        entry["individual_differences"] = {
-                            "mean_r2": id_res.get("mean_r2"),
-                            "max_r2": id_res.get("max_r2"),
-                            "best_param": id_res.get("best_param"),
-                            "per_param_r2": id_res.get("per_param_r2"),
-                            "summary_text": id_res.get("summary_text", ""),
-                        }
-                        # Also store at top level for monitor dashboard
-                        entry["mean_r2"] = id_res.get("mean_r2")
-                        entry["max_r2"] = id_res.get("max_r2")
-                        entry["best_param"] = id_res.get("best_param")
-                        entry["per_param_r2"] = id_res.get("per_param_r2")
-                    # Include validation metrics for test evaluation (Step 9)
-                    if r.get("val_metric_value") is not None:
-                        entry["val_metric_value"] = r["val_metric_value"]
-                        entry["val_mean_nll"] = r.get("val_mean_nll")
-                        entry["val_eval_metrics"] = r.get("val_eval_metrics", [])
-                        entry["val_per_participant_nll"] = r.get(
-                            "val_per_participant_nll", []
-                        )
-                    val_id = r.get("val_individual_differences")
-                    if val_id and isinstance(val_id, dict):
-                        entry["val_individual_differences"] = {
-                            "mean_r2": val_id.get("mean_r2"),
-                            "max_r2": val_id.get("max_r2"),
-                            "best_param": val_id.get("best_param"),
-                            "per_param_r2": val_id.get("per_param_r2"),
-                        }
-                    serializable_results.append(entry)
-
-                # Replace existing entry for same (client_id, iteration), or append
-                new_entry = {
-                    "client_id": client_id,
-                    "iteration": iteration,
-                    "results": serializable_results,
+        serializable_results = []
+        for result in results:
+            entry = {
+                "function_name": result.get("function_name", ""),
+                "metric_name": result.get("metric_name", "BIC"),
+                "metric_value": result.get("metric_value", float("inf")),
+                "param_names": result.get("param_names", []),
+                "code": result.get("code", ""),
+            }
+            if result.get("error"):
+                entry["error"] = result["error"]
+            if result.get("recovery_r") is not None:
+                entry["recovery_r"] = result["recovery_r"]
+            if result.get("recovery_per_param"):
+                entry["recovery_per_param"] = result["recovery_per_param"]
+            if result.get("eval_metrics"):
+                entry["eval_metrics"] = result.get("eval_metrics")
+            if result.get("participant_n_trials"):
+                entry["participant_n_trials"] = result.get("participant_n_trials")
+            id_res = result.get("individual_differences")
+            if id_res and isinstance(id_res, dict):
+                entry["individual_differences"] = {
+                    "mean_r2": id_res.get("mean_r2"),
+                    "max_r2": id_res.get("max_r2"),
+                    "best_param": id_res.get("best_param"),
+                    "per_param_r2": id_res.get("per_param_r2"),
+                    "summary_text": id_res.get("summary_text", ""),
                 }
-                replaced = False
-                for idx, existing_entry in enumerate(data["iteration_history"]):
-                    if (
-                        existing_entry.get("client_id") == client_id
-                        and existing_entry.get("iteration") == iteration
-                    ):
-                        data["iteration_history"][idx] = new_entry
-                        replaced = True
-                        break
-                if not replaced:
-                    data["iteration_history"].append(new_entry)
+                entry["mean_r2"] = id_res.get("mean_r2")
+                entry["max_r2"] = id_res.get("max_r2")
+                entry["best_param"] = id_res.get("best_param")
+                entry["per_param_r2"] = id_res.get("per_param_r2")
+            if result.get("val_metric_value") is not None:
+                entry["val_metric_value"] = result["val_metric_value"]
+                entry["val_mean_nll"] = result.get("val_mean_nll")
+                entry["val_eval_metrics"] = result.get("val_eval_metrics", [])
+                entry["val_per_participant_nll"] = result.get(
+                    "val_per_participant_nll", []
+                )
+            val_id = result.get("val_individual_differences")
+            if val_id and isinstance(val_id, dict):
+                entry["val_individual_differences"] = {
+                    "mean_r2": val_id.get("mean_r2"),
+                    "max_r2": val_id.get("max_r2"),
+                    "best_param": val_id.get("best_param"),
+                    "per_param_r2": val_id.get("per_param_r2"),
+                }
+            serializable_results.append(entry)
 
-                # Merge tried param sets (deduplicate)
-                if tried_param_sets:
-                    existing = {tuple(s) for s in data["tried_param_sets"]}
-                    for ps in tried_param_sets:
-                        key = tuple(ps)
-                        if key not in existing:
-                            data["tried_param_sets"].append(ps)
-                            existing.add(key)
+        def _update(conn):
+            existing = conn.execute(
+                "SELECT activity FROM runtime_client_entries WHERE client_id = ?",
+                [client_key],
+            ).fetchone()
+            activity = existing[0] if existing is not None else None
+            history_row = conn.execute(
+                "SELECT created_at FROM runtime_iteration_history "
+                "WHERE client_id = ? AND iteration = ?",
+                [client_key, iteration],
+            ).fetchone()
+            existing_created_at = (
+                history_row[0] if history_row is not None and history_row[0] else timestamp
+            )
 
-                # Update global best if this client has a better model
-                if best_metric is not None and best_model is not None:
-                    current_best = data["global_best"]
-                    if (
-                        current_best is None
-                        or best_metric < current_best["metric_value"]
-                    ):
-                        data["global_best"] = {
-                            "metric_value": best_metric,
-                            "model_code": best_model,
-                            "param_names": param_names or [],
-                            "client_id": client_id,
-                            "iteration": iteration,
-                        }
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_client_entries "
+                "(client_id, last_iteration, best_metric, status, updated_at, had_runnable_model, activity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    client_key,
+                    iteration,
+                    best_metric,
+                    status,
+                    timestamp,
+                    had_runnable_model,
+                    activity,
+                ],
+            )
 
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_iteration_history "
+                "(client_id, iteration, results, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                [
+                    client_key,
+                    iteration,
+                    self._to_json_text(serializable_results),
+                    existing_created_at,
+                    timestamp,
+                ],
+            )
+
+            for param_set in tried_param_sets:
+                param_key = self._to_json_text(param_set)
+                conn.execute(
+                    "INSERT OR IGNORE INTO runtime_tried_param_sets (param_key, param_set) "
+                    "VALUES (?, ?)",
+                    [param_key, param_key],
+                )
+
+            if best_metric is not None and best_model is not None:
+                current = conn.execute(
+                    "SELECT metric_value FROM runtime_global_best WHERE singleton = 1"
+                ).fetchone()
+                if current is None or current[0] is None or best_metric < current[0]:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO runtime_global_best "
+                        "(singleton, metric_value, model_code, param_names, client_id, iteration) "
+                        "VALUES (1, ?, ?, ?, ?, ?)",
+                        [
+                            best_metric,
+                            best_model,
+                            self._to_json_text(param_names or []),
+                            client_key,
+                            iteration,
+                        ],
+                    )
+
+        self._with_connection(write=True, operation="update", callback=_update)
 
     def get_max_iteration(self):
-        """Return the highest iteration number across all clients, or -1 if none."""
-        data = self.read()
-        max_iter = -1
-        for entry in data.get("iteration_history", []):
-            it = entry.get("iteration")
-            if it is not None and it > max_iter:
-                max_iter = it
-        return max_iter
+        """Return the highest iteration number across all clients, or -1."""
+        row = self._fetchone(
+            "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history"
+        )
+        return row["max_iteration"] if row and row["max_iteration"] is not None else -1
 
     def get_max_iteration_for_client(self, client_id):
-        """Return highest fully completed iteration for this client, or -1 if none."""
-        data = self.read()
-        target = str(client_id)
-        client_entry = data.get("client_entries", {}).get(target, {})
-        status = client_entry.get("status")
-        last_iteration = client_entry.get("last_iteration", -1)
-
-        max_iter = -1
-        for entry in data.get("iteration_history", []):
-            it = entry.get("iteration")
-            if it is not None and str(entry.get("client_id")) == target:
-                # If currently retrying, don't count the retrying iteration itself
-                if status == "retrying" and last_iteration >= 0 and it == last_iteration:
-                    continue
-                if it > max_iter:
-                    max_iter = it
-        return max_iter
+        """Return highest fully completed iteration for this client, or -1."""
+        client_key = self._client_key(client_id)
+        entry = self._fetchone(
+            "SELECT status, last_iteration FROM runtime_client_entries WHERE client_id = ?",
+            [client_key],
+        ) or {}
+        status = entry.get("status")
+        last_iteration = entry.get("last_iteration", -1)
+        if status == "retrying":
+            row = self._fetchone(
+                "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history "
+                "WHERE client_id = ? AND iteration <> ?",
+                [client_key, last_iteration],
+            )
+        else:
+            row = self._fetchone(
+                "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history "
+                "WHERE client_id = ?",
+                [client_key],
+            )
+        return row["max_iteration"] if row and row["max_iteration"] is not None else -1
 
     def get_max_generator_iteration(self, client_id):
         """Return highest completed CMG generator iteration for this client, or -1."""
-        data = self.read()
-        target = str(client_id)
-        generations = data.get("candidate_generations", {})
-        max_iter = -1
-        for key, entry in data.get("generator_status", {}).items():
-            try:
-                it = int(key)
-            except (TypeError, ValueError):
-                continue
-            if str(entry.get("client_id")) != target:
-                continue
-            if entry.get("status") != "complete":
-                continue
-            if key not in generations:
-                continue
-            if it > max_iter:
-                max_iter = it
-        return max_iter
+        row = self._fetchone(
+            "SELECT MAX(gs.iteration) AS max_iteration "
+            "FROM runtime_generator_status gs "
+            "JOIN runtime_candidate_generations cg ON cg.iteration = gs.iteration "
+            "WHERE gs.client_id = ? AND gs.status = 'complete'",
+            [self._client_key(client_id)],
+        )
+        return row["max_iteration"] if row and row["max_iteration"] is not None else -1
 
     def set_activity(self, client_id, activity):
         """Update a client's current activity without pushing results."""
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
 
-                entry = data["client_entries"].get(str(client_id), {})
-                entry["activity"] = activity
-                entry["updated_at"] = datetime.now().isoformat()
-                data["client_entries"][str(client_id)] = entry
+        def _set(conn):
+            existing = conn.execute(
+                "SELECT last_iteration, best_metric, status, had_runnable_model "
+                "FROM runtime_client_entries WHERE client_id = ?",
+                [self._client_key(client_id)],
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO runtime_client_entries "
+                    "(client_id, last_iteration, best_metric, status, updated_at, had_runnable_model, activity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        self._client_key(client_id),
+                        None,
+                        None,
+                        None,
+                        datetime.now().isoformat(),
+                        None,
+                        activity,
+                    ],
+                )
+            else:
+                conn.execute(
+                    "UPDATE runtime_client_entries SET activity = ?, updated_at = ? WHERE client_id = ?",
+                    [activity, datetime.now().isoformat(), self._client_key(client_id)],
+                )
 
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="set-activity", callback=_set)
 
     def mark_complete(self, client_id):
         """Mark a client as complete in the registry."""
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
 
-                if str(client_id) in data["client_entries"]:
-                    data["client_entries"][str(client_id)]["status"] = "complete"
-                    data["client_entries"][str(client_id)]["updated_at"] = (
-                        datetime.now().isoformat()
-                    )
+        def _mark(conn):
+            conn.execute(
+                "UPDATE runtime_client_entries SET status = 'complete', updated_at = ? WHERE client_id = ?",
+                [datetime.now().isoformat(), self._client_key(client_id)],
+            )
 
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="mark-complete", callback=_mark)
 
     def set_baseline(self, baseline_result):
-        """Write baseline result to the registry under the 'baseline' key."""
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
+        """Write baseline result to the canonical runtime store."""
 
-                # Store a serializable subset (no numpy arrays)
-                data["baseline"] = {
-                    "function_name": baseline_result.get(
-                        "function_name", "baseline_model"
-                    ),
-                    "metric_name": baseline_result.get("metric_name", "BIC"),
-                    "metric_value": baseline_result.get("metric_value"),
-                    "param_names": baseline_result.get("param_names", []),
-                    "eval_metrics": baseline_result.get("eval_metrics", []),
-                }
-                # Include individual differences if available
-                id_res = baseline_result.get("individual_differences")
-                if id_res and isinstance(id_res, dict):
-                    data["baseline"]["mean_r2"] = id_res.get("mean_r2")
-                    data["baseline"]["max_r2"] = id_res.get("max_r2")
-                    data["baseline"]["best_param"] = id_res.get("best_param")
-                    data["baseline"]["per_param_r2"] = id_res.get("per_param_r2")
+        def _set(conn):
+            id_res = baseline_result.get("individual_differences") or {}
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_baseline "
+                "(singleton, function_name, metric_name, metric_value, param_names, eval_metrics, "
+                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    baseline_result.get("function_name", "baseline_model"),
+                    baseline_result.get("metric_name", "BIC"),
+                    baseline_result.get("metric_value"),
+                    self._to_json_text(baseline_result.get("param_names", [])),
+                    self._to_json_text(baseline_result.get("eval_metrics", [])),
+                    id_res.get("mean_r2"),
+                    id_res.get("max_r2"),
+                    id_res.get("best_param"),
+                    self._to_json_text(id_res.get("per_param_r2", {})),
+                    baseline_result.get("code"),
+                    baseline_result.get("val_mean_nll"),
+                ],
+            )
 
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="set-baseline", callback=_set)
 
     def count_clients_at_iteration(self, iteration: int) -> int:
-        """
-        Count the number of distinct clients that have written results for an iteration.
-
-        Returns the count of unique client_ids in iteration_history with the given iteration.
-        """
-        data = self.read()
-        seen_clients = set()
-        for entry in data.get("iteration_history", []):
-            if entry.get("iteration") == iteration:
-                client_id = entry.get("client_id")
-                if client_id is not None:
-                    seen_clients.add(client_id)
-        return len(seen_clients)
+        """Count the number of distinct clients that wrote results for an iteration."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS n_clients FROM runtime_iteration_history WHERE iteration = ?",
+            [iteration],
+        )
+        return int(row["n_clients"]) if row else 0
 
     def wait_for_iteration(
         self,
@@ -409,15 +513,7 @@ class SharedRegistry:
         timeout_seconds: float,
         poll_seconds: float = 2.0,
     ) -> int:
-        """
-        Poll until at least n_expected clients have written iteration results, or timeout.
-
-        Polls count_clients_at_iteration every poll_seconds until:
-        - count >= n_expected (returns count immediately), or
-        - timeout_seconds elapses (returns count at that time)
-
-        Returns the count of clients who contributed to the iteration.
-        """
+        """Poll until at least *n_expected* clients have written iteration results."""
         start_time = time.time()
         while True:
             count = self.count_clients_at_iteration(iteration)
@@ -439,36 +535,26 @@ class SharedRegistry:
             time.sleep(poll_seconds)
 
     def count_clients_complete(self, iteration: int) -> int:
-        """
-        Count clients who completed an iteration (not retrying).
-
-        Returns the count of clients with status in ("complete", "complete_no_success").
-        """
-        data = self.read()
-        count = 0
-        for entry in data.get("iteration_history", []):
-            if entry.get("iteration") == iteration:
-                client_id = entry.get("client_id")
-                client_entry = data.get("client_entries", {}).get(str(client_id), {})
-                if client_entry.get("status") in ("complete", "complete_no_success"):
-                    count += 1
-        return count
+        """Count clients who completed an iteration (not retrying)."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS n_clients "
+            "FROM runtime_iteration_history h "
+            "JOIN runtime_client_entries c ON c.client_id = h.client_id "
+            "WHERE h.iteration = ? AND c.status IN ('complete', 'complete_no_success')",
+            [iteration],
+        )
+        return int(row["n_clients"]) if row else 0
 
     def count_clients_with_models(self, iteration: int) -> int:
-        """
-        Count clients who produced at least one runnable model.
-
-        Returns the count of clients where had_runnable_model is True.
-        """
-        data = self.read()
-        count = 0
-        for entry in data.get("iteration_history", []):
-            if entry.get("iteration") == iteration:
-                client_id = entry.get("client_id")
-                client_entry = data.get("client_entries", {}).get(str(client_id), {})
-                if client_entry.get("had_runnable_model", False):
-                    count += 1
-        return count
+        """Count clients who produced at least one runnable model."""
+        row = self._fetchone(
+            "SELECT COUNT(*) AS n_clients "
+            "FROM runtime_iteration_history h "
+            "JOIN runtime_client_entries c ON c.client_id = h.client_id "
+            "WHERE h.iteration = ? AND COALESCE(c.had_runnable_model, FALSE)",
+            [iteration],
+        )
+        return int(row["n_clients"]) if row else 0
 
     def wait_for_clients_complete(
         self,
@@ -477,29 +563,7 @@ class SharedRegistry:
         timeout_seconds: float,
         poll_seconds: float = 5.0,
     ) -> int:
-        """
-        Poll until n_expected clients have completed an iteration (not retrying).
-
-        This is different from wait_for_iteration which counts clients who wrote
-        ANY results. This method waits for clients to mark themselves as complete,
-        accounting for retry scenarios where clients may regenerate models.
-
-        Parameters
-        ----------
-        iteration : int
-            Iteration number to wait for
-        n_expected : int
-            Number of clients expected to complete
-        timeout_seconds : float
-            Maximum time to wait
-        poll_seconds : float
-            Polling interval
-
-        Returns
-        -------
-        int
-            Number of clients who completed
-        """
+        """Poll until *n_expected* clients have completed an iteration."""
         start_time = time.time()
         while True:
             count = self.count_clients_complete(iteration)
@@ -523,123 +587,85 @@ class SharedRegistry:
     def set_judge_feedback(
         self,
         iteration: int,
-        synthesized_feedback: str | dict,  # R2: dict keyed by persona name
+        synthesized_feedback: str | dict,
         verdict_payload: dict,
     ) -> None:
-        """
-        Store the shared judge verdict for an iteration.
+        """Store the shared judge verdict for an iteration."""
 
-        Parameters
-        ----------
-        iteration : int
-            Iteration number
-        synthesized_feedback : str or dict
-            If str: single global feedback (backward compat)
-            If dict: per-persona feedback {persona_name: feedback_str, ...}
-        verdict_payload : dict
-            Metadata about the verdict
+        feedback_dict = (
+            {"default": synthesized_feedback}
+            if isinstance(synthesized_feedback, str)
+            else synthesized_feedback
+        )
 
-        The verdict is stored in a new top-level 'judge_iterations' dict keyed by iteration.
-        """
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
+        def _set(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_judge_iterations "
+                "(iteration, synthesized_feedback, verdict, failed, error, timestamp) "
+                "VALUES (?, ?, ?, FALSE, NULL, ?)",
+                [
+                    iteration,
+                    self._to_json_text(feedback_dict),
+                    self._to_json_text(verdict_payload),
+                    datetime.now().isoformat(),
+                ],
+            )
 
-                # Initialize judge_iterations if not present
-                if "judge_iterations" not in data:
-                    data["judge_iterations"] = {}
-
-                # R2: Normalize feedback to dict format
-                if isinstance(synthesized_feedback, str):
-                    feedback_dict = {"default": synthesized_feedback}
-                else:
-                    feedback_dict = synthesized_feedback
-
-                # Store the verdict with timestamp
-                data["judge_iterations"][str(iteration)] = {
-                    "synthesized_feedback": feedback_dict,
-                    "verdict": verdict_payload,
-                    "timestamp": datetime.now().isoformat(),
-                }
-
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="set-judge-feedback", callback=_set)
 
     def set_judge_failure(self, iteration: int, error: str) -> None:
-        """Write an explicit failure entry for an iteration so clients can detect it."""
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
+        """Write an explicit failure entry for an iteration."""
 
-                if "judge_iterations" not in data:
-                    data["judge_iterations"] = {}
+        def _set(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_judge_iterations "
+                "(iteration, synthesized_feedback, verdict, failed, error, timestamp) "
+                "VALUES (?, ?, ?, TRUE, ?, ?)",
+                [
+                    iteration,
+                    self._to_json_text({}),
+                    self._to_json_text({}),
+                    error,
+                    datetime.now().isoformat(),
+                ],
+            )
 
-                data["judge_iterations"][str(iteration)] = {
-                    "failed": True,
-                    "error": error,
-                    "timestamp": datetime.now().isoformat(),
-                }
-
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="set-judge-failure", callback=_set)
 
     def get_judge_feedback(self, iteration: int) -> Optional[dict]:
-        """
-        Retrieve the stored judge verdict for an iteration (full dict with per-persona feedback).
-
-        Returns the verdict dict (with 'synthesized_feedback' dict and 'verdict' keys)
-        or None if not yet written.
-        """
-        data = self.read()
-        judge_iterations = data.get("judge_iterations", {})
-        return judge_iterations.get(str(iteration))
+        """Retrieve the stored judge verdict for an iteration."""
+        row = self._fetchone(
+            "SELECT synthesized_feedback, verdict, failed, error, timestamp "
+            "FROM runtime_judge_iterations WHERE iteration = ?",
+            [iteration],
+        )
+        if row is None:
+            return None
+        result = {
+            "synthesized_feedback": self._from_json_value(row["synthesized_feedback"]) or {},
+            "verdict": self._from_json_value(row["verdict"]) or {},
+            "timestamp": row["timestamp"],
+        }
+        if row["failed"]:
+            result["failed"] = True
+            result["error"] = row["error"]
+        return result
 
     def get_judge_feedback_for_persona(
         self, iteration: int, persona_name: str, fallback: str = "default"
     ) -> Optional[dict]:
-        """
-        R2: Retrieve persona-specific judge feedback for an iteration.
-
-        Parameters
-        ----------
-        iteration : int
-            Iteration number
-        persona_name : str
-            Name of the persona (e.g. 'exploit', 'explore', 'diverse')
-        fallback : str
-            Fallback key if persona not found; defaults to 'default'
-
-        Returns the full verdict dict but with synthesized_feedback narrowed to the
-        persona-specific text (or fallback if persona not found).
-        """
+        """Retrieve persona-specific judge feedback for an iteration."""
         verdict_dict = self.get_judge_feedback(iteration)
         if verdict_dict is None:
             return None
 
         feedback_dict = verdict_dict.get("synthesized_feedback", {})
-        # Ensure feedback is dict format (backward compat with old str-based storage)
         if isinstance(feedback_dict, str):
             feedback_dict = {"default": feedback_dict}
 
-        # Get persona-specific feedback or fall back
         persona_feedback = feedback_dict.get(
             persona_name, feedback_dict.get(fallback, "")
         )
-
         return {
             "synthesized_feedback": persona_feedback,
             "verdict": verdict_dict.get("verdict", {}),
@@ -652,15 +678,7 @@ class SharedRegistry:
         timeout_seconds: float,
         poll_seconds: float = 2.0,
     ) -> Optional[dict]:
-        """
-        Client-side helper: poll until judge feedback is available for an iteration, or timeout.
-
-        Polls get_judge_feedback every poll_seconds until:
-        - feedback is available (returns the dict), or
-        - timeout_seconds elapses (returns None)
-
-        Used by clients to wait for the orchestrator's shared verdict.
-        """
+        """Poll until judge feedback is available for an iteration, or timeout."""
         start_time = time.time()
         while True:
             feedback = self.get_judge_feedback(iteration)
@@ -688,46 +706,62 @@ class SharedRegistry:
 
             time.sleep(poll_seconds)
 
-
     def set_candidate_models(self, iteration, candidates, generated_by):
-        """Publish generated candidates for one iteration.
+        """Publish generated candidates for one iteration."""
 
-        Idempotent for restarts: if candidates already exist for this iteration,
-        do not overwrite them.
-        """
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
-
-                generations = data.setdefault("candidate_generations", {})
-                if str(iteration) in generations:
-                    console.print(
-                        f"[yellow]Candidates already exist for iteration {iteration}, "
-                        f"not overwriting[/]"
-                    )
-                    return generations[str(iteration)]
-
-                entry = {
-                    "candidates": candidates,
-                    "generated_by": generated_by,
-                    "timestamp": datetime.now().isoformat(),
+        def _set(conn):
+            existing = conn.execute(
+                "SELECT candidates, generated_by, timestamp "
+                "FROM runtime_candidate_generations WHERE iteration = ?",
+                [iteration],
+            ).fetchone()
+            if existing is not None:
+                console.print(
+                    f"[yellow]Candidates already exist for iteration {iteration}, not overwriting[/]"
+                )
+                return {
+                    "candidates": self._from_json_value(existing[0]) or [],
+                    "generated_by": self._restore_client_id(existing[1]),
+                    "timestamp": existing[2],
                 }
-                generations[str(iteration)] = entry
-                self._atomic_write(data)
-                return entry
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            entry = {
+                "candidates": candidates,
+                "generated_by": generated_by,
+                "timestamp": datetime.now().isoformat(),
+            }
+            conn.execute(
+                "INSERT INTO runtime_candidate_generations "
+                "(iteration, candidates, generated_by, timestamp) VALUES (?, ?, ?, ?)",
+                [
+                    iteration,
+                    self._to_json_text(candidates),
+                    self._client_key(generated_by),
+                    entry["timestamp"],
+                ],
+            )
+            return entry
+
+        return self._with_connection(
+            write=True,
+            operation="set-candidate-models",
+            callback=_set,
+        )
 
     def get_candidate_models(self, iteration) -> Optional[dict]:
-        """Return published candidates for iteration, or None."""
-        data = self.read()
-        return data.get("candidate_generations", {}).get(str(iteration))
+        """Return published candidates for an iteration, or None."""
+        row = self._fetchone(
+            "SELECT candidates, generated_by, timestamp "
+            "FROM runtime_candidate_generations WHERE iteration = ?",
+            [iteration],
+        )
+        if row is None:
+            return None
+        return {
+            "candidates": self._from_json_value(row["candidates"]) or [],
+            "generated_by": self._restore_client_id(row["generated_by"]),
+            "timestamp": row["timestamp"],
+        }
 
     def wait_for_candidate_models(
         self,
@@ -758,80 +792,56 @@ class SharedRegistry:
             time.sleep(poll_seconds)
 
     def update_candidate_model(self, iteration, index, candidate):
-        """Overwrite one candidate after evaluator repair.
+        """Overwrite one candidate after evaluator repair."""
 
-        Raises ValueError if generation or candidate index is missing.
-        """
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
+        def _update(conn):
+            row = conn.execute(
+                "SELECT candidates, generated_by, timestamp "
+                "FROM runtime_candidate_generations WHERE iteration = ?",
+                [iteration],
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No candidate generation entry for iteration {iteration}")
 
-                generations = data.get("candidate_generations", {})
-                gen_entry = generations.get(str(iteration))
-                if gen_entry is None:
-                    raise ValueError(
-                        f"No candidate generation entry for iteration {iteration}"
+            candidates = self._from_json_value(row[0]) or []
+            for i, existing in enumerate(candidates):
+                if existing.get("index") == index:
+                    candidates[i] = candidate
+                    conn.execute(
+                        "UPDATE runtime_candidate_generations SET candidates = ? WHERE iteration = ?",
+                        [self._to_json_text(candidates), iteration],
                     )
+                    return True
 
-                candidates = gen_entry.get("candidates", [])
-                for i, c in enumerate(candidates):
-                    if c.get("index") == index:
-                        candidates[i] = candidate
-                        gen_entry["candidates"] = candidates
-                        self._atomic_write(data)
-                        return True
+            raise ValueError(f"No candidate with index {index} in iteration {iteration}")
 
-                raise ValueError(
-                    f"No candidate with index {index} in iteration {iteration}"
-                )
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return self._with_connection(
+            write=True,
+            operation="update-candidate-model",
+            callback=_update,
+        )
 
-    def set_generator_status(self, iteration, client_id, status, n_candidates=None, error=None):
-        """Record generator progress separately from evaluator results.
+    def set_generator_status(
+        self, iteration, client_id, status, n_candidates=None, error=None
+    ):
+        """Record generator progress separately from evaluator results."""
 
-        Parameters
-        ----------
-        iteration : int
-            Iteration number.
-        client_id : str or int
-            Generator client identifier.
-        status : str
-            One of "complete", "failed", or other status string.
-        n_candidates : int, optional
-            Number of candidates published (0 if failure).
-        error : str, optional
-            Error message if status is "failed".
-        """
-        with open(self.registry_path, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    data = json.loads(content)
-                else:
-                    data = self._empty_registry()
+        def _set(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_generator_status "
+                "(iteration, client_id, status, n_candidates, error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    iteration,
+                    self._client_key(client_id),
+                    status,
+                    n_candidates,
+                    error,
+                    datetime.now().isoformat(),
+                ],
+            )
 
-                gen_status = data.setdefault("generator_status", {})
-                entry = {
-                    "client_id": client_id,
-                    "status": status,
-                    "n_candidates": n_candidates,
-                    "updated_at": datetime.now().isoformat(),
-                }
-                if error is not None:
-                    entry["error"] = error
-                gen_status[str(iteration)] = entry
-                self._atomic_write(data)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._with_connection(write=True, operation="set-generator-status", callback=_set)
 
 
 def apply_client_profile(cfg, profile_name):

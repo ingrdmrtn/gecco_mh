@@ -1,12 +1,13 @@
-"""Tests for centralized model generation registry methods."""
+"""Tests for DuckDB-backed centralized model generation registry methods."""
 
-import json
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from gecco.diagnostic_store import DiagnosticStore
 from gecco.coordination import SharedRegistry
 
 
@@ -17,7 +18,9 @@ def registry():
         registry_path = f.name
     reg = SharedRegistry(registry_path)
     yield reg
-    os.unlink(registry_path)
+    for path in (Path(registry_path), reg.db_path, reg.lock_path):
+        if path.exists():
+            path.unlink()
 
 
 def test_empty_registry_has_cmg_keys():
@@ -94,20 +97,13 @@ def test_wait_for_candidate_models_timeout(registry):
     assert result is None
 
 
-def test_existing_registry_without_cmg_keys():
-    """Verify that old registry files without CMG keys don't crash."""
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
-        json.dump({"global_best": None, "baseline": None, "tried_param_sets": [], "client_entries": {}, "iteration_history": []}, f)
-        registry_path = f.name
-    try:
-        reg = SharedRegistry(registry_path)
-        # These should not crash
-        assert reg.get_candidate_models(0) is None
-        reg.set_generator_status(0, "gen", "complete", n_candidates=1)
-        reg.set_candidate_models(0, [{"index": 0, "func_name": "m1", "code": ""}], "gen")
-        assert reg.get_candidate_models(0) is not None
-    finally:
-        os.unlink(registry_path)
+def test_registry_initialises_duckdb_state_without_json_payload(tmp_path):
+    """Initialisation should create a DuckDB-backed runtime store."""
+    registry_path = tmp_path / "registry.json"
+    reg = SharedRegistry(registry_path)
+
+    assert reg.db_path.exists()
+    assert reg.read()["candidate_generations"] == {}
 
 
 def test_set_generator_status_with_error(registry):
@@ -224,3 +220,122 @@ def test_get_max_generator_iteration_multiple(registry):
     registry.set_candidate_models(1, [{"index": 0, "func_name": "m2", "code": "..."}], "generator")
     registry.set_generator_status(1, "generator", "complete", n_candidates=1)
     assert registry.get_max_generator_iteration("generator") == 1
+
+
+def test_registry_round_trip_preserves_runtime_snapshot(registry):
+    """Writers and readers should round-trip runtime state via DuckDB."""
+    registry.update(
+        client_id=0,
+        iteration=0,
+        results=[
+            {
+                "function_name": "m1",
+                "metric_name": "BIC",
+                "metric_value": 101.5,
+                "param_names": ["alpha"],
+                "code": "def m1(): pass",
+                "individual_differences": {
+                    "mean_r2": 0.2,
+                    "max_r2": 0.3,
+                    "best_param": "alpha",
+                    "per_param_r2": {"alpha": 0.3},
+                },
+            }
+        ],
+        best_model="def m1(): pass",
+        best_metric=101.5,
+        param_names=["alpha"],
+        tried_param_sets=[["alpha"]],
+        status="complete",
+        had_runnable_model=True,
+    )
+    registry.set_baseline(
+        {
+            "function_name": "baseline_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "param_names": ["beta"],
+            "code": "def baseline_model(): pass",
+        }
+    )
+
+    snapshot = registry.read()
+
+    assert snapshot["global_best"]["client_id"] == 0
+    assert snapshot["global_best"]["metric_value"] == pytest.approx(101.5)
+    assert snapshot["baseline"]["code"] == "def baseline_model(): pass"
+    assert snapshot["tried_param_sets"] == [["alpha"]]
+    assert snapshot["client_entries"]["0"]["status"] == "complete"
+    assert snapshot["iteration_history"][0]["results"][0]["function_name"] == "m1"
+
+
+def test_registry_supports_restart_and_reload(tmp_path):
+    """A new client instance should observe previously committed DuckDB state."""
+    registry_path = tmp_path / "registry.json"
+    reg1 = SharedRegistry(registry_path)
+    reg1.update(
+        client_id="generator",
+        iteration=2,
+        results=[{"function_name": "m2", "metric_value": 88.0}],
+        status="complete",
+    )
+
+    reg2 = SharedRegistry(registry_path)
+    snapshot = reg2.read()
+
+    assert reg2.get_max_iteration() == 2
+    assert snapshot["iteration_history"][0]["client_id"] == "generator"
+    assert snapshot["client_entries"]["generator"]["last_iteration"] == 2
+
+
+def test_registry_concurrent_clients_share_single_canonical_store(tmp_path):
+    """Concurrent clients should serialize writes through DuckDB-backed locking."""
+    registry_path = tmp_path / "registry.json"
+
+    def _write(client_id: int) -> None:
+        local_registry = SharedRegistry(registry_path)
+        local_registry.update(
+            client_id=client_id,
+            iteration=0,
+            results=[{"function_name": f"m{client_id}", "metric_value": 100.0 + client_id}],
+            status="complete",
+            had_runnable_model=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(_write, range(4)))
+
+    registry = SharedRegistry(registry_path)
+    snapshot = registry.read()
+
+    assert registry.count_clients_at_iteration(0) == 4
+    assert len(snapshot["iteration_history"]) == 4
+    assert sorted(snapshot["client_entries"].keys()) == ["0", "1", "2", "3"]
+
+
+def test_runtime_views_match_registry_state(registry):
+    """DuckDB status and coordination views should reflect runtime updates."""
+    registry.update(
+        client_id=0,
+        iteration=1,
+        results=[{"function_name": "m1", "metric_value": 10.0}],
+        status="complete",
+        had_runnable_model=True,
+    )
+    registry.set_candidate_models(1, [{"index": 0, "func_name": "m1", "code": "..."}], "generator")
+    registry.set_generator_status(1, "generator", "complete", n_candidates=1)
+    registry.set_judge_feedback(1, "Looks good.", {"accepted": True})
+
+    store = DiagnosticStore(registry.db_path)
+    status_rows = store.fetchall("SELECT * FROM runtime_status_view")
+    coordination_rows = store.fetchall(
+        "SELECT * FROM runtime_coordination_view WHERE iteration = 1"
+    )
+    store.close()
+
+    assert status_rows[0]["client_id"] == "0"
+    assert status_rows[0]["status"] == "complete"
+    assert coordination_rows[0]["n_client_results"] == 1
+    assert coordination_rows[0]["n_candidates"] == 1
+    assert coordination_rows[0]["generator_status"] == "complete"
+    assert coordination_rows[0]["has_judge_feedback"] is True

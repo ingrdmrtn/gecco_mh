@@ -1,10 +1,13 @@
 """
-Rebuild a DiagnosticStore from the canonical JSON artifacts in
+Rebuild diagnostic artifact tables from exported JSON files in
 ``results/{task}/bics/``.
 
+This rebuild path is for diagnostic/import use only. Runtime coordination
+state is canonical in DuckDB and is not reconstructed from JSON artifacts.
+
 Use this when:
-* The ``.duckdb`` file is missing or corrupted.
-* The schema was changed and a full rebuild is needed.
+* The diagnostic artifact tables need to be recreated.
+* A separate diagnostic-only database is required from saved artefacts.
 
 Usage::
 
@@ -90,7 +93,7 @@ def rebuild_from_artifacts(
     overwrite: bool = True,
     iterations: list[int] | None = None,
 ) -> DiagnosticStore:
-    """Rebuild the diagnostic store from JSON artifact files.
+    """Rebuild diagnostic artifact tables from JSON export files.
 
     Parameters
     ----------

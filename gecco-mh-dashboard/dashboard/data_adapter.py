@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import re
 from datetime import datetime
@@ -9,6 +8,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from gecco.coordination import SharedRegistry
 
 # BIC filtering configuration for dashboard display
 BIC_PERCENTILE = 95  # Show up to 95th percentile
@@ -41,24 +42,15 @@ def _apply_bic_cap(
     return rows
 
 
-def _read_json_locked(path: Path) -> dict[str, Any] | None:
-    """Read JSON under shared lock. Returns None when unavailable/unreadable."""
-    if not path.exists():
-        return None
-
-    try:
-        with open(path, "r") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                return json.load(f)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    except (json.JSONDecodeError, FileNotFoundError, OSError):
-        return None
-
-
 def load_registry_snapshot(results_dir: Path) -> dict[str, Any] | None:
-    return _read_json_locked(results_dir / "shared_registry.json")
+    """Load the canonical DuckDB registry snapshot for the dashboard."""
+    registry_path = results_dir / "shared_registry.duckdb"
+    if not registry_path.exists():
+        return None
+    try:
+        return SharedRegistry.open_existing(registry_path).read()
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def _age_from_iso(timestamp: str | None) -> str:

@@ -41,6 +41,22 @@ class SharedRegistry:
         self.lock_path.touch(exist_ok=True)
         self._initialise_store()
 
+    @classmethod
+    def open_existing(cls, registry_path: str | Path) -> "SharedRegistry":
+        """Open an existing registry without initialising schema.
+
+        Args:
+            registry_path: Path to the registry file used to derive the DuckDB file.
+
+        Returns:
+            A registry handle that can be used for read-only access.
+        """
+        instance = cls.__new__(cls)
+        instance.registry_path = Path(registry_path)
+        instance.db_path = cls.db_path_for_registry(instance.registry_path)
+        instance.lock_path = Path(f"{instance.db_path}.lock")
+        return instance
+
     @staticmethod
     def db_path_for_registry(registry_path: str | Path) -> Path:
         """Return the canonical DuckDB path for a registry path."""
@@ -89,35 +105,58 @@ class SharedRegistry:
         return value
 
     def _initialise_store(self) -> None:
-        def _create(conn):
-            create_schema(conn)
+        def _create(connection):
+            create_schema(connection)
 
-        self._with_connection(write=True, operation="initialise", callback=_create)
+        self._with_connection(
+            write=True,
+            operation="initialise",
+            callback=_create,
+            initialise_schema=True,
+        )
 
-    def _with_connection(self, *, write: bool, operation: str, callback):
-        lock_mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
-        with open(self.lock_path, "a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), lock_mode)
-            conn = duckdb.connect(str(self.db_path))
+    def _with_connection(
+        self,
+        *,
+        write: bool,
+        operation: str,
+        callback,
+        initialise_schema: bool = False,
+    ):
+        lock_file = None
+        connection = None
+        try:
+            if write or self.lock_path.exists():
+                lock_file = open(self.lock_path, "a+")
+                lock_mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
+                fcntl.flock(lock_file.fileno(), lock_mode)
+
+            connect_kwargs = {} if write else {"read_only": True}
+            connection = duckdb.connect(str(self.db_path), **connect_kwargs)
             try:
-                create_schema(conn)
+                if initialise_schema:
+                    create_schema(connection)
                 if write:
-                    conn.execute("BEGIN TRANSACTION")
-                result = callback(conn)
+                    connection.execute("BEGIN TRANSACTION")
+                result = callback(connection)
                 if write:
-                    conn.execute("COMMIT")
+                    connection.execute("COMMIT")
                 return result
             except Exception as exc:
                 if write:
                     try:
-                        conn.execute("ROLLBACK")
+                        connection.execute("ROLLBACK")
                     except Exception:
                         pass
                 capture_coordination_error(error=exc, operation=operation)
                 raise
             finally:
-                conn.close()
+                if connection is not None:
+                    connection.close()
+        finally:
+            if lock_file is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
 
     def _fetchone(self, sql: str, params: list[Any] | None = None) -> dict[str, Any] | None:
         def _query(conn):
@@ -197,16 +236,19 @@ class SharedRegistry:
                 }
 
             for row in conn.execute(
-                "SELECT client_id, iteration, results "
+                "SELECT client_id, iteration, results, status, had_runnable_model "
                 "FROM runtime_iteration_history ORDER BY created_at, client_id"
             ).fetchall():
-                data["iteration_history"].append(
-                    {
-                        "client_id": self._restore_client_id(row[0]),
-                        "iteration": row[1],
-                        "results": self._from_json_value(row[2]) or [],
-                    }
-                )
+                history_entry = {
+                    "client_id": self._restore_client_id(row[0]),
+                    "iteration": row[1],
+                    "results": self._from_json_value(row[2]) or [],
+                }
+                if row[3] is not None:
+                    history_entry["status"] = row[3]
+                if row[4] is not None:
+                    history_entry["had_runnable_model"] = row[4]
+                data["iteration_history"].append(history_entry)
 
             for row in conn.execute(
                 "SELECT iteration, candidates, generated_by, timestamp "
@@ -349,11 +391,14 @@ class SharedRegistry:
 
             conn.execute(
                 "INSERT OR REPLACE INTO runtime_iteration_history "
-                "(client_id, iteration, results, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                "(client_id, iteration, results, status, had_runnable_model, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
                     client_key,
                     iteration,
                     self._to_json_text(serializable_results),
+                    status,
+                    had_runnable_model,
                     existing_created_at,
                     timestamp,
                 ],
@@ -397,24 +442,11 @@ class SharedRegistry:
     def get_max_iteration_for_client(self, client_id):
         """Return highest fully completed iteration for this client, or -1."""
         client_key = self._client_key(client_id)
-        entry = self._fetchone(
-            "SELECT status, last_iteration FROM runtime_client_entries WHERE client_id = ?",
+        row = self._fetchone(
+            "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history "
+            "WHERE client_id = ? AND status IN ('complete', 'complete_no_success')",
             [client_key],
-        ) or {}
-        status = entry.get("status")
-        last_iteration = entry.get("last_iteration", -1)
-        if status == "retrying":
-            row = self._fetchone(
-                "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history "
-                "WHERE client_id = ? AND iteration <> ?",
-                [client_key, last_iteration],
-            )
-        else:
-            row = self._fetchone(
-                "SELECT MAX(iteration) AS max_iteration FROM runtime_iteration_history "
-                "WHERE client_id = ?",
-                [client_key],
-            )
+        )
         return row["max_iteration"] if row and row["max_iteration"] is not None else -1
 
     def get_max_generator_iteration(self, client_id):
@@ -538,9 +570,8 @@ class SharedRegistry:
         """Count clients who completed an iteration (not retrying)."""
         row = self._fetchone(
             "SELECT COUNT(*) AS n_clients "
-            "FROM runtime_iteration_history h "
-            "JOIN runtime_client_entries c ON c.client_id = h.client_id "
-            "WHERE h.iteration = ? AND c.status IN ('complete', 'complete_no_success')",
+            "FROM runtime_iteration_history "
+            "WHERE iteration = ? AND status IN ('complete', 'complete_no_success')",
             [iteration],
         )
         return int(row["n_clients"]) if row else 0
@@ -549,9 +580,8 @@ class SharedRegistry:
         """Count clients who produced at least one runnable model."""
         row = self._fetchone(
             "SELECT COUNT(*) AS n_clients "
-            "FROM runtime_iteration_history h "
-            "JOIN runtime_client_entries c ON c.client_id = h.client_id "
-            "WHERE h.iteration = ? AND COALESCE(c.had_runnable_model, FALSE)",
+            "FROM runtime_iteration_history "
+            "WHERE iteration = ? AND COALESCE(had_runnable_model, FALSE)",
             [iteration],
         )
         return int(row["n_clients"]) if row else 0

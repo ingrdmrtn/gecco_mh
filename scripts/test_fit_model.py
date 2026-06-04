@@ -23,7 +23,6 @@ Usage examples:
 
 import os, sys
 import argparse
-import json
 import numpy as np
 from pathlib import Path
 
@@ -32,6 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config.schema import load_config
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.offline_evaluation.fit_generated_models import run_fit, run_fit_hierarchical
+from gecco.coordination import SharedRegistry
 from gecco.utils import TimestampedConsole
 
 from rich.console import Console
@@ -46,15 +46,14 @@ def load_code_from_file(path: str) -> str:
 
 
 def load_code_from_registry(
-    results_dir: Path, model_name: str = None, model_index: int = None
+    results_dir: Path, model_name: str | None = None, model_index: int | None = None
 ) -> str:
     """Extract model code from the shared registry."""
-    registry_path = results_dir / "shared_registry.json"
+    registry_path = results_dir / "shared_registry.duckdb"
     if not registry_path.exists():
         raise FileNotFoundError(f"Registry not found: {registry_path}")
 
-    with open(registry_path) as f:
-        data = json.load(f)
+    data = SharedRegistry.open_existing(registry_path).read()
 
     # Collect all models from iteration history
     all_models = []

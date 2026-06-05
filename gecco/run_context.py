@@ -98,6 +98,58 @@ class RunContext:
         for subdir in self._artifact_subdirs:
             (self.results_dir / subdir).mkdir(parents=True, exist_ok=True)
 
+    @property
+    def is_individual(self) -> bool:
+        """Return whether this run uses individual fitting."""
+
+        return self.fit_type == "individual"
+
+    def _participant_suffix(self, participant: str | None = None) -> str:
+        """Return the participant filename suffix for individual runs."""
+
+        if not self.is_individual or participant is None:
+            return ""
+        return f"_participant{participant}"
+
+    def candidate_model_path(
+        self,
+        *,
+        iteration: int,
+        run_idx: int,
+        tag: str = "",
+        participant: str | None = None,
+    ) -> Path:
+        """Return the canonical candidate model file path."""
+
+        suffix = self._participant_suffix(participant)
+        return self.results_dir / "models" / f"iter{iteration}{tag}_run{run_idx}{suffix}.txt"
+
+    def iteration_results_path(
+        self,
+        *,
+        iteration: int,
+        run_idx: int,
+        tag: str = "",
+        participant: str | None = None,
+    ) -> Path:
+        """Return the canonical iteration-results file path."""
+
+        suffix = self._participant_suffix(participant)
+        return self.results_dir / "bics" / f"iter{iteration}{tag}_run{run_idx}{suffix}.json"
+
+    def feedback_path(
+        self,
+        *,
+        iteration: int,
+        run_idx: int,
+        tag: str = "",
+        participant: str | None = None,
+    ) -> Path:
+        """Return the canonical feedback file path."""
+
+        suffix = self._participant_suffix(participant)
+        return self.results_dir / "feedback" / f"iter{iteration}{tag}_run{run_idx}{suffix}.txt"
+
     def default_diagnostics_path(self) -> Path:
         """Return the canonical diagnostics DuckDB file path."""
 

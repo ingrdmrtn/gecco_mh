@@ -21,8 +21,13 @@ console = TimestampedConsole()
 class ArtifactStore:
     """Persist model, feedback, and iteration artefacts for a run."""
 
-    def __init__(self, results_dir: str | Path, diagnostic_store: DiagnosticStore | None = None):
-        self.results_dir = Path(results_dir)
+    def __init__(
+        self,
+        run_context: RunContext | str | Path,
+        diagnostic_store: DiagnosticStore | None = None,
+    ):
+        self.run_context = run_context if isinstance(run_context, RunContext) else None
+        self.results_dir = run_context.results_dir if isinstance(run_context, RunContext) else Path(run_context)
         self.diagnostic_store = diagnostic_store
 
     def _model_dir(self) -> Path:
@@ -50,6 +55,13 @@ class ArtifactStore:
     ) -> Path:
         """Return the canonical candidate model file path."""
 
+        if self.run_context is not None:
+            return self.run_context.candidate_model_path(
+                iteration=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                participant=participant,
+            )
         suffix = f"_participant{participant}" if participant else ""
         return self._model_dir() / f"iter{iteration}{tag}_run{run_idx}{suffix}.txt"
 
@@ -104,8 +116,16 @@ class ArtifactStore:
     ) -> Path:
         """Persist the plain-text feedback artefact."""
 
-        suffix = f"_participant{participant}" if participant else ""
-        feedback_file = self._feedback_dir() / f"iter{iteration}{tag}_run{run_idx}{suffix}.txt"
+        if self.run_context is not None:
+            feedback_file = self.run_context.feedback_path(
+                iteration=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                participant=participant,
+            )
+        else:
+            suffix = f"_participant{participant}" if participant else ""
+            feedback_file = self._feedback_dir() / f"iter{iteration}{tag}_run{run_idx}{suffix}.txt"
         feedback_file.write_text(feedback, encoding="utf-8")
         return feedback_file
 
@@ -135,11 +155,10 @@ class ArtifactStore:
             ``True`` when at least one runnable model was observed.
         """
 
-        suffix = f"_participant{results_source.participant[0]}" if results_source is not None and hasattr(results_source, "participant") else ""
-        bic_file = self._bics_dir() / f"iter{iteration}{tag}_run{run_idx}{suffix}.json"
-        bic_file.write_text(
-            json.dumps(iteration_results, indent=2, default=str), encoding="utf-8"
-        )
+        participant = None
+        is_individual = bool(self.run_context.is_individual) if self.run_context is not None else False
+        if is_individual and results_source is not None and hasattr(results_source, "participant"):
+            participant = results_source.participant[0]
 
         ppc_results_map = {
             row["function_name"]: row["ppc"]
@@ -159,6 +178,20 @@ class ArtifactStore:
                 )
             except Exception as exc:  # pragma: no cover - surfaced via search logs
                 console.print(f"[yellow]Diagnostic store write failed:[/] {exc}")
+
+        if self.run_context is not None:
+            bic_file = self.run_context.iteration_results_path(
+                iteration=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                participant=participant,
+            )
+        else:
+            suffix = f"_participant{participant}" if participant else ""
+            bic_file = self._bics_dir() / f"iter{iteration}{tag}_run{run_idx}{suffix}.json"
+        bic_file.write_text(
+            json.dumps(iteration_results, indent=2, default=str), encoding="utf-8"
+        )
 
         had_runnable_model = (
             any(

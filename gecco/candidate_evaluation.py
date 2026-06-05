@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
 
@@ -26,25 +26,34 @@ class CandidateEvaluator:
     def evaluate_iteration(
         self,
         *,
-        search: Any,
         iteration: int,
         run_idx: int,
-        feedback: str,
         cmg_cfg: Any,
+        tag: str,
+        client_id: Any,
+        evaluator_index: int | None,
         baseline_bic: float | None,
+        shared_registry: Any,
+        fit_candidate_model: Callable[..., tuple[dict | None, bool]],
+        is_repairable_error: Callable[[dict | None], bool],
+        repair_candidate: Callable[..., dict],
+        update_registry: Callable[..., None],
+        finalize_iteration_results: Callable[..., bool],
+        max_syntax_retries: int,
+        barrier_timeout_seconds: int,
+        participant: str | None = None,
     ) -> CandidateEvaluationResult:
         """Evaluate the candidate assigned to this client."""
 
-        idx = search._cmg_evaluator_index(cmg_cfg)
+        idx = evaluator_index
         if idx is None:
             raise ValueError(
-                f"CMG evaluator client_id must be numeric in range 0..{cmg_cfg.n_models - 1}; got {search.client_id!r}"
+                f"CMG evaluator client_id must be numeric in range 0..{cmg_cfg.n_models - 1}; got {client_id!r}"
             )
 
-        barrier_timeout = getattr(getattr(search.cfg.judge, "barrier", None), "client_wait_seconds", 1800)
-        gen_data = search.shared_registry.wait_for_candidate_models(
+        gen_data = shared_registry.wait_for_candidate_models(
             iteration,
-            timeout_seconds=barrier_timeout,
+            timeout_seconds=barrier_timeout_seconds,
         )
         if gen_data is None:
             raise TimeoutError(f"Timed out waiting for CMG candidates for iteration {iteration}")
@@ -63,8 +72,6 @@ class CandidateEvaluator:
             "parameters": candidate.get("parameters", []),
         }
 
-        tag = search._file_tag()
-        participant = getattr(search.df, "participant", [None])[0] if getattr(search, "df", None) is not None else None
         model_file = self.artifact_store.candidate_model_path(
             iteration=iteration,
             run_idx=run_idx,
@@ -75,11 +82,10 @@ class CandidateEvaluator:
 
         iteration_results: list[dict[str, Any]] = []
         syntax_retry_count = 0
-        max_syntax_retries = getattr(getattr(search.cfg, "validation", None), "max_syntax_retries", 2)
         current_model_dict = model_dict
 
         while syntax_retry_count <= max_syntax_retries:
-            result, should_stop = search._fit_candidate_model(
+            result, should_stop = fit_candidate_model(
                 model_dict=current_model_dict,
                 model_idx=idx,
                 n_models=cmg_cfg.n_models,
@@ -90,16 +96,16 @@ class CandidateEvaluator:
                 baseline_bic=baseline_bic,
             )
 
-            is_repairable_error = search._is_cmg_repairable_error(result)
+            repairable_error = is_repairable_error(result)
 
-            if not is_repairable_error or syntax_retry_count >= max_syntax_retries:
+            if not repairable_error or syntax_retry_count >= max_syntax_retries:
                 if result is not None:
                     iteration_results = [result]
                 break
 
             syntax_retry_count += 1
-            search._update_registry(iteration, [], status="retrying")
-            current_model_dict = search._repair_cmg_candidate(
+            update_registry(iteration, [], status="retrying")
+            current_model_dict = repair_candidate(
                 candidate=candidate,
                 current_model_dict=current_model_dict,
                 error_result=result,
@@ -114,7 +120,7 @@ class CandidateEvaluator:
             result.setdefault("expected_func_name", func_name)
             result.setdefault("display_name", display_name)
 
-        search._finalize_iteration_results(
+        finalize_iteration_results(
             it=iteration,
             run_idx=run_idx,
             tag=tag,

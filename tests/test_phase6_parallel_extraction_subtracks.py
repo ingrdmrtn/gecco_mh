@@ -17,21 +17,27 @@ from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.run_context import RunContext
 
 
+def _group_cfg() -> SimpleNamespace:
+    return SimpleNamespace(task=SimpleNamespace(name="phase6_task"), evaluation=SimpleNamespace(fit_type="group"))
+
+
+def _individual_cfg() -> SimpleNamespace:
+    return SimpleNamespace(task=SimpleNamespace(name="phase6_task"), evaluation=SimpleNamespace(fit_type="individual"))
+
+
 def test_run_context_resolves_paths_and_cleans_tempdir(tmp_path: Path):
     """RunContext should own run paths and temporary-directory lifecycle."""
 
-    cfg = SimpleNamespace(
-        task=SimpleNamespace(name="phase6_task"),
-        evaluation=SimpleNamespace(fit_type="individual"),
-    )
-
-    context = RunContext.from_cfg(cfg, project_root=tmp_path, client_id=3)
+    context = RunContext.from_cfg(_individual_cfg(), project_root=tmp_path, client_id=3)
     try:
         assert context.project_root == tmp_path
         assert context.results_dir == tmp_path / "results" / "phase6_task_individual"
-        assert (context.results_dir / "models").exists()
-        assert (context.results_dir / "bics").exists()
-        assert (context.results_dir / "feedback").exists()
+        assert context.is_individual is True
+        assert context.candidate_model_path(iteration=0, run_idx=2, tag="", participant="p1") == (
+            tmp_path / "results" / "phase6_task_individual" / "models" / "iter0_run2_participantp1.txt"
+        )
+        assert context.feedback_path(iteration=1, run_idx=2, tag="", participant="p1").name == "iter1_run2_participantp1.txt"
+        assert context.iteration_results_path(iteration=0, run_idx=2, tag="").name == "iter0_run2.json"
         assert context.diagnostics_path == context.results_dir / "diagnostics_3.duckdb"
         assert context.tempdir_path.exists()
         assert context.tempdir_path.parent == tmp_path / "tmp"
@@ -51,116 +57,101 @@ def test_run_context_rejects_missing_required_config(tmp_path: Path):
         RunContext.from_cfg(cfg, project_root=tmp_path)
 
 
-def test_artifact_store_iteration_write_round_trip(tmp_path: Path):
-    """Artefact writes should round-trip through DuckDB as the canonical store."""
+def test_artifact_store_contract_handles_group_and_individual_paths(tmp_path: Path):
+    """Artefact writes should round-trip and use the correct path layout."""
 
+    group_context = RunContext.from_cfg(_group_cfg(), project_root=tmp_path)
+    individual_context = RunContext.from_cfg(_individual_cfg(), project_root=tmp_path)
     store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
-    artifact_store = ArtifactStore(tmp_path, store)
+    try:
+        group_store = ArtifactStore(group_context, store)
+        individual_store = ArtifactStore(individual_context, store)
 
-    iteration_results = [
-        {
-            "function_name": "model_a",
-            "metric_name": "BIC",
-            "metric_value": 12.5,
-            "param_names": ["alpha"],
-            "code": "def model_a():\n    return 0",
-        }
-    ]
+        assert group_store.candidate_model_path(iteration=0, run_idx=1, tag="") == (
+            tmp_path / "results" / "phase6_task" / "models" / "iter0_run1.txt"
+        )
+        assert individual_store.candidate_model_path(iteration=0, run_idx=1, tag="", participant="p1") == (
+            tmp_path / "results" / "phase6_task_individual" / "models" / "iter0_run1_participantp1.txt"
+        )
 
-    had_runnable_model = artifact_store.write_iteration_results(
-        iteration=0,
-        run_idx=1,
-        tag="",
-        iteration_results=iteration_results,
-        client_id="client-a",
-    )
+        iteration_results = [
+            {
+                "function_name": "model_a",
+                "metric_name": "BIC",
+                "metric_value": 12.5,
+                "param_names": ["alpha"],
+                "code": "def model_a():\n    return 0",
+            }
+        ]
 
-    assert had_runnable_model is True
-    assert (tmp_path / "bics" / "iter0_run1.json").exists()
-    assert store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
+        had_runnable_model = group_store.write_iteration_results(
+            iteration=0,
+            run_idx=1,
+            tag="",
+            iteration_results=iteration_results,
+            client_id="client-a",
+        )
 
-    # A repeated write should remain idempotent at the DuckDB layer.
-    artifact_store.write_iteration_results(
-        iteration=0,
-        run_idx=1,
-        tag="",
-        iteration_results=iteration_results,
-        client_id="client-a",
-    )
-    assert store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
-    store.close()
+        assert had_runnable_model is True
+        assert (tmp_path / "results" / "phase6_task" / "bics" / "iter0_run1.json").exists()
+        assert store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
+    finally:
+        store.close()
+        group_context.close()
+        individual_context.close()
 
 
-def test_candidate_generator_contract_uses_generation_backend_and_registry(tmp_path: Path):
-    """The generator service should persist artefacts and publish candidates."""
+def test_candidate_generator_contract_uses_explicit_inputs_and_registry(tmp_path: Path):
+    """The generator should operate from explicit inputs rather than search internals."""
 
-    search = MagicMock()
-    search.cfg = SimpleNamespace(
-        clients={
-            "client-a": SimpleNamespace(
-                naive_ideation=SimpleNamespace(enabled=False)
-            )
-        }
-    )
-    search.client_id = "client-a"
-    search.df = SimpleNamespace(participant=["p1"])
-    search.results_dir = tmp_path
-    search._file_tag.return_value = ""
-    search._set_activity = MagicMock()
-    search.prompt_builder.build_input_prompt.return_value = "prompt text"
-    search.generate_models.return_value = (
-        "def model_a():\n    return 0",
-        [
-            {"name": "model_a", "code": "code_a", "parameters": ["alpha"]},
-            {"name": "model_b", "code": "code_b", "parameters": ["beta"]},
-        ],
-    )
-    search.generate_models_naive = MagicMock()
-    search.shared_registry = MagicMock()
+    run_context = RunContext.from_cfg(_group_cfg(), project_root=tmp_path)
+    artifact_store = ArtifactStore(run_context)
+    generator = CandidateGenerator(artifact_store)
+    shared_registry = MagicMock()
 
-    generator = CandidateGenerator(ArtifactStore(tmp_path))
     result = generator.generate_iteration(
-        search=search,
         iteration=0,
         run_idx=2,
         feedback="use simpler models",
         cmg_cfg=SimpleNamespace(n_models=2),
+        tag="",
+        client_id="client-a",
+        naive_enabled=False,
+        build_prompt=MagicMock(return_value="prompt text"),
+        generate_models=MagicMock(
+            return_value=(
+                "def model_a():\n    return 0",
+                [
+                    {"name": "model_a", "code": "code_a", "parameters": ["alpha"]},
+                    {"name": "model_b", "code": "code_b", "parameters": ["beta"]},
+                ],
+            )
+        ),
+        generate_models_naive=MagicMock(),
+        shared_registry=shared_registry,
+        participant=None,
+        set_activity=MagicMock(),
     )
 
-    search.generate_models.assert_called_once_with("prompt text", n_models=2)
-    search.shared_registry.set_candidate_models.assert_called_once()
-    search.shared_registry.set_generator_status.assert_called_once_with(
+    assert result.candidates[0]["func_name"] == "cognitive_model1"
+    assert result.model_file.exists()
+    shared_registry.set_candidate_models.assert_called_once()
+    shared_registry.set_generator_status.assert_called_once_with(
         iteration=0,
         client_id="client-a",
         status="complete",
         n_candidates=2,
     )
-    assert result.candidates[0]["func_name"] == "cognitive_model1"
-    assert result.model_file.exists()
+    run_context.close()
 
 
 def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path):
-    """The evaluator service should fit the assigned candidate and finalise it."""
+    """The evaluator should fit the assigned candidate and finalise it."""
 
-    search = MagicMock()
-    search.client_id = 0
-    search.df = SimpleNamespace(participant=["p1"])
-    search.results_dir = tmp_path
-    search.cfg = SimpleNamespace(
-        judge=SimpleNamespace(barrier=SimpleNamespace(client_wait_seconds=1)),
-        validation=SimpleNamespace(max_syntax_retries=0),
-    )
-    search._file_tag.return_value = ""
-    search._cmg_evaluator_index.return_value = 0
-    search._is_cmg_repairable_error.return_value = False
-    search._fit_candidate_model.return_value = (
-        {"function_name": "model_a", "metric_name": "BIC", "metric_value": 10.0},
-        False,
-    )
-    search._finalize_iteration_results = MagicMock()
-    search._update_registry = MagicMock()
-    search.shared_registry = MagicMock()
-    search.shared_registry.wait_for_candidate_models.return_value = {
+    run_context = RunContext.from_cfg(_group_cfg(), project_root=tmp_path)
+    artifact_store = ArtifactStore(run_context)
+    shared_registry = MagicMock()
+    shared_registry.wait_for_candidate_models.return_value = {
         "candidates": [
             {
                 "index": 0,
@@ -172,41 +163,79 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
         ]
     }
 
-    evaluator = CandidateEvaluator(ArtifactStore(tmp_path))
+    fit_candidate_model = MagicMock(
+        side_effect=[
+            (
+                {
+                    "function_name": "model_a",
+                    "metric_name": "VALIDATION_ERROR",
+                    "metric_value": float("inf"),
+                    "error_type": "syntax",
+                    "error_message": "bad syntax",
+                    "error_details": {},
+                },
+                False,
+            ),
+            (
+                {
+                    "function_name": "model_a",
+                    "metric_name": "BIC",
+                    "metric_value": 10.0,
+                    "param_names": [],
+                },
+                False,
+            ),
+        ]
+    )
+    repair_candidate = MagicMock(
+        return_value={
+            "func_name": "cognitive_model1",
+            "name": "model_a",
+            "code": "def model_a():\n    return 1",
+            "parameters": [],
+        }
+    )
+    update_registry = MagicMock()
+    finalize_iteration_results = MagicMock(return_value=True)
+
+    evaluator = CandidateEvaluator(artifact_store)
     result = evaluator.evaluate_iteration(
-        search=search,
         iteration=0,
         run_idx=3,
-        feedback="feedback",
         cmg_cfg=SimpleNamespace(n_models=1),
+        tag="",
+        client_id=0,
+        evaluator_index=0,
         baseline_bic=99.0,
+        shared_registry=shared_registry,
+        fit_candidate_model=fit_candidate_model,
+        is_repairable_error=lambda row: row is not None and row.get("metric_name") == "VALIDATION_ERROR",
+        repair_candidate=repair_candidate,
+        update_registry=update_registry,
+        finalize_iteration_results=finalize_iteration_results,
+        max_syntax_retries=1,
+        barrier_timeout_seconds=1,
     )
 
-    search._fit_candidate_model.assert_called_once()
-    search._finalize_iteration_results.assert_called_once()
     assert result.iteration_results[0]["metric_value"] == 10.0
     assert result.model_file.exists()
+    update_registry.assert_called_once_with(0, [], status="retrying")
+    finalize_iteration_results.assert_called_once()
+    run_context.close()
 
 
 def test_feedback_coordinator_uses_orchestrated_pipeline_for_persona_feedback(tmp_path: Path):
     """The feedback coordinator should adapt orchestrated feedback for the active persona."""
 
-    search = SimpleNamespace(
-        tool_judge=MagicMock(),
-        cfg=SimpleNamespace(),
-        results_dir=tmp_path,
-        client_id="client-a",
-        best_model=None,
-        best_metric=None,
-        shared_registry=None,
-        _set_activity=MagicMock(),
-    )
+    judge = MagicMock()
     artifact = MagicMock()
     artifact.feedback_for_persona.return_value = "use fewer free parameters"
 
     with patch("gecco.feedback_coordinator.run_orchestrated_judge_pipeline", return_value=artifact) as runner:
         feedback, verdict = FeedbackCoordinator().resolve_feedback(
-            search=search,
+            judge=judge,
+            cfg=SimpleNamespace(),
+            results_dir=tmp_path,
             iteration=4,
             run_idx=1,
             tag="",
@@ -214,28 +243,20 @@ def test_feedback_coordinator_uses_orchestrated_pipeline_for_persona_feedback(tm
             best_metric=None,
             recovery_failures=[{"name": "model_a"}],
             prev_had_success=True,
+            persona_name="client-a",
+            set_activity=MagicMock(),
         )
 
     assert feedback == "use fewer free parameters"
     assert verdict.synthesized_feedback == "use fewer free parameters"
     runner.assert_called_once()
-    search._set_activity.assert_called_once()
 
 
 def test_distributed_coordinator_sync_and_update_delegate_registry():
     """Distributed coordination should be a small registry-facing service."""
 
-    search = SimpleNamespace(
-        shared_registry=MagicMock(),
-        best_metric=float("inf"),
-        best_model=None,
-        best_params=[],
-        tried_param_sets=[],
-        feedback=SimpleNamespace(history=[]),
-        _merged_history_count=0,
-        client_id="client-a",
-    )
-    search.shared_registry.read.return_value = {
+    shared_registry = MagicMock()
+    shared_registry.read.return_value = {
         "global_best": {
             "metric_value": 9.0,
             "model_code": "def best():\n    return 0",
@@ -249,17 +270,31 @@ def test_distributed_coordinator_sync_and_update_delegate_registry():
     }
 
     coordinator = DistributedCoordinator()
-    coordinator.sync_from_registry(search=search)
+    sync_result = coordinator.sync_from_registry(
+        shared_registry=shared_registry,
+        best_metric=float("inf"),
+        best_model=None,
+        best_params=[],
+        tried_param_sets=[],
+        feedback_history=[],
+        merged_history_count=0,
+        client_id="client-a",
+    )
 
-    assert search.best_metric == 9.0
-    assert search.best_model == "def best():\n    return 0"
-    assert search.feedback.history[0]["client_id"] == "client-b"
+    assert sync_result.best_metric == 9.0
+    assert sync_result.best_model == "def best():\n    return 0"
+    assert sync_result.feedback_history[0]["client_id"] == "client-b"
 
     coordinator.update_registry(
-        search=search,
+        shared_registry=shared_registry,
+        client_id="client-a",
         iteration=1,
         results=[{"function_name": "model_a"}],
+        best_model="def best():\n    return 0",
+        best_metric=9.0,
+        best_params=["alpha"],
+        tried_param_sets=[["alpha"]],
         status="complete",
         had_runnable_model=True,
     )
-    search.shared_registry.update.assert_called_once()
+    shared_registry.update.assert_called_once()

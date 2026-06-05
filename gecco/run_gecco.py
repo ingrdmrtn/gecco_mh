@@ -182,7 +182,7 @@ class GeCCoModelSearch:
                 )
                 console.print("[dim]Unified judge pipeline initialised.[/]")
 
-        self.artifact_store = ArtifactStore(self.results_dir, self.diagnostic_store)
+        self.artifact_store = ArtifactStore(self.run_context, self.diagnostic_store)
         self.candidate_generator = CandidateGenerator(self.artifact_store)
         self.candidate_evaluator = CandidateEvaluator(self.artifact_store)
         self.feedback_coordinator = FeedbackCoordinator()
@@ -213,6 +213,15 @@ class GeCCoModelSearch:
             if block_residual_cfg
             else 10
         )
+
+    def close(self) -> None:
+        """Release runtime-owned resources."""
+
+        if getattr(self, "diagnostic_store", None) is not None:
+            self.diagnostic_store.close()
+            self.diagnostic_store = None
+        if getattr(self, "run_context", None) is not None:
+            self.run_context.close()
 
     def _cmg_config(self):
         """Return CMG config object if enabled, else None."""
@@ -952,12 +961,31 @@ class GeCCoModelSearch:
         cross-client data.
         """
         coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
-        coordinator.sync_from_registry(search=self)
+        sync_result = coordinator.sync_from_registry(
+            shared_registry=self.shared_registry,
+            best_metric=self.best_metric,
+            best_model=self.best_model,
+            best_params=self.best_params,
+            tried_param_sets=self.tried_param_sets,
+            feedback_history=self.feedback.history,
+            merged_history_count=self._merged_history_count,
+            client_id=self.client_id,
+        )
+        self.best_metric = sync_result.best_metric
+        self.best_model = sync_result.best_model
+        self.best_params = sync_result.best_params
+        self.tried_param_sets = sync_result.tried_param_sets
+        self.feedback.history = sync_result.feedback_history
+        self._merged_history_count = sync_result.merged_history_count
 
     def _set_activity(self, activity):
         """Update current activity in the shared registry."""
         coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
-        coordinator.set_activity(search=self, activity=activity)
+        coordinator.set_activity(
+            shared_registry=self.shared_registry,
+            client_id=self.client_id,
+            activity=activity,
+        )
 
     def _update_registry(
         self, iteration, results, status="running", had_runnable_model=None
@@ -965,9 +993,14 @@ class GeCCoModelSearch:
         """Push this iteration's results to the shared registry."""
         coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
         coordinator.update_registry(
-            search=self,
+            shared_registry=self.shared_registry,
+            client_id=self.client_id,
             iteration=iteration,
             results=results,
+            best_model=self.best_model,
+            best_metric=self.best_metric,
+            best_params=self.best_params,
+            tried_param_sets=self.tried_param_sets,
             status=status,
             had_runnable_model=had_runnable_model,
         )
@@ -1531,31 +1564,78 @@ class GeCCoModelSearch:
 
     def _run_cmg_generator_iteration(self, it, run_idx, feedback, cmg_cfg):
         """Generator path: generate candidates and publish to registry."""
+        client_config = (
+            getattr(self.cfg.clients, self.client_id, None) if self.client_id else None
+        )
+        naive_enabled = bool(
+            client_config
+            and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
+        )
+        participant = (
+            getattr(self.df, "participant", [None])[0]
+            if getattr(self, "df", None) is not None
+            else None
+        )
         generator = getattr(self, "candidate_generator", None) or CandidateGenerator(
             getattr(self, "artifact_store", None)
-            or ArtifactStore(self.results_dir, getattr(self, "diagnostic_store", None))
+            or ArtifactStore(
+                getattr(self, "run_context", None) or self.results_dir,
+                getattr(self, "diagnostic_store", None),
+            )
         )
         generator.generate_iteration(
-            search=self,
             iteration=it,
             run_idx=run_idx,
             feedback=feedback,
             cmg_cfg=cmg_cfg,
+            tag=self._file_tag(),
+            client_id=self.client_id,
+            naive_enabled=naive_enabled,
+            build_prompt=self.prompt_builder.build_input_prompt,
+            generate_models=self.generate_models,
+            generate_models_naive=self.generate_models_naive,
+            shared_registry=self.shared_registry,
+            participant=participant,
+            set_activity=self._set_activity,
         )
 
     def _run_cmg_evaluator_iteration(self, it, run_idx, feedback, cmg_cfg, baseline_bic):
         """Evaluator path: fit assigned candidate with repair loop."""
+        participant = (
+            getattr(self.df, "participant", [None])[0]
+            if getattr(self, "df", None) is not None
+            else None
+        )
         evaluator = getattr(self, "candidate_evaluator", None) or CandidateEvaluator(
             getattr(self, "artifact_store", None)
-            or ArtifactStore(self.results_dir, getattr(self, "diagnostic_store", None))
+            or ArtifactStore(
+                getattr(self, "run_context", None) or self.results_dir,
+                getattr(self, "diagnostic_store", None),
+            )
         )
         evaluator.evaluate_iteration(
-            search=self,
             iteration=it,
             run_idx=run_idx,
-            feedback=feedback,
             cmg_cfg=cmg_cfg,
+            tag=self._file_tag(),
+            client_id=self.client_id,
+            evaluator_index=self._cmg_evaluator_index(cmg_cfg),
             baseline_bic=baseline_bic,
+            shared_registry=self.shared_registry,
+            fit_candidate_model=self._fit_candidate_model,
+            is_repairable_error=self._is_cmg_repairable_error,
+            repair_candidate=self._repair_cmg_candidate,
+            update_registry=self._update_registry,
+            finalize_iteration_results=self._finalize_iteration_results,
+            max_syntax_retries=getattr(
+                getattr(self.cfg, "validation", None), "max_syntax_retries", 2
+            ),
+            barrier_timeout_seconds=getattr(
+                getattr(self.cfg.judge, "barrier", None),
+                "client_wait_seconds",
+                1800,
+            ),
+            participant=participant,
         )
 
     def _repair_cmg_candidate(
@@ -1723,7 +1803,8 @@ class GeCCoModelSearch:
         self._set_activity(f"saving results (iter {it})")
 
         artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
-            self.results_dir, getattr(self, "diagnostic_store", None)
+            getattr(self, "run_context", None) or self.results_dir,
+            getattr(self, "diagnostic_store", None),
         )
 
         had_runnable_model = artifact_store.write_iteration_results(
@@ -1751,7 +1832,12 @@ class GeCCoModelSearch:
         # Resume from the next iteration after what's already in the registry
         cmg_cfg = self._cmg_config()
         distributed_coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
-        start_iter = distributed_coordinator.start_iteration(search=self, cmg_cfg=cmg_cfg)
+        start_iter = distributed_coordinator.start_iteration(
+            shared_registry=self.shared_registry,
+            client_id=self.client_id,
+            cmg_cfg=cmg_cfg,
+            is_generator=self._cmg_is_generator(cmg_cfg) if cmg_cfg is not None else False,
+        )
         max_existing = start_iter - 1
         if max_existing >= 0:
             console.print(
@@ -1864,7 +1950,9 @@ class GeCCoModelSearch:
                 if self.tool_judge is not None:
                     feedback_coordinator = getattr(self, "feedback_coordinator", None) or FeedbackCoordinator()
                     feedback, verdict = feedback_coordinator.resolve_feedback(
-                        search=self,
+                        judge=self.tool_judge,
+                        cfg=self.cfg,
+                        results_dir=self.results_dir,
                         iteration=it,
                         run_idx=run_idx,
                         tag=tag,
@@ -1872,6 +1960,8 @@ class GeCCoModelSearch:
                         best_metric=self.best_metric,
                         recovery_failures=recovery_failures,
                         prev_had_success=prev_had_success,
+                        persona_name=self.client_id or "default",
+                        set_activity=self._set_activity,
                     )
                 else:
                     feedback = ""
@@ -1884,7 +1974,8 @@ class GeCCoModelSearch:
             if feedback:
                 participant = self.df.participant[0] if hasattr(self.df, "participant") else None
                 artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
-                    self.results_dir, getattr(self, "diagnostic_store", None)
+                    getattr(self, "run_context", None) or self.results_dir,
+                    getattr(self, "diagnostic_store", None),
                 )
                 artifact_store.write_feedback_text(
                     iteration=it,

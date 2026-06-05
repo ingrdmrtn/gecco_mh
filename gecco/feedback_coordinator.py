@@ -15,7 +15,9 @@ class FeedbackCoordinator:
     def resolve_feedback(
         self,
         *,
-        search: Any,
+        judge: Any,
+        cfg: Any,
+        results_dir: Any,
         iteration: int,
         run_idx: int,
         tag: str,
@@ -23,20 +25,23 @@ class FeedbackCoordinator:
         best_metric: float | None,
         recovery_failures: list[dict[str, Any]] | None,
         prev_had_success: bool,
+        persona_name: str = "default",
+        set_activity: Any | None = None,
     ) -> tuple[str, Any]:
         """Return feedback text and a verdict-like payload."""
 
-        if search.tool_judge is None:
+        if judge is None:
             return "", SimpleNamespace(synthesized_feedback="", key_recommendations=[])
 
-        search._set_activity(f"judge synthesis (iter {iteration})")
+        if set_activity is not None:
+            set_activity(f"judge synthesis (iter {iteration})")
         from gecco import run_gecco as run_gecco_module
 
         runner = run_orchestrated_judge_pipeline or run_gecco_module.run_orchestrated_judge_pipeline
         artifact = runner(
-            judge=search.tool_judge,
-            cfg=search.cfg,
-            results_dir=search.results_dir,
+            judge=judge,
+            cfg=cfg,
+            results_dir=results_dir,
             iteration=iteration,
             run_idx=run_idx,
             tag=tag,
@@ -45,7 +50,6 @@ class FeedbackCoordinator:
             recovery_failures=recovery_failures if recovery_failures else None,
             prev_had_success=prev_had_success,
         )
-        persona_name = search.client_id or "default"
         feedback = artifact.feedback_for_persona(persona_name)
         verdict = SimpleNamespace(
             synthesized_feedback=feedback,

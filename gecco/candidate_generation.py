@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
 
@@ -29,40 +28,33 @@ class CandidateGenerator:
     def generate_iteration(
         self,
         *,
-        search: Any,
         iteration: int,
         run_idx: int,
         feedback: str,
         cmg_cfg: Any,
+        tag: str,
+        client_id: Any,
+        naive_enabled: bool,
+        build_prompt: Callable[..., str],
+        generate_models: Callable[..., tuple[str, list[dict[str, Any]]]],
+        generate_models_naive: Callable[..., tuple[str, list[dict[str, Any]]]],
+        shared_registry: Any,
+        participant: str | None = None,
+        set_activity: Callable[[str], None] | None = None,
     ) -> CandidateGenerationResult:
         """Run one candidate-generation iteration."""
 
         n_models = cmg_cfg.n_models
-        tag = search._file_tag()
-        search._set_activity(f"generating centralized candidates (iter {iteration})")
+        if set_activity is not None:
+            set_activity(f"generating centralized candidates (iter {iteration})")
 
         try:
-            client_config = (
-                getattr(search.cfg.clients, search.client_id, None) if search.client_id else None
-            )
-            naive_enabled = bool(
-                client_config
-                and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
-            )
-
             if naive_enabled:
-                code_text, parsed_models = search.generate_models_naive(feedback, n_models=n_models)
+                code_text, parsed_models = generate_models_naive(feedback, n_models=n_models)
             else:
-                prompt = search.prompt_builder.build_input_prompt(
-                    feedback_text=feedback, n_models=n_models
-                )
-                code_text, parsed_models = search.generate_models(prompt, n_models=n_models)
+                prompt = build_prompt(feedback_text=feedback, n_models=n_models)
+                code_text, parsed_models = generate_models(prompt, n_models=n_models)
 
-            participant = (
-                getattr(search.df, "participant", [None])[0]
-                if getattr(search, "df", None) is not None
-                else None
-            )
             model_file = self.artifact_store.write_candidate_artifacts(
                 iteration=iteration,
                 run_idx=run_idx,
@@ -94,10 +86,10 @@ class CandidateGenerator:
                     f"CMG generator produced {len(candidates)} candidates, expected {n_models}"
                 )
 
-            search.shared_registry.set_candidate_models(iteration, candidates, search.client_id)
-            search.shared_registry.set_generator_status(
+            shared_registry.set_candidate_models(iteration, candidates, client_id)
+            shared_registry.set_generator_status(
                 iteration=iteration,
-                client_id=search.client_id,
+                client_id=client_id,
                 status="complete",
                 n_candidates=len(candidates),
             )
@@ -108,10 +100,10 @@ class CandidateGenerator:
                 model_file=model_file,
             )
         except Exception as exc:
-            if search.shared_registry is not None:
-                search.shared_registry.set_generator_status(
+            if shared_registry is not None:
+                shared_registry.set_generator_status(
                     iteration=iteration,
-                    client_id=search.client_id,
+                    client_id=client_id,
                     status="failed",
                     n_candidates=0,
                     error=str(exc),

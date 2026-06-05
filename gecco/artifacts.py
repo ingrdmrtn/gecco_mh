@@ -75,7 +75,7 @@ class ArtifactStore:
         parsed_models: list[dict[str, Any]],
         participant: str | None = None,
     ) -> Path:
-        """Persist raw and structured candidate-generation artefacts."""
+        """Persist raw and structured candidate-generation inspection artefacts."""
 
         model_file = self.candidate_model_path(
             iteration=iteration,
@@ -149,7 +149,7 @@ class ArtifactStore:
         client_id: Any = None,
         results_source: Any = None,
     ) -> bool:
-        """Persist iteration results to JSON and DuckDB.
+        """Persist iteration results to DuckDB and inspection JSON.
 
         Returns:
             ``True`` when at least one runnable model was observed.

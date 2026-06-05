@@ -14,6 +14,7 @@ from gecco.candidate_generation import CandidateGenerator
 from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.distributed_coordinator import DistributedCoordinator
 from gecco.feedback_coordinator import FeedbackCoordinator
+from gecco.run_gecco import GeCCoModelSearch
 from gecco.run_context import RunContext
 
 
@@ -230,9 +231,17 @@ def test_feedback_coordinator_uses_orchestrated_pipeline_for_persona_feedback(tm
     judge = MagicMock()
     artifact = MagicMock()
     artifact.feedback_for_persona.return_value = "use fewer free parameters"
+    original_import = __import__
 
-    with patch("gecco.feedback_coordinator.run_orchestrated_judge_pipeline", return_value=artifact) as runner:
-        feedback, verdict = FeedbackCoordinator().resolve_feedback(
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "gecco.run_gecco":
+            raise AssertionError("FeedbackCoordinator should not import gecco.run_gecco")
+        return original_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=guarded_import):
+        feedback, verdict = FeedbackCoordinator(
+            run_orchestrated_judge_pipeline=MagicMock(return_value=artifact)
+        ).resolve_feedback(
             judge=judge,
             cfg=SimpleNamespace(),
             results_dir=tmp_path,
@@ -249,7 +258,7 @@ def test_feedback_coordinator_uses_orchestrated_pipeline_for_persona_feedback(tm
 
     assert feedback == "use fewer free parameters"
     assert verdict.synthesized_feedback == "use fewer free parameters"
-    runner.assert_called_once()
+    artifact.feedback_for_persona.assert_called_once_with("client-a")
 
 
 def test_distributed_coordinator_sync_and_update_delegate_registry():
@@ -298,3 +307,99 @@ def test_distributed_coordinator_sync_and_update_delegate_registry():
         had_runnable_model=True,
     )
     shared_registry.update.assert_called_once()
+
+
+def test_run_n_shots_non_cmg_routes_through_extracted_services(tmp_path: Path):
+    """Non-CMG iterations should use the extracted generator/evaluator services."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        judge=None,
+        validation=SimpleNamespace(max_syntax_retries=0),
+        clients={},
+    )
+    search.df = SimpleNamespace()
+    search.df_val = None
+    search.model = object()
+    search.tokenizer = object()
+    search.prompt_builder = SimpleNamespace(
+        build_input_prompt=MagicMock(return_value="prompt text")
+    )
+    search.client_id = None
+    search.shared_registry = None
+    search.best_model = None
+    search.best_metric = float("inf")
+    search.best_params = []
+    search.best_param_names = []
+    search.best_param_values = None
+    search.best_iter = -1
+    search.best_id_results = None
+    search.tried_param_sets = []
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.tool_judge = None
+    search._merged_history_count = 0
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 100
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 10
+    search.run_context = None
+    search.results_dir = tmp_path / "results"
+    search.artifact_store = MagicMock()
+    search.artifact_store.results_dir = search.results_dir
+    search.artifact_store.write_candidate_artifacts = MagicMock(
+        return_value=search.results_dir / "models" / "iter0_run0.txt"
+    )
+    search.candidate_generator = MagicMock()
+    search.candidate_generator.generate_models = MagicMock(
+        return_value=(
+            "code text",
+            [
+                {
+                    "name": "model_a",
+                    "code": "def model_a():\n    return 0",
+                    "parameters": [],
+                }
+            ],
+        )
+    )
+    search.candidate_generator.generate_models_naive = MagicMock(
+        side_effect=AssertionError("naive generation should not be used")
+    )
+    search.candidate_evaluator = MagicMock()
+    search.candidate_evaluator.fit_candidate_model = MagicMock(
+        return_value=(
+            {
+                "function_name": "model_a",
+                "metric_name": "BIC",
+                "metric_value": 1.0,
+                "param_names": [],
+                "code": "def model_a():\n    return 0",
+            },
+            False,
+        )
+    )
+    search.candidate_evaluator.finalize_iteration_results = MagicMock(return_value=True)
+    search.generate_models = MagicMock(side_effect=AssertionError("old path used"))
+    search.generate_models_naive = MagicMock(side_effect=AssertionError("old path used"))
+    search._fit_candidate_model = MagicMock(side_effect=AssertionError("old path used"))
+    search._finalize_iteration_results = MagicMock(side_effect=AssertionError("old path used"))
+    search._cmg_config = MagicMock(return_value=None)
+    search._sync_from_registry = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._set_activity = MagicMock()
+    search._update_registry = MagicMock()
+    search.generate = MagicMock(return_value="text")
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    search.run_n_shots(0, None)
+
+    search.candidate_generator.generate_models.assert_called_once()
+    search.candidate_evaluator.fit_candidate_model.assert_called_once()
+    search.candidate_evaluator.finalize_iteration_results.assert_called_once()

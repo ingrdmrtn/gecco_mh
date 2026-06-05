@@ -6,11 +6,13 @@ from types import SimpleNamespace
 from typing import Any
 
 
-run_orchestrated_judge_pipeline = None
-
-
 class FeedbackCoordinator:
     """Resolve feedback text for a search iteration."""
+
+    def __init__(self, run_orchestrated_judge_pipeline):
+        """Initialise the coordinator with explicit orchestration helpers."""
+
+        self._run_orchestrated_judge_pipeline = run_orchestrated_judge_pipeline
 
     def resolve_feedback(
         self,
@@ -35,10 +37,7 @@ class FeedbackCoordinator:
 
         if set_activity is not None:
             set_activity(f"judge synthesis (iter {iteration})")
-        from gecco import run_gecco as run_gecco_module
-
-        runner = run_orchestrated_judge_pipeline or run_gecco_module.run_orchestrated_judge_pipeline
-        artifact = runner(
+        artifact = self._run_orchestrated_judge_pipeline(
             judge=judge,
             cfg=cfg,
             results_dir=results_dir,

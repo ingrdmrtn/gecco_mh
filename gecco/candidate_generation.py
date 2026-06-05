@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
+from gecco.utils import TimestampedConsole
+
+
+console = TimestampedConsole()
 
 
 @dataclass(slots=True)
@@ -109,3 +113,308 @@ class CandidateGenerator:
                     error=str(exc),
                 )
             raise
+
+    def generate_models(
+        self,
+        *,
+        prompt: str,
+        n_models: int,
+        cfg: Any,
+        generate_text: Callable[..., str],
+        model: Any,
+        tokenizer: Any,
+        save_review: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Generate structured candidate models from an explicit prompt.
+
+        Args:
+            prompt: Prompt text to send to the generation backend.
+            n_models: Number of candidate models to request.
+            cfg: Runtime configuration.
+            generate_text: Low-level text-generation callable.
+            model: Back-end model object.
+            tokenizer: Tokeniser for the back-end model.
+            save_review: Optional callback for persisting review payloads.
+
+        Returns:
+            A ``(raw_text, models)`` pair.
+        """
+
+        from gecco.structured_output import (
+            build_correction_prompt,
+            build_fix_prompt,
+            build_review_prompt,
+            get_model_schema,
+            get_review_schema,
+            get_schema_instructions,
+            parse_model_response,
+            parse_review_response,
+            validate_single_model,
+        )
+
+        structured = getattr(cfg.llm, "structured_output", True)
+        validation_cfg = getattr(cfg, "validation", None)
+        max_retries = (
+            getattr(validation_cfg, "retry_limit", 3)
+            if validation_cfg is not None
+            else 3
+        )
+
+        include_analysis = getattr(cfg.llm, "analysis_scratchpad", True)
+        model_schema = get_model_schema(n_models, include_analysis=include_analysis)
+
+        raw_text = generate_text(
+            model,
+            tokenizer,
+            prompt,
+            response_schema=model_schema if structured else None,
+        )
+        models, _ = parse_model_response(raw_text, n_models, structured_output=structured)
+
+        if not models:
+            console.print("[yellow]No models extracted from LLM response[/]")
+            return raw_text, []
+
+        for model_dict in models:
+            if model_dict.get("analysis"):
+                console.print(
+                    f"  [dim]{model_dict['name']} analysis:[/] "
+                    f"{model_dict['analysis'][:200]}"
+                    f"{'...' if len(model_dict['analysis']) > 200 else ''}"
+                )
+
+        validated_models: list[dict[str, Any]] = []
+        for index, model_dict in enumerate(models):
+            validated_model = model_dict
+            model_name = model_dict.get("name", f"cognitive_model{index + 1}")
+            validation_result = None
+
+            for retry_attempt in range(max_retries):
+                validation_result = validate_single_model(validated_model)
+
+                if validation_result.is_valid:
+                    console.print(
+                        f"  [dim]Model {index + 1} ({model_name}) passed validation[/]"
+                    )
+                    break
+
+                error_trace = "\n".join(f"  {err}" for err in validation_result.errors)
+                console.print(
+                    f"  [yellow]Model {index + 1} ({model_name}) failed validation "
+                    f"(attempt {retry_attempt + 1}/{max_retries}):[/]\n{error_trace}"
+                )
+
+                schema_instructions = get_schema_instructions(1, include_analysis=False)
+                correction_prompt = build_correction_prompt(
+                    model=validated_model,
+                    model_index=index + 1,
+                    validation_errors=validation_result.errors,
+                    schema_instructions=schema_instructions,
+                )
+
+                correction_schema = get_model_schema(1, include_analysis=False)
+                correction_text = generate_text(
+                    model,
+                    tokenizer,
+                    correction_prompt,
+                    response_schema=correction_schema if structured else None,
+                )
+                corrected, _ = parse_model_response(
+                    correction_text, 1, structured_output=structured
+                )
+
+                if corrected:
+                    validated_model = corrected[0]
+                else:
+                    console.print("  [yellow]Failed to parse correction attempt[/]")
+                    break
+
+            if validation_result is not None and validation_result.is_valid:
+                validated_models.append(validated_model)
+            else:
+                console.print(
+                    f"  [bold red]Model {index + 1} ({model_name}) failed validation "
+                    f"after {max_retries} retries — skipping[/]"
+                )
+                validated_models.append(
+                    {
+                        "name": model_name,
+                        "rationale": model_dict.get("rationale", ""),
+                        "code": model_dict.get("code", ""),
+                        "analysis": model_dict.get("analysis", ""),
+                        "validation_failed": True,
+                        "validation_errors": validation_result.errors if validation_result else [],
+                    }
+                )
+
+        models = validated_models
+        if not models:
+            console.print("[yellow]All models failed validation — no models to process[/]")
+            return raw_text, []
+
+        reviewer_config = getattr(cfg.llm, "reviewer", None)
+        if reviewer_config and getattr(reviewer_config, "enabled", False) and models:
+            guardrails = getattr(cfg.llm, "guardrails", [])
+            persona = getattr(reviewer_config, "persona", None)
+            focus_areas = getattr(reviewer_config, "focus_areas", None)
+
+            console.print("[dim]Running code review...[/]")
+            review_prompt = build_review_prompt(
+                models,
+                guardrails=guardrails,
+                persona=persona,
+                focus_areas=focus_areas,
+            )
+            review_schema = get_review_schema()
+            review_text = generate_text(
+                model,
+                tokenizer,
+                review_prompt,
+                response_schema=review_schema if structured else None,
+            )
+            review = parse_review_response(review_text)
+
+            if save_review is not None:
+                save_review(review)
+
+            total_issues = sum(len(r.get("issues", [])) for r in review.get("reviews", []))
+
+            if total_issues > 0:
+                console.print(
+                    f"[dim]Review found {total_issues} issue(s) across "
+                    f"{sum(1 for r in review.get('reviews', []) if r.get('issues'))} model(s)[/]"
+                )
+
+                fix_prompt = build_fix_prompt(models, review, guardrails=guardrails)
+                if fix_prompt:
+                    console.print("[dim]Requesting fixes...[/]")
+                    fix_text = generate_text(
+                        model,
+                        tokenizer,
+                        fix_prompt,
+                        response_schema=model_schema if structured else None,
+                    )
+                    fixed_models, _ = parse_model_response(
+                        fix_text, n_models, structured_output=structured
+                    )
+
+                    if fixed_models and len(fixed_models) == len(models):
+                        for original, fixed in zip(models, fixed_models):
+                            original["code"] = fixed["code"]
+                            if fixed.get("rationale"):
+                                original["rationale"] = fixed["rationale"]
+                        console.print(f"[dim]Applied fixes to {len(models)} model(s)[/]")
+                    else:
+                        console.print("[yellow]Fix parsing failed — using original models[/]")
+            else:
+                non_passing = sum(
+                    1
+                    for r in review.get("reviews", [])
+                    if r.get("overall_assessment", "passes") != "passes"
+                )
+                if non_passing == 0:
+                    console.print("[dim]Review passed — no issues found[/]")
+                else:
+                    console.print(
+                        f"[dim]Review found {non_passing} model(s) with issues (no fix attempted)[/]"
+                    )
+
+        return raw_text, models
+
+    def generate_models_naive(
+        self,
+        *,
+        feedback_text: str,
+        n_models: int,
+        cfg: Any,
+        prompt_builder: Any,
+        generate_text: Callable[..., str],
+        model: Any,
+        tokenizer: Any,
+        save_review: Callable[[dict[str, Any]], None] | None = None,
+        force_include_feedback: bool = False,
+        client_config: Any | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Run the two-phase naive ideation generation path.
+
+        Args:
+            feedback_text: Current feedback to condition generation.
+            n_models: Number of models to generate.
+            cfg: Runtime configuration.
+            prompt_builder: Prompt builder with the standard and naive prompts.
+            generate_text: Low-level text-generation callable.
+            model: Back-end model object.
+            tokenizer: Tokeniser for the back-end model.
+            save_review: Optional review persistence callback.
+            force_include_feedback: Whether the prompt must include feedback.
+
+        Returns:
+            A ``(raw_text, models)`` pair.
+        """
+
+        naive_cfg = (
+            getattr(client_config, "naive_ideation", None) if client_config else None
+        )
+
+        if not naive_cfg or not getattr(naive_cfg, "enabled", False):
+            prompt = prompt_builder.build_input_prompt(
+                feedback_text=feedback_text,
+                n_models=n_models,
+                force_include_feedback=force_include_feedback,
+            )
+            return self.generate_models(
+                prompt=prompt,
+                n_models=n_models,
+                cfg=cfg,
+                generate_text=generate_text,
+                model=model,
+                tokenizer=tokenizer,
+                save_review=save_review,
+            )
+
+        persona = naive_cfg.persona
+        translation_preamble = getattr(naive_cfg, "translation_preamble", None)
+
+        if "hf" in cfg.llm.provider or "huggingface" in cfg.llm.provider:
+            console.print(
+                "[yellow]Warning: HuggingFace backend does not support system prompts. "
+                "Phase 1 persona will have no effect.[/]"
+            )
+
+        console.print("  [dim]Phase 1: Naive psychological ideation...[/]")
+        naive_prompt = prompt_builder.build_naive_prompt(feedback_text)
+
+        naive_idea = generate_text(
+            model,
+            tokenizer,
+            naive_prompt,
+            response_schema=None,
+            system_prompt=persona,
+        )
+
+        if not naive_idea:
+            console.print(
+                "  [yellow]Phase 1 ideation failed to return an idea — using empty idea.[/]"
+            )
+            naive_idea = ""
+        else:
+            console.print(f"  [dim]Naive hypothesis:[/] {naive_idea[:200]}...")
+
+        console.print("  [dim]Phase 2: Computational translation...[/]")
+        prompt = prompt_builder.build_input_prompt(
+            feedback_text=feedback_text,
+            naive_idea=naive_idea,
+            translation_preamble=translation_preamble,
+            n_models=n_models,
+            force_include_feedback=force_include_feedback,
+        )
+
+        return self.generate_models(
+            prompt=prompt,
+            n_models=n_models,
+            cfg=cfg,
+            generate_text=generate_text,
+            model=model,
+            tokenizer=tokenizer,
+            save_review=save_review,
+        )

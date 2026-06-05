@@ -185,7 +185,7 @@ class GeCCoModelSearch:
         self.artifact_store = ArtifactStore(self.run_context, self.diagnostic_store)
         self.candidate_generator = CandidateGenerator(self.artifact_store)
         self.candidate_evaluator = CandidateEvaluator(self.artifact_store)
-        self.feedback_coordinator = FeedbackCoordinator()
+        self.feedback_coordinator = FeedbackCoordinator(run_orchestrated_judge_pipeline)
         self.distributed_coordinator = DistributedCoordinator()
 
         # --- PPC config ---
@@ -1948,7 +1948,7 @@ class GeCCoModelSearch:
                         ]
 
                 if self.tool_judge is not None:
-                    feedback_coordinator = getattr(self, "feedback_coordinator", None) or FeedbackCoordinator()
+                    feedback_coordinator = getattr(self, "feedback_coordinator", None) or FeedbackCoordinator(run_orchestrated_judge_pipeline)
                     feedback, verdict = feedback_coordinator.resolve_feedback(
                         judge=self.tool_judge,
                         cfg=self.cfg,
@@ -2002,6 +2002,16 @@ class GeCCoModelSearch:
             max_syntax_retries = getattr(
                 getattr(self.cfg, "validation", None), "max_syntax_retries", 2
             )
+            artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
+                getattr(self, "run_context", None) or self.results_dir,
+                getattr(self, "diagnostic_store", None),
+            )
+            generator = getattr(self, "candidate_generator", None) or CandidateGenerator(
+                artifact_store
+            )
+            evaluator = getattr(self, "candidate_evaluator", None) or CandidateEvaluator(
+                artifact_store
+            )
 
             while syntax_retry_count <= max_syntax_retries:
                 self._set_activity(
@@ -2025,48 +2035,56 @@ class GeCCoModelSearch:
                     )
 
                 if naive_enabled:
-                    code_text, parsed_models = self.generate_models_naive(feedback)
+                    code_text, parsed_models = generator.generate_models_naive(
+                        feedback_text=feedback,
+                        n_models=getattr(self.cfg.llm, "models_per_iteration", 1),
+                        cfg=self.cfg,
+                        client_config=client_config,
+                        prompt_builder=self.prompt_builder,
+                        generate_text=self.generate,
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        save_review=lambda review: artifact_store.write_review(
+                            review, iteration=it, tag=tag
+                        ),
+                    )
                 else:
                     prompt = self.prompt_builder.build_input_prompt(
                         feedback_text=feedback
                     )
-                    code_text, parsed_models = self.generate_models(prompt)
+                    code_text, parsed_models = generator.generate_models(
+                        prompt=prompt,
+                        n_models=getattr(self.cfg.llm, "models_per_iteration", 1),
+                        cfg=self.cfg,
+                        generate_text=self.generate,
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        save_review=lambda review: artifact_store.write_review(
+                            review, iteration=it, tag=tag
+                        ),
+                    )
 
                 tag = self._file_tag()
-                model_file = (
-                    self.results_dir / "models" / f"iter{it}{tag}_run{run_idx}.txt"
-                    if getattr(self.cfg.evaluation, "fit_type", "group") != "individual"
-                    else self.results_dir
-                    / "models"
-                    / f"iter{it}{tag}_run{run_idx}_participant{self.df.participant[0]}.txt"
+                participant = (
+                    self.df.participant[0]
+                    if getattr(self.cfg.evaluation, "fit_type", "group") == "individual"
+                    and hasattr(self.df, "participant")
+                    else None
                 )
-
-                with open(model_file, "w") as f:
-                    f.write(code_text)
-
-                # Save structured output (analysis, names, rationale) for inspection
-                if parsed_models:
-                    structured_file = model_file.with_suffix(".json")
-                    with open(structured_file, "w") as f:
-                        json.dump(
-                            [
-                                {
-                                    "name": m["name"],
-                                    "rationale": m.get("rationale", ""),
-                                    "analysis": m.get("analysis", ""),
-                                    "parameters": m.get("parameters", []),
-                                }
-                                for m in parsed_models
-                            ],
-                            f,
-                            indent=2,
-                        )
+                model_file = artifact_store.write_candidate_artifacts(
+                    iteration=it,
+                    run_idx=run_idx,
+                    tag=tag,
+                    code_text=code_text,
+                    parsed_models=parsed_models,
+                    participant=participant,
+                )
 
                 iteration_results = []
 
                 n_models = len(parsed_models)
                 for i, model_dict in enumerate(parsed_models):
-                    result, should_stop = self._fit_candidate_model(
+                    result, should_stop = evaluator.fit_candidate_model(
                         model_dict=model_dict,
                         model_idx=i,
                         n_models=n_models,
@@ -2075,9 +2093,85 @@ class GeCCoModelSearch:
                         tag=tag,
                         model_file=model_file,
                         baseline_bic=baseline_bic,
+                        df=self.df,
+                        cfg=self.cfg,
+                        recovery_checker=self.recovery_checker,
+                        id_eval_data=self.id_eval_data,
+                        ppc_enabled=self.ppc_enabled,
+                        ppc_simulator=self._ppc_simulator,
+                        ppc_n_sims=self.ppc_n_sims,
+                        block_residuals_enabled=self.block_residuals_enabled,
+                        block_residuals_n_blocks=self.block_residuals_n_blocks,
+                        df_val=self.df_val,
+                        set_activity=self._set_activity,
+                        participant=participant,
                     )
                     if result is not None:
                         iteration_results.append(result)
+                        self.tried_param_sets.append(result.get("param_names", []))
+                        mean_metric = float(result.get("metric_value", float("inf")))
+                        if mean_metric < self.best_metric:
+                            self.best_metric = mean_metric
+                            self.best_model = result.get("code")
+                            self.best_iter = it
+                            self.best_params = result.get("param_names", [])
+                            self.best_param_names = result.get("param_names", [])
+                            self.best_param_values = result.get("parameter_values")
+                            self.best_id_results = result.get("individual_differences")
+                            console.print(
+                                f"  [bold green]New best model:[/] {result.get('function_name')} ({result.get('metric_name')}={mean_metric:.2f})"
+                            )
+
+                            best_model_file = (
+                                artifact_store.results_dir
+                                / "models"
+                                / f"best_model{tag}_{run_idx}.txt"
+                                if getattr(self.cfg.evaluation, "fit_type", "group")
+                                != "individual"
+                                else artifact_store.results_dir
+                                / "models"
+                                / f"best_model{tag}_{run_idx}_participant{participant}.txt"
+                            )
+                            best_model_file.parent.mkdir(parents=True, exist_ok=True)
+                            best_model_file.write_text(result.get("code", ""), encoding="utf-8")
+
+                            best_bic_file = (
+                                artifact_store.results_dir
+                                / "bics"
+                                / f"best_bic{tag}_{run_idx}.json"
+                                if getattr(self.cfg.evaluation, "fit_type", "group")
+                                != "individual"
+                                else artifact_store.results_dir
+                                / "bics"
+                                / f"best_bic{tag}_{run_idx}_participant{participant}.json"
+                            )
+                            best_bic_file.parent.mkdir(parents=True, exist_ok=True)
+                            with best_bic_file.open("w", encoding="utf-8") as file_obj:
+                                json.dump({"bic": mean_metric}, file_obj, cls=_NumpyJSONEncoder)
+
+                            if result.get("val_metric_value") is not None:
+                                best_bic_val_file = (
+                                    artifact_store.results_dir
+                                    / "bics"
+                                    / f"best_bic_val{tag}_{run_idx}.json"
+                                    if getattr(self.cfg.evaluation, "fit_type", "group")
+                                    != "individual"
+                                    else artifact_store.results_dir
+                                    / "bics"
+                                    / f"best_bic_val{tag}_{run_idx}_participant{participant}.json"
+                                )
+                                best_bic_val_file.parent.mkdir(parents=True, exist_ok=True)
+                                with best_bic_val_file.open("w", encoding="utf-8") as file_obj:
+                                    json.dump(
+                                        {
+                                            "mean_BIC": result["val_metric_value"],
+                                            "mean_NLL": result["val_mean_nll"],
+                                            "individual_BIC": result.get("val_eval_metrics", []),
+                                            "individual_NLL": result.get("val_per_participant_nll", []),
+                                        },
+                                        file_obj,
+                                        cls=_NumpyJSONEncoder,
+                                    )
                     if should_stop:
                         stop_iterations = True
                         break
@@ -2106,11 +2200,16 @@ class GeCCoModelSearch:
                     continue
 
                 # All retries exhausted or at least one model succeeded — finalize
-                self._finalize_iteration_results(
+                evaluator.finalize_iteration_results(
                     it=it,
                     run_idx=run_idx,
                     tag=tag,
                     iteration_results=iteration_results,
+                    client_id=self.client_id,
+                    results_source=self.df,
+                    shared_registry=self.shared_registry,
+                    update_registry=self._update_registry,
+                    feedback_record=self.feedback.record_iteration,
                 )
 
                 # Break out of retry loop - we're done with this iteration

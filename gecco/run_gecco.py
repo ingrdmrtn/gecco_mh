@@ -223,6 +223,33 @@ class GeCCoModelSearch:
         if getattr(self, "run_context", None) is not None:
             self.run_context.close()
 
+    # --- Explicit collaborator accessors (no fallback construction) ---
+
+    def _require_candidate_generator(self):
+        if not hasattr(self, "candidate_generator") or self.candidate_generator is None:
+            raise RuntimeError("CandidateGenerator collaborator is required")
+        return self.candidate_generator
+
+    def _require_candidate_evaluator(self):
+        if not hasattr(self, "candidate_evaluator") or self.candidate_evaluator is None:
+            raise RuntimeError("CandidateEvaluator collaborator is required")
+        return self.candidate_evaluator
+
+    def _require_artifact_store(self):
+        if not hasattr(self, "artifact_store") or self.artifact_store is None:
+            raise RuntimeError("ArtifactStore collaborator is required")
+        return self.artifact_store
+
+    def _require_distributed_coordinator(self):
+        if not hasattr(self, "distributed_coordinator") or self.distributed_coordinator is None:
+            raise RuntimeError("DistributedCoordinator collaborator is required")
+        return self.distributed_coordinator
+
+    def _require_feedback_coordinator(self):
+        if not hasattr(self, "feedback_coordinator") or self.feedback_coordinator is None:
+            raise RuntimeError("FeedbackCoordinator collaborator is required")
+        return self.feedback_coordinator
+
     def _cmg_config(self):
         """Return CMG config object if enabled, else None."""
         cmg_cfg = getattr(self.cfg, "centralized_model_generation", None)
@@ -960,7 +987,7 @@ class GeCCoModelSearch:
         self.feedback.history so all feedback analysis methods see
         cross-client data.
         """
-        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator = self._require_distributed_coordinator()
         sync_result = coordinator.sync_from_registry(
             shared_registry=self.shared_registry,
             best_metric=self.best_metric,
@@ -980,7 +1007,7 @@ class GeCCoModelSearch:
 
     def _set_activity(self, activity):
         """Update current activity in the shared registry."""
-        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator = self._require_distributed_coordinator()
         coordinator.set_activity(
             shared_registry=self.shared_registry,
             client_id=self.client_id,
@@ -991,7 +1018,7 @@ class GeCCoModelSearch:
         self, iteration, results, status="running", had_runnable_model=None
     ):
         """Push this iteration's results to the shared registry."""
-        coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        coordinator = self._require_distributed_coordinator()
         coordinator.update_registry(
             shared_registry=self.shared_registry,
             client_id=self.client_id,
@@ -1475,47 +1502,24 @@ class GeCCoModelSearch:
                 with open(best_model_file, "w") as f:
                     f.write(func_code)
 
-                best_bic_file = (
-                    self.results_dir
-                    / "bics"
-                    / f"best_bic{tag}_{run_idx}.json"
+                artifact_store = self._require_artifact_store()
+                participant = (
+                    self.df.participant[0]
                     if getattr(self.cfg.evaluation, "fit_type", "group")
-                    != "individual"
-                    else self.results_dir
-                    / "bics"
-                    / f"best_bic{tag}_{run_idx}_participant{self.df.participant[0]}.json"
+                    == "individual"
+                    and hasattr(self.df, "participant")
+                    else None
                 )
-                with open(best_bic_file, "w") as f:
-                    json.dump(
-                        {"bic": mean_metric}, f, cls=_NumpyJSONEncoder
-                    )
-
-                if val_fit_res is not None:
-                    best_bic_val_file = (
-                        self.results_dir
-                        / "bics"
-                        / f"best_bic_val{tag}_{run_idx}.json"
-                        if getattr(self.cfg.evaluation, "fit_type", "group")
-                        != "individual"
-                        else self.results_dir
-                        / "bics"
-                        / f"best_bic_val{tag}_{run_idx}_participant{self.df.participant[0]}.json"
-                    )
-                    with open(best_bic_val_file, "w") as f:
-                        json.dump(
-                            {
-                                "mean_BIC": val_fit_res["metric_value"],
-                                "mean_NLL": val_fit_res["mean_nll"],
-                                "individual_BIC": val_fit_res[
-                                    "eval_metrics"
-                                ],
-                                "individual_NLL": val_fit_res[
-                                    "per_participant_nll"
-                                ],
-                            },
-                            f,
-                            cls=_NumpyJSONEncoder,
-                        )
+                artifact_store.write_best_metric_inspection(
+                    run_idx=run_idx,
+                    tag=tag,
+                    metric_value=mean_metric,
+                    val_metric_value=val_fit_res["metric_value"] if val_fit_res is not None else None,
+                    val_mean_nll=val_fit_res["mean_nll"] if val_fit_res is not None else None,
+                    val_eval_metrics=val_fit_res["eval_metrics"] if val_fit_res is not None else None,
+                    val_per_participant_nll=val_fit_res["per_participant_nll"] if val_fit_res is not None else None,
+                    participant=participant,
+                )
 
             should_stop = (
                 baseline_bic is not None and mean_metric < baseline_bic
@@ -1576,25 +1580,25 @@ class GeCCoModelSearch:
             if getattr(self, "df", None) is not None
             else None
         )
-        generator = getattr(self, "candidate_generator", None) or CandidateGenerator(
-            getattr(self, "artifact_store", None)
-            or ArtifactStore(
-                getattr(self, "run_context", None) or self.results_dir,
-                getattr(self, "diagnostic_store", None),
-            )
-        )
+        generator = self._require_candidate_generator()
+        tag = self._file_tag()
         generator.generate_iteration(
             iteration=it,
             run_idx=run_idx,
             feedback=feedback,
             cmg_cfg=cmg_cfg,
-            tag=self._file_tag(),
+            tag=tag,
             client_id=self.client_id,
             naive_enabled=naive_enabled,
-            build_prompt=self.prompt_builder.build_input_prompt,
-            generate_models=self.generate_models,
-            generate_models_naive=self.generate_models_naive,
+            prompt_builder=self.prompt_builder,
+            generate_text=self.generate,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            cfg=self.cfg,
             shared_registry=self.shared_registry,
+            save_review=lambda review: self._require_artifact_store().write_review(
+                review, iteration=it, tag=tag
+            ),
             participant=participant,
             set_activity=self._set_activity,
         )
@@ -1606,13 +1610,7 @@ class GeCCoModelSearch:
             if getattr(self, "df", None) is not None
             else None
         )
-        evaluator = getattr(self, "candidate_evaluator", None) or CandidateEvaluator(
-            getattr(self, "artifact_store", None)
-            or ArtifactStore(
-                getattr(self, "run_context", None) or self.results_dir,
-                getattr(self, "diagnostic_store", None),
-            )
-        )
+        evaluator = self._require_candidate_evaluator()
         evaluator.evaluate_iteration(
             iteration=it,
             run_idx=run_idx,
@@ -1622,11 +1620,24 @@ class GeCCoModelSearch:
             evaluator_index=self._cmg_evaluator_index(cmg_cfg),
             baseline_bic=baseline_bic,
             shared_registry=self.shared_registry,
-            fit_candidate_model=self._fit_candidate_model,
-            is_repairable_error=self._is_cmg_repairable_error,
-            repair_candidate=self._repair_cmg_candidate,
-            update_registry=self._update_registry,
-            finalize_iteration_results=self._finalize_iteration_results,
+            df=self.df,
+            cfg=self.cfg,
+            recovery_checker=self.recovery_checker,
+            id_eval_data=self.id_eval_data,
+            ppc_enabled=self.ppc_enabled,
+            ppc_simulator=self._ppc_simulator,
+            ppc_n_sims=self.ppc_n_sims,
+            block_residuals_enabled=self.block_residuals_enabled,
+            block_residuals_n_blocks=self.block_residuals_n_blocks,
+            df_val=self.df_val,
+            set_activity=self._set_activity,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            generate_text=self.generate,
+            prompt_builder=self.prompt_builder,
+            on_retry=lambda iteration, results, status: self._update_registry(
+                iteration, results, status=status
+            ),
             max_syntax_retries=getattr(
                 getattr(self.cfg, "validation", None), "max_syntax_retries", 2
             ),
@@ -1802,10 +1813,7 @@ class GeCCoModelSearch:
         """
         self._set_activity(f"saving results (iter {it})")
 
-        artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
-            getattr(self, "run_context", None) or self.results_dir,
-            getattr(self, "diagnostic_store", None),
-        )
+        artifact_store = self._require_artifact_store()
 
         had_runnable_model = artifact_store.write_iteration_results(
             iteration=it,
@@ -1831,7 +1839,7 @@ class GeCCoModelSearch:
     def run_n_shots(self, run_idx, baseline_bic):
         # Resume from the next iteration after what's already in the registry
         cmg_cfg = self._cmg_config()
-        distributed_coordinator = getattr(self, "distributed_coordinator", None) or DistributedCoordinator()
+        distributed_coordinator = self._require_distributed_coordinator()
         start_iter = distributed_coordinator.start_iteration(
             shared_registry=self.shared_registry,
             client_id=self.client_id,
@@ -1948,7 +1956,7 @@ class GeCCoModelSearch:
                         ]
 
                 if self.tool_judge is not None:
-                    feedback_coordinator = getattr(self, "feedback_coordinator", None) or FeedbackCoordinator(run_orchestrated_judge_pipeline)
+                    feedback_coordinator = self._require_feedback_coordinator()
                     feedback, verdict = feedback_coordinator.resolve_feedback(
                         judge=self.tool_judge,
                         cfg=self.cfg,
@@ -1973,10 +1981,7 @@ class GeCCoModelSearch:
             # Save feedback for inspection (runs whenever feedback was populated)
             if feedback:
                 participant = self.df.participant[0] if hasattr(self.df, "participant") else None
-                artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
-                    getattr(self, "run_context", None) or self.results_dir,
-                    getattr(self, "diagnostic_store", None),
-                )
+                artifact_store = self._require_artifact_store()
                 artifact_store.write_feedback_text(
                     iteration=it,
                     run_idx=run_idx,
@@ -2002,16 +2007,9 @@ class GeCCoModelSearch:
             max_syntax_retries = getattr(
                 getattr(self.cfg, "validation", None), "max_syntax_retries", 2
             )
-            artifact_store = getattr(self, "artifact_store", None) or ArtifactStore(
-                getattr(self, "run_context", None) or self.results_dir,
-                getattr(self, "diagnostic_store", None),
-            )
-            generator = getattr(self, "candidate_generator", None) or CandidateGenerator(
-                artifact_store
-            )
-            evaluator = getattr(self, "candidate_evaluator", None) or CandidateEvaluator(
-                artifact_store
-            )
+            artifact_store = self._require_artifact_store()
+            generator = self._require_candidate_generator()
+            evaluator = self._require_candidate_evaluator()
 
             while syntax_retry_count <= max_syntax_retries:
                 self._set_activity(
@@ -2135,43 +2133,16 @@ class GeCCoModelSearch:
                             best_model_file.parent.mkdir(parents=True, exist_ok=True)
                             best_model_file.write_text(result.get("code", ""), encoding="utf-8")
 
-                            best_bic_file = (
-                                artifact_store.results_dir
-                                / "bics"
-                                / f"best_bic{tag}_{run_idx}.json"
-                                if getattr(self.cfg.evaluation, "fit_type", "group")
-                                != "individual"
-                                else artifact_store.results_dir
-                                / "bics"
-                                / f"best_bic{tag}_{run_idx}_participant{participant}.json"
+                            artifact_store.write_best_metric_inspection(
+                                run_idx=run_idx,
+                                tag=tag,
+                                metric_value=mean_metric,
+                                val_metric_value=result.get("val_metric_value"),
+                                val_mean_nll=result.get("val_mean_nll"),
+                                val_eval_metrics=result.get("val_eval_metrics"),
+                                val_per_participant_nll=result.get("val_per_participant_nll"),
+                                participant=participant,
                             )
-                            best_bic_file.parent.mkdir(parents=True, exist_ok=True)
-                            with best_bic_file.open("w", encoding="utf-8") as file_obj:
-                                json.dump({"bic": mean_metric}, file_obj, cls=_NumpyJSONEncoder)
-
-                            if result.get("val_metric_value") is not None:
-                                best_bic_val_file = (
-                                    artifact_store.results_dir
-                                    / "bics"
-                                    / f"best_bic_val{tag}_{run_idx}.json"
-                                    if getattr(self.cfg.evaluation, "fit_type", "group")
-                                    != "individual"
-                                    else artifact_store.results_dir
-                                    / "bics"
-                                    / f"best_bic_val{tag}_{run_idx}_participant{participant}.json"
-                                )
-                                best_bic_val_file.parent.mkdir(parents=True, exist_ok=True)
-                                with best_bic_val_file.open("w", encoding="utf-8") as file_obj:
-                                    json.dump(
-                                        {
-                                            "mean_BIC": result["val_metric_value"],
-                                            "mean_NLL": result["val_mean_nll"],
-                                            "individual_BIC": result.get("val_eval_metrics", []),
-                                            "individual_NLL": result.get("val_per_participant_nll", []),
-                                        },
-                                        file_obj,
-                                        cls=_NumpyJSONEncoder,
-                                    )
                     if should_stop:
                         stop_iterations = True
                         break
@@ -2201,14 +2172,16 @@ class GeCCoModelSearch:
 
                 # All retries exhausted or at least one model succeeded — finalize
                 evaluator.finalize_iteration_results(
-                    it=it,
+                    iteration=it,
                     run_idx=run_idx,
                     tag=tag,
                     iteration_results=iteration_results,
                     client_id=self.client_id,
                     results_source=self.df,
                     shared_registry=self.shared_registry,
-                    update_registry=self._update_registry,
+                    on_registry_update=lambda iteration, results, status, had_runnable_model: self._update_registry(
+                        iteration, results, status=status, had_runnable_model=had_runnable_model
+                    ),
                     feedback_record=self.feedback.record_iteration,
                 )
 

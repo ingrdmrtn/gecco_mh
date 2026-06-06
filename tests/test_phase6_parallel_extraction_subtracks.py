@@ -59,7 +59,7 @@ def test_run_context_rejects_missing_required_config(tmp_path: Path):
 
 
 def test_artifact_store_contract_handles_group_and_individual_paths(tmp_path: Path):
-    """Artefact writes should round-trip and use the correct path layout."""
+    """Artefact writes should round-trip through DuckDB and skip JSON by default."""
 
     group_context = RunContext.from_cfg(_group_cfg(), project_root=tmp_path)
     individual_context = RunContext.from_cfg(_individual_cfg(), project_root=tmp_path)
@@ -94,7 +94,9 @@ def test_artifact_store_contract_handles_group_and_individual_paths(tmp_path: Pa
         )
 
         assert had_runnable_model is True
-        assert (tmp_path / "results" / "phase6_task" / "bics" / "iter0_run1.json").exists()
+        assert group_store.diagnostic_store.fetchone("SELECT COUNT(*) AS n FROM iterations") == {"n": 1}
+        assert group_store.diagnostic_store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
+        assert not (tmp_path / "results" / "phase6_task" / "bics" / "iter0_run1.json").exists()
         assert store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
     finally:
         store.close()
@@ -110,6 +112,19 @@ def test_candidate_generator_contract_uses_explicit_inputs_and_registry(tmp_path
     generator = CandidateGenerator(artifact_store)
     shared_registry = MagicMock()
 
+    # generate_iteration should call self.generate_models / self.generate_models_naive
+    # directly instead of receiving monolith callbacks.
+    generator.generate_models = MagicMock(
+        return_value=(
+            "def model_a():\n    return 0",
+            [
+                {"name": "model_a", "code": "code_a", "parameters": ["alpha"]},
+                {"name": "model_b", "code": "code_b", "parameters": ["beta"]},
+            ],
+        )
+    )
+    generator.generate_models_naive = MagicMock()
+
     result = generator.generate_iteration(
         iteration=0,
         run_idx=2,
@@ -118,17 +133,11 @@ def test_candidate_generator_contract_uses_explicit_inputs_and_registry(tmp_path
         tag="",
         client_id="client-a",
         naive_enabled=False,
-        build_prompt=MagicMock(return_value="prompt text"),
-        generate_models=MagicMock(
-            return_value=(
-                "def model_a():\n    return 0",
-                [
-                    {"name": "model_a", "code": "code_a", "parameters": ["alpha"]},
-                    {"name": "model_b", "code": "code_b", "parameters": ["beta"]},
-                ],
-            )
-        ),
-        generate_models_naive=MagicMock(),
+        prompt_builder=MagicMock(),
+        generate_text=MagicMock(),
+        model=object(),
+        tokenizer=object(),
+        cfg=SimpleNamespace(llm=SimpleNamespace(), clients=SimpleNamespace()),
         shared_registry=shared_registry,
         participant=None,
         set_activity=MagicMock(),
@@ -136,6 +145,8 @@ def test_candidate_generator_contract_uses_explicit_inputs_and_registry(tmp_path
 
     assert result.candidates[0]["func_name"] == "cognitive_model1"
     assert result.model_file.exists()
+    generator.generate_models.assert_called_once()
+    assert generator.generate_models_naive.called is False
     shared_registry.set_candidate_models.assert_called_once()
     shared_registry.set_generator_status.assert_called_once_with(
         iteration=0,
@@ -164,7 +175,9 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
         ]
     }
 
-    fit_candidate_model = MagicMock(
+    evaluator = CandidateEvaluator(artifact_store)
+    # Patch fit_candidate_model so we do not need real data/fitting.
+    evaluator.fit_candidate_model = MagicMock(
         side_effect=[
             (
                 {
@@ -188,7 +201,7 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
             ),
         ]
     )
-    repair_candidate = MagicMock(
+    evaluator._repair_candidate = MagicMock(
         return_value={
             "func_name": "cognitive_model1",
             "name": "model_a",
@@ -196,10 +209,10 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
             "parameters": [],
         }
     )
-    update_registry = MagicMock()
-    finalize_iteration_results = MagicMock(return_value=True)
+    on_retry = MagicMock()
+    on_registry_update = MagicMock()
+    feedback_record = MagicMock()
 
-    evaluator = CandidateEvaluator(artifact_store)
     result = evaluator.evaluate_iteration(
         iteration=0,
         run_idx=3,
@@ -209,19 +222,21 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
         evaluator_index=0,
         baseline_bic=99.0,
         shared_registry=shared_registry,
-        fit_candidate_model=fit_candidate_model,
-        is_repairable_error=lambda row: row is not None and row.get("metric_name") == "VALIDATION_ERROR",
-        repair_candidate=repair_candidate,
-        update_registry=update_registry,
-        finalize_iteration_results=finalize_iteration_results,
+        df=SimpleNamespace(),
+        cfg=SimpleNamespace(),
+        model=object(),
+        tokenizer=object(),
+        generate_text=MagicMock(),
+        prompt_builder=MagicMock(),
+        on_retry=on_retry,
         max_syntax_retries=1,
         barrier_timeout_seconds=1,
     )
 
     assert result.iteration_results[0]["metric_value"] == 10.0
     assert result.model_file.exists()
-    update_registry.assert_called_once_with(0, [], status="retrying")
-    finalize_iteration_results.assert_called_once()
+    evaluator.fit_candidate_model.assert_called()
+    on_retry.assert_called_once_with(0, [], status="retrying")
     run_context.close()
 
 
@@ -403,3 +418,301 @@ def test_run_n_shots_non_cmg_routes_through_extracted_services(tmp_path: Path):
     search.candidate_generator.generate_models.assert_called_once()
     search.candidate_evaluator.fit_candidate_model.assert_called_once()
     search.candidate_evaluator.finalize_iteration_results.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Characterization tests (Chunk 0) – freeze current monolith behaviour
+# ---------------------------------------------------------------------------
+
+def test_characterization_non_cmg_monolith_owns_generation_and_evaluation(tmp_path: Path):
+    """Characterization: missing service collaborators now fail fast instead of falling back.
+
+    After Chunk 1, the monolith no longer constructs services on demand.
+    """
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        judge=None,
+        validation=SimpleNamespace(max_syntax_retries=0),
+        clients={},
+    )
+    search.df = SimpleNamespace()
+    search.df_val = None
+    search.model = object()
+    search.tokenizer = object()
+    search.prompt_builder = SimpleNamespace(
+        build_input_prompt=MagicMock(return_value="prompt text")
+    )
+    search.client_id = None
+    search.shared_registry = None
+    search.best_model = None
+    search.best_metric = float("inf")
+    search.best_params = []
+    search.best_param_names = []
+    search.best_param_values = None
+    search.best_iter = -1
+    search.best_id_results = None
+    search.tried_param_sets = []
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.tool_judge = None
+    search._merged_history_count = 0
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 100
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 10
+    search.run_context = None
+    search.results_dir = tmp_path / "results"
+    # Intentionally omit service attributes; the run should fail fast.
+    search._cmg_config = MagicMock(return_value=None)
+    search._sync_from_registry = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._set_activity = MagicMock()
+    search._update_registry = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    with pytest.raises(RuntimeError, match="ArtifactStore"):
+        search.run_n_shots(0, None)
+
+
+def test_artifact_store_succeeds_without_runtime_json_output(tmp_path: Path):
+    """The runtime should succeed even when inspection JSON is disabled."""
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="json_char_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "json_char.duckdb")
+    store = ArtifactStore(run_context, diagnostic_store)
+
+    iteration_results = [
+        {
+            "function_name": "model_a",
+            "metric_name": "BIC",
+            "metric_value": 12.0,
+            "param_names": ["alpha"],
+            "code": "def model_a():\n    return 0",
+        }
+    ]
+
+    had_runnable_model = store.write_iteration_results(
+        iteration=0,
+        run_idx=1,
+        tag="",
+        iteration_results=iteration_results,
+        client_id="client-a",
+    )
+
+    json_path = tmp_path / "results" / "json_char_task" / "bics" / "iter0_run1.json"
+    assert had_runnable_model is True
+    assert not json_path.exists()
+    assert diagnostic_store.fetchone("SELECT COUNT(*) AS n FROM iterations") == {"n": 1}
+    diagnostic_store.close()
+    run_context.close()
+
+
+def test_characterization_fallback_constructor_patterns_exist(tmp_path: Path):
+    """Characterization: fallback constructor patterns have been removed from the monolith.
+
+    After Chunk 1, missing collaborators raise RuntimeError instead of being
+    constructed on demand.
+    """
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        judge=None,
+        validation=SimpleNamespace(max_syntax_retries=0),
+        clients={},
+    )
+    search.df = SimpleNamespace()
+    search.df_val = None
+    search.model = object()
+    search.tokenizer = object()
+    search.prompt_builder = SimpleNamespace(
+        build_input_prompt=MagicMock(return_value="prompt text")
+    )
+    search.client_id = None
+    search.shared_registry = None
+    search.best_model = None
+    search.best_metric = float("inf")
+    search.best_params = []
+    search.best_param_names = []
+    search.best_param_values = None
+    search.best_iter = -1
+    search.best_id_results = None
+    search.tried_param_sets = []
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.tool_judge = None
+    search._merged_history_count = 0
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 100
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 10
+    search.run_context = None
+    search.results_dir = tmp_path / "results"
+    search._cmg_config = MagicMock(return_value=None)
+    search._sync_from_registry = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._set_activity = MagicMock()
+    search._update_registry = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    with pytest.raises(RuntimeError, match="ArtifactStore"):
+        search.run_n_shots(0, None)
+
+
+def test_best_model_state_updates_without_runtime_json_output(tmp_path: Path):
+    """Best-model state should update without relying on runtime JSON files."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        judge=None,
+        validation=SimpleNamespace(max_syntax_retries=0),
+        clients={},
+    )
+    search.df = SimpleNamespace()
+    search.df_val = None
+    search.model = object()
+    search.tokenizer = object()
+    search.prompt_builder = SimpleNamespace(
+        build_input_prompt=MagicMock(return_value="prompt text")
+    )
+    search.client_id = None
+    search.shared_registry = None
+    search.best_model = None
+    search.best_metric = float("inf")
+    search.best_params = []
+    search.best_param_names = []
+    search.best_param_values = None
+    search.best_iter = -1
+    search.best_id_results = None
+    search.tried_param_sets = []
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.tool_judge = None
+    search._merged_history_count = 0
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 100
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 10
+    search.run_context = None
+    search.results_dir = tmp_path / "results"
+    search.results_dir.mkdir(parents=True, exist_ok=True)
+    # Use a real ArtifactStore so that file-system writes in the monolith loop work.
+    search.artifact_store = ArtifactStore(search.results_dir)
+    search.candidate_generator = MagicMock()
+    search.candidate_generator.generate_models = MagicMock(
+        return_value=(
+            "code text",
+            [{"name": "model_a", "code": "def model_a():\n    return 0", "parameters": []}],
+        )
+    )
+    search.candidate_evaluator = MagicMock()
+    search.candidate_evaluator.fit_candidate_model = MagicMock(
+        return_value=({
+            "function_name": "model_a",
+            "metric_name": "BIC",
+            "metric_value": 1.0,
+            "param_names": [],
+            "code": "def model_a():\n    return 0",
+            "parameter_values": [],
+        }, False)
+    )
+    search.candidate_evaluator.finalize_iteration_results = MagicMock(return_value=True)
+    search.generate_models = MagicMock(side_effect=AssertionError("old path used"))
+    search.generate_models_naive = MagicMock(side_effect=AssertionError("old path used"))
+    search._fit_candidate_model = MagicMock(side_effect=AssertionError("old path used"))
+    search._finalize_iteration_results = MagicMock(side_effect=AssertionError("old path used"))
+    search._cmg_config = MagicMock(return_value=None)
+    search._sync_from_registry = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._set_activity = MagicMock()
+    search._update_registry = MagicMock()
+    search.generate = MagicMock(return_value="text")
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    search.run_n_shots(0, None)
+
+    # The monolith currently writes best-model files inline during the non-CMG loop.
+    # This assertion documents that behaviour; after Chunk 3/4 this ownership should move.
+    # We assert on runtime state rather than exact file paths to avoid fragility.
+    assert search.best_metric == 1.0, "Monolith should update best_metric inline"
+    assert search.best_model == "def model_a():\n    return 0", "Monolith should update best_model inline"
+    assert not any((search.results_dir / "bics").glob("best_bic*.json"))
+
+
+# ---------------------------------------------------------------------------
+# Chunk 1 tests – explicit service wiring, no fallback constructors
+# ---------------------------------------------------------------------------
+
+def test_missing_candidate_generator_fails_fast():
+    """Accessing the candidate generator without wiring should raise RuntimeError."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    with pytest.raises(RuntimeError, match="CandidateGenerator"):
+        search._require_candidate_generator()
+
+
+def test_missing_candidate_evaluator_fails_fast():
+    """Accessing the candidate evaluator without wiring should raise RuntimeError."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    with pytest.raises(RuntimeError, match="CandidateEvaluator"):
+        search._require_candidate_evaluator()
+
+
+def test_missing_artifact_store_fails_fast():
+    """Accessing the artifact store without wiring should raise RuntimeError."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    with pytest.raises(RuntimeError, match="ArtifactStore"):
+        search._require_artifact_store()
+
+
+def test_missing_distributed_coordinator_fails_fast():
+    """Accessing the distributed coordinator without wiring should raise RuntimeError."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    with pytest.raises(RuntimeError, match="DistributedCoordinator"):
+        search._require_distributed_coordinator()
+
+
+def test_missing_feedback_coordinator_fails_fast():
+    """Accessing the feedback coordinator without wiring should raise RuntimeError."""
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    with pytest.raises(RuntimeError, match="FeedbackCoordinator"):
+        search._require_feedback_coordinator()
+
+
+def test_no_fallback_constructor_patterns_in_source():
+    """Source code should not contain `getattr(self, ..., None) or Constructor(...)` patterns."""
+
+    import inspect
+    source = inspect.getsource(GeCCoModelSearch)
+    # After Chunk 1 these fallback constructor patterns should be gone.
+    assert "getattr(self, \"candidate_generator\", None) or CandidateGenerator" not in source
+    assert "getattr(self, \"candidate_evaluator\", None) or CandidateEvaluator" not in source
+    assert "getattr(self, \"artifact_store\", None) or ArtifactStore" not in source
+    assert "getattr(self, \"distributed_coordinator\", None) or DistributedCoordinator" not in source
+    assert "getattr(self, \"feedback_coordinator\", None) or FeedbackCoordinator" not in source

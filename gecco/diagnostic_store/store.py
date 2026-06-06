@@ -171,8 +171,7 @@ class DiagnosticStore:
         run_idx:
             Index of the independent run (distributed mode).
         iteration_results:
-            The list of per-model dicts produced by the GeCCo model loop
-            (same structure written to ``bics/iterN_runX.json``).
+            The list of per-model dicts produced by the GeCCo model loop.
         ppc_results:
             Optional dict mapping model name → PPC output from
             :func:`gecco.offline_evaluation.ppc.compute_ppc`.

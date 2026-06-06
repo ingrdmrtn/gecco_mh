@@ -60,7 +60,7 @@ def test_candidate_evaluator_fits_and_finalises_without_monolith(tmp_path: Path)
     assert should_stop is False
     assert result["metric_name"] == "BIC"
 
-    update_registry = MagicMock()
+    on_registry_update = MagicMock()
     had_runnable_model = evaluator.finalize_iteration_results(
         iteration=0,
         run_idx=1,
@@ -69,13 +69,15 @@ def test_candidate_evaluator_fits_and_finalises_without_monolith(tmp_path: Path)
         client_id=None,
         results_source=SimpleNamespace(),
         shared_registry=None,
-        update_registry=update_registry,
+        on_registry_update=on_registry_update,
         feedback_record=MagicMock(),
     )
 
     assert had_runnable_model is True
-    assert (run_context.results_dir / "bics" / "iter0_run1.json").exists()
-    update_registry.assert_called_once()
+    assert not (run_context.results_dir / "bics" / "iter0_run1.json").exists()
+    assert diagnostic_store.fetchone("SELECT COUNT(*) AS n FROM iterations") == {"n": 1}
+    assert diagnostic_store.fetchone("SELECT COUNT(*) AS n FROM models") == {"n": 1}
+    on_registry_update.assert_called_once()
 
     diagnostic_store.close()
     run_context.close()

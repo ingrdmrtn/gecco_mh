@@ -67,5 +67,5 @@ def test_candidate_generator_generates_and_persists_models_without_monolith(tmp_
 
     assert models[0]["name"] == "model_a"
     assert model_file.exists()
-    assert model_file.with_suffix(".json").exists()
+    assert not model_file.with_suffix(".json").exists()
     run_context.close()

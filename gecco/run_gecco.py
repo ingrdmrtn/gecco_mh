@@ -24,7 +24,7 @@ from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
 from gecco.artifacts import ArtifactStore
-from gecco.candidate_evaluation import CandidateEvaluator
+from gecco.candidate_evaluation import BestModelState, CandidateEvaluator
 from gecco.candidate_generation import CandidateGenerator
 from gecco.distributed_coordinator import DistributedCoordinator
 from gecco.feedback_coordinator import FeedbackCoordinator
@@ -116,6 +116,7 @@ class GeCCoModelSearch:
         self.best_param_values = None
         self.tried_param_sets = []
         self.best_id_results = None
+        self.best_state = BestModelState()
 
         # --- Track which registry entries we've already merged ---
         self._merged_history_count = 0
@@ -214,6 +215,8 @@ class GeCCoModelSearch:
             else 10
         )
 
+        self._sync_best_state_from_attrs()
+
     def close(self) -> None:
         """Release runtime-owned resources."""
 
@@ -249,6 +252,28 @@ class GeCCoModelSearch:
         if not hasattr(self, "feedback_coordinator") or self.feedback_coordinator is None:
             raise RuntimeError("FeedbackCoordinator collaborator is required")
         return self.feedback_coordinator
+
+    def _sync_best_state_from_attrs(self) -> None:
+        """Mirror the public best-model attributes into the shared state object."""
+
+        self.best_state.best_metric = self.best_metric
+        self.best_state.best_model = self.best_model
+        self.best_state.best_params = list(self.best_params)
+        self.best_state.best_iter = self.best_iter
+        self.best_state.best_param_names = list(self.best_param_names)
+        self.best_state.best_param_values = self.best_param_values
+        self.best_state.best_id_results = self.best_id_results
+
+    def _sync_best_attrs_from_state(self) -> None:
+        """Mirror the shared best-model state back to public attributes."""
+
+        self.best_metric = self.best_state.best_metric
+        self.best_model = self.best_state.best_model
+        self.best_params = list(self.best_state.best_params)
+        self.best_iter = self.best_state.best_iter
+        self.best_param_names = list(self.best_state.best_param_names)
+        self.best_param_values = self.best_state.best_param_values
+        self.best_id_results = self.best_state.best_id_results
 
     def _cmg_config(self):
         """Return CMG config object if enabled, else None."""
@@ -1004,6 +1029,7 @@ class GeCCoModelSearch:
         self.tried_param_sets = sync_result.tried_param_sets
         self.feedback.history = sync_result.feedback_history
         self._merged_history_count = sync_result.merged_history_count
+        self._sync_best_state_from_attrs()
 
     def _set_activity(self, activity):
         """Update current activity in the shared registry."""
@@ -1647,7 +1673,9 @@ class GeCCoModelSearch:
                 1800,
             ),
             participant=participant,
+            best_state=self.best_state,
         )
+        self._sync_best_attrs_from_state()
 
     def _repair_cmg_candidate(
         self,
@@ -1856,8 +1884,6 @@ class GeCCoModelSearch:
         for it in range(start_iter, end_iter):
             console.rule(f"[bold]Iteration {it}")
 
-            stop_iterations = False  # ✅ reset each iteration
-
             # --- Sync from shared registry (distributed mode) ---
             self._sync_from_registry()
 
@@ -2010,6 +2036,12 @@ class GeCCoModelSearch:
             artifact_store = self._require_artifact_store()
             generator = self._require_candidate_generator()
             evaluator = self._require_candidate_evaluator()
+            participant = (
+                self.df.participant[0]
+                if getattr(self.cfg.evaluation, "fit_type", "group") == "individual"
+                and hasattr(self.df, "participant")
+                else None
+            )
 
             while syntax_retry_count <= max_syntax_retries:
                 self._set_activity(
@@ -2017,175 +2049,67 @@ class GeCCoModelSearch:
                 )
 
                 # Update registry with retrying status if not first attempt
-                if syntax_retry_count > 0 and self.shared_registry is not None:
-                    self._update_registry(it, [], status="retrying")
-
-                # Check for naive ideation
-                client_config = (
-                    getattr(self.cfg.clients, self.client_id, None)
-                    if self.client_id
-                    else None
+                generation_result = generator.generate_non_cmg_iteration(
+                    iteration=it,
+                    run_idx=run_idx,
+                    feedback=feedback,
+                    n_models=getattr(self.cfg.llm, "models_per_iteration", 1),
+                    cfg=self.cfg,
+                    tag=tag,
+                    prompt_builder=self.prompt_builder,
+                    generate_text=self.generate,
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    participant=participant,
+                    save_review=lambda review: artifact_store.write_review(
+                        review, iteration=it, tag=tag
+                    ),
+                    client_id=self.client_id,
                 )
-                naive_enabled = False
-                if client_config and hasattr(client_config, "naive_ideation"):
-                    naive_enabled = getattr(
-                        client_config.naive_ideation, "enabled", False
-                    )
 
-                if naive_enabled:
-                    code_text, parsed_models = generator.generate_models_naive(
-                        feedback_text=feedback,
-                        n_models=getattr(self.cfg.llm, "models_per_iteration", 1),
-                        cfg=self.cfg,
-                        client_config=client_config,
-                        prompt_builder=self.prompt_builder,
-                        generate_text=self.generate,
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        save_review=lambda review: artifact_store.write_review(
-                            review, iteration=it, tag=tag
-                        ),
-                    )
-                else:
-                    prompt = self.prompt_builder.build_input_prompt(
-                        feedback_text=feedback
-                    )
-                    code_text, parsed_models = generator.generate_models(
-                        prompt=prompt,
-                        n_models=getattr(self.cfg.llm, "models_per_iteration", 1),
-                        cfg=self.cfg,
-                        generate_text=self.generate,
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        save_review=lambda review: artifact_store.write_review(
-                            review, iteration=it, tag=tag
-                        ),
-                    )
-
-                tag = self._file_tag()
-                participant = (
-                    self.df.participant[0]
-                    if getattr(self.cfg.evaluation, "fit_type", "group") == "individual"
-                    and hasattr(self.df, "participant")
-                    else None
-                )
-                model_file = artifact_store.write_candidate_artifacts(
+                evaluation_result = evaluator.run_non_cmg_iteration(
                     iteration=it,
                     run_idx=run_idx,
                     tag=tag,
-                    code_text=code_text,
-                    parsed_models=parsed_models,
+                    generation_result=generation_result,
+                    baseline_bic=baseline_bic,
+                    df=self.df,
+                    cfg=self.cfg,
+                    shared_registry=self.shared_registry,
+                    client_id=self.client_id,
+                    results_source=self.df,
+                    best_state=self.best_state,
+                    recovery_checker=self.recovery_checker,
+                    id_eval_data=self.id_eval_data,
+                    ppc_enabled=self.ppc_enabled,
+                    ppc_simulator=self._ppc_simulator,
+                    ppc_n_sims=self.ppc_n_sims,
+                    block_residuals_enabled=self.block_residuals_enabled,
+                    block_residuals_n_blocks=self.block_residuals_n_blocks,
+                    df_val=self.df_val,
+                    set_activity=self._set_activity,
+                    on_retry=self._update_registry,
+                    max_syntax_retries=max_syntax_retries,
+                    syntax_retry_count=syntax_retry_count,
                     participant=participant,
-                )
-
-                iteration_results = []
-
-                n_models = len(parsed_models)
-                for i, model_dict in enumerate(parsed_models):
-                    result, should_stop = evaluator.fit_candidate_model(
-                        model_dict=model_dict,
-                        model_idx=i,
-                        n_models=n_models,
-                        it=it,
-                        run_idx=run_idx,
-                        tag=tag,
-                        model_file=model_file,
-                        baseline_bic=baseline_bic,
-                        df=self.df,
-                        cfg=self.cfg,
-                        recovery_checker=self.recovery_checker,
-                        id_eval_data=self.id_eval_data,
-                        ppc_enabled=self.ppc_enabled,
-                        ppc_simulator=self._ppc_simulator,
-                        ppc_n_sims=self.ppc_n_sims,
-                        block_residuals_enabled=self.block_residuals_enabled,
-                        block_residuals_n_blocks=self.block_residuals_n_blocks,
-                        df_val=self.df_val,
-                        set_activity=self._set_activity,
-                        participant=participant,
+                    on_registry_update=self._update_registry,
+                    feedback_record=self.feedback.record_iteration,
                     )
-                    if result is not None:
-                        iteration_results.append(result)
-                        self.tried_param_sets.append(result.get("param_names", []))
-                        mean_metric = float(result.get("metric_value", float("inf")))
-                        if mean_metric < self.best_metric:
-                            self.best_metric = mean_metric
-                            self.best_model = result.get("code")
-                            self.best_iter = it
-                            self.best_params = result.get("param_names", [])
-                            self.best_param_names = result.get("param_names", [])
-                            self.best_param_values = result.get("parameter_values")
-                            self.best_id_results = result.get("individual_differences")
-                            console.print(
-                                f"  [bold green]New best model:[/] {result.get('function_name')} ({result.get('metric_name')}={mean_metric:.2f})"
-                            )
 
-                            best_model_file = (
-                                artifact_store.results_dir
-                                / "models"
-                                / f"best_model{tag}_{run_idx}.txt"
-                                if getattr(self.cfg.evaluation, "fit_type", "group")
-                                != "individual"
-                                else artifact_store.results_dir
-                                / "models"
-                                / f"best_model{tag}_{run_idx}_participant{participant}.txt"
-                            )
-                            best_model_file.parent.mkdir(parents=True, exist_ok=True)
-                            best_model_file.write_text(result.get("code", ""), encoding="utf-8")
+                self._sync_best_attrs_from_state()
 
-                            artifact_store.write_best_metric_inspection(
-                                run_idx=run_idx,
-                                tag=tag,
-                                metric_value=mean_metric,
-                                val_metric_value=result.get("val_metric_value"),
-                                val_mean_nll=result.get("val_mean_nll"),
-                                val_eval_metrics=result.get("val_eval_metrics"),
-                                val_per_participant_nll=result.get("val_per_participant_nll"),
-                                participant=participant,
-                            )
-                    if should_stop:
-                        stop_iterations = True
-                        break
-
-                # --- Check for syntax retry BEFORE publishing completion ---
-                all_syntax_errors = (
-                    all(
-                        r.get("metric_name") in ("VALIDATION_ERROR", "FIT_ERROR")
-                        for r in iteration_results
-                    )
-                    and iteration_results
-                )
-
-                if all_syntax_errors and syntax_retry_count < max_syntax_retries:
-                    error_feedback = self._build_syntax_error_feedback(
-                        iteration_results
-                    )
-                    feedback = error_feedback
+                if evaluation_result.should_retry:
+                    feedback = evaluation_result.retry_feedback or feedback
                     syntax_retry_count += 1
-                    if self.shared_registry is not None:
-                        self._update_registry(it, [], status="retrying")
                     console.print(
                         f"[yellow]All models failed syntax validation, retrying "
                         f"({syntax_retry_count}/{max_syntax_retries})[/]"
                     )
                     continue
 
-                # All retries exhausted or at least one model succeeded — finalize
-                evaluator.finalize_iteration_results(
-                    iteration=it,
-                    run_idx=run_idx,
-                    tag=tag,
-                    iteration_results=iteration_results,
-                    client_id=self.client_id,
-                    results_source=self.df,
-                    shared_registry=self.shared_registry,
-                    on_registry_update=lambda iteration, results, status, had_runnable_model: self._update_registry(
-                        iteration, results, status=status, had_runnable_model=had_runnable_model
-                    ),
-                    feedback_record=self.feedback.record_iteration,
-                )
+                if evaluation_result.had_runnable_model:
+                    self._sync_best_attrs_from_state()
 
-                # Break out of retry loop - we're done with this iteration
                 break
 
         console.print(

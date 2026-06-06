@@ -39,10 +39,13 @@ class CandidateGenerator:
         tag: str,
         client_id: Any,
         naive_enabled: bool,
-        build_prompt: Callable[..., str],
-        generate_models: Callable[..., tuple[str, list[dict[str, Any]]]],
-        generate_models_naive: Callable[..., tuple[str, list[dict[str, Any]]]],
+        prompt_builder: Any,
+        generate_text: Callable[..., str],
+        model: Any,
+        tokenizer: Any,
+        cfg: Any,
         shared_registry: Any,
+        save_review: Callable[[dict[str, Any]], None] | None = None,
         participant: str | None = None,
         set_activity: Callable[[str], None] | None = None,
     ) -> CandidateGenerationResult:
@@ -52,12 +55,36 @@ class CandidateGenerator:
         if set_activity is not None:
             set_activity(f"generating centralized candidates (iter {iteration})")
 
+        client_config = (
+            getattr(cfg.clients, client_id, None) if client_id else None
+        )
+
         try:
             if naive_enabled:
-                code_text, parsed_models = generate_models_naive(feedback, n_models=n_models)
+                code_text, parsed_models = self.generate_models_naive(
+                    feedback_text=feedback,
+                    n_models=n_models,
+                    cfg=cfg,
+                    prompt_builder=prompt_builder,
+                    generate_text=generate_text,
+                    model=model,
+                    tokenizer=tokenizer,
+                    save_review=save_review,
+                    client_config=client_config,
+                )
             else:
-                prompt = build_prompt(feedback_text=feedback, n_models=n_models)
-                code_text, parsed_models = generate_models(prompt, n_models=n_models)
+                prompt = prompt_builder.build_input_prompt(
+                    feedback_text=feedback, n_models=n_models
+                )
+                code_text, parsed_models = self.generate_models(
+                    prompt=prompt,
+                    n_models=n_models,
+                    cfg=cfg,
+                    generate_text=generate_text,
+                    model=model,
+                    tokenizer=tokenizer,
+                    save_review=save_review,
+                )
 
             model_file = self.artifact_store.write_candidate_artifacts(
                 iteration=iteration,
@@ -113,6 +140,97 @@ class CandidateGenerator:
                     error=str(exc),
                 )
             raise
+
+    def generate_non_cmg_iteration(
+        self,
+        *,
+        iteration: int,
+        run_idx: int,
+        feedback: str,
+        n_models: int,
+        cfg: Any,
+        tag: str,
+        prompt_builder: Any,
+        generate_text: Callable[..., str],
+        model: Any,
+        tokenizer: Any,
+        participant: str | None = None,
+        save_review: Callable[[dict[str, Any]], None] | None = None,
+        force_include_feedback: bool = False,
+        client_id: Any | None = None,
+    ) -> CandidateGenerationResult:
+        """Generate and persist one non-CMG candidate batch."""
+
+        client_config = getattr(cfg.clients, client_id, None) if client_id else None
+
+        if getattr(client_config, "naive_ideation", None) and getattr(
+            client_config.naive_ideation, "enabled", False
+        ):
+            code_text, parsed_models = self.generate_models_naive(
+                feedback_text=feedback,
+                n_models=n_models,
+                cfg=cfg,
+                prompt_builder=prompt_builder,
+                generate_text=generate_text,
+                model=model,
+                tokenizer=tokenizer,
+                save_review=save_review,
+                client_config=client_config,
+                force_include_feedback=force_include_feedback,
+            )
+        else:
+            prompt = prompt_builder.build_input_prompt(
+                feedback_text=feedback,
+                n_models=n_models,
+                force_include_feedback=force_include_feedback,
+            )
+            code_text, parsed_models = self.generate_models(
+                prompt=prompt,
+                n_models=n_models,
+                cfg=cfg,
+                generate_text=generate_text,
+                model=model,
+                tokenizer=tokenizer,
+                save_review=save_review,
+            )
+
+        model_file = self.artifact_store.write_candidate_artifacts(
+            iteration=iteration,
+            run_idx=run_idx,
+            tag=tag,
+            code_text=code_text,
+            parsed_models=parsed_models,
+            participant=participant,
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for index, model_dict in enumerate(parsed_models):
+            func_name = f"cognitive_model{index + 1}"
+            candidates.append(
+                {
+                    "index": index,
+                    "func_name": func_name,
+                    "name": model_dict.get("name", func_name),
+                    "code": model_dict.get("code", ""),
+                    "rationale": model_dict.get("rationale", ""),
+                    "analysis": model_dict.get("analysis", ""),
+                    "parameters": model_dict.get("parameters", []),
+                    "validation_failed": model_dict.get("validation_failed", False),
+                    "validation_errors": model_dict.get("validation_errors", []),
+                }
+            )
+
+        if len(candidates) != n_models:
+            raise ValueError(
+                f"Generator produced {len(candidates)} candidates, expected {n_models}"
+            )
+
+        return CandidateGenerationResult(
+            code_text=code_text,
+            parsed_models=parsed_models,
+            candidates=candidates,
+            model_file=model_file,
+        )
 
     def generate_models(
         self,

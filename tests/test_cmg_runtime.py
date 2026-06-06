@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from gecco.artifacts import ArtifactStore
+from gecco.candidate_evaluation import CandidateEvaluator
+from gecco.run_context import RunContext
 from gecco.run_gecco import GeCCoModelSearch
 
 
@@ -260,25 +263,16 @@ def test_runtime_missing_shared_registry():
 
 # --- _fit_candidate_model empty code (Chunk 3) ---
 
-def test_empty_code_returns_validation_error():
+def test_empty_code_returns_validation_error(tmp_path):
     """Empty candidate code should return a VALIDATION_ERROR result, not None."""
-    search = MagicMock(spec=GeCCoModelSearch)
-    search.cfg = SimpleNamespace(evaluation=SimpleNamespace(metric="bic"))
-    search.recovery_checker = None
-    search.df = None
-    search.df_val = None
-    search.id_eval_data = None
-    search._ppc_simulator = None
-    search.ppc_enabled = False
-    search.block_residuals_enabled = False
-    search.best_metric = float("inf")
-    search.tried_param_sets = []
-    search._set_activity = MagicMock()
-    search.results_dir = MagicMock()
-
-    search._fit_candidate_model = GeCCoModelSearch._fit_candidate_model.__get__(
-        search, GeCCoModelSearch
+    cfg = SimpleNamespace(
+        evaluation=SimpleNamespace(fit_type="group"),
+        task=SimpleNamespace(name="cmg_runtime"),
+        data=SimpleNamespace(input_columns=[]),
     )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    artifact_store = ArtifactStore(run_context)
+    evaluator = CandidateEvaluator(artifact_store)
 
     model_dict = {
         "func_name": "cognitive_model1",
@@ -286,21 +280,24 @@ def test_empty_code_returns_validation_error():
         "code": "",
         "parameters": [],
     }
-    result, should_stop = search._fit_candidate_model(
+    result, should_stop = evaluator.fit_candidate_model(
         model_dict=model_dict,
         model_idx=0,
         n_models=1,
         it=0,
         run_idx=0,
         tag="",
-        model_file="dummy.txt",
+        model_file=artifact_store.candidate_model_path(iteration=0, run_idx=0, tag=""),
         baseline_bic=None,
+        df=SimpleNamespace(),
+        cfg=cfg,
     )
     assert result is not None
     assert result["metric_name"] == "VALIDATION_ERROR"
     assert result["error_type"] == "empty_code"
     assert "No code provided" in result["error_message"]
     assert should_stop is False
+    run_context.close()
 
 
 # --- build_prompt force_include_feedback (Chunk 2) ---
@@ -404,15 +401,21 @@ def test_run_n_shots_generator_resume_uses_generator_helper():
     search._cmg_is_generator = GeCCoModelSearch._cmg_is_generator.__get__(search, GeCCoModelSearch)
     search._cmg_evaluator_index = GeCCoModelSearch._cmg_evaluator_index.__get__(search, GeCCoModelSearch)
     search._validate_cmg_runtime = GeCCoModelSearch._validate_cmg_runtime.__get__(search, GeCCoModelSearch)
+    search._require_distributed_coordinator = GeCCoModelSearch._require_distributed_coordinator.__get__(search, GeCCoModelSearch)
     search._run_cmg_generator_iteration = MagicMock()
     search._run_cmg_evaluator_iteration = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=1))
     search.results_dir = MagicMock()
 
     search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
     search.run_n_shots(0, None)
 
-    search.shared_registry.get_max_generator_iteration.assert_called_once_with("generator")
-    search.shared_registry.get_max_iteration_for_client.assert_not_called()
+    search.distributed_coordinator.start_iteration.assert_called_once_with(
+        shared_registry=search.shared_registry,
+        client_id="generator",
+        cmg_cfg=cmg,
+        is_generator=True,
+    )
 
 
 def test_run_n_shots_evaluator_resume_uses_per_client_helper():
@@ -452,15 +455,21 @@ def test_run_n_shots_evaluator_resume_uses_per_client_helper():
     search._cmg_is_generator = GeCCoModelSearch._cmg_is_generator.__get__(search, GeCCoModelSearch)
     search._cmg_evaluator_index = GeCCoModelSearch._cmg_evaluator_index.__get__(search, GeCCoModelSearch)
     search._validate_cmg_runtime = GeCCoModelSearch._validate_cmg_runtime.__get__(search, GeCCoModelSearch)
+    search._require_distributed_coordinator = GeCCoModelSearch._require_distributed_coordinator.__get__(search, GeCCoModelSearch)
     search._run_cmg_generator_iteration = MagicMock()
     search._run_cmg_evaluator_iteration = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=1))
     search.results_dir = MagicMock()
 
     search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
     search.run_n_shots(0, None)
 
-    search.shared_registry.get_max_iteration_for_client.assert_called_once_with(0)
-    search.shared_registry.get_max_generator_iteration.assert_not_called()
+    search.distributed_coordinator.start_iteration.assert_called_once_with(
+        shared_registry=search.shared_registry,
+        client_id=0,
+        cmg_cfg=cmg,
+        is_generator=False,
+    )
 
 
 def test_run_n_shots_respects_max_iterations_on_resume():
@@ -501,6 +510,7 @@ def test_run_n_shots_respects_max_iterations_on_resume():
     search._cmg_is_generator = GeCCoModelSearch._cmg_is_generator.__get__(search, GeCCoModelSearch)
     search._cmg_evaluator_index = GeCCoModelSearch._cmg_evaluator_index.__get__(search, GeCCoModelSearch)
     search._validate_cmg_runtime = GeCCoModelSearch._validate_cmg_runtime.__get__(search, GeCCoModelSearch)
+    search._require_distributed_coordinator = GeCCoModelSearch._require_distributed_coordinator.__get__(search, GeCCoModelSearch)
     # Track which iterations the evaluator processes
     processed_iterations = []
 
@@ -509,12 +519,13 @@ def test_run_n_shots_respects_max_iterations_on_resume():
 
     search._run_cmg_evaluator_iteration = mock_evaluator
     search._run_cmg_generator_iteration = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=1))
     search.results_dir = MagicMock()
 
     search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
     search.run_n_shots(0, None)
 
-    # max_iterations=2, completed iteration 0, so should only process iteration 1
+    # start_iteration returns 1, so the client should only process iteration 1.
     assert processed_iterations == [1]
 
 

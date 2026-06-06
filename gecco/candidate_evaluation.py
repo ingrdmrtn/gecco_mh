@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
+from gecco.candidate_generation import CandidateGenerationResult
 from gecco.utils import TimestampedConsole
 
 
@@ -21,11 +23,292 @@ class CandidateEvaluationResult:
     model_file: Path
 
 
+@dataclass(slots=True)
+class BestModelState:
+    """Mutable best-model state shared between the orchestrator and evaluator."""
+
+    best_metric: float = float("inf")
+    best_model: str | None = None
+    best_params: list[Any] = field(default_factory=list)
+    best_iter: int = -1
+    best_param_names: list[str] = field(default_factory=list)
+    best_param_values: Any | None = None
+    best_id_results: Any | None = None
+
+
+@dataclass(slots=True)
+class NonCMGEvaluationResult:
+    """Structured result from a non-CMG iteration attempt."""
+
+    iteration_results: list[dict[str, Any]]
+    had_runnable_model: bool
+    should_retry: bool
+    retry_feedback: str | None = None
+
+
 class CandidateEvaluator:
     """Evaluate and, when needed, repair a generated candidate."""
 
     def __init__(self, artifact_store: ArtifactStore):
         self.artifact_store = artifact_store
+
+    def _is_repairable_error(self, result: dict | None) -> bool:
+        """Return True if a CMG candidate result should trigger the repair loop."""
+        if result is None:
+            return False
+        metric_name = result.get("metric_name")
+        if metric_name in ("VALIDATION_ERROR", "FIT_ERROR"):
+            return True
+        if metric_name == "RECOVERY_FAILED":
+            return bool(result.get("simulation_error")) and result.get("recovery_n_successful", 0) == 0
+        return False
+
+    def _update_best_state(
+        self,
+        *,
+        best_state: BestModelState | None,
+        result: dict[str, Any],
+        iteration: int,
+        run_idx: int,
+        tag: str,
+        participant: str | None = None,
+    ) -> bool:
+        """Update the best-model state and persist inspection artefacts when improved."""
+
+        if best_state is None:
+            return False
+
+        mean_metric = float(result.get("metric_value", float("inf")))
+        if mean_metric >= best_state.best_metric:
+            return False
+
+        best_state.best_metric = mean_metric
+        best_state.best_model = result.get("code")
+        best_state.best_iter = iteration
+        best_state.best_params = list(result.get("param_names", []))
+        best_state.best_param_names = list(result.get("param_names", []))
+        best_state.best_param_values = result.get("parameter_values")
+        best_state.best_id_results = result.get("individual_differences")
+
+        self.artifact_store.write_best_model_code(
+            run_idx=run_idx,
+            tag=tag,
+            code_text=result.get("code", ""),
+            participant=participant,
+        )
+        self.artifact_store.write_best_metric_inspection(
+            run_idx=run_idx,
+            tag=tag,
+            metric_value=mean_metric,
+            val_metric_value=result.get("val_metric_value"),
+            val_mean_nll=result.get("val_mean_nll"),
+            val_eval_metrics=result.get("val_eval_metrics"),
+            val_per_participant_nll=result.get("val_per_participant_nll"),
+            participant=participant,
+        )
+        return True
+
+    def _repair_candidate(
+        self,
+        *,
+        candidate: dict,
+        current_model_dict: dict,
+        error_result: dict,
+        expected_func_name: str,
+        iteration: int,
+        candidate_index: int,
+        cfg: Any,
+        model: Any,
+        tokenizer: Any,
+        generate_text: Callable[..., str],
+        prompt_builder: Any,
+        shared_registry: Any,
+    ) -> dict:
+        """Repair one assigned candidate using the generation backend.
+
+        Builds a repair prompt with the failing code, error details, and
+        full task context, then generates exactly one repaired model.
+        """
+        from gecco.structured_output import parse_model_response, get_model_schema
+
+        error_feedback = self._build_syntax_error_feedback([error_result])
+        current_code = current_model_dict.get("code", "")
+        candidate_name = current_model_dict.get("name", expected_func_name)
+        candidate_params = current_model_dict.get("parameters", [])
+        candidate_rationale = candidate.get("rationale", "")
+
+        repair_section = (
+            f"The assigned candidate model failed validation or fitting.\n\n"
+            f"You must repair this exact candidate. Do not propose a new model idea.\n\n"
+            f"Assigned function name: `{expected_func_name}`\n"
+            f"Candidate name: {candidate_name}\n"
+            f"Candidate rationale: {candidate_rationale}\n"
+            f"Candidate parameters: {candidate_params}\n\n"
+            f"Current code:\n"
+            f"```python\n{current_code}\n```\n\n"
+            f"Error:\n{error_feedback}\n\n"
+            f"Requirements:\n"
+            f"- Return exactly one repaired model.\n"
+            f"- The repaired code must define `{expected_func_name}` exactly.\n"
+            f"- Keep the same conceptual mechanism unless a small change is necessary "
+            f"to make it runnable.\n"
+            f"- Keep parameter declarations consistent with the repaired code.\n"
+        )
+
+        new_models = None
+        try:
+            client_config = (
+                getattr(cfg.clients, getattr(cfg, "client_id", None), None)
+                if getattr(cfg, "client_id", None)
+                else None
+            )
+            naive_enabled = bool(
+                client_config
+                and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
+            )
+
+            if naive_enabled:
+                # Build a naive repair path if needed; for now fall through to standard.
+                prompt = prompt_builder.build_input_prompt(
+                    feedback_text=repair_section,
+                    n_models=1,
+                    force_include_feedback=True,
+                )
+            else:
+                prompt = prompt_builder.build_input_prompt(
+                    feedback_text=repair_section,
+                    n_models=1,
+                    force_include_feedback=True,
+                )
+
+            correction_schema = get_model_schema(1, include_analysis=False)
+            structured = getattr(cfg.llm, "structured_output", True)
+            correction_text = generate_text(
+                model,
+                tokenizer,
+                prompt,
+                response_schema=correction_schema if structured else None,
+            )
+            corrected, _ = parse_model_response(correction_text, 1, structured_output=structured)
+            if corrected:
+                new_models = corrected
+        except Exception as exc:
+            console.print(f"  [yellow]CMG repair generation failed: {exc}[/]")
+            new_models = None
+
+        if not new_models:
+            console.print(
+                "[yellow]CMG repair produced no models — keeping original code[/]"
+            )
+            return current_model_dict
+
+        repaired = new_models[0]
+        repaired["func_name"] = expected_func_name
+        repaired["name"] = repaired.get(
+            "name", current_model_dict.get("name", expected_func_name)
+        )
+        repaired_code = repaired.get("code", "")
+
+        # Structural validation — ensure repaired code actually defines the function
+        if not self._validate_repaired_func_name(repaired_code, expected_func_name):
+            return current_model_dict
+
+        updated_candidate = dict(candidate)
+        updated_candidate.update({
+            "code": repaired_code,
+            "name": repaired.get("name", updated_candidate.get("name", expected_func_name)),
+            "parameters": repaired.get("parameters", updated_candidate.get("parameters", [])),
+            "func_name": expected_func_name,
+        })
+        shared_registry.update_candidate_model(
+            iteration, candidate_index, updated_candidate
+        )
+
+        console.print(f"[green]CMG evaluator {candidate_index}: repaired candidate code[/]")
+
+        return {
+            "func_name": expected_func_name,
+            "name": updated_candidate["name"],
+            "code": repaired_code,
+            "parameters": updated_candidate.get("parameters", []),
+        }
+
+    def _validate_repaired_func_name(self, repaired_code: str, expected_func_name: str) -> bool:
+        """Check that repaired code structurally defines the expected function."""
+        import ast
+
+        try:
+            tree = ast.parse(repaired_code)
+            found = any(
+                isinstance(node, ast.FunctionDef) and node.name == expected_func_name
+                for node in ast.walk(tree)
+            )
+            if not found:
+                console.print(
+                    f"[yellow]Repaired code does not define function "
+                    f"`{expected_func_name}`[/]"
+                )
+                return False
+        except SyntaxError as exc:
+            console.print(
+                f"[yellow]Repaired code has a syntax error: {exc}[/]"
+            )
+            return False
+
+        try:
+            from gecco.offline_evaluation.utils import build_model_spec
+            build_model_spec(
+                repaired_code,
+                expected_func_name=expected_func_name,
+                cfg=None,
+                structured_params=[],
+            )
+            return True
+        except Exception as exc:
+            console.print(
+                f"[yellow]Repaired code failed structural validation: {exc}[/]"
+            )
+            return False
+
+    def _build_syntax_error_feedback(self, iteration_results: list[dict]) -> str:
+        """Build feedback text from syntax/validation errors for regeneration."""
+        error_messages = []
+        for i, result in enumerate(iteration_results):
+            model_name = result.get("function_name", f"model_{i}")
+            error_type = result.get("metric_name", "ERROR")
+
+            if error_type == "VALIDATION_ERROR":
+                msg = result.get("error_message", "Unknown validation error")
+                error_messages.append(f"- {model_name}: {msg}")
+            elif error_type == "FIT_ERROR":
+                error_msg = result.get("error", "Unknown fit error")
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                error_messages.append(f"- {model_name}: {error_msg}")
+            elif error_type == "RECOVERY_FAILED":
+                sim_err = result.get("simulation_error")
+                if sim_err:
+                    error_messages.append(
+                        f"- {model_name}: parameter recovery simulation failed: {sim_err}. "
+                        f"The model must always return a finite numeric negative log-likelihood, "
+                        f"including when called on short prefix trial arrays during simulation."
+                    )
+                else:
+                    error_messages.append(
+                        f"- {model_name}: parameter recovery failed."
+                    )
+
+        if not error_messages:
+            return "All models failed validation. Please review and fix syntax errors."
+
+        feedback = "The following models failed syntax/validation:\n"
+        feedback += "\n".join(error_messages)
+        feedback += (
+            "\n\nPlease regenerate the models with correct Python syntax. "
+            "Ensure all functions are properly defined, parentheses match, "
+            "and all required imports are handled."
+        )
+        return feedback
 
     def evaluate_iteration(
         self,
@@ -38,14 +321,26 @@ class CandidateEvaluator:
         evaluator_index: int | None,
         baseline_bic: float | None,
         shared_registry: Any,
-        fit_candidate_model: Callable[..., tuple[dict | None, bool]],
-        is_repairable_error: Callable[[dict | None], bool],
-        repair_candidate: Callable[..., dict],
-        update_registry: Callable[..., None],
-        finalize_iteration_results: Callable[..., bool],
+        df: Any,
+        cfg: Any,
+        recovery_checker: Any | None = None,
+        id_eval_data: Any | None = None,
+        ppc_enabled: bool = False,
+        ppc_simulator: Any | None = None,
+        ppc_n_sims: int = 100,
+        block_residuals_enabled: bool = False,
+        block_residuals_n_blocks: int = 10,
+        df_val: Any | None = None,
+        set_activity: Callable[[str], None] | None = None,
+        model: Any | None = None,
+        tokenizer: Any | None = None,
+        generate_text: Callable[..., str] | None = None,
+        prompt_builder: Any | None = None,
+        on_retry: Callable[..., None] | None = None,
         max_syntax_retries: int,
         barrier_timeout_seconds: int,
         participant: str | None = None,
+        best_state: BestModelState | None = None,
     ) -> CandidateEvaluationResult:
         """Evaluate the candidate assigned to this client."""
 
@@ -89,7 +384,7 @@ class CandidateEvaluator:
         current_model_dict = model_dict
 
         while syntax_retry_count <= max_syntax_retries:
-            result, should_stop = fit_candidate_model(
+            result, should_stop = self.fit_candidate_model(
                 model_dict=current_model_dict,
                 model_idx=idx,
                 n_models=cmg_cfg.n_models,
@@ -98,9 +393,21 @@ class CandidateEvaluator:
                 tag=tag,
                 model_file=model_file,
                 baseline_bic=baseline_bic,
+                df=df,
+                cfg=cfg,
+                recovery_checker=recovery_checker,
+                id_eval_data=id_eval_data,
+                ppc_enabled=ppc_enabled,
+                ppc_simulator=ppc_simulator,
+                ppc_n_sims=ppc_n_sims,
+                block_residuals_enabled=block_residuals_enabled,
+                block_residuals_n_blocks=block_residuals_n_blocks,
+                df_val=df_val,
+                set_activity=set_activity,
+                participant=participant,
             )
 
-            repairable_error = is_repairable_error(result)
+            repairable_error = self._is_repairable_error(result)
 
             if not repairable_error or syntax_retry_count >= max_syntax_retries:
                 if result is not None:
@@ -108,14 +415,22 @@ class CandidateEvaluator:
                 break
 
             syntax_retry_count += 1
-            update_registry(iteration, [], status="retrying")
-            current_model_dict = repair_candidate(
+            if on_retry is not None:
+                on_retry(iteration, [], status="retrying")
+
+            current_model_dict = self._repair_candidate(
                 candidate=candidate,
                 current_model_dict=current_model_dict,
                 error_result=result,
                 expected_func_name=func_name,
                 iteration=iteration,
                 candidate_index=idx,
+                cfg=cfg,
+                model=model,
+                tokenizer=tokenizer,
+                generate_text=generate_text,
+                prompt_builder=prompt_builder,
+                shared_registry=shared_registry,
             )
             model_file.write_text(current_model_dict.get("code", ""), encoding="utf-8")
 
@@ -124,13 +439,151 @@ class CandidateEvaluator:
             result.setdefault("expected_func_name", func_name)
             result.setdefault("display_name", display_name)
 
-        finalize_iteration_results(
-            it=iteration,
+        if result is not None:
+            self._update_best_state(
+                best_state=best_state,
+                result=result,
+                iteration=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                participant=participant,
+            )
+
+        self.finalize_iteration_results(
+            iteration=iteration,
             run_idx=run_idx,
             tag=tag,
             iteration_results=iteration_results,
+            client_id=client_id,
+            results_source=df,
+            shared_registry=shared_registry,
+            on_registry_update=self._update_registry_from_evaluator,
+            feedback_record=lambda it, results: None,
         )
         return CandidateEvaluationResult(iteration_results=iteration_results, model_file=model_file)
+
+    def _update_registry_from_evaluator(
+        self,
+        iteration: int,
+        iteration_results: list[dict[str, Any]],
+        status: str,
+        had_runnable_model: bool | None,
+    ) -> None:
+        """Placeholder for registry update during evaluator finalization.
+
+        The orchestrator injects the real registry update path; this default
+        is a no-op so that the evaluator can be tested standalone.
+        """
+        pass
+
+    def run_non_cmg_iteration(
+        self,
+        *,
+        iteration: int,
+        run_idx: int,
+        tag: str,
+        generation_result: CandidateGenerationResult,
+        baseline_bic: float | None,
+        df: Any,
+        cfg: Any,
+        shared_registry: Any,
+        client_id: Any,
+        results_source: Any,
+        best_state: BestModelState | None = None,
+        recovery_checker: Any | None = None,
+        id_eval_data: Any | None = None,
+        ppc_enabled: bool = False,
+        ppc_simulator: Any | None = None,
+        ppc_n_sims: int = 100,
+        block_residuals_enabled: bool = False,
+        block_residuals_n_blocks: int = 10,
+        df_val: Any | None = None,
+        set_activity: Callable[[str], None] | None = None,
+        on_retry: Callable[..., None] | None = None,
+        max_syntax_retries: int = 0,
+        syntax_retry_count: int = 0,
+        participant: str | None = None,
+        on_registry_update: Callable[..., None] | None = None,
+        feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
+    ) -> NonCMGEvaluationResult:
+        """Evaluate a non-CMG batch and finalise it when no retry is needed."""
+
+        iteration_results: list[dict[str, Any]] = []
+
+        for model_idx, model_dict in enumerate(generation_result.parsed_models):
+            result, should_stop = self.fit_candidate_model(
+                model_dict=model_dict,
+                model_idx=model_idx,
+                n_models=len(generation_result.parsed_models),
+                it=iteration,
+                run_idx=run_idx,
+                tag=tag,
+                model_file=generation_result.model_file,
+                baseline_bic=baseline_bic,
+                df=df,
+                cfg=cfg,
+                recovery_checker=recovery_checker,
+                id_eval_data=id_eval_data,
+                ppc_enabled=ppc_enabled,
+                ppc_simulator=ppc_simulator,
+                ppc_n_sims=ppc_n_sims,
+                block_residuals_enabled=block_residuals_enabled,
+                block_residuals_n_blocks=block_residuals_n_blocks,
+                df_val=df_val,
+                set_activity=set_activity,
+                participant=participant,
+            )
+
+            if result is not None:
+                iteration_results.append(result)
+                self._update_best_state(
+                    best_state=best_state,
+                    result=result,
+                    iteration=iteration,
+                    run_idx=run_idx,
+                    tag=tag,
+                    participant=participant,
+                )
+
+            if should_stop:
+                break
+
+        all_syntax_errors = (
+            all(
+                row.get("metric_name") in ("VALIDATION_ERROR", "FIT_ERROR")
+                for row in iteration_results
+            )
+            and iteration_results
+        )
+
+        if all_syntax_errors and syntax_retry_count < max_syntax_retries:
+            retry_feedback = self._build_syntax_error_feedback(iteration_results)
+            if on_retry is not None:
+                on_retry(iteration, [], status="retrying")
+            return NonCMGEvaluationResult(
+                iteration_results=iteration_results,
+                had_runnable_model=False,
+                should_retry=True,
+                retry_feedback=retry_feedback,
+            )
+
+        had_runnable_model = self.finalize_iteration_results(
+            iteration=iteration,
+            run_idx=run_idx,
+            tag=tag,
+            iteration_results=iteration_results,
+            client_id=client_id,
+            results_source=results_source,
+            shared_registry=shared_registry,
+            on_registry_update=on_registry_update,
+            feedback_record=feedback_record,
+        )
+
+        return NonCMGEvaluationResult(
+            iteration_results=iteration_results,
+            had_runnable_model=had_runnable_model,
+            should_retry=False,
+        )
 
     def _smoke_test_model_return_value(self, spec: Any, cfg: Any) -> str | None:
         """Check that a model returns a finite numeric value on dummy inputs."""
@@ -579,8 +1032,8 @@ class CandidateEvaluator:
         client_id: Any,
         results_source: Any,
         shared_registry: Any,
-        update_registry: Callable[..., None],
-        feedback_record: Callable[[int, list[dict[str, Any]]], None],
+        on_registry_update: Callable[..., None] | None = None,
+        feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
     ) -> bool:
         """Persist and publish results for one completed iteration."""
 
@@ -593,14 +1046,16 @@ class CandidateEvaluator:
             results_source=results_source,
         )
 
-        feedback_record(iteration, iteration_results)
+        if feedback_record is not None:
+            feedback_record(iteration, iteration_results)
 
         completion_status = "complete" if had_runnable_model else "complete_no_success"
-        update_registry(
-            iteration,
-            iteration_results,
-            status=completion_status,
-            had_runnable_model=had_runnable_model,
-        )
+        if on_registry_update is not None:
+            on_registry_update(
+                iteration,
+                iteration_results,
+                status=completion_status,
+                had_runnable_model=had_runnable_model,
+            )
 
         return had_runnable_model

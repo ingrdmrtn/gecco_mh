@@ -159,6 +159,21 @@ class ArtifactStore:
 
         return best_bic_file, best_bic_val_file
 
+    def write_best_model_code(
+        self,
+        *,
+        run_idx: int,
+        tag: str,
+        code_text: str,
+        participant: str | None = None,
+    ) -> Path:
+        """Persist the current best model code as a plain text artefact."""
+
+        suffix = f"_participant{participant}" if participant else ""
+        best_model_file = self._model_dir() / f"best_model{tag}_{run_idx}{suffix}.txt"
+        best_model_file.write_text(code_text, encoding="utf-8")
+        return best_model_file
+
     def write_feedback_text(
         self,
         *,

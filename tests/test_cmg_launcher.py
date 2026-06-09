@@ -25,15 +25,10 @@ def mock_cmg_cfg():
 
 def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
     """Default (SLURM) with --dry-run should print actual sbatch commands without submitting."""
-    from scripts.launch_cmg_distributed import main
+    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
 
-    with patch.object(sys, "argv", [
-        "launch_cmg_distributed.py",
-        "--config", "two_step_factors_cmg.yaml",
-        "--dry-run",
-    ]):
-        with patch("scripts.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
-            main()
+    with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
+        run_cmg_distributed_launcher(config="two_step_factors_cmg.yaml", dry_run=True)
 
     captured = capsys.readouterr()
     output = captured.out
@@ -79,16 +74,14 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
 
 def test_slurm_dry_run_can_disable_final_eval(mock_cmg_cfg, capsys):
     """CLI override should suppress the final evaluation job."""
-    from scripts.launch_cmg_distributed import main
+    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
 
-    with patch.object(sys, "argv", [
-        "launch_cmg_distributed.py",
-        "--config", "two_step_factors_cmg.yaml",
-        "--dry-run",
-        "--no-run-final-eval",
-    ]):
-        with patch("scripts.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
-            main()
+    with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
+        run_cmg_distributed_launcher(
+            config="two_step_factors_cmg.yaml",
+            dry_run=True,
+            run_final_eval=False,
+        )
 
     captured = capsys.readouterr()
     output = captured.out

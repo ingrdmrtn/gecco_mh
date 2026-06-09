@@ -9,7 +9,7 @@
 
 # Post-processing script: runs test evaluation after all distributed clients complete.
 #
-# Usage (normally called by launch_distributed.py):
+# Usage (normally called by `gecco run distributed`):
 #   sbatch --dependency=afterok:$CLIENT_JOB_ID bash/run_test_evaluation.sh two_step_factors_distributed.yaml results/two_step_factors
 
 CONFIG=${1:-"two_step_factors_distributed.yaml"}
@@ -42,7 +42,7 @@ echo "[test-eval] Results dir: $RESULTS_DIR"
 echo "[test-eval] Python: $(which python)"
 
 # Run the test evaluation script
-python scripts/run_test_evaluation.py \
+python -m gecco internal test-evaluation \
     --config "$CONFIG" \
     --results-dir "$RESULTS_DIR" \
     --write-store

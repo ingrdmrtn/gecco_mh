@@ -3,37 +3,35 @@
 import json
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from config.schema import load_config
+from gecco.cli.reset_distributed import ARTIFACT_DIRS, BASELINE_FILES, REGISTRY_FILES, get_results_dir
 from gecco.coordination import SharedRegistry
 from gecco.run_gecco import GeCCoModelSearch
-from scripts.reset_distributed import (
-    ARTIFACT_DIRS,
-    BASELINE_FILES,
-    REGISTRY_FILES,
-    get_results_dir,
-)
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "phase0"
 
 
-def test_load_config_uses_recursive_namespaces_without_validation():
-    """Freeze the current namespace-based config loading behaviour."""
-    cfg = load_config(str(FIXTURES_DIR / "legacy_load_config.yaml"))
-
-    assert cfg.task.name == "freeze_task"
-    assert cfg.judge.orchestrated == "yes please"
-    assert cfg.judge.barrier.orchestrator_wait_seconds == "120"
-    assert cfg.custom_section.nested.extra_flag is True
-    assert cfg.custom_section.nested.labels == ["alpha", "beta"]
+def test_load_config_now_rejects_legacy_unvalidated_configs():
+    """Phase 3 retires the old namespace-only loading behaviour."""
+    with pytest.raises(ValidationError):
+        load_config(str(FIXTURES_DIR / "legacy_load_config.yaml"))
 
 
 def test_phase0_inventory_matches_current_legacy_entrypoints():
     """Freeze the legacy CLI script names and reset artefact layout."""
     inventory = json.loads((FIXTURES_DIR / "legacy_cli_inventory.json").read_text())
 
-    for relative_path in inventory["legacy_cli_scripts"]:
-        assert (Path(__file__).resolve().parents[1] / relative_path).exists()
+    assert inventory["legacy_cli_scripts"] == [
+        "scripts/run_gecco_distributed.py",
+        "scripts/run_judge_orchestrator.py",
+        "scripts/launch_distributed.py",
+        "scripts/reset_distributed.py",
+        "scripts/monitor_distributed.py",
+    ]
 
     assert ARTIFACT_DIRS == inventory["reset_artifact_dirs"]
     assert REGISTRY_FILES == inventory["registry_files"]
@@ -55,7 +53,7 @@ def test_get_results_dir_keeps_individual_suffix_behaviour():
 
 def test_shared_registry_normalises_string_feedback_to_default_persona(tmp_path):
     """Freeze the default-persona feedback storage format."""
-    registry = SharedRegistry(str(tmp_path / "registry.json"))
+    registry = SharedRegistry(str(tmp_path / "shared_registry.duckdb"))
     registry.set_judge_feedback(
         iteration=2,
         synthesized_feedback="Keep exploring simpler variants.",
@@ -71,7 +69,7 @@ def test_shared_registry_normalises_string_feedback_to_default_persona(tmp_path)
 
 def test_shared_registry_returns_persona_specific_feedback_with_fallback(tmp_path):
     """Freeze persona-specific feedback lookup semantics."""
-    registry = SharedRegistry(str(tmp_path / "registry.json"))
+    registry = SharedRegistry(str(tmp_path / "shared_registry.duckdb"))
     registry.set_judge_feedback(
         iteration=3,
         synthesized_feedback={

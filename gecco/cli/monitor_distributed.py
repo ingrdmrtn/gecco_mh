@@ -56,7 +56,13 @@ def build_client_table(data):
     for client_id in sorted(entries.keys(), key=int):
         entry = entries[client_id]
         status = entry.get("status", "unknown")
-        style = "green" if status == "complete" else "yellow" if status == "running" else "red"
+        style = (
+            "green"
+            if status in {"complete", "complete_no_success"}
+            else "yellow"
+            if status == "running"
+            else "red"
+        )
         status_text = Text(status, style=style)
 
         best = entry.get("best_metric")
@@ -254,7 +260,11 @@ def build_summary_stats(data):
     total_iters = len(history)
     n_clients = len(entries)
     running = sum(1 for entry in entries.values() if entry.get("status") == "running")
-    complete = sum(1 for entry in entries.values() if entry.get("status") == "complete")
+    complete = sum(
+        1
+        for entry in entries.values()
+        if entry.get("status") in {"complete", "complete_no_success"}
+    )
     n_param_combos = len(tried)
 
     lines = [

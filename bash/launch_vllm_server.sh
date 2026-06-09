@@ -17,7 +17,7 @@
 # in your GeCCo job script:
 #
 #   source $HOME/.vllm_env
-#   python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
+#   python scripts/two_step_demo.py --config config/two_step_vllm_example.yaml
 
 MODEL=${1:-"Qwen/Qwen2.5-14B-Instruct"}
 PORT=${2:-8000}

@@ -1,15 +1,15 @@
 #!/bin/bash -l
 #SBATCH -J gecco-client
 #SBATCH -N 1
-# --cpus-per-task is set dynamically by launch_distributed.py (or override with sbatch --cpus-per-task=N)
+# --cpus-per-task is set dynamically by `gecco run distributed` (or override with sbatch --cpus-per-task=N)
 #SBATCH --mem=64G
 #SBATCH -t 8:00:00
 #SBATCH --output=logs/gecco-client-%A_%a.out
 #SBATCH --error=logs/gecco-client-%A_%a.err
-# NOTE: --array is set dynamically by launch_distributed.py (or override with sbatch --array=...)
+# NOTE: --array is set dynamically by `gecco run distributed` (or override with sbatch --array=...)
 
 # Usage (preferred — reads profiles from config automatically):
-#   python scripts/launch_distributed.py --config two_step_factors_distributed.yaml
+#   python -m gecco run distributed --config two_step_factors_distributed.yaml
 #
 # Manual usage:
 #   sbatch --array=0-4 --dependency=afterok:$VLLM_JOB \
@@ -108,7 +108,7 @@ else
 fi
 
 # Run the distributed client
-python scripts/run_gecco_distributed.py \
+python -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
     $PROFILE_ARG \

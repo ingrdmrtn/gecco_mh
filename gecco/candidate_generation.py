@@ -7,10 +7,20 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
+from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.utils import TimestampedConsole
 
 
 console = TimestampedConsole()
+
+
+def _mapping_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a key from either a mapping or an attribute container."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 @dataclass(slots=True)
@@ -45,7 +55,6 @@ class CandidateGenerator:
         tokenizer: Any,
         cfg: Any,
         shared_registry: Any,
-        save_review: Callable[[dict[str, Any]], None] | None = None,
         participant: str | None = None,
         set_activity: Callable[[str], None] | None = None,
     ) -> CandidateGenerationResult:
@@ -55,9 +64,8 @@ class CandidateGenerator:
         if set_activity is not None:
             set_activity(f"generating centralized candidates (iter {iteration})")
 
-        client_config = (
-            getattr(cfg.clients, client_id, None) if client_id else None
-        )
+        clients = _mapping_get(cfg, "clients")
+        client_config = _mapping_get(clients, client_id) if client_id else None
 
         try:
             if naive_enabled:
@@ -69,7 +77,8 @@ class CandidateGenerator:
                     generate_text=generate_text,
                     model=model,
                     tokenizer=tokenizer,
-                    save_review=save_review,
+                    iteration=iteration,
+                    tag=tag,
                     client_config=client_config,
                 )
             else:
@@ -83,7 +92,8 @@ class CandidateGenerator:
                     generate_text=generate_text,
                     model=model,
                     tokenizer=tokenizer,
-                    save_review=save_review,
+                    iteration=iteration,
+                    tag=tag,
                 )
 
             model_file = self.artifact_store.write_candidate_artifacts(
@@ -155,17 +165,17 @@ class CandidateGenerator:
         model: Any,
         tokenizer: Any,
         participant: str | None = None,
-        save_review: Callable[[dict[str, Any]], None] | None = None,
         force_include_feedback: bool = False,
         client_id: Any | None = None,
     ) -> CandidateGenerationResult:
         """Generate and persist one non-CMG candidate batch."""
 
-        client_config = getattr(cfg.clients, client_id, None) if client_id else None
+        clients = _mapping_get(cfg, "clients")
+        client_config = _mapping_get(clients, client_id) if client_id else None
 
-        if getattr(client_config, "naive_ideation", None) and getattr(
-            client_config.naive_ideation, "enabled", False
-        ):
+        naive_cfg = _mapping_get(client_config, "naive_ideation")
+
+        if naive_cfg and _mapping_get(naive_cfg, "enabled", False):
             code_text, parsed_models = self.generate_models_naive(
                 feedback_text=feedback,
                 n_models=n_models,
@@ -174,7 +184,8 @@ class CandidateGenerator:
                 generate_text=generate_text,
                 model=model,
                 tokenizer=tokenizer,
-                save_review=save_review,
+                iteration=iteration,
+                tag=tag,
                 client_config=client_config,
                 force_include_feedback=force_include_feedback,
             )
@@ -191,7 +202,8 @@ class CandidateGenerator:
                 generate_text=generate_text,
                 model=model,
                 tokenizer=tokenizer,
-                save_review=save_review,
+                iteration=iteration,
+                tag=tag,
             )
 
         model_file = self.artifact_store.write_candidate_artifacts(
@@ -241,7 +253,8 @@ class CandidateGenerator:
         generate_text: Callable[..., str],
         model: Any,
         tokenizer: Any,
-        save_review: Callable[[dict[str, Any]], None] | None = None,
+        iteration: int | None = None,
+        tag: str = "",
     ) -> tuple[str, list[dict[str, Any]]]:
         """Generate structured candidate models from an explicit prompt.
 
@@ -252,7 +265,8 @@ class CandidateGenerator:
             generate_text: Low-level text-generation callable.
             model: Back-end model object.
             tokenizer: Tokeniser for the back-end model.
-            save_review: Optional callback for persisting review payloads.
+            iteration: Optional iteration index for review persistence.
+            tag: Optional file tag used for review persistence.
 
         Returns:
             A ``(raw_text, models)`` pair.
@@ -392,8 +406,8 @@ class CandidateGenerator:
             )
             review = parse_review_response(review_text)
 
-            if save_review is not None:
-                save_review(review)
+            if iteration is not None:
+                self.artifact_store.write_review(review, iteration=iteration, tag=tag)
 
             total_issues = sum(len(r.get("issues", [])) for r in review.get("reviews", []))
 
@@ -449,7 +463,8 @@ class CandidateGenerator:
         generate_text: Callable[..., str],
         model: Any,
         tokenizer: Any,
-        save_review: Callable[[dict[str, Any]], None] | None = None,
+        iteration: int | None = None,
+        tag: str = "",
         force_include_feedback: bool = False,
         client_config: Any | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
@@ -463,18 +478,17 @@ class CandidateGenerator:
             generate_text: Low-level text-generation callable.
             model: Back-end model object.
             tokenizer: Tokeniser for the back-end model.
-            save_review: Optional review persistence callback.
+            iteration: Optional iteration index for review persistence.
+            tag: Optional file tag used for review persistence.
             force_include_feedback: Whether the prompt must include feedback.
 
         Returns:
             A ``(raw_text, models)`` pair.
         """
 
-        naive_cfg = (
-            getattr(client_config, "naive_ideation", None) if client_config else None
-        )
+        naive_cfg = _mapping_get(client_config, "naive_ideation") if client_config else None
 
-        if not naive_cfg or not getattr(naive_cfg, "enabled", False):
+        if not naive_cfg or not _mapping_get(naive_cfg, "enabled", False):
             prompt = prompt_builder.build_input_prompt(
                 feedback_text=feedback_text,
                 n_models=n_models,
@@ -487,13 +501,14 @@ class CandidateGenerator:
                 generate_text=generate_text,
                 model=model,
                 tokenizer=tokenizer,
-                save_review=save_review,
+                iteration=iteration,
+                tag=tag,
             )
 
-        persona = naive_cfg.persona
-        translation_preamble = getattr(naive_cfg, "translation_preamble", None)
+        persona = _mapping_get(naive_cfg, "persona")
+        translation_preamble = _mapping_get(naive_cfg, "translation_preamble")
 
-        if "hf" in cfg.llm.provider or "huggingface" in cfg.llm.provider:
+        if not get_provider_spec(cfg.llm.provider).supports_system_prompt:
             console.print(
                 "[yellow]Warning: HuggingFace backend does not support system prompts. "
                 "Phase 1 persona will have no effect.[/]"
@@ -534,5 +549,6 @@ class CandidateGenerator:
             generate_text=generate_text,
             model=model,
             tokenizer=tokenizer,
-            save_review=save_review,
+            iteration=iteration,
+            tag=tag,
         )

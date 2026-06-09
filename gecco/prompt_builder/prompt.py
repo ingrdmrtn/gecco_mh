@@ -1,6 +1,8 @@
 import numpy as np
 from typing import Optional
 
+from gecco.load_llms.provider_registry import get_provider_spec
+
 
 def build_prompt(
     cfg,
@@ -135,7 +137,7 @@ def build_prompt(
             f"{translation_preamble.replace('{naive_idea}', naive_idea)}\n\n"
         )
 
-    if cfg.llm.provider in ["openai", "claude", "gemini", "kcl"]:
+    if get_provider_spec(cfg.llm.provider).prompt_family == "closed":
         # --- prompt layout for closed models ---
 
         # {metadata_section}

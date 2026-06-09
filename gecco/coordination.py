@@ -492,17 +492,6 @@ class SharedRegistry:
 
         self._with_connection(write=True, operation="set-activity", callback=_set)
 
-    def mark_complete(self, client_id):
-        """Mark a client as complete in the registry."""
-
-        def _mark(conn):
-            conn.execute(
-                "UPDATE runtime_client_entries SET status = 'complete', updated_at = ? WHERE client_id = ?",
-                [datetime.now().isoformat(), self._client_key(client_id)],
-            )
-
-        self._with_connection(write=True, operation="mark-complete", callback=_mark)
-
     def set_baseline(self, baseline_result):
         """Write baseline result to the canonical runtime store."""
 
@@ -886,27 +875,27 @@ def apply_client_profile(cfg, profile_name):
     - extra_guardrails: appended to cfg.llm.guardrails list
     - All other fields: direct override on cfg.llm
     """
-    clients = getattr(cfg, "clients", None)
+    clients = _mapping_get(cfg, "clients")
     if not clients:
         raise ValueError("No 'clients' section in config")
 
-    profile = getattr(clients, profile_name, None)
-    if not profile:
-        available = [k for k in vars(clients).keys()] if clients else []
+    profile = _mapping_get(clients, profile_name)
+    if profile is None:
+        available = list(clients.keys()) if isinstance(clients, dict) else list(vars(clients).keys())
         raise ValueError(
             f"Client profile '{profile_name}' not found. "
             f"Available profiles: {available}"
         )
 
-    llm_overrides = getattr(profile, "llm", None)
+    llm_overrides = _mapping_get(profile, "llm")
     if llm_overrides:
         # Append suffix to system prompt
-        suffix = getattr(llm_overrides, "system_prompt_suffix", None)
+        suffix = _mapping_get(llm_overrides, "system_prompt_suffix")
         if suffix:
             cfg.llm.system_prompt = cfg.llm.system_prompt.rstrip() + "\n\n" + suffix
 
         # Append extra guardrails
-        extra = getattr(llm_overrides, "extra_guardrails", None)
+        extra = _mapping_get(llm_overrides, "extra_guardrails")
         if extra:
             if not hasattr(cfg.llm, "guardrails") or cfg.llm.guardrails is None:
                 cfg.llm.guardrails = []
@@ -914,8 +903,18 @@ def apply_client_profile(cfg, profile_name):
 
         # Override other LLM fields directly
         skip = {"system_prompt_suffix", "extra_guardrails"}
-        for key, val in vars(llm_overrides).items():
+        llm_items = llm_overrides.items() if isinstance(llm_overrides, dict) else vars(llm_overrides).items()
+        for key, val in llm_items:
             if key not in skip:
                 setattr(cfg.llm, key, val)
 
     console.print(f"[dim]Applied client profile '[cyan]{profile_name}[/]'[/]")
+
+
+def _mapping_get(obj, key, default=None):
+    """Read a key from either a mapping or an attribute container."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)

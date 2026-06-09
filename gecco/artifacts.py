@@ -206,8 +206,7 @@ class ArtifactStore:
 
         review_dir = self.results_dir / "reviews"
         review_dir.mkdir(parents=True, exist_ok=True)
-        existing = list(review_dir.glob("iter*.json"))
-        review_file = review_dir / f"iter{len(existing) + 1}{tag}.json"
+        review_file = review_dir / f"iter{iteration}{tag}.json"
         review_file.write_text(json.dumps(review, indent=2), encoding="utf-8")
         return review_file
 
@@ -239,17 +238,14 @@ class ArtifactStore:
         }
 
         if self.diagnostic_store is not None:
-            try:
-                self.diagnostic_store.write_iteration(
-                    iteration=iteration,
-                    run_idx=run_idx,
-                    iteration_results=iteration_results,
-                    ppc_results=ppc_results_map if ppc_results_map else None,
-                    tag=tag,
-                    client_id=client_id,
-                )
-            except Exception as exc:  # pragma: no cover - surfaced via search logs
-                console.print(f"[yellow]Diagnostic store write failed:[/] {exc}")
+            self.diagnostic_store.write_iteration(
+                iteration=iteration,
+                run_idx=run_idx,
+                iteration_results=iteration_results,
+                ppc_results=ppc_results_map if ppc_results_map else None,
+                tag=tag,
+                client_id=client_id,
+            )
 
         if self.inspection_output_enabled:
             if self.run_context is not None:

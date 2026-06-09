@@ -108,6 +108,35 @@ class CandidateEvaluator:
         )
         return True
 
+    def _publish_registry_status(
+        self,
+        *,
+        shared_registry: Any,
+        client_id: Any,
+        iteration: int,
+        results: list[dict[str, Any]],
+        status: str,
+        had_runnable_model: bool | None,
+        best_state: BestModelState | None,
+        tried_param_sets: list[list[Any]] | None,
+    ) -> None:
+        """Publish evaluator-owned registry state after persistence succeeds."""
+
+        if shared_registry is None:
+            return
+
+        shared_registry.update(
+            client_id=client_id,
+            iteration=iteration,
+            results=results,
+            best_model=best_state.best_model if best_state is not None else None,
+            best_metric=best_state.best_metric if best_state is not None else None,
+            param_names=list(best_state.best_params) if best_state is not None else None,
+            tried_param_sets=tried_param_sets or [],
+            status=status,
+            had_runnable_model=had_runnable_model,
+        )
+
     def _repair_candidate(
         self,
         *,
@@ -157,29 +186,11 @@ class CandidateEvaluator:
 
         new_models = None
         try:
-            client_config = (
-                getattr(cfg.clients, getattr(cfg, "client_id", None), None)
-                if getattr(cfg, "client_id", None)
-                else None
+            prompt = prompt_builder.build_input_prompt(
+                feedback_text=repair_section,
+                n_models=1,
+                force_include_feedback=True,
             )
-            naive_enabled = bool(
-                client_config
-                and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
-            )
-
-            if naive_enabled:
-                # Build a naive repair path if needed; for now fall through to standard.
-                prompt = prompt_builder.build_input_prompt(
-                    feedback_text=repair_section,
-                    n_models=1,
-                    force_include_feedback=True,
-                )
-            else:
-                prompt = prompt_builder.build_input_prompt(
-                    feedback_text=repair_section,
-                    n_models=1,
-                    force_include_feedback=True,
-                )
 
             correction_schema = get_model_schema(1, include_analysis=False)
             structured = getattr(cfg.llm, "structured_output", True)
@@ -210,7 +221,14 @@ class CandidateEvaluator:
         repaired_code = repaired.get("code", "")
 
         # Structural validation — ensure repaired code actually defines the function
-        if not self._validate_repaired_func_name(repaired_code, expected_func_name):
+        if not self._validate_repaired_func_name(
+            repaired_code,
+            expected_func_name,
+            cfg=cfg,
+            structured_params=repaired.get(
+                "parameters", current_model_dict.get("parameters", [])
+            ),
+        ):
             return current_model_dict
 
         updated_candidate = dict(candidate)
@@ -233,7 +251,15 @@ class CandidateEvaluator:
             "parameters": updated_candidate.get("parameters", []),
         }
 
-    def _validate_repaired_func_name(self, repaired_code: str, expected_func_name: str) -> bool:
+    def _validate_repaired_func_name(
+        self,
+        repaired_code: str,
+        expected_func_name: str,
+        *,
+        cfg: Any | None = None,
+        structured_params: list[dict[str, Any]] | None = None,
+        base_class_code: str | None = None,
+    ) -> bool:
         """Check that repaired code structurally defines the expected function."""
         import ast
 
@@ -241,6 +267,13 @@ class CandidateEvaluator:
             tree = ast.parse(repaired_code)
             found = any(
                 isinstance(node, ast.FunctionDef) and node.name == expected_func_name
+                for node in ast.walk(tree)
+            ) or any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == expected_func_name
+                    for target in node.targets
+                )
                 for node in ast.walk(tree)
             )
             if not found:
@@ -260,8 +293,9 @@ class CandidateEvaluator:
             build_model_spec(
                 repaired_code,
                 expected_func_name=expected_func_name,
-                cfg=None,
-                structured_params=[],
+                cfg=cfg,
+                base_class_code=base_class_code,
+                structured_params=structured_params or [],
             )
             return True
         except Exception as exc:
@@ -336,13 +370,47 @@ class CandidateEvaluator:
         tokenizer: Any | None = None,
         generate_text: Callable[..., str] | None = None,
         prompt_builder: Any | None = None,
-        on_retry: Callable[..., None] | None = None,
         max_syntax_retries: int,
         barrier_timeout_seconds: int,
         participant: str | None = None,
         best_state: BestModelState | None = None,
+        tried_param_sets: list[list[Any]] | None = None,
     ) -> CandidateEvaluationResult:
-        """Evaluate the candidate assigned to this client."""
+        """Evaluate the candidate assigned to this client.
+
+        Args:
+            iteration: Iteration index.
+            run_idx: Run index.
+            cmg_cfg: CMG configuration.
+            tag: File-tag suffix for persisted artefacts.
+            client_id: Active client identifier.
+            evaluator_index: Evaluator-owned candidate index.
+            baseline_bic: Optional early-stop threshold.
+            shared_registry: Shared registry collaborator.
+            df: Training data frame.
+            cfg: Runtime configuration.
+            recovery_checker: Optional recovery helper.
+            id_eval_data: Optional individual-differences data.
+            ppc_enabled: Whether PPC diagnostics are enabled.
+            ppc_simulator: Optional PPC simulator.
+            ppc_n_sims: Number of PPC simulations.
+            block_residuals_enabled: Whether block residuals are enabled.
+            block_residuals_n_blocks: Number of residual blocks.
+            df_val: Optional validation data frame.
+            set_activity: Optional activity callback.
+            model: LLM model handle.
+            tokenizer: LLM tokenizer handle.
+            generate_text: Low-level text-generation backend.
+            prompt_builder: Prompt builder collaborator.
+            max_syntax_retries: Maximum repair attempts.
+            barrier_timeout_seconds: Candidate wait timeout in seconds.
+            participant: Optional participant identifier.
+            best_state: Shared best-model state.
+            tried_param_sets: Mutable list tracking successful parameter sets.
+
+        Returns:
+            Structured evaluation results for the assigned candidate.
+        """
 
         idx = evaluator_index
         if idx is None:
@@ -405,6 +473,7 @@ class CandidateEvaluator:
                 df_val=df_val,
                 set_activity=set_activity,
                 participant=participant,
+                tried_param_sets=tried_param_sets,
             )
 
             repairable_error = self._is_repairable_error(result)
@@ -415,8 +484,16 @@ class CandidateEvaluator:
                 break
 
             syntax_retry_count += 1
-            if on_retry is not None:
-                on_retry(iteration, [], status="retrying")
+            self._publish_registry_status(
+                shared_registry=shared_registry,
+                client_id=client_id,
+                iteration=iteration,
+                results=[],
+                status="retrying",
+                had_runnable_model=False,
+                best_state=best_state,
+                tried_param_sets=tried_param_sets,
+            )
 
             current_model_dict = self._repair_candidate(
                 candidate=candidate,
@@ -457,24 +534,11 @@ class CandidateEvaluator:
             client_id=client_id,
             results_source=df,
             shared_registry=shared_registry,
-            on_registry_update=self._update_registry_from_evaluator,
-            feedback_record=lambda it, results: None,
+            best_state=best_state,
+            tried_param_sets=tried_param_sets,
+            feedback_record=None,
         )
         return CandidateEvaluationResult(iteration_results=iteration_results, model_file=model_file)
-
-    def _update_registry_from_evaluator(
-        self,
-        iteration: int,
-        iteration_results: list[dict[str, Any]],
-        status: str,
-        had_runnable_model: bool | None,
-    ) -> None:
-        """Placeholder for registry update during evaluator finalization.
-
-        The orchestrator injects the real registry update path; this default
-        is a no-op so that the evaluator can be tested standalone.
-        """
-        pass
 
     def run_non_cmg_iteration(
         self,
@@ -499,14 +563,44 @@ class CandidateEvaluator:
         block_residuals_n_blocks: int = 10,
         df_val: Any | None = None,
         set_activity: Callable[[str], None] | None = None,
-        on_retry: Callable[..., None] | None = None,
         max_syntax_retries: int = 0,
         syntax_retry_count: int = 0,
         participant: str | None = None,
-        on_registry_update: Callable[..., None] | None = None,
         feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
+        tried_param_sets: list[list[Any]] | None = None,
     ) -> NonCMGEvaluationResult:
-        """Evaluate a non-CMG batch and finalise it when no retry is needed."""
+        """Evaluate a non-CMG batch and finalise it when no retry is needed.
+
+        Args:
+            iteration: Iteration index.
+            run_idx: Run index.
+            tag: File-tag suffix for persisted artefacts.
+            generation_result: Generated candidate batch.
+            baseline_bic: Optional early-stop threshold.
+            df: Training data frame.
+            cfg: Runtime configuration.
+            shared_registry: Shared registry collaborator.
+            client_id: Active client identifier.
+            results_source: Runtime results source for participant metadata.
+            best_state: Shared best-model state.
+            recovery_checker: Optional recovery helper.
+            id_eval_data: Optional individual-differences data.
+            ppc_enabled: Whether PPC diagnostics are enabled.
+            ppc_simulator: Optional PPC simulator.
+            ppc_n_sims: Number of PPC simulations.
+            block_residuals_enabled: Whether block residuals are enabled.
+            block_residuals_n_blocks: Number of residual blocks.
+            df_val: Optional validation data frame.
+            set_activity: Optional activity callback.
+            max_syntax_retries: Maximum retry attempts.
+            syntax_retry_count: Current retry count.
+            participant: Optional participant identifier.
+            feedback_record: Optional feedback-history recorder.
+            tried_param_sets: Mutable list tracking successful parameter sets.
+
+        Returns:
+            Structured outcome for the non-CMG iteration.
+        """
 
         iteration_results: list[dict[str, Any]] = []
 
@@ -532,6 +626,7 @@ class CandidateEvaluator:
                 df_val=df_val,
                 set_activity=set_activity,
                 participant=participant,
+                tried_param_sets=tried_param_sets,
             )
 
             if result is not None:
@@ -558,8 +653,16 @@ class CandidateEvaluator:
 
         if all_syntax_errors and syntax_retry_count < max_syntax_retries:
             retry_feedback = self._build_syntax_error_feedback(iteration_results)
-            if on_retry is not None:
-                on_retry(iteration, [], status="retrying")
+            self._publish_registry_status(
+                shared_registry=shared_registry,
+                client_id=client_id,
+                iteration=iteration,
+                results=[],
+                status="retrying",
+                had_runnable_model=False,
+                best_state=best_state,
+                tried_param_sets=tried_param_sets,
+            )
             return NonCMGEvaluationResult(
                 iteration_results=iteration_results,
                 had_runnable_model=False,
@@ -575,7 +678,8 @@ class CandidateEvaluator:
             client_id=client_id,
             results_source=results_source,
             shared_registry=shared_registry,
-            on_registry_update=on_registry_update,
+            best_state=best_state,
+            tried_param_sets=tried_param_sets,
             feedback_record=feedback_record,
         )
 
@@ -642,6 +746,7 @@ class CandidateEvaluator:
         df_val: Any | None = None,
         set_activity: Callable[[str], None] | None = None,
         participant: str | None = None,
+        tried_param_sets: list[list[Any]] | None = None,
     ) -> tuple[dict | None, bool]:
         """Fit one candidate model with explicit collaborators.
 
@@ -666,6 +771,7 @@ class CandidateEvaluator:
             df_val: Optional validation frame.
             set_activity: Optional status callback.
             participant: Optional participant identifier.
+            tried_param_sets: Mutable list tracking successful parameter sets.
 
         Returns:
             A ``(result_dict, should_stop)`` pair.
@@ -823,6 +929,8 @@ class CandidateEvaluator:
             mean_metric = float(fit_res["metric_value"])
             metric_name = fit_res["metric_name"]
             params = fit_res["param_names"]
+            if tried_param_sets is not None:
+                tried_param_sets.append(list(params))
 
             console.print(
                 f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
@@ -1032,7 +1140,8 @@ class CandidateEvaluator:
         client_id: Any,
         results_source: Any,
         shared_registry: Any,
-        on_registry_update: Callable[..., None] | None = None,
+        best_state: BestModelState | None = None,
+        tried_param_sets: list[list[Any]] | None = None,
         feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
     ) -> bool:
         """Persist and publish results for one completed iteration."""
@@ -1050,12 +1159,15 @@ class CandidateEvaluator:
             feedback_record(iteration, iteration_results)
 
         completion_status = "complete" if had_runnable_model else "complete_no_success"
-        if on_registry_update is not None:
-            on_registry_update(
-                iteration,
-                iteration_results,
-                status=completion_status,
-                had_runnable_model=had_runnable_model,
-            )
+        self._publish_registry_status(
+            shared_registry=shared_registry,
+            client_id=client_id,
+            iteration=iteration,
+            results=iteration_results,
+            status=completion_status,
+            had_runnable_model=had_runnable_model,
+            best_state=best_state,
+            tried_param_sets=tried_param_sets,
+        )
 
         return had_runnable_model

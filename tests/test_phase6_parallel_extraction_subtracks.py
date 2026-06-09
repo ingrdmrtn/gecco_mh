@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +18,31 @@ from gecco.distributed_coordinator import DistributedCoordinator
 from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.run_gecco import GeCCoModelSearch
 from gecco.run_context import RunContext
+
+
+FORBIDDEN_RUNNER_METHODS = {
+    "generate_models",
+    "generate_models_naive",
+    "_save_review",
+    "_fit_candidate_model",
+    "_repair_cmg_candidate",
+    "_validate_repaired_func_name",
+    "_finalize_iteration_results",
+    "_is_cmg_repairable_error",
+    "_build_syntax_error_feedback",
+    "_smoke_test_model_return_value",
+}
+
+
+def _class_method_names(cls: type) -> set[str]:
+    source = inspect.getsource(cls)
+    tree = ast.parse(source)
+    class_def = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+    return {
+        node.name
+        for node in class_def.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
 
 def _group_cfg() -> SimpleNamespace:
@@ -209,10 +236,6 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
             "parameters": [],
         }
     )
-    on_retry = MagicMock()
-    on_registry_update = MagicMock()
-    feedback_record = MagicMock()
-
     result = evaluator.evaluate_iteration(
         iteration=0,
         run_idx=3,
@@ -228,7 +251,6 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
         tokenizer=object(),
         generate_text=MagicMock(),
         prompt_builder=MagicMock(),
-        on_retry=on_retry,
         max_syntax_retries=1,
         barrier_timeout_seconds=1,
     )
@@ -236,7 +258,7 @@ def test_candidate_evaluator_contract_finalises_iteration_results(tmp_path: Path
     assert result.iteration_results[0]["metric_value"] == 10.0
     assert result.model_file.exists()
     evaluator.fit_candidate_model.assert_called()
-    on_retry.assert_called_once_with(0, [], status="retrying")
+    assert shared_registry.update.call_count == 2
     run_context.close()
 
 
@@ -410,7 +432,6 @@ def test_missing_feedback_coordinator_fails_fast():
 def test_no_fallback_constructor_patterns_in_source():
     """Source code should not contain `getattr(self, ..., None) or Constructor(...)` patterns."""
 
-    import inspect
     source = inspect.getsource(GeCCoModelSearch)
     # After Chunk 1 these fallback constructor patterns should be gone.
     assert "getattr(self, \"candidate_generator\", None) or CandidateGenerator" not in source
@@ -418,3 +439,100 @@ def test_no_fallback_constructor_patterns_in_source():
     assert "getattr(self, \"artifact_store\", None) or ArtifactStore" not in source
     assert "getattr(self, \"distributed_coordinator\", None) or DistributedCoordinator" not in source
     assert "getattr(self, \"feedback_coordinator\", None) or FeedbackCoordinator" not in source
+
+
+def test_runner_source_guard_has_no_duplicate_phase6_methods():
+    """GeCCoModelSearch should be orchestration-only after Phase 6 completion."""
+
+    assert FORBIDDEN_RUNNER_METHODS.isdisjoint(_class_method_names(GeCCoModelSearch))
+
+
+def test_runner_does_not_pass_review_persistence_callback_to_generator():
+    """Review persistence should stay inside CandidateGenerator."""
+
+    method_source = inspect.getsource(GeCCoModelSearch._run_cmg_generator_iteration)
+
+    assert "save_review=" not in method_source
+    assert "write_review(" not in method_source
+
+
+def test_runner_does_not_route_evaluator_finalisation_through_callbacks():
+    """CMG finalisation should not be callback-owned by the runner."""
+
+    helper_source = inspect.getsource(GeCCoModelSearch._run_cmg_evaluator_iteration)
+    runner_source = inspect.getsource(GeCCoModelSearch.run_n_shots)
+    evaluator_source = inspect.getsource(CandidateEvaluator)
+
+    assert "on_retry=" not in helper_source
+    assert "_update_registry(" not in helper_source
+    assert "_update_registry_from_evaluator" not in evaluator_source
+    assert "mark_complete(" not in runner_source
+
+
+def test_candidate_evaluator_source_avoids_lambda_callback_binding():
+    """CandidateEvaluator should not encode the feedback callback as a lambda source pattern."""
+
+    source = inspect.getsource(CandidateEvaluator.evaluate_iteration)
+
+    assert "feedback_record=lambda" not in source
+
+
+def test_artifact_store_review_persistence_is_iteration_deterministic():
+    """Review files should be addressed by explicit iteration and tag only."""
+
+    source = inspect.getsource(ArtifactStore.write_review)
+
+    assert "len(existing)" not in source
+    assert 'glob("iter*.json")' not in source
+
+
+def test_services_do_not_import_or_call_back_into_monolith_core_methods():
+    """Extracted services should not depend on GeCCoModelSearch core methods."""
+
+    for service_cls in (CandidateGenerator, CandidateEvaluator):
+        source = inspect.getsource(service_cls)
+        tree = ast.parse(source)
+        assert all(
+            not (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "gecco.run_gecco"
+            )
+            for node in ast.walk(tree)
+        )
+        assert all(
+            not (
+                isinstance(node, ast.Name)
+                and node.id == "GeCCoModelSearch"
+            )
+            for node in ast.walk(tree)
+        )
+
+
+def test_artifact_store_write_failures_surface_immediately(tmp_path: Path):
+    """Canonical runtime-store write failures should fail fast."""
+
+    class FailingDiagnosticStore:
+        def write_iteration(self, **_: object) -> None:
+            raise RuntimeError("duckdb unavailable")
+
+    run_context = RunContext.from_cfg(_group_cfg(), project_root=tmp_path)
+    store = ArtifactStore(run_context, FailingDiagnosticStore())
+
+    with pytest.raises(RuntimeError, match="duckdb unavailable"):
+        store.write_iteration_results(
+            iteration=0,
+            run_idx=1,
+            tag="",
+            iteration_results=[
+                {
+                    "function_name": "model_a",
+                    "metric_name": "BIC",
+                    "metric_value": 1.0,
+                    "param_names": ["alpha"],
+                    "code": "def model_a():\n    return 0",
+                }
+            ],
+            client_id="client-a",
+        )
+
+    run_context.close()

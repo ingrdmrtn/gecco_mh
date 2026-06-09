@@ -3,7 +3,7 @@ import os
 import json
 import math
 import time
-from typing import Optional
+from typing import Any, Optional
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,22 +20,28 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from gecco.offline_evaluation.fit_generated_models import (
-    run_fit_hierarchical as run_fit,
-)
 from gecco.artifacts import ArtifactStore
 from gecco.candidate_evaluation import BestModelState, CandidateEvaluator
 from gecco.candidate_generation import CandidateGenerator
 from gecco.distributed_coordinator import DistributedCoordinator
 from gecco.feedback_coordinator import FeedbackCoordinator
+from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.run_context import RunContext
 from gecco.utils import log as _log, TimestampedConsole
-from gecco.sentry_init import capture_fit_error, capture_recovery_failed
 from config.schema import get_judge_capabilities
 from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 from pathlib import Path
 
 console = TimestampedConsole()
+
+
+def _mapping_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a key from either a mapping or an attribute container."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -160,7 +166,7 @@ class GeCCoModelSearch:
 
         # --- Unified judge pipeline ---
         self.tool_judge = None
-        self.judge_orchestrated = bool(judge_cfg is not None)
+        self.judge_enabled = bool(judge_cfg is not None)
         judge_capabilities = get_judge_capabilities(cfg)
         if judge_cfg:
             if shared_registry is not None:
@@ -282,20 +288,6 @@ class GeCCoModelSearch:
             return None
         return cmg_cfg
 
-    def _is_cmg_repairable_error(self, result: dict | None) -> bool:
-        """Return True if a CMG candidate result should trigger the repair loop."""
-        if result is None:
-            return False
-
-        metric_name = result.get("metric_name")
-        if metric_name in ("VALIDATION_ERROR", "FIT_ERROR"):
-            return True
-
-        if metric_name == "RECOVERY_FAILED":
-            return bool(result.get("simulation_error")) and result.get("recovery_n_successful", 0) == 0
-
-        return False
-
     def _cmg_is_generator(self, cmg_cfg):
         """Return True if this client is the CMG generator."""
         return str(self.client_id) == str(getattr(cmg_cfg, "generator_client", ""))
@@ -315,8 +307,8 @@ class GeCCoModelSearch:
         """Validate CMG config at runtime. Raises ValueError if invalid."""
         if self.shared_registry is None:
             raise ValueError("centralized_model_generation requires a shared registry")
-        if not getattr(getattr(self.cfg, "judge", None), "orchestrated", False):
-            raise ValueError("centralized_model_generation requires judge.orchestrated: true")
+        if getattr(self.cfg, "judge", None) is None:
+            raise ValueError("centralized_model_generation requires judge configuration")
         generator_client = str(getattr(cmg_cfg, "generator_client", ""))
         if not generator_client:
             raise ValueError("centralized_model_generation.generator_client is required")
@@ -362,7 +354,7 @@ class GeCCoModelSearch:
         """
         if model is None:
             raise ValueError("Model not initialized correctly.")
-        provider = self.cfg.llm.provider.lower()
+        provider_spec = get_provider_spec(self.cfg.llm.provider)
         active_system_prompt = (
             system_prompt if system_prompt is not None else self.cfg.llm.system_prompt
         )
@@ -370,9 +362,9 @@ class GeCCoModelSearch:
         # -----------------------------
         # OpenAI / GPT-style generation
         # -----------------------------
-        if "openai" in provider or "gpt" in provider:
+        if provider_spec.api_family == "openai":
             console.print(
-                f"[yellow]Using OpenAI-compatible API provider: {self.cfg.llm.base_model}[/]"
+                f"[yellow]Using {provider_spec.label} API provider: {self.cfg.llm.base_model}[/]"
             )
             max_out = self.cfg.llm.max_output_tokens
             reasoning_effort = getattr(self.cfg.llm, "reasoning_effort", "medium")
@@ -407,9 +399,9 @@ class GeCCoModelSearch:
 
             return decoded
 
-        elif "gemini" in provider:
+        elif provider_spec.api_family == "gemini":
             console.print(
-                f"[yellow]Using Gemini-compatible API provider: {self.cfg.llm.base_model}[/]"
+                f"[yellow]Using {provider_spec.label} API provider: {self.cfg.llm.base_model}[/]"
             )
             from google.genai import types
 
@@ -473,14 +465,9 @@ class GeCCoModelSearch:
         # -----------------------------
         # vLLM / KCL / OpenCode / OpenRouter (OpenAI-compatible API)
         # -----------------------------
-        elif (
-            "vllm" in provider
-            or "kcl" in provider
-            or "opencode" in provider
-            or "openrouter" in provider
-        ):
+        elif provider_spec.api_family == "openai_compatible":
             console.print(
-                f"[yellow]Using vLLM-compatible API provider: {self.cfg.llm.base_model}[/]"
+                f"[yellow]Using {provider_spec.label} API provider: {self.cfg.llm.base_model}[/]"
             )
             max_out = getattr(
                 self.cfg.llm,
@@ -488,14 +475,7 @@ class GeCCoModelSearch:
                 getattr(self.cfg.llm, "max_tokens", 4096),
             )
 
-            if "kcl" in provider:
-                provider_label = "KCL"
-            elif "opencode" in provider:
-                provider_label = "OpenCode Zen"
-            elif "openrouter" in provider:
-                provider_label = "OpenRouter"
-            else:
-                provider_label = "vLLM"
+            provider_label = provider_spec.label
             temperature = getattr(self.cfg.llm, "temperature", None)
             console.print(
                 f"[dim]Generating with {provider_label} [cyan]{self.cfg.llm.base_model}[/] "
@@ -518,8 +498,9 @@ class GeCCoModelSearch:
             # (opt-in via supports_json_schema: true in config).
             # All other providers (vLLM, KCL, OpenCode) fall back to json_object mode.
             if response_schema is not None:
-                use_json_schema = "openrouter" in provider and getattr(
-                    self.cfg.llm, "supports_json_schema", False
+                use_json_schema = (
+                    provider_spec.structured_output_mode == "chat_json_schema_optional"
+                    and getattr(self.cfg.llm, "supports_json_schema", False)
                 )
                 if use_json_schema:
                     from gecco.structured_output import get_chat_json_schema_format
@@ -698,307 +679,6 @@ class GeCCoModelSearch:
             )
             return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    def generate_models(self, prompt, n_models: int | None = None):
-        """
-        Generate cognitive models with structured output, parsing, and
-        optional review-and-fix cycle.
-
-        Parameters
-        ----------
-        prompt : str
-            The prompt to send to the LLM.
-        n_models : int, optional
-            Number of models to generate. Defaults to cfg.llm.models_per_iteration.
-
-        Returns
-        -------
-        tuple of (raw_text, list of model dicts)
-            Each model dict has keys: name, rationale, code, analysis.
-        """
-        from gecco.structured_output import (
-            parse_model_response,
-            build_review_prompt,
-            build_fix_prompt,
-            parse_review_response,
-            validate_single_model,
-            build_correction_prompt,
-            get_schema_instructions,
-            get_model_schema,
-            get_review_schema,
-        )
-
-        structured = getattr(self.cfg.llm, "structured_output", True)
-        n_models = n_models if n_models is not None else self.cfg.llm.models_per_iteration
-        validation_cfg = getattr(self.cfg, "validation", None)
-        max_retries = (
-            getattr(validation_cfg, "retry_limit", 3)
-            if validation_cfg is not None
-            else 3
-        )
-
-        # --- Initial generation ---
-        include_analysis = getattr(self.cfg.llm, "analysis_scratchpad", True)
-        model_schema = get_model_schema(n_models, include_analysis=include_analysis)
-
-        raw_text = self.generate(
-            self.model,
-            self.tokenizer,
-            prompt,
-            response_schema=model_schema if structured else None,
-        )
-        models, json_ok = parse_model_response(
-            raw_text, n_models, structured_output=structured
-        )
-
-        if not models:
-            console.print("[yellow]No models extracted from LLM response[/]")
-            return raw_text, []
-
-        # Log analysis scratchpads
-        for m in models:
-            if m.get("analysis"):
-                console.print(
-                    f"  [dim]{m['name']} analysis:[/] "
-                    f"{m['analysis'][:200]}{'...' if len(m['analysis']) > 200 else ''}"
-                )
-
-        # --- Validation correction loop ---
-        # Validate each model with Pydantic and retry on failures,
-        # BEFORE the review-and-fix cycle to avoid wasting compute on invalid models.
-        validated_models = []
-        for i, model in enumerate(models):
-            validated_model = model
-            model_name = model.get("name", f"cognitive_model{i + 1}")
-            validation_result = None
-
-            for retry_attempt in range(max_retries):
-                validation_result = validate_single_model(validated_model)
-
-                if validation_result.is_valid:
-                    console.print(
-                        f"  [dim]Model {i + 1} ({model_name}) passed validation[/]"
-                    )
-                    break
-
-                error_trace = "\n".join(f"  {err}" for err in validation_result.errors)
-                console.print(
-                    f"  [yellow]Model {i + 1} ({model_name}) failed validation "
-                    f"(attempt {retry_attempt + 1}/{max_retries}):[/]\n{error_trace}"
-                )
-
-                schema_instructions = get_schema_instructions(1, include_analysis=False)
-                correction_prompt = build_correction_prompt(
-                    model=validated_model,
-                    model_index=i + 1,
-                    validation_errors=validation_result.errors,
-                    schema_instructions=schema_instructions,
-                )
-
-                correction_schema = get_model_schema(1, include_analysis=False)
-                correction_text = self.generate(
-                    self.model,
-                    self.tokenizer,
-                    correction_prompt,
-                    response_schema=correction_schema if structured else None,
-                )
-                corrected, _ = parse_model_response(
-                    correction_text, 1, structured_output=structured
-                )
-
-                if corrected:
-                    validated_model = corrected[0]
-                else:
-                    console.print("  [yellow]Failed to parse correction attempt[/]")
-                    break
-
-            if validation_result is not None and validation_result.is_valid:
-                validated_models.append(validated_model)
-            else:
-                console.print(
-                    f"  [bold red]Model {i + 1} ({model_name}) failed validation "
-                    f"after {max_retries} retries — skipping[/]"
-                )
-                validated_models.append(
-                    {
-                        "name": model_name,
-                        "rationale": model.get("rationale", ""),
-                        "code": model.get("code", ""),
-                        "analysis": model.get("analysis", ""),
-                        "validation_failed": True,
-                        "validation_errors": validation_result.errors
-                        if validation_result
-                        else [],
-                    }
-                )
-
-        models = validated_models
-        if not models:
-            console.print(
-                "[yellow]All models failed validation — no models to process[/]"
-            )
-            return raw_text, []
-
-        # --- Review-and-Fix cycle (optional) ---
-        reviewer_config = getattr(self.cfg.llm, "reviewer", None)
-        if reviewer_config and getattr(reviewer_config, "enabled", False) and models:
-            guardrails = getattr(self.cfg.llm, "guardrails", [])
-            persona = getattr(reviewer_config, "persona", None)
-            focus_areas = getattr(reviewer_config, "focus_areas", None)
-
-            # --- Review phase ---
-            console.print("[dim]Running code review...[/]")
-            review_prompt = build_review_prompt(
-                models,
-                guardrails=guardrails,
-                persona=persona,
-                focus_areas=focus_areas,
-            )
-            review_schema = get_review_schema()
-            review_text = self.generate(
-                self.model,
-                self.tokenizer,
-                review_prompt,
-                response_schema=review_schema if structured else None,
-            )
-            review = parse_review_response(review_text)
-
-            # --- Save review to disk ---
-            self._save_review(review)
-
-            # --- Check if any issues found ---
-            total_issues = sum(
-                len(r.get("issues", [])) for r in review.get("reviews", [])
-            )
-
-            if total_issues > 0:
-                console.print(
-                    f"[dim]Review found {total_issues} issue(s) across "
-                    f"{sum(1 for r in review.get('reviews', []) if r.get('issues'))} model(s)[/]"
-                )
-
-                # --- Fix phase ---
-                fix_prompt = build_fix_prompt(models, review, guardrails=guardrails)
-                if fix_prompt:
-                    console.print("[dim]Requesting fixes...[/]")
-                    fix_text = self.generate(
-                        self.model,
-                        self.tokenizer,
-                        fix_prompt,
-                        response_schema=model_schema if structured else None,
-                    )
-                    fixed_models, fixed_json_ok = parse_model_response(
-                        fix_text, n_models, structured_output=structured
-                    )
-
-                    if fixed_models and len(fixed_models) == len(models):
-                        # Preserve names/analysis from originals, use fixed code
-                        for orig, fixed in zip(models, fixed_models):
-                            orig["code"] = fixed["code"]
-                            if fixed.get("rationale"):
-                                orig["rationale"] = fixed["rationale"]
-                        console.print(
-                            f"[dim]Applied fixes to {len(models)} model(s)[/]"
-                        )
-                    else:
-                        console.print(
-                            "[yellow]Fix parsing failed — using original models[/]"
-                        )
-            else:
-                # Check if any models have non-passing assessments
-                non_passing = sum(
-                    1
-                    for r in review.get("reviews", [])
-                    if r.get("overall_assessment", "passes") != "passes"
-                )
-                if non_passing == 0:
-                    console.print("[dim]Review passed — no issues found[/]")
-                else:
-                    console.print(
-                        f"[dim]Review found {non_passing} model(s) with issues (no fix attempted)[/]"
-                    )
-
-        return raw_text, models
-
-    def generate_models_naive(self, feedback_text, n_models: int | None = None, force_include_feedback: bool = False):
-        """
-        Two-phase generation:
-        1. Phase 1: Naive ideation (psychologist persona)
-        2. Phase 2: Computational translation (neuroscientist persona)
-        """
-        # 1. Read naive ideation config
-        client_config = (
-            getattr(self.cfg.clients, self.client_id, None) if self.client_id else None
-        )
-        naive_cfg = (
-            getattr(client_config, "naive_ideation", None) if client_config else None
-        )
-
-        if not naive_cfg or not getattr(naive_cfg, "enabled", False):
-            # Fallback to standard generation if misconfigured
-            prompt = self.prompt_builder.build_input_prompt(feedback_text=feedback_text, n_models=n_models, force_include_feedback=force_include_feedback)
-            return self.generate_models(prompt, n_models=n_models)
-
-        persona = naive_cfg.persona
-        translation_preamble = getattr(naive_cfg, "translation_preamble", None)
-
-        if "hf" in self.cfg.llm.provider or "huggingface" in self.cfg.llm.provider:
-            console.print(
-                "[yellow]Warning: HuggingFace backend does not support system prompts. "
-                "Phase 1 persona will have no effect.[/]"
-            )
-
-        # 2. Phase 1 — ideation call
-        console.print("  [dim]Phase 1: Naive psychological ideation...[/]")
-        naive_prompt = self.prompt_builder.build_naive_prompt(feedback_text)
-
-        naive_idea = self.generate(
-            self.model,
-            self.tokenizer,
-            naive_prompt,
-            response_schema=None,  # Plain text
-            system_prompt=persona,
-        )
-
-        if not naive_idea:
-            console.print(
-                "  [yellow]Phase 1 ideation failed to return an idea — using empty idea.[/]"
-            )
-            naive_idea = ""
-        else:
-            console.print(f"  [dim]Naive hypothesis:[/] {naive_idea[:200]}...")
-
-        # 3. Phase 2 — translation call
-        console.print("  [dim]Phase 2: Computational translation...[/]")
-        prompt = self.prompt_builder.build_input_prompt(
-            feedback_text=feedback_text,
-            naive_idea=naive_idea,
-            translation_preamble=translation_preamble,
-            n_models=n_models,
-            force_include_feedback=force_include_feedback,
-        )
-
-        return self.generate_models(prompt, n_models=n_models)
-
-    def _save_review(self, review: dict):
-        """
-        Save review comments to disk for debugging.
-
-        Parameters
-        ----------
-        review : dict
-            Structured review from parse_review_response().
-        """
-        review_dir = self.results_dir / "reviews"
-        review_dir.mkdir(parents=True, exist_ok=True)
-
-        # Use iteration count for filename
-        existing = list(review_dir.glob("iter*.json"))
-        iteration = len(existing) + 1
-        review_file = review_dir / f"iter{iteration}{self._file_tag()}.json"
-
-        with open(review_file, "w") as f:
-            json.dump(review, f, indent=2)
-
     def _file_tag(self):
         """Return a client tag for filenames, or empty string if not distributed."""
         if self.client_id is not None:
@@ -1040,566 +720,13 @@ class GeCCoModelSearch:
             activity=activity,
         )
 
-    def _update_registry(
-        self, iteration, results, status="running", had_runnable_model=None
-    ):
-        """Push this iteration's results to the shared registry."""
-        coordinator = self._require_distributed_coordinator()
-        coordinator.update_registry(
-            shared_registry=self.shared_registry,
-            client_id=self.client_id,
-            iteration=iteration,
-            results=results,
-            best_model=self.best_model,
-            best_metric=self.best_metric,
-            best_params=self.best_params,
-            tried_param_sets=self.tried_param_sets,
-            status=status,
-            had_runnable_model=had_runnable_model,
-        )
-
-    def _build_syntax_error_feedback(self, iteration_results):
-        """
-        Build feedback text from syntax/validation errors for regeneration.
-
-        This is used when all models fail syntax validation to help the LLM
-        understand what went wrong and how to fix it.
-        """
-        error_messages = []
-        for i, result in enumerate(iteration_results):
-            model_name = result.get("function_name", f"model_{i}")
-            error_type = result.get("metric_name", "ERROR")
-
-            if error_type == "VALIDATION_ERROR":
-                msg = result.get("error_message", "Unknown validation error")
-                error_messages.append(f"- {model_name}: {msg}")
-            elif error_type == "FIT_ERROR":
-                error_msg = result.get("error", "Unknown fit error")
-                # Truncate very long error messages
-                if len(error_msg) > 200:
-                    error_msg = error_msg[:200] + "..."
-                error_messages.append(f"- {model_name}: {error_msg}")
-            elif error_type == "RECOVERY_FAILED":
-                sim_err = result.get("simulation_error")
-                if sim_err:
-                    error_messages.append(
-                        f"- {model_name}: parameter recovery simulation failed: {sim_err}. "
-                        "The model must always return a finite numeric negative log-likelihood, "
-                        "including when called on short prefix trial arrays during simulation."
-                    )
-                else:
-                    error_messages.append(
-                        f"- {model_name}: parameter recovery failed."
-                    )
-
-        if not error_messages:
-            return "All models failed validation. Please review and fix syntax errors."
-
-        feedback = "The following models failed syntax/validation:\n"
-        feedback += "\n".join(error_messages)
-        feedback += (
-            "\n\nPlease regenerate the models with correct Python syntax. "
-            "Ensure all functions are properly defined, parentheses match, "
-            "and all required imports are handled."
-        )
-        return feedback
-
-    def _smoke_test_model_return_value(self, spec) -> str | None:
-        """Run a lightweight smoke test on a compiled model spec.
-
-        Returns an error string if the model returns None, a non-numeric value,
-        or a non-finite value when called with dummy inputs; otherwise None.
-        """
-        n = 3
-        dummy_arrays = []
-        for _ in getattr(self.cfg.data, "input_columns", []):
-            dummy_arrays.append(np.zeros(n, dtype=np.int64))
-
-        params = []
-        for p in spec.param_names:
-            lb, ub = spec.bounds[p]
-            params.append((float(lb) + float(ub)) / 2.0)
-        params = np.asarray(params, dtype=float)
-
-        try:
-            value = spec.func(*dummy_arrays, params)
-        except Exception as e:
-            return f"{type(e).__name__}: {e}"
-
-        if value is None:
-            return "Model returned None instead of a numeric negative log-likelihood."
-
-        try:
-            value = float(value)
-        except Exception:
-            return f"Model returned non-numeric value of type {type(value).__name__}."
-
-        if not np.isfinite(value):
-            return f"Model returned non-finite value: {value}."
-
-        return None
-
-    def _fit_candidate_model(
-        self,
-        model_dict: dict,
-        model_idx: int,
-        n_models: int,
-        it: int,
-        run_idx: int,
-        tag: str,
-        model_file,
-        baseline_bic,
-    ) -> tuple[dict | None, bool]:
-        """Fit one candidate model.
-
-        Returns (result_dict, should_stop).
-        should_stop is True when the candidate beats the baseline BIC.
-        """
-        from gecco.offline_evaluation.exceptions import ModelValidationError
-
-        func_name = model_dict.get("func_name", f"cognitive_model{model_idx + 1}")
-        display_name = model_dict.get("name", func_name)
-        func_code = model_dict.get("code", "")
-        structured_params = model_dict.get("parameters")
-        recovery = None
-
-        if not func_code:
-            return {
-                "function_name": display_name,
-                "metric_name": "VALIDATION_ERROR",
-                "metric_value": float("inf"),
-                "param_names": [],
-                "code": func_code,
-                "error_type": "empty_code",
-                "error_message": f"No code provided for {func_name}",
-                "error_details": {"expected_func_name": func_name},
-            }, False
-
-        try:
-            # --- Parameter recovery check (optional) ---
-            if self.recovery_checker is not None:
-                self._set_activity(
-                    f"parameter recovery {model_idx + 1}/{n_models}: {display_name} (iter {it})"
-                )
-                from gecco.offline_evaluation.utils import build_model_spec
-                from gecco.offline_evaluation.exceptions import (
-                    ModelValidationError,
-                )
-
-                try:
-                    spec = build_model_spec(
-                        func_code,
-                        expected_func_name=func_name,
-                        cfg=self.cfg,
-                        structured_params=structured_params,
-                    )
-                    smoke_error = self._smoke_test_model_return_value(spec)
-                    if smoke_error:
-                        return {
-                            "function_name": display_name,
-                            "metric_name": "FIT_ERROR",
-                            "metric_value": float("inf"),
-                            "param_names": spec.param_names,
-                            "code": func_code,
-                            "error": smoke_error,
-                        }, False
-                    console.print(
-                        f"  [dim]Running parameter recovery check for {display_name} "
-                        f"({self.recovery_checker.n_subjects} subjects, "
-                        f"{self.recovery_checker.n_trials} trials)...[/]"
-                    )
-                    recovery = self.recovery_checker.check(spec)
-                    if not recovery["passed"]:
-                        sim_err = recovery.get("simulation_error")
-                        if sim_err and recovery["n_successful"] == 0:
-                            console.print(
-                                f"  [yellow]{display_name} failed parameter recovery "
-                                f"— simulation error: {sim_err}[/]"
-                            )
-                        else:
-                            console.print(
-                                f"  [yellow]{display_name} failed parameter recovery "
-                                f"(mean r={recovery['mean_r']:.2f}, "
-                                f"threshold={self.recovery_checker.threshold})[/]"
-                            )
-                        result = {
-                            "function_name": display_name,
-                            "metric_name": "RECOVERY_FAILED",
-                            "metric_value": float("inf"),
-                            "param_names": spec.param_names,
-                            "code": func_code,
-                            "recovery_r": recovery["mean_r"],
-                            "recovery_per_param": recovery[
-                                "per_param_r"
-                            ],
-                            "recovery_n_successful": recovery[
-                                "n_successful"
-                            ],
-                            "simulation_error": sim_err,
-                        }
-                        capture_recovery_failed(
-                            iteration=it,
-                            model_name=display_name,
-                            error=Exception(
-                                f"Parameter recovery failed (mean r={recovery['mean_r']:.2f})"
-                            ),
-                        )
-                        return result, False
-                except ModelValidationError as e:
-                    console.print(
-                        f"  [yellow]{display_name} validation error ({e.error_type}): {e.message}[/]"
-                    )
-                    if e.details:
-                        for k, v in e.details.items():
-                            console.print(f"    [dim]{k}: {v}[/]")
-                    safe_details = {}
-                    for k, v in e.details.items():
-                        try:
-                            json.dumps(v)
-                            safe_details[k] = v
-                        except (TypeError, ValueError):
-                            safe_details[k] = str(v)
-                    return {
-                        "function_name": display_name,
-                        "metric_name": "VALIDATION_ERROR",
-                        "metric_value": float("inf"),
-                        "param_names": [],
-                        "code": func_code,
-                        "error_type": e.error_type,
-                        "error_message": e.message,
-                        "error_details": safe_details,
-                    }, False
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]{display_name} recovery check error: {e}[/]"
-                    )
-                    capture_fit_error(
-                        iteration=it,
-                        model_name=display_name,
-                        error=e,
-                        run=run_idx,
-                    )
-                    return {
-                        "function_name": display_name,
-                        "metric_name": "FIT_ERROR",
-                        "metric_value": float("inf"),
-                        "param_names": [],
-                        "code": func_code,
-                        "error": str(e),
-                    }, False
-
-            self._set_activity(
-                f"fitting model {model_idx + 1}/{n_models}: {display_name} (iter {it})"
-            )
-            fit_res = run_fit(
-                self.df,
-                func_code,
-                cfg=self.cfg,
-                expected_func_name=func_name,
-                structured_params=structured_params,
-            )
-
-            mean_metric = float(fit_res["metric_value"])
-            metric_name = fit_res["metric_name"]
-            params = fit_res["param_names"]
-            self.tried_param_sets.append(params)
-
-            console.print(
-                f"  [bold]{display_name}[/]: mean {metric_name} = [cyan]{mean_metric:.2f}[/]"
-            )
-
-            # --- Individual differences evaluation (optional) ---
-            id_results = None
-            if self.id_eval_data is not None:
-                try:
-                    from gecco.offline_evaluation.individual_differences import (
-                        evaluate_individual_differences,
-                    )
-
-                    id_results = evaluate_individual_differences(
-                        fit_res,
-                        self.df,
-                        self.cfg,
-                        id_data=self.id_eval_data,
-                    )
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]Individual differences eval failed for {display_name}:[/] {e}"
-                    )
-
-            # --- Validation on val split (if provided) ---
-            val_fit_res = None
-            val_id_results = None
-            if self.df_val is not None:
-                try:
-                    val_fit_res = run_fit(
-                        self.df_val,
-                        func_code,
-                        cfg=self.cfg,
-                        expected_func_name=func_name,
-                        structured_params=structured_params,
-                    )
-                    console.print(
-                        f"    [dim]val {metric_name} = [cyan]{val_fit_res['metric_value']:.2f}[/]"
-                    )
-                    if self.id_eval_data is not None:
-                        try:
-                            val_id_results = (
-                                evaluate_individual_differences(
-                                    val_fit_res,
-                                    self.df_val,
-                                    self.cfg,
-                                    id_data=self.id_eval_data,
-                                )
-                            )
-                        except Exception as e:
-                            console.print(
-                                f"  [yellow]Individual differences eval failed for {display_name} on val:[/] {e}"
-                            )
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]Val fitting failed for {display_name}:[/] {e}"
-                    )
-
-            # --- Posterior predictive checks (optional) ---
-            ppc_result = None
-            block_residuals_result = None
-            needs_diagnostic_spec = bool(
-                fit_res.get("parameter_values")
-                and (
-                    (self.ppc_enabled and self._ppc_simulator is not None)
-                    or self.block_residuals_enabled
-                )
-            )
-            diagnostic_spec = None
-            if needs_diagnostic_spec:
-                try:
-                    from gecco.offline_evaluation.utils import (
-                        build_model_spec,
-                    )
-
-                    diagnostic_spec = build_model_spec(
-                        func_code,
-                        expected_func_name=func_name,
-                        cfg=self.cfg,
-                        structured_params=structured_params,
-                    )
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]Diagnostic spec build failed for {display_name}:[/] {e}"
-                    )
-
-            if (
-                self.ppc_enabled
-                and self._ppc_simulator is not None
-                and fit_res.get("parameter_values")
-                and diagnostic_spec is not None
-            ):
-                try:
-                    from gecco.offline_evaluation.ppc import compute_ppc
-
-                    console.print(
-                        f"  [dim]Computing PPC for {display_name} "
-                        f"(n_sims={self.ppc_n_sims})...[/]"
-                    )
-
-                    from gecco.offline_evaluation.ppc import (
-                        _get_participants,
-                    )
-
-                    _, participants = _get_participants(self.df)
-                    n_participants = len(participants)
-
-                    ppc_progress = Progress(
-                        TextColumn(
-                            "[progress.description]{task.description}"
-                        ),
-                        BarColumn(),
-                        MofNCompleteColumn(),
-                        TimeElapsedColumn(),
-                    )
-
-                    with ppc_progress:
-                        task_id = ppc_progress.add_task(
-                            f"  [dim]PPC {display_name}[/]",
-                            total=n_participants,
-                        )
-                        ppc_result = compute_ppc(
-                            spec=diagnostic_spec,
-                            df=self.df,
-                            fitted_params_list=fit_res["parameter_values"],
-                            simulator=self._ppc_simulator,
-                            n_sims=self.ppc_n_sims,
-                            input_columns=list(self.cfg.data.input_columns),
-                            n_jobs=-1,
-                            progress_callback=lambda: ppc_progress.advance(
-                                task_id
-                            ),
-                        )
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]PPC failed for {display_name}:[/] {e}"
-                    )
-
-            if (
-                self.block_residuals_enabled
-                and fit_res.get("parameter_values")
-                and diagnostic_spec is not None
-            ):
-                try:
-                    from gecco.offline_evaluation.ppc import (
-                        compute_block_residuals,
-                    )
-
-                    console.print(
-                        f"  [dim]Computing block residuals for {display_name} "
-                        f"(n_blocks={self.block_residuals_n_blocks})...[/]"
-                    )
-                    block_residuals_result = compute_block_residuals(
-                        spec=diagnostic_spec,
-                        df=self.df,
-                        fitted_params_list=fit_res["parameter_values"],
-                        n_blocks=self.block_residuals_n_blocks,
-                        input_columns=list(self.cfg.data.input_columns),
-                    )
-                except Exception as e:
-                    console.print(
-                        f"  [yellow]Block residuals failed for {display_name}:[/] {e}"
-                    )
-
-            result_dict = {
-                "function_name": display_name,
-                "metric_name": metric_name,
-                "metric_value": mean_metric,
-                "param_names": params,
-                "code_file": str(model_file),
-                "recovery": recovery
-                if self.recovery_checker is not None
-                else None,
-                "individual_differences": id_results,
-                "code": func_code,
-                "eval_metrics": fit_res.get("eval_metrics", []),
-                "participant_n_trials": fit_res.get(
-                    "participant_n_trials", []
-                ),
-                "parameter_values": fit_res.get("parameter_values", []),
-                "mean_nll": fit_res.get("mean_nll"),
-                "per_participant_nll": fit_res.get("per_participant_nll"),
-            }
-            if val_fit_res is not None:
-                result_dict["val_metric_value"] = val_fit_res[
-                    "metric_value"
-                ]
-                result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
-                result_dict["val_eval_metrics"] = val_fit_res[
-                    "eval_metrics"
-                ]
-                result_dict["val_per_participant_nll"] = val_fit_res[
-                    "per_participant_nll"
-                ]
-                result_dict["val_individual_differences"] = val_id_results
-            if ppc_result is not None:
-                result_dict["ppc"] = ppc_result
-            if block_residuals_result is not None:
-                result_dict["block_residuals"] = block_residuals_result
-
-            if mean_metric < self.best_metric:
-                self.best_metric = mean_metric
-                self.best_model = func_code
-                self.best_iter = it
-                self.best_params = params
-                self.best_param_names = fit_res["param_names"]
-                self.best_param_values = fit_res["parameter_values"]
-                self.best_id_results = id_results
-                console.print(
-                    f"  [bold green]New best model:[/] {display_name} ({metric_name}={mean_metric:.2f})"
-                )
-
-                best_model_file = (
-                    self.results_dir
-                    / "models"
-                    / f"best_model{tag}_{run_idx}.txt"
-                    if getattr(self.cfg.evaluation, "fit_type", "group")
-                    != "individual"
-                    else self.results_dir
-                    / "models"
-                    / f"best_model{tag}_{run_idx}_participant{self.df.participant[0]}.txt"
-                )
-                with open(best_model_file, "w") as f:
-                    f.write(func_code)
-
-                artifact_store = self._require_artifact_store()
-                participant = (
-                    self.df.participant[0]
-                    if getattr(self.cfg.evaluation, "fit_type", "group")
-                    == "individual"
-                    and hasattr(self.df, "participant")
-                    else None
-                )
-                artifact_store.write_best_metric_inspection(
-                    run_idx=run_idx,
-                    tag=tag,
-                    metric_value=mean_metric,
-                    val_metric_value=val_fit_res["metric_value"] if val_fit_res is not None else None,
-                    val_mean_nll=val_fit_res["mean_nll"] if val_fit_res is not None else None,
-                    val_eval_metrics=val_fit_res["eval_metrics"] if val_fit_res is not None else None,
-                    val_per_participant_nll=val_fit_res["per_participant_nll"] if val_fit_res is not None else None,
-                    participant=participant,
-                )
-
-            should_stop = (
-                baseline_bic is not None and mean_metric < baseline_bic
-            )
-            return result_dict, should_stop
-
-        except ModelValidationError as e:
-            console.print(
-                f"  [bold red]Validation error in {display_name}:[/] {e.message}"
-            )
-            safe_details = {}
-            for k, v in e.details.items():
-                try:
-                    json.dumps(v)
-                    safe_details[k] = v
-                except (TypeError, ValueError):
-                    safe_details[k] = str(v)
-            return {
-                "function_name": display_name,
-                "metric_name": "VALIDATION_ERROR",
-                "metric_value": float("inf"),
-                "param_names": [],
-                "code": func_code,
-                "error_type": e.error_type,
-                "error_message": e.message,
-                "error_details": safe_details,
-            }, False
-        except Exception as e:
-            console.print(
-                f"  [bold red]Error fitting {display_name}:[/] {e}"
-            )
-            capture_fit_error(
-                iteration=it,
-                model_name=display_name,
-                error=e,
-                run=run_idx,
-            )
-            return {
-                "function_name": display_name,
-                "metric_name": "FIT_ERROR",
-                "metric_value": float("inf"),
-                "param_names": [],
-                "code": func_code,
-                "error": str(e),
-            }, False
-
     def _run_cmg_generator_iteration(self, it, run_idx, feedback, cmg_cfg):
         """Generator path: generate candidates and publish to registry."""
-        client_config = (
-            getattr(self.cfg.clients, self.client_id, None) if self.client_id else None
-        )
+        clients = _mapping_get(self.cfg, "clients")
+        client_config = _mapping_get(clients, self.client_id) if self.client_id else None
         naive_enabled = bool(
             client_config
-            and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
+            and _mapping_get(_mapping_get(client_config, "naive_ideation"), "enabled", False)
         )
         participant = (
             getattr(self.df, "participant", [None])[0]
@@ -1622,9 +749,6 @@ class GeCCoModelSearch:
             tokenizer=self.tokenizer,
             cfg=self.cfg,
             shared_registry=self.shared_registry,
-            save_review=lambda review: self._require_artifact_store().write_review(
-                review, iteration=it, tag=tag
-            ),
             participant=participant,
             set_activity=self._set_activity,
         )
@@ -1661,9 +785,6 @@ class GeCCoModelSearch:
             tokenizer=self.tokenizer,
             generate_text=self.generate,
             prompt_builder=self.prompt_builder,
-            on_retry=lambda iteration, results, status: self._update_registry(
-                iteration, results, status=status
-            ),
             max_syntax_retries=getattr(
                 getattr(self.cfg, "validation", None), "max_syntax_retries", 2
             ),
@@ -1674,195 +795,9 @@ class GeCCoModelSearch:
             ),
             participant=participant,
             best_state=self.best_state,
+            tried_param_sets=self.tried_param_sets,
         )
         self._sync_best_attrs_from_state()
-
-    def _repair_cmg_candidate(
-        self,
-        candidate: dict,
-        current_model_dict: dict,
-        error_result: dict,
-        expected_func_name: str,
-        iteration: int,
-        candidate_index: int,
-    ) -> dict:
-        """Use the evaluator LLM path to repair one assigned candidate.
-
-        Builds a repair prompt with the failing code, error details, and
-        full task context (template, guardrails, schema), then generates
-        exactly one repaired model.
-        """
-        error_feedback = self._build_syntax_error_feedback([error_result])
-        current_code = current_model_dict.get("code", "")
-        candidate_name = current_model_dict.get("name", expected_func_name)
-        candidate_params = current_model_dict.get("parameters", [])
-        candidate_rationale = candidate.get("rationale", "")
-
-        repair_section = (
-            f"The assigned candidate model failed validation or fitting.\n\n"
-            f"You must repair this exact candidate. Do not propose a new model idea.\n\n"
-            f"Assigned function name: `{expected_func_name}`\n"
-            f"Candidate name: {candidate_name}\n"
-            f"Candidate rationale: {candidate_rationale}\n"
-            f"Candidate parameters: {candidate_params}\n\n"
-            f"Current code:\n"
-            f"```python\n{current_code}\n```\n\n"
-            f"Error:\n{error_feedback}\n\n"
-            f"Requirements:\n"
-            f"- Return exactly one repaired model.\n"
-            f"- The repaired code must define `{expected_func_name}` exactly.\n"
-            f"- Keep the same conceptual mechanism unless a small change is necessary "
-            f"to make it runnable.\n"
-            f"- Keep parameter declarations consistent with the repaired code.\n"
-        )
-
-        new_models = None
-        try:
-            # Check if evaluator uses naive ideation
-            client_config = (
-                getattr(self.cfg.clients, self.client_id, None)
-                if self.client_id
-                else None
-            )
-            naive_enabled = bool(
-                client_config
-                and getattr(getattr(client_config, "naive_ideation", None), "enabled", False)
-            )
-
-            if naive_enabled:
-                _, new_models = self.generate_models_naive(
-                    repair_section, n_models=1, force_include_feedback=True
-                )
-            else:
-                prompt = self.prompt_builder.build_input_prompt(
-                    feedback_text=repair_section,
-                    n_models=1,
-                    force_include_feedback=True,
-                )
-                _, new_models = self.generate_models(prompt, n_models=1)
-        except Exception as e:
-            console.print(f"  [yellow]CMG repair generation failed: {e}[/]")
-            new_models = None
-
-        if not new_models:
-            console.print(
-                "[yellow]CMG repair produced no models — keeping original code[/]"
-            )
-            return current_model_dict
-
-        repaired = new_models[0]
-        repaired["func_name"] = expected_func_name
-        repaired["name"] = repaired.get(
-            "name", current_model_dict.get("name", expected_func_name)
-        )
-        repaired_code = repaired.get("code", "")
-
-        # Structural validation — ensure repaired code actually defines the function
-        if not self._validate_repaired_func_name(repaired_code, expected_func_name):
-            return current_model_dict
-
-        updated_candidate = dict(candidate)
-        updated_candidate.update({
-            "code": repaired_code,
-            "name": repaired.get("name", updated_candidate.get("name", expected_func_name)),
-            "parameters": repaired.get("parameters", updated_candidate.get("parameters", [])),
-            "func_name": expected_func_name,
-        })
-        self.shared_registry.update_candidate_model(
-            iteration, candidate_index, updated_candidate
-        )
-
-        console.print(f"[green]CMG evaluator {candidate_index}: repaired candidate code[/]")
-
-        return {
-            "func_name": expected_func_name,
-            "name": updated_candidate["name"],
-            "code": repaired_code,
-            "parameters": updated_candidate.get("parameters", []),
-        }
-
-    def _validate_repaired_func_name(
-        self, repaired_code: str, expected_func_name: str
-    ) -> bool:
-        """Check that repaired code structurally defines the expected function.
-
-        Uses Python AST to verify the exact function name exists in the code,
-        then runs build_model_spec for additional structural validation.
-        Returns True if valid, False otherwise.
-        """
-        import ast
-
-        try:
-            tree = ast.parse(repaired_code)
-            found = any(
-                isinstance(node, ast.FunctionDef) and node.name == expected_func_name
-                for node in ast.walk(tree)
-            )
-            if not found:
-                console.print(
-                    f"[yellow]Repaired code does not define function "
-                    f"`{expected_func_name}`[/]"
-                )
-                return False
-        except SyntaxError as e:
-            console.print(
-                f"[yellow]Repaired code has a syntax error: {e}[/]"
-            )
-            return False
-
-        # Additional structural validation via build_model_spec
-        try:
-            from gecco.offline_evaluation.utils import build_model_spec
-
-            build_model_spec(
-                repaired_code,
-                expected_func_name=expected_func_name,
-                cfg=self.cfg,
-                structured_params=[],
-            )
-            return True
-        except Exception as e:
-            console.print(
-                f"[yellow]Repaired code failed structural validation: {e}[/]"
-            )
-            return False
-
-    def _finalize_iteration_results(
-        self,
-        it: int,
-        run_idx: int,
-        tag: str,
-        iteration_results: list[dict],
-    ):
-        """Save and publish evaluator results for one completed iteration.
-
-        This handles the save/finalize logic that was previously embedded
-        in the syntax retry loop.
-        """
-        self._set_activity(f"saving results (iter {it})")
-
-        artifact_store = self._require_artifact_store()
-
-        had_runnable_model = artifact_store.write_iteration_results(
-            iteration=it,
-            run_idx=run_idx,
-            tag=tag,
-            iteration_results=iteration_results,
-            client_id=self.client_id,
-            results_source=self.df,
-        )
-
-        self.feedback.record_iteration(it, iteration_results)
-
-        completion_status = "complete" if had_runnable_model else "complete_no_success"
-        self._update_registry(
-            it,
-            iteration_results,
-            status=completion_status,
-            had_runnable_model=had_runnable_model,
-        )
-
-        return had_runnable_model
 
     def run_n_shots(self, run_idx, baseline_bic):
         # Resume from the next iteration after what's already in the registry
@@ -1890,11 +825,7 @@ class GeCCoModelSearch:
             tag = self._file_tag()
             feedback = ""
 
-            orchestrated_judge_enabled = self.shared_registry is not None and bool(
-                getattr(self, "judge_orchestrated", False)
-            )
-
-            if orchestrated_judge_enabled and it > 0:
+            if self.shared_registry is not None and bool(getattr(self, "judge_enabled", False)) and it > 0:
                 barrier_timeout = getattr(
                     getattr(self.cfg.judge, "barrier", None),
                     "client_wait_seconds",
@@ -2061,9 +992,6 @@ class GeCCoModelSearch:
                     model=self.model,
                     tokenizer=self.tokenizer,
                     participant=participant,
-                    save_review=lambda review: artifact_store.write_review(
-                        review, iteration=it, tag=tag
-                    ),
                     client_id=self.client_id,
                 )
 
@@ -2088,12 +1016,11 @@ class GeCCoModelSearch:
                     block_residuals_n_blocks=self.block_residuals_n_blocks,
                     df_val=self.df_val,
                     set_activity=self._set_activity,
-                    on_retry=self._update_registry,
                     max_syntax_retries=max_syntax_retries,
                     syntax_retry_count=syntax_retry_count,
                     participant=participant,
-                    on_registry_update=self._update_registry,
                     feedback_record=self.feedback.record_iteration,
+                    tried_param_sets=self.tried_param_sets,
                     )
 
                 self._sync_best_attrs_from_state()
@@ -2140,9 +1067,5 @@ class GeCCoModelSearch:
             )
 
             param_df.to_csv(param_file, index=False)
-
-        # --- Mark client complete in shared registry ---
-        if self.shared_registry is not None and self.client_id is not None:
-            self.shared_registry.mark_complete(self.client_id)
 
         return self.best_model, self.best_metric, self.best_params

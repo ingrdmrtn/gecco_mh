@@ -38,6 +38,190 @@ class DiagnosticStore:
         self._conn = duckdb.connect(self.db_path)
         create_schema(self._conn)
 
+    def import_from_source_db(self, source_db_path: str | Path) -> None:
+        """Import diagnostic rows from another DuckDB file into this store."""
+
+        source_path = Path(source_db_path)
+        if source_path.resolve() == Path(self.db_path).resolve():
+            return
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source diagnostic store not found: {source_path}")
+
+        def _load_json_value(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                try:
+                    return orjson.loads(value)
+                except orjson.JSONDecodeError:
+                    return value
+            return value
+
+        iteration_id_map: dict[int, int] = {}
+        model_id_map: dict[int, int] = {}
+
+        with duckdb.connect(str(source_path), read_only=True) as source_conn:
+            iterations = source_conn.execute(
+                "SELECT iteration_id, run_idx, iteration, client_id, tag, timestamp, "
+                "n_models_proposed FROM iterations ORDER BY iteration_id"
+            ).fetchall()
+            models = source_conn.execute(
+                "SELECT model_id, iteration_id, run_idx, iteration, name, code, metric_name, "
+                "metric_value, mean_nll, split, param_names, status FROM models ORDER BY model_id"
+            ).fetchall()
+            participants = source_conn.execute(
+                "SELECT model_id, participant_idx, bic, nll, n_trials, params "
+                "FROM model_participants ORDER BY id"
+            ).fetchall()
+            parameter_recovery_rows = source_conn.execute(
+                "SELECT model_id, passed, mean_r, n_successful, per_param_r, simulation_error "
+                "FROM parameter_recovery ORDER BY model_id"
+            ).fetchall()
+            individual_differences_rows = source_conn.execute(
+                "SELECT model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split "
+                "FROM individual_differences ORDER BY model_id"
+            ).fetchall()
+            ppc_rows = source_conn.execute(
+                "SELECT model_id, participant_id, statistic_name, condition, observed, "
+                "simulated_mean, simulated_q025, simulated_q975, n_sims FROM ppc ORDER BY ppc_id"
+            ).fetchall()
+            block_residual_rows = source_conn.execute(
+                "SELECT model_id, participant_id, block_idx, block_start, block_end, "
+                "mean_nll_per_trial, n_trials FROM block_residuals ORDER BY id"
+            ).fetchall()
+            validation_error_rows = source_conn.execute(
+                "SELECT model_id, error_type, error_message, error_details "
+                "FROM validation_errors ORDER BY error_id"
+            ).fetchall()
+
+        with self._lock:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                for row in iterations:
+                    old_iteration_id = row[0]
+                    new_iteration_id = self._get_or_create_iteration(
+                        run_idx=row[1],
+                        iteration=row[2],
+                        tag=row[4] or "",
+                        client_id=row[3],
+                        timestamp=row[5],
+                        n_models_proposed=row[6] or 0,
+                    )
+                    iteration_id_map[old_iteration_id] = new_iteration_id
+
+                for row in models:
+                    old_model_id = row[0]
+                    old_iteration_id = row[1]
+                    new_iteration_id = iteration_id_map[old_iteration_id]
+                    new_model_id = self._insert_model(
+                        iteration_id=new_iteration_id,
+                        run_idx=row[2],
+                        iteration=row[3],
+                        name=row[4],
+                        code=row[5],
+                        metric_name=row[6],
+                        metric_value=row[7],
+                        param_names=_load_json_value(row[10]) or [],
+                        status=row[11],
+                        mean_nll=row[8],
+                        split=row[9] or "train",
+                    )
+                    model_id_map[old_model_id] = new_model_id
+
+                for row in participants:
+                    self._conn.execute(
+                        "INSERT INTO model_participants "
+                        "(id, model_id, participant_idx, bic, nll, n_trials, params) "
+                        "VALUES (nextval('model_participants_id_seq'),?,?,?,?,?,?)",
+                        [
+                            model_id_map[row[0]],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                        ],
+                    )
+
+                for row in parameter_recovery_rows:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO parameter_recovery "
+                        "(model_id, passed, mean_r, n_successful, per_param_r, simulation_error) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [
+                            model_id_map[row[0]],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                        ],
+                    )
+
+                for row in individual_differences_rows:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO individual_differences "
+                        "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        [
+                            model_id_map[row[0]],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                            row[6],
+                        ],
+                    )
+
+                for row in ppc_rows:
+                    self._conn.execute(
+                        "INSERT INTO ppc "
+                        "(ppc_id, model_id, participant_id, statistic_name, condition, observed, "
+                        "simulated_mean, simulated_q025, simulated_q975, n_sims) "
+                        "VALUES (nextval('ppc_id_seq'),?,?,?,?,?,?,?,?,?)",
+                        [
+                            model_id_map[row[0]],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                            row[6],
+                            row[7],
+                            row[8],
+                        ],
+                    )
+
+                for row in block_residual_rows:
+                    self._conn.execute(
+                        "INSERT INTO block_residuals "
+                        "(id, model_id, participant_id, block_idx, block_start, block_end, "
+                        "mean_nll_per_trial, n_trials) VALUES (nextval('block_res_id_seq'),?,?,?,?,?,?,?)",
+                        [
+                            model_id_map[row[0]],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                            row[6],
+                        ],
+                    )
+
+                for row in validation_error_rows:
+                    self._conn.execute(
+                        "INSERT INTO validation_errors "
+                        "(error_id, model_id, error_type, error_message, error_details) "
+                        "VALUES (nextval('validation_errors_id_seq'),?,?,?,?)",
+                        [model_id_map[row[0]], row[1], row[2], row[3]],
+                    )
+
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     # ------------------------------------------------------------------ #
     # Low-level helpers
     # ------------------------------------------------------------------ #

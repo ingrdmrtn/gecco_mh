@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing as mp
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -35,11 +36,25 @@ def _load_dashboard_module(module_name: str, relative_path: str):
     return module
 
 
+def _load_project_module(module_name: str, relative_path: str):
+    """Load a project module directly from its file path."""
+    module_path = PROJECT_ROOT / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 dashboard_data_adapter = _load_dashboard_module(
     "phase5_dashboard_data_adapter", "dashboard/data_adapter.py"
 )
 dashboard_config = _load_dashboard_module(
     "phase5_dashboard_config", "dashboard/config.py"
+)
+test_fit_model_script = _load_project_module(
+    "phase5_test_fit_model", "scripts/test_fit_model.py"
 )
 
 
@@ -142,7 +157,7 @@ def test_runtime_iteration_history_counts_use_per_iteration_fields(
     assert row == {"n_clients_complete": 1, "n_clients_with_models": 1}
 
 
-def test_fit_baseline_if_needed_writes_only_to_registry_and_never_touches_baseline_json(
+def test_fit_baseline_if_needed_writes_only_to_registry_and_never_touches_baseline_duckdb(
     registry: SharedRegistry, tmp_path: Path
 ):
     """Baseline runtime state should be stored only in DuckDB."""
@@ -173,14 +188,14 @@ def test_fit_baseline_if_needed_writes_only_to_registry_and_never_touches_baseli
 
     assert result is not None
     assert registry.read()["baseline"]["metric_value"] == pytest.approx(12.5)
-    assert not any(tmp_path.rglob("baseline.json"))
-    assert not any(tmp_path.rglob("baseline.lock"))
+    assert not any(tmp_path.rglob("baseline.duckdb"))
+    assert not any(tmp_path.rglob("baseline.duckdb.lock"))
 
 
-def test_fit_baseline_if_needed_is_single_fit_under_concurrency(
+def test_fit_baseline_if_needed_is_single_fit_under_process_contention(
     registry: SharedRegistry,
 ):
-    """Only one client should perform the baseline fit under contention."""
+    """Only one process should perform the baseline fit under contention."""
     cfg = SimpleNamespace(
         baseline=SimpleNamespace(model="def baseline_model(data):\n    return data"),
         llm=SimpleNamespace(template_model=None),
@@ -193,34 +208,166 @@ def test_fit_baseline_if_needed_is_single_fit_under_concurrency(
         "eval_metrics": [1.0],
         "participant_n_trials": [5],
     }
-    call_count = 0
+
+    ctx = mp.get_context("fork")
+    call_count = ctx.Value("i", 0)
 
     def _slow_fit(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
+        with call_count.get_lock():
+            call_count.value += 1
         time.sleep(0.1)
         return fit_result
+
+    barrier = ctx.Barrier(5)
+    results_queue = ctx.Queue()
+
+    def _worker() -> None:
+        try:
+            barrier.wait()
+            local_registry = SharedRegistry.open_existing(registry.registry_path)
+            result = fit_baseline_if_needed(
+                cfg=cfg,
+                df_train=df_train,
+                registry=local_registry,
+                id_eval_data=None,
+            )
+            results_queue.put(("ok", result))
+        except Exception as exc:  # pragma: no cover - surfaced via queue assertions
+            results_queue.put(("error", repr(exc)))
 
     with patch(
         "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
         side_effect=_slow_fit,
     ):
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            results = list(
-                executor.map(
-                    lambda _: fit_baseline_if_needed(
-                        cfg=cfg,
-                        df_train=df_train,
-                        registry=registry,
-                        id_eval_data=None,
-                    ),
-                    range(4),
-                )
-            )
+        processes = [ctx.Process(target=_worker) for _ in range(4)]
+        for process in processes:
+            process.start()
 
-    assert call_count == 1
-    assert all(result is not None for result in results)
+        barrier.wait()
+
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+    results = [results_queue.get(timeout=1) for _ in range(4)]
+    assert all(status == "ok" for status, _ in results)
+    assert all(result is not None for _, result in results)
+
+    assert call_count.value == 1
     assert registry.read()["baseline"]["metric_value"] == pytest.approx(12.5)
+
+
+def test_run_test_evaluation_opens_existing_registry_read_only(tmp_path: Path, monkeypatch):
+    """The test-evaluation pipeline must open the provided registry snapshot read-only."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    (project_root / "results").mkdir(parents=True)
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "custom_results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=0),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {"iteration_history": [], "baseline": {}}
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "collect_candidates", return_value=[]):
+                with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                    registry_cls.open_existing.return_value = fake_registry
+                    registry_cls.side_effect = AssertionError("constructor path must not be used")
+
+                    result = test_eval.run_test_evaluation(
+                        config="unused",
+                        results_dir=str(results_dir),
+                        write_store=False,
+                    )
+
+    registry_cls.open_existing.assert_called_once_with(registry_path)
+    assert result is None
+
+
+def test_run_test_evaluation_does_not_use_default_results_dir(tmp_path: Path, monkeypatch):
+    """A stale default results location must not be reused in place of the explicit run."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    default_results_dir = project_root / "results" / "test-evaluation"
+    default_results_dir.mkdir(parents=True)
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "explicit_results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=0),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {"iteration_history": [], "baseline": {}}
+
+    def _open_existing(path):
+        assert path == registry_path
+        assert path != default_results_dir / "shared_registry.duckdb"
+        return fake_registry
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "collect_candidates", return_value=[]):
+                with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                    registry_cls.open_existing.side_effect = _open_existing
+                    registry_cls.side_effect = AssertionError("constructor path must not be used")
+
+                    result = test_eval.run_test_evaluation(
+                        config="unused",
+                        results_dir=str(results_dir),
+                        write_store=False,
+                    )
+
+    registry_cls.open_existing.assert_called_once_with(registry_path)
+    registry_cls.assert_not_called()
+    assert default_results_dir.exists()
+    assert result is None
+
+
+def test_test_fit_model_uses_shared_registry_duckdb(tmp_path: Path):
+    """The script helper should read candidate code from the DuckDB registry."""
+    results_dir = tmp_path / "script_results"
+    results_dir.mkdir()
+    (results_dir / "shared_registry.duckdb").touch()
+
+    registry_snapshot = {
+        "iteration_history": [
+            {
+                "client_id": 0,
+                "iteration": 0,
+                "results": [
+                    {
+                        "function_name": "candidate_model",
+                        "metric_name": "BIC",
+                        "metric_value": 12.3,
+                        "code": "def candidate_model():\n    return 1",
+                    }
+                ],
+            }
+        ]
+    }
+
+    with patch.object(test_fit_model_script, "SharedRegistry") as registry_cls:
+        registry_cls.open_existing.return_value.read.return_value = registry_snapshot
+        code = test_fit_model_script.load_code_from_registry(results_dir)
+
+    registry_cls.open_existing.assert_called_once_with(results_dir / "shared_registry.duckdb")
+    assert code == "def candidate_model():\n    return 1"
 
 
 def test_baseline_read_after_initial_fit_uses_registry_state(
@@ -334,7 +481,7 @@ def test_available_tasks_detects_duckdb_registry_files(tmp_path: Path):
     (results_root / "task_a").mkdir(parents=True)
     (results_root / "task_b").mkdir(parents=True)
     (results_root / "task_a" / "shared_registry.duckdb").touch()
-    (results_root / "task_b" / "legacy_registry.json").touch()
+    (results_root / "task_b" / "legacy_registry.txt").touch()
 
     with patch.object(dashboard_config, "project_root", return_value=tmp_path):
         tasks = dashboard_config.available_tasks()

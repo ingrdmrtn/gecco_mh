@@ -9,7 +9,7 @@ Call :func:`create_schema` on a fresh DuckDB connection to initialise the
 database.
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CREATE_STATEMENTS = [
     # ------------------------------------------------------------------ #
@@ -204,11 +204,13 @@ CREATE_STATEMENTS = [
     """,
     """
     CREATE TABLE IF NOT EXISTS runtime_iteration_history (
-        client_id    VARCHAR NOT NULL,
-        iteration    INTEGER NOT NULL,
-        results      JSON,
-        created_at   VARCHAR,
-        updated_at   VARCHAR,
+        client_id            VARCHAR NOT NULL,
+        iteration            INTEGER NOT NULL,
+        results              JSON,
+        status               VARCHAR,
+        had_runnable_model   BOOLEAN,
+        created_at           VARCHAR,
+        updated_at           VARCHAR,
         PRIMARY KEY (client_id, iteration)
     )
     """,
@@ -283,16 +285,15 @@ CREATE_STATEMENTS = [
     ),
     client_counts AS (
         SELECT
-            h.iteration,
+            iteration,
             COUNT(*) FILTER (
-                WHERE c.status IN ('complete', 'complete_no_success')
+                WHERE status IN ('complete', 'complete_no_success')
             ) AS n_clients_complete,
             COUNT(*) FILTER (
-                WHERE COALESCE(c.had_runnable_model, FALSE)
+                WHERE COALESCE(had_runnable_model, FALSE)
             ) AS n_clients_with_models
         FROM runtime_iteration_history h
-        LEFT JOIN runtime_client_entries c ON c.client_id = h.client_id
-        GROUP BY h.iteration
+        GROUP BY iteration
     )
     SELECT
         i.iteration,
@@ -320,13 +321,13 @@ CREATE_STATEMENTS = [
 ]
 
 
-def create_schema(conn) -> None:
-    """Initialise all tables in *conn* (idempotent)."""
+def create_schema(connection) -> None:
+    """Initialise all tables in *connection* (idempotent)."""
     for stmt in CREATE_STATEMENTS:
-        conn.execute(stmt.strip())
+        connection.execute(stmt.strip())
 
-    version_row = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+    version_row = connection.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
     if version_row == 0:
-        conn.execute("INSERT INTO schema_version VALUES (?)", [SCHEMA_VERSION])
+        connection.execute("INSERT INTO schema_version VALUES (?)", [SCHEMA_VERSION])
     else:
-        conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])
+        connection.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])

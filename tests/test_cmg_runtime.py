@@ -7,6 +7,8 @@ import pytest
 
 from gecco.artifacts import ArtifactStore
 from gecco.candidate_evaluation import CandidateEvaluator
+from gecco.candidate_generation import CandidateGenerator
+from gecco.coordination import SharedRegistry
 from gecco.run_context import RunContext
 from gecco.run_gecco import GeCCoModelSearch
 
@@ -21,7 +23,7 @@ def _make_cmg_cfg(enabled=True, generator_client="generator", n_models=2):
 
 def _make_search(client_id=None, cfg=None):
     mock_cfg = cfg or SimpleNamespace(
-        judge=SimpleNamespace(orchestrated=True),
+        judge=SimpleNamespace(capabilities=[]),
         clients={},
     )
     search = MagicMock(spec=GeCCoModelSearch)
@@ -46,7 +48,10 @@ def test_cmg_config_disabled():
 
 def test_cmg_config_enabled():
     cmg = _make_cmg_cfg()
-    cfg = SimpleNamespace(centralized_model_generation=cmg, judge=SimpleNamespace(orchestrated=True))
+    cfg = SimpleNamespace(
+        centralized_model_generation=cmg,
+        judge=SimpleNamespace(capabilities=[]),
+    )
     search = _make_search(cfg=cfg)
     result = search._cmg_config()
     assert result is not None
@@ -65,6 +70,64 @@ def test_cmg_is_generator_mismatch():
     cmg = _make_cmg_cfg(generator_client="generator")
     search = _make_search(client_id="evaluator_1")
     assert search._cmg_is_generator(cmg) is False
+
+
+def test_cmg_generator_profile_lookup_supports_dict_backed_clients(tmp_path):
+    """CMG generator lookup should honour dict-backed client profiles."""
+    artifact_store = MagicMock()
+    artifact_store.write_candidate_artifacts.return_value = tmp_path / "candidate.py"
+    generator = CandidateGenerator(artifact_store)
+    prompt_builder = MagicMock()
+    prompt_builder.build_naive_prompt.return_value = "naive prompt"
+    prompt_builder.build_input_prompt.return_value = "translated prompt"
+
+    generate_text = MagicMock(return_value="psychological hypothesis")
+
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(provider="mock-provider"),
+        clients={
+            "generator": {
+                "naive_ideation": {
+                    "enabled": True,
+                    "persona": "dict persona",
+                    "translation_preamble": "dict translation",
+                }
+            }
+        },
+    )
+
+    with patch("gecco.candidate_generation.get_provider_spec") as mock_provider_spec:
+        mock_provider_spec.return_value = SimpleNamespace(supports_system_prompt=True)
+        with patch.object(
+            CandidateGenerator,
+            "generate_models",
+            autospec=True,
+            return_value=("code", [{"name": "cognitive_model1"}]),
+        ) as mock_generate_models:
+            result = generator.generate_non_cmg_iteration(
+                iteration=0,
+                run_idx=0,
+                feedback="",
+                n_models=1,
+                cfg=cfg,
+                tag="",
+                prompt_builder=prompt_builder,
+                generate_text=generate_text,
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                client_id="generator",
+            )
+
+    assert generate_text.call_args.kwargs["system_prompt"] == "dict persona"
+    prompt_builder.build_input_prompt.assert_called_once_with(
+        feedback_text="",
+        naive_idea="psychological hypothesis",
+        translation_preamble="dict translation",
+        n_models=1,
+        force_include_feedback=False,
+    )
+    assert mock_generate_models.call_args.kwargs["prompt"] == "translated prompt"
+    assert result.code_text == "code"
 
 
 
@@ -111,20 +174,22 @@ def test_evaluator_index_none_n_models():
 # --- _validate_repaired_func_name ---
 
 @pytest.fixture
-def search_with_cfg():
-    """Return a GeCCoModelSearch-like object with a minimal cfg for build_model_spec."""
+def evaluator_with_store(tmp_path):
+    """Return a CandidateEvaluator with a minimal artefact boundary."""
+
     cfg = SimpleNamespace(
+        task=SimpleNamespace(name="cmg_runtime"),
         evaluation=SimpleNamespace(metric="bic"),
     )
-    search = MagicMock(spec=GeCCoModelSearch)
-    search.cfg = cfg
-    search._validate_repaired_func_name = GeCCoModelSearch._validate_repaired_func_name.__get__(
-        search, GeCCoModelSearch
-    )
-    return search
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    evaluator = CandidateEvaluator(ArtifactStore(run_context))
+    try:
+        yield evaluator
+    finally:
+        run_context.close()
 
 
-def test_validate_func_name_valid(search_with_cfg):
+def test_validate_func_name_valid(evaluator_with_store):
     """Valid code defining the expected function with proper params should pass."""
     code = """
 @njit
@@ -141,10 +206,10 @@ def cognitive_model1(action_1, state, action_2, reward, model_parameters):
         nll -= np.log(1.0 / 2)
     return nll
 """
-    assert search_with_cfg._validate_repaired_func_name(code, "cognitive_model1") is True
+    assert evaluator_with_store._validate_repaired_func_name(code, "cognitive_model1") is True
 
 
-def test_validate_func_name_wrong_name(search_with_cfg):
+def test_validate_func_name_wrong_name(evaluator_with_store):
     """Code defining a different function name should fail."""
     code = """
 @njit
@@ -161,10 +226,10 @@ def cognitive_model2(action_1, state, action_2, reward, model_parameters):
         nll -= np.log(1.0 / 2)
     return nll
 """
-    assert search_with_cfg._validate_repaired_func_name(code, "cognitive_model1") is False
+    assert evaluator_with_store._validate_repaired_func_name(code, "cognitive_model1") is False
 
 
-def test_validate_func_name_name_in_comment_only(search_with_cfg):
+def test_validate_func_name_name_in_comment_only(evaluator_with_store):
     """Code with expected name only in a comment should fail."""
     code = """
 # This is cognitive_model1
@@ -182,17 +247,17 @@ def cognitive_model2(action_1, state, action_2, reward, model_parameters):
         nll -= np.log(1.0 / 2)
     return nll
 """
-    assert search_with_cfg._validate_repaired_func_name(code, "cognitive_model1") is False
+    assert evaluator_with_store._validate_repaired_func_name(code, "cognitive_model1") is False
 
 
-def test_validate_func_name_syntax_error(search_with_cfg):
+def test_validate_func_name_syntax_error(evaluator_with_store):
     """Malformed code should fail."""
     code = """
 @njit
 def cognitive_model1(action_1, state, action_2, reward
     return 0.0
 """
-    assert search_with_cfg._validate_repaired_func_name(code, "cognitive_model1") is False
+    assert evaluator_with_store._validate_repaired_func_name(code, "cognitive_model1") is False
 
 
 # --- _validate_cmg_runtime (numeric generator rejection) ---
@@ -213,7 +278,7 @@ def test_runtime_numeric_generator_rejected():
     cmg = _make_cmg_cfg(generator_client="0")
     cfg = SimpleNamespace(
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True),
+        judge=SimpleNamespace(capabilities=[]),
     )
     search = _make_runtime_validatable(client_id=0, cfg=cfg)
     with pytest.raises(ValueError, match="named profile"):
@@ -225,22 +290,22 @@ def test_runtime_named_generator_accepted():
     cmg = _make_cmg_cfg(generator_client="generator")
     cfg = SimpleNamespace(
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True),
+        judge=SimpleNamespace(capabilities=[]),
     )
     search = _make_runtime_validatable(client_id="generator", cfg=cfg)
     # Should not raise
     search._validate_cmg_runtime(cmg)
 
 
-def test_runtime_missing_judge_orchestrated():
-    """CMG requires judge.orchestrated to be True."""
+def test_runtime_missing_judge_configuration():
+    """CMG requires validated judge configuration, not a retired flag."""
     cmg = _make_cmg_cfg(generator_client="generator")
     cfg = SimpleNamespace(
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=False),
+        judge=None,
     )
     search = _make_runtime_validatable(client_id="generator", cfg=cfg)
-    with pytest.raises(ValueError, match="judge.orchestrated"):
+    with pytest.raises(ValueError, match="judge configuration"):
         search._validate_cmg_runtime(cmg)
 
 
@@ -249,7 +314,7 @@ def test_runtime_missing_shared_registry():
     cmg = _make_cmg_cfg(generator_client="generator")
     cfg = SimpleNamespace(
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True),
+        judge=SimpleNamespace(capabilities=[]),
     )
     search = MagicMock(spec=GeCCoModelSearch)
     search.cfg = cfg
@@ -371,7 +436,7 @@ def test_run_n_shots_generator_resume_uses_generator_helper():
         task=SimpleNamespace(name="test"),
         loop=SimpleNamespace(max_iterations=0),
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True, barrier=SimpleNamespace(client_wait_seconds=1)),
+        judge=SimpleNamespace(capabilities=[], barrier=SimpleNamespace(client_wait_seconds=1)),
         evaluation=SimpleNamespace(fit_type="group", metric="bic"),
         llm=SimpleNamespace(provider="openai", models_per_iteration=1),
         clients=SimpleNamespace(),
@@ -425,7 +490,7 @@ def test_run_n_shots_evaluator_resume_uses_per_client_helper():
         task=SimpleNamespace(name="test"),
         loop=SimpleNamespace(max_iterations=0),
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True, barrier=SimpleNamespace(client_wait_seconds=1)),
+        judge=SimpleNamespace(capabilities=[], barrier=SimpleNamespace(client_wait_seconds=1)),
         evaluation=SimpleNamespace(fit_type="group", metric="bic"),
         llm=SimpleNamespace(provider="openai", models_per_iteration=1),
         clients=SimpleNamespace(),
@@ -479,7 +544,7 @@ def test_run_n_shots_respects_max_iterations_on_resume():
         task=SimpleNamespace(name="test"),
         loop=SimpleNamespace(max_iterations=2),
         centralized_model_generation=cmg,
-        judge=SimpleNamespace(orchestrated=True, barrier=SimpleNamespace(client_wait_seconds=1)),
+        judge=SimpleNamespace(capabilities=[], barrier=SimpleNamespace(client_wait_seconds=1)),
         evaluation=SimpleNamespace(fit_type="group", metric="bic"),
         llm=SimpleNamespace(provider="openai", models_per_iteration=1),
         clients=SimpleNamespace(),
@@ -529,69 +594,153 @@ def test_run_n_shots_respects_max_iterations_on_resume():
     assert processed_iterations == [1]
 
 
-# --- _is_cmg_repairable_error (Chunk 2) ---
+def test_run_n_shots_preserves_terminal_no_success_status(tmp_path):
+    """CMG evaluator exit should not overwrite terminal no-success status."""
 
-def _make_search_with_repairable():
+    cmg = _make_cmg_cfg(generator_client="generator", n_models=1)
     cfg = SimpleNamespace(
-        data=SimpleNamespace(input_columns=["action_1", "state", "action_2", "reward"]),
+        task=SimpleNamespace(name="cmg_runtime"),
+        loop=SimpleNamespace(max_iterations=1),
+        centralized_model_generation=cmg,
+        judge=SimpleNamespace(capabilities=[], barrier=SimpleNamespace(client_wait_seconds=1)),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(provider="openai", models_per_iteration=1),
+        clients=SimpleNamespace(),
     )
+
     search = MagicMock(spec=GeCCoModelSearch)
     search.cfg = cfg
-    search._is_cmg_repairable_error = GeCCoModelSearch._is_cmg_repairable_error.__get__(
-        search, GeCCoModelSearch
-    )
-    search._smoke_test_model_return_value = GeCCoModelSearch._smoke_test_model_return_value.__get__(
-        search, GeCCoModelSearch
-    )
-    return search
+    search.client_id = 0
+    search.shared_registry = SharedRegistry(tmp_path / "shared_registry.duckdb")
+    search.shared_registry.mark_complete = MagicMock()
+    search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
+    search.df = SimpleNamespace()
+    search.df_val = None
+    search.best_model = None
+    search.best_metric = float("inf")
+    search.best_iter = -1
+    search.best_params = []
+    search.feedback = MagicMock()
+    search.feedback.history = []
+    search.feedback.record_iteration = MagicMock()
+    search.tried_param_sets = []
+    search.results_dir = tmp_path / "results"
+    search._file_tag = MagicMock(return_value="")
+    search._sync_from_registry = MagicMock()
+    search._set_activity = MagicMock()
+    search._sync_best_attrs_from_state = MagicMock()
+    search._cmg_config = GeCCoModelSearch._cmg_config.__get__(search, GeCCoModelSearch)
+    search._cmg_is_generator = GeCCoModelSearch._cmg_is_generator.__get__(search, GeCCoModelSearch)
+    search._cmg_evaluator_index = GeCCoModelSearch._cmg_evaluator_index.__get__(search, GeCCoModelSearch)
+    search._validate_cmg_runtime = GeCCoModelSearch._validate_cmg_runtime.__get__(search, GeCCoModelSearch)
+    search._require_distributed_coordinator = GeCCoModelSearch._require_distributed_coordinator.__get__(search, GeCCoModelSearch)
+    search._run_cmg_generator_iteration = MagicMock()
+
+    def _fake_run_cmg_evaluator_iteration(it, run_idx, feedback, cmg_cfg, baseline_bic):
+        search.shared_registry.update(
+            client_id=0,
+            iteration=it,
+            results=[
+                {
+                    "function_name": "model_a",
+                    "metric_name": "VALIDATION_ERROR",
+                    "metric_value": float("inf"),
+                    "param_names": [],
+                    "code": "def model_a():\n    return 0",
+                }
+            ],
+            status="complete_no_success",
+            had_runnable_model=False,
+        )
+
+    search._run_cmg_evaluator_iteration = _fake_run_cmg_evaluator_iteration
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    search.run_n_shots(0, None)
+
+    snapshot = search.shared_registry.read()
+
+    assert snapshot["client_entries"]["0"]["status"] == "complete_no_success"
+    assert snapshot["client_entries"]["0"]["had_runnable_model"] is False
+    search.shared_registry.mark_complete.assert_not_called()
 
 
-def test_recovery_simulation_failure_is_repairable():
+# --- _is_cmg_repairable_error (Chunk 2) ---
+
+def _make_search_with_repairable(tmp_path):
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=["action_1", "state", "action_2", "reward"]),
+        llm=SimpleNamespace(
+            abstract_base_model="""\
+class CognitiveModelBase:
+    pass
+
+def make_cognitive_model(model_cls):
+    def cognitive_model(action_1, state, action_2, reward, model_parameters):
+        return model_cls().compute_nll(action_1, state, action_2, reward, model_parameters)
+    return cognitive_model
+""",
+        ),
+    )
+    run_context = RunContext.from_cfg(
+        SimpleNamespace(task=SimpleNamespace(name="cmg_runtime"), evaluation=SimpleNamespace(metric="bic")),
+        project_root=tmp_path,
+    )
+    evaluator = CandidateEvaluator(ArtifactStore(run_context))
+    return evaluator, cfg, run_context
+
+
+def test_recovery_simulation_failure_is_repairable(tmp_path):
     """RECOVERY_FAILED with simulation_error and 0 successes should be repairable."""
-    search = _make_search_with_repairable()
+    evaluator, _, run_context = _make_search_with_repairable(tmp_path)
     result = {
         "metric_name": "RECOVERY_FAILED",
         "simulation_error": "TypeError: bad operand type for unary -: 'NoneType'",
         "recovery_n_successful": 0,
     }
-    assert search._is_cmg_repairable_error(result) is True
+    assert evaluator._is_repairable_error(result) is True
+    run_context.close()
 
 
-def test_poor_recovery_is_not_repairable():
+def test_poor_recovery_is_not_repairable(tmp_path):
     """RECOVERY_FAILED without simulation_error and with some successes is not repairable."""
-    search = _make_search_with_repairable()
+    evaluator, _, run_context = _make_search_with_repairable(tmp_path)
     result = {
         "metric_name": "RECOVERY_FAILED",
         "simulation_error": None,
         "recovery_n_successful": 50,
         "recovery_r": 0.1,
     }
-    assert search._is_cmg_repairable_error(result) is False
+    assert evaluator._is_repairable_error(result) is False
+    run_context.close()
 
 
-def test_validation_error_is_repairable():
+def test_validation_error_is_repairable(tmp_path):
     """VALIDATION_ERROR should still be repairable."""
-    search = _make_search_with_repairable()
-    assert search._is_cmg_repairable_error({"metric_name": "VALIDATION_ERROR"}) is True
+    evaluator, _, run_context = _make_search_with_repairable(tmp_path)
+    assert evaluator._is_repairable_error({"metric_name": "VALIDATION_ERROR"}) is True
+    run_context.close()
 
 
-def test_fit_error_is_repairable():
+def test_fit_error_is_repairable(tmp_path):
     """FIT_ERROR should still be repairable."""
-    search = _make_search_with_repairable()
-    assert search._is_cmg_repairable_error({"metric_name": "FIT_ERROR"}) is True
+    evaluator, _, run_context = _make_search_with_repairable(tmp_path)
+    assert evaluator._is_repairable_error({"metric_name": "FIT_ERROR"}) is True
+    run_context.close()
 
 
-def test_none_result_is_not_repairable():
+def test_none_result_is_not_repairable(tmp_path):
     """None result should not be repairable."""
-    search = _make_search_with_repairable()
-    assert search._is_cmg_repairable_error(None) is False
+    evaluator, _, run_context = _make_search_with_repairable(tmp_path)
+    assert evaluator._is_repairable_error(None) is False
+    run_context.close()
 
 
 # --- _smoke_test_model_return_value (Chunk 4) ---
 
-def test_smoke_test_catches_none():
+def test_smoke_test_catches_none(tmp_path):
     """A model returning None should produce an error string."""
-    search = _make_search_with_repairable()
+    evaluator, cfg, run_context = _make_search_with_repairable(tmp_path)
 
     def bad_model(action_1, state, action_2, reward, model_parameters):
         return None
@@ -601,14 +750,15 @@ def test_smoke_test_catches_none():
         param_names=["alpha"],
         bounds={"alpha": [0, 1]},
     )
-    error = search._smoke_test_model_return_value(spec)
+    error = evaluator._smoke_test_model_return_value(spec, cfg)
     assert error is not None
     assert "returned None" in error
+    run_context.close()
 
 
-def test_smoke_test_catches_non_numeric():
+def test_smoke_test_catches_non_numeric(tmp_path):
     """A model returning a non-numeric string should produce an error string."""
-    search = _make_search_with_repairable()
+    evaluator, cfg, run_context = _make_search_with_repairable(tmp_path)
 
     def bad_model(action_1, state, action_2, reward, model_parameters):
         return "not a number"
@@ -618,14 +768,15 @@ def test_smoke_test_catches_non_numeric():
         param_names=["alpha"],
         bounds={"alpha": [0, 1]},
     )
-    error = search._smoke_test_model_return_value(spec)
+    error = evaluator._smoke_test_model_return_value(spec, cfg)
     assert error is not None
     assert "non-numeric" in error
+    run_context.close()
 
 
-def test_smoke_test_catches_non_finite():
+def test_smoke_test_catches_non_finite(tmp_path):
     """A model returning inf should produce an error string."""
-    search = _make_search_with_repairable()
+    evaluator, cfg, run_context = _make_search_with_repairable(tmp_path)
 
     def bad_model(action_1, state, action_2, reward, model_parameters):
         return float("inf")
@@ -635,14 +786,15 @@ def test_smoke_test_catches_non_finite():
         param_names=["alpha"],
         bounds={"alpha": [0, 1]},
     )
-    error = search._smoke_test_model_return_value(spec)
+    error = evaluator._smoke_test_model_return_value(spec, cfg)
     assert error is not None
     assert "non-finite" in error
+    run_context.close()
 
 
-def test_smoke_test_accepts_numeric_return():
+def test_smoke_test_accepts_numeric_return(tmp_path):
     """A model returning a finite numeric value should pass the smoke test."""
-    search = _make_search_with_repairable()
+    evaluator, cfg, run_context = _make_search_with_repairable(tmp_path)
 
     def good_model(action_1, state, action_2, reward, model_parameters):
         return 1.23
@@ -652,5 +804,49 @@ def test_smoke_test_accepts_numeric_return():
         param_names=["alpha"],
         bounds={"alpha": [0, 1]},
     )
-    error = search._smoke_test_model_return_value(spec)
+    error = evaluator._smoke_test_model_return_value(spec, cfg)
     assert error is None
+    run_context.close()
+
+
+def test_validate_func_name_class_based_candidate_uses_context(evaluator_with_store):
+    """Class-based repaired candidates should validate with config-backed context."""
+
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(
+            abstract_base_model="""\
+class CognitiveModelBase:
+    pass
+
+def make_cognitive_model(model_cls):
+    def wrapper(action_1, state, action_2, reward, model_parameters):
+        return model_cls().compute_nll(action_1, state, action_2, reward, model_parameters)
+    return wrapper
+"""
+        )
+    )
+    code = """
+class ParticipantModel1(CognitiveModelBase):
+    \"\"\"Bounds:\nalpha: [0, 1]\"\"\"
+
+    def compute_nll(self, action_1, state, action_2, reward, model_parameters):
+        alpha, = model_parameters
+        return float(alpha)
+
+@njit
+def cognitive_model1(action_1, state, action_2, reward, model_parameters):
+    return ParticipantModel1().compute_nll(
+        action_1,
+        state,
+        action_2,
+        reward,
+        model_parameters,
+    )
+"""
+
+    assert evaluator_with_store._validate_repaired_func_name(
+        code,
+        "cognitive_model1",
+        cfg=cfg,
+        structured_params=[{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
+    ) is True

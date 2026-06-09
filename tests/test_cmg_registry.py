@@ -1,7 +1,6 @@
 """Tests for DuckDB-backed centralized model generation registry methods."""
 
 import os
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -12,15 +11,11 @@ from gecco.coordination import SharedRegistry
 
 
 @pytest.fixture
-def registry():
+def registry(tmp_path):
     """Create a temporary registry for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        registry_path = f.name
+    registry_path = tmp_path / "shared_registry.duckdb"
     reg = SharedRegistry(registry_path)
     yield reg
-    for path in (Path(registry_path), reg.db_path, reg.lock_path):
-        if path.exists():
-            path.unlink()
 
 
 def test_empty_registry_has_cmg_keys():
@@ -97,9 +92,9 @@ def test_wait_for_candidate_models_timeout(registry):
     assert result is None
 
 
-def test_registry_initialises_duckdb_state_without_json_payload(tmp_path):
+def test_registry_initialises_duckdb_state_without_legacy_payload(tmp_path):
     """Initialisation should create a DuckDB-backed runtime store."""
-    registry_path = tmp_path / "registry.json"
+    registry_path = tmp_path / "shared_registry.duckdb"
     reg = SharedRegistry(registry_path)
 
     assert reg.db_path.exists()
@@ -271,7 +266,7 @@ def test_registry_round_trip_preserves_runtime_snapshot(registry):
 
 def test_registry_supports_restart_and_reload(tmp_path):
     """A new client instance should observe previously committed DuckDB state."""
-    registry_path = tmp_path / "registry.json"
+    registry_path = tmp_path / "shared_registry.duckdb"
     reg1 = SharedRegistry(registry_path)
     reg1.update(
         client_id="generator",
@@ -290,7 +285,7 @@ def test_registry_supports_restart_and_reload(tmp_path):
 
 def test_registry_concurrent_clients_share_single_canonical_store(tmp_path):
     """Concurrent clients should serialize writes through DuckDB-backed locking."""
-    registry_path = tmp_path / "registry.json"
+    registry_path = tmp_path / "shared_registry.duckdb"
 
     def _write(client_id: int) -> None:
         local_registry = SharedRegistry(registry_path)

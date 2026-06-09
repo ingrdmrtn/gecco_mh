@@ -25,6 +25,7 @@ class FeedbackArtifact(BaseModel):
         best_bic: Best score seen when the judge ran.
         tool_call_trace: Compact tool trace for auditability.
         full_trace: Full tool loop trace.
+        metadata: Structured provenance and shortcut metadata.
         per_angle: Structured angle analyses returned by synthesis.
         key_recommendations: Deduplicated recommendations across personas.
         synthesized_feedback: Final feedback keyed by persona name.
@@ -45,6 +46,7 @@ class FeedbackArtifact(BaseModel):
     best_bic: float | None = None
     tool_call_trace: list[dict[str, Any]] = Field(default_factory=list)
     full_trace: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     per_angle: list[dict[str, Any]] = Field(default_factory=list)
     key_recommendations: list[str] = Field(default_factory=list)
     synthesized_feedback: dict[str, str] = Field(default_factory=dict)
@@ -62,12 +64,80 @@ class FeedbackArtifact(BaseModel):
             persona_name: Preferred persona key.
 
         Returns:
-            The matching feedback string, or the default entry, or an empty string.
+            The matching feedback string, or the default entry, or an empty string
+            when the artifact has no feedback at all.
+
+        Raises:
+            ValueError: If feedback exists, but neither ``persona_name`` nor
+                ``default`` is available.
         """
-        return self.synthesized_feedback.get(
-            persona_name,
-            self.synthesized_feedback.get("default", ""),
-        )
+        if persona_name in self.synthesized_feedback:
+            return self.synthesized_feedback[persona_name]
+        if "default" in self.synthesized_feedback:
+            return self.synthesized_feedback["default"]
+        if self.synthesized_feedback:
+            available = ", ".join(sorted(self.synthesized_feedback))
+            raise ValueError(
+                f"No feedback available for persona '{persona_name}'. "
+                f"Available personas: {available}."
+            )
+        return ""
+
+
+def _normalise_clients(cfg: Any) -> dict[str, Any]:
+    """Return client configs as a plain mapping."""
+    clients = getattr(cfg, "clients", {}) or {}
+    if isinstance(clients, dict):
+        return dict(clients)
+    return {
+        name: getattr(clients, name)
+        for name in vars(clients).keys()
+        if not name.startswith("_")
+    }
+
+
+def _mapping_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a key from either a mapping or an attribute container."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _resolve_synthesis_personas(cfg: Any) -> dict[str, Any | None]:
+    """Resolve the personas that should receive synthesis output."""
+    clients = _normalise_clients(cfg)
+    cmg_cfg = getattr(cfg, "centralized_model_generation", None)
+    if getattr(cmg_cfg, "enabled", False):
+        generator_name = getattr(cmg_cfg, "generator_client", "generator")
+        return {generator_name: clients.get(generator_name)}
+    if judge_has_capability(cfg, "persona_synthesis") and clients:
+        return clients
+    return {"default": None}
+
+
+def _persona_suffix(persona_config: Any | None) -> str:
+    """Extract persona-specific synthesis guidance."""
+    llm_config = _mapping_get(persona_config, "llm")
+    if llm_config is None:
+        return ""
+    return _mapping_get(llm_config, "feedback_guidance") or _mapping_get(
+        llm_config, "system_prompt_suffix", ""
+    )
+
+
+def _coerce_feedback_map(
+    synthesized_feedback: dict[str, str] | str | None,
+    *,
+    default_persona: str = "default",
+) -> dict[str, str]:
+    """Normalise feedback into the canonical persona-keyed mapping."""
+    if isinstance(synthesized_feedback, dict):
+        return dict(synthesized_feedback)
+    if synthesized_feedback is None:
+        return {default_persona: ""}
+    return {default_persona: synthesized_feedback}
 
 
 def build_feedback_artifact(
@@ -135,6 +205,7 @@ def build_feedback_artifact(
         best_bic=analysis_data.get("best_bic"),
         tool_call_trace=analysis_data.get("trace", []),
         full_trace=analysis_data.get("full_trace", []),
+        metadata=dict(analysis_data.get("metadata", {}) or {}),
         per_angle=per_angle,
         key_recommendations=key_recommendations,
         synthesized_feedback=final_feedback,
@@ -213,67 +284,23 @@ def run_orchestrated_judge_pipeline(
 
     verdict_payloads: list[dict[str, Any]] = []
     if analysis_data.get("short_circuit"):
-        if getattr(getattr(cfg, "centralized_model_generation", None), "enabled", False):
-            generator_name = getattr(
-                getattr(cfg, "centralized_model_generation", None),
-                "generator_client",
-                "generator",
-            )
-            synthesized_feedback = {generator_name: analysis_data["analysis_text"]}
-        else:
-            synthesized_feedback = {"default": analysis_data["analysis_text"]}
+        verdict_payloads.extend(analysis_data.get("verdict_payloads", []) or [])
+        shortcut_verdict_payload = analysis_data.get("shortcut_verdict_payload")
+        if shortcut_verdict_payload:
+            verdict_payloads.append(shortcut_verdict_payload)
+        synthesized_feedback = _coerce_feedback_map(
+            analysis_data.get("synthesized_feedback", analysis_data.get("analysis_text"))
+        )
     else:
-        clients = getattr(cfg, "clients", {}) or {}
-        if not isinstance(clients, dict):
-            clients = {
-                name: getattr(clients, name)
-                for name in vars(clients).keys()
-                if not name.startswith("_")
-            }
-
         synthesized_feedback: dict[str, str] = {}
-        if getattr(getattr(cfg, "centralized_model_generation", None), "enabled", False):
-            generator_name = getattr(
-                getattr(cfg, "centralized_model_generation", None),
-                "generator_client",
-                "generator",
-            )
-            persona_config = clients.get(generator_name) if clients else None
-            persona_suffix = ""
-            if persona_config and hasattr(persona_config, "llm"):
-                persona_suffix = getattr(
-                    persona_config.llm, "feedback_guidance", None
-                ) or getattr(persona_config.llm, "system_prompt_suffix", "")
+        for persona_name, persona_config in _resolve_synthesis_personas(cfg).items():
             feedback_text, verdict_payload = judge.synthesize_for_persona(
                 analysis_data,
-                persona_name=generator_name,
-                persona_suffix=persona_suffix,
+                persona_name=persona_name,
+                persona_suffix=_persona_suffix(persona_config),
                 persona_config=persona_config,
             )
-            synthesized_feedback[generator_name] = feedback_text
-            verdict_payloads.append(verdict_payload)
-        elif clients:
-            for persona_name, persona_config in clients.items():
-                persona_suffix = ""
-                if persona_config and hasattr(persona_config, "llm"):
-                    persona_suffix = getattr(
-                        persona_config.llm, "feedback_guidance", None
-                    ) or getattr(persona_config.llm, "system_prompt_suffix", "")
-                feedback_text, verdict_payload = judge.synthesize_for_persona(
-                    analysis_data,
-                    persona_name=persona_name,
-                    persona_suffix=persona_suffix,
-                    persona_config=persona_config,
-                )
-                synthesized_feedback[persona_name] = feedback_text
-                verdict_payloads.append(verdict_payload)
-        else:
-            feedback_text, verdict_payload = judge.synthesize_for_persona(
-                analysis_data,
-                persona_name="default",
-                persona_suffix="",
-            )
-            synthesized_feedback["default"] = feedback_text
+            synthesized_feedback[persona_name] = feedback_text
             verdict_payloads.append(verdict_payload)
 
     artifact = build_feedback_artifact(

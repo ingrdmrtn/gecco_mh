@@ -32,7 +32,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 from rich.console import Console
@@ -256,7 +256,7 @@ and statistical model comparison. You are familiar with common pitfalls in model
 such as overfitting, underfitting, identifiability issues, and lack of psychological interpretability.
 
 Your task is to analyse the current state of the model search by querying a diagnostic \
-database through tool calls, then synthesise actionable feedback for the next iteration.
+database through tool calls, then synthesise feedback from the evidence you gathered.
 
 You will analyse from six angles — call tools to gather evidence for each:
 
@@ -267,8 +267,8 @@ any participants are outliers.
 
 2. **Parameter identifiability** — Check parameter recovery diagnostics for the best 2-3 \
 models, not just the top one. Identify which parameters are well-recovered across models \
-and which are problematic. Flag parameters with low recovery r and suggest whether they \
-should be removed or reparameterised.
+and which are problematic. Flag parameters with low recovery r and describe why they may \
+be unstable or hard to interpret.
 
 3. **Predictive adequacy** — Inspect PPC records if available. Compare PPC performance \
 across the best models — does one capture certain patterns better than another? Identify \
@@ -278,8 +278,9 @@ residuals to identify where in the task the model systematically underperforms.
 4. **Individual differences** — Compare R² across the best models. Which model's parameters \
 have the strongest individual-differences signal? Examine which parameters predict self-report \
 scores (R²). Also check whether the best-fitting model differs across participants; high \
-heterogeneity can indicate a need for hybrid or mixture mechanisms. Highlight parameters \
-with strong individual-differences signal and suggest building on them. \
+heterogeneity can indicate that different participants rely on different mechanisms. Highlight \
+parameters with strong individual-differences signal and note how that signal varies across \
+participants. \
 IMPORTANT — R² expectations for individual differences: because self-report measures are \
 noisy and only indirectly linked to task behaviour, R² values in this domain are typically \
 very low (0.01–0.10). An R² of 0.05 is a meaningful and promising signal, not a poor result. \
@@ -296,11 +297,8 @@ decision rules, memory, attention) have been tried across iterations? What has b
 
 After gathering evidence across all angles, produce:
 - A brief per-angle summary (findings + confidence).
-- A list of 3–5 concrete recommendations for the next iteration.
-- A synthesized_feedback paragraph (≤ 500 words) to improve the next iteration of \
-    model development.
-
-Be specific: cite model names, parameter names, BIC values, and r values from the data.
+- A synthesized_feedback paragraph (≤ 500 words) describing the main patterns and contrasts \
+in the current search.
 
 Quantify your confidence: If you do not have much data to support an angle, say so and \
 give a low confidence rating. If the evidence is strong, give a high confidence rating.
@@ -318,9 +316,9 @@ a soft cap; prefer depth on load-bearing findings over breadth for its own sake.
 ---
 
 If a previous iteration's verdict is included below, use it to:
-- Assess whether your prior recommendations were followed
+- Assess whether your prior guidance was followed
 - Identify whether BIC improved, stagnated, or regressed
-- Avoid repeating suggestions that were already given
+- Avoid repeating ideas that were already given
 - Focus on what's new or different this iteration
 
 ---
@@ -332,6 +330,23 @@ tool calls, or internal model IDs. Models must be described by their mechanisms 
 The feedback should be comparative — discuss multiple models' strengths and weaknesses.
 """
 
+
+def _build_judge_system_prompt(capabilities: list[str]) -> str:
+    """Return the judge system prompt tailored to enabled capabilities."""
+    prompt = _JUDGE_SYSTEM_PROMPT
+    extra_lines: list[str] = []
+    if "recommendations" in capabilities:
+        extra_lines.append(
+            "- A list of 3–5 concrete recommendations for the next iteration."
+        )
+    if "citations" in capabilities:
+        extra_lines.append(
+            "Be specific: cite model names, parameter names, BIC values, and r values from the data."
+        )
+    if extra_lines:
+        prompt += "\n\n" + "\n".join(extra_lines)
+    return prompt
+
 _JUDGE_USER_TEMPLATE = """The model search has just completed iteration {iteration}.
 Current best BIC: {best_bic}
 Total iterations so far: {n_iterations}
@@ -341,23 +356,6 @@ Iteration {iteration} summary:
 - Models this iteration: {n_total} total ({n_ok} fit, {n_failed} failed)
 - Best BIC this iteration: {best_iter_bic}
 - BIC trajectory: {trajectory_str}
-
-IMPORTANT — database conventions:
-- "iteration" and "run_idx" are different fields.  "iteration" is the search step \
-(currently {iteration}); "run_idx" is the client/run identifier ({run_idx}).  Do NOT \
-pass the iteration number as run_idx.  Most tools do not require run_idx — omit it \
-to query across all runs.
-- The best model is identified by its BIC value ({best_bic}).  Use get_best_models() \
-to find it in the database and obtain its model_id.  Do not search by name.
-
-Model naming convention: Each model has a `name` field (e.g., "rwg_alpha_beta") \
-set by the LLM that generated it. Names are NOT guaranteed unique across \
-iterations. When referring to models in your synthesized_feedback, describe \
-them by their mechanism AND include their name + BIC in parentheses, \
-e.g., "the model with separate learning rates for gains and losses \
-(separate_lr_gain_loss, BIC=2847)". The BIC disambiguates models that \
-share a name. Never use the numeric model_id (e.g., "model 5", "ID 11") — \
-the generator LLM cannot look up IDs.
 
 Please query the diagnostic database to analyse this iteration from all six angles, \
 then produce your verdict.
@@ -970,28 +968,7 @@ def _parse_verdict_from_text(
 # Synthesis prompt — second-pass structured extraction
 # ======================================================================
 
-_SYNTHESIS_PROMPT_TEMPLATE = """Based on your analysis above, please produce a final verdict as a JSON object with this exact structure:
-
-```json
-{{
-  "per_angle": [
-    {{
-      "angle": "<angle name>",
-      "findings": "...",
-      "confidence": "high"
-    }}
-  ],
-  "key_recommendations": [
-    "Recommendation 1...",
-    "Recommendation 2..."
-  ],
-  "synthesized_feedback": "Structured feedback (≤ 500 words) for the model-generating LLM.",
-  "cited_models": [
-    {{"name": "rwg_alpha_beta", "bic": 2847.2, "mechanism": "separate lr gain/loss"}},
-    {{"name": "base_rwg", "bic": 3102.1, "mechanism": "standard RW with single lr"}}
-  ]
-}}
-```
+_SYNTHESIS_PROMPT_TEMPLATE = """Based on your analysis above, please produce a final verdict as a JSON object.
 
 Include one entry in per_angle for each of the following {num_angles} analytical perspectives:
 {angles_list}
@@ -999,18 +976,81 @@ Include one entry in per_angle for each of the following {num_angles} analytical
 SYNTHESIZED_FEEDBACK FORMAT — The `synthesized_feedback` field must follow this structure:
 
 {feedback_format_instructions}
-If previous verdict context was provided, explicitly note whether prior suggestions were followed and whether they appeared to help.
 
 IMPORTANT PROHIBITIONS — Never reference:
 {prohibitions}
-
-{always_cite}
-
-The `cited_models` field must list every model you referenced by name in `synthesized_feedback`. \
-{cited_models_format} \
-This is used to verify citations against the database — only include models whose names you \
-actually found in tool results.
 """
+
+
+def _build_feedback_format_instructions(capabilities: list[str], profile: dict) -> str:
+    """Return synthesis formatting guidance for the active capability set."""
+    if "citations" not in capabilities:
+        instructions = [
+            "1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically.",
+            "2. **What partially worked** (2-3 sentences) — Compare models with mixed strengths and weaknesses.",
+            "3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them.",
+        ]
+        if "recommendations" in capabilities:
+            instructions.append(
+                "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as \"try X because Y\"."
+            )
+        return "\n\n".join(instructions)
+
+    feedback_format_instructions = profile["feedback_format_instructions"]
+    if "recommendations" not in capabilities:
+        feedback_format_instructions = re.sub(
+            r"\n\n4\. \*\*What to try next\*\*.*$",
+            "",
+            feedback_format_instructions,
+            flags=re.S,
+        )
+        feedback_format_instructions += (
+            "\n\nKeep the feedback descriptive and omit a dedicated next-step section."
+        )
+    return feedback_format_instructions
+
+
+def _build_synthesis_prompt(
+    capabilities: list[str],
+    profile: dict,
+    persona_name: str,
+    persona_suffix: str,
+    is_stuck: bool,
+) -> str:
+    """Build the second-pass synthesis prompt for the active capability set."""
+    angles_list = "\n".join(
+        f"{i + 1}. {name} — {desc}"
+        for i, (name, desc) in enumerate(profile["angles"])
+    )
+    prompt = _SYNTHESIS_PROMPT_TEMPLATE.format(
+        num_angles=len(profile["angles"]),
+        angles_list=angles_list,
+        feedback_format_instructions=_build_feedback_format_instructions(
+            capabilities, profile
+        ),
+        prohibitions=profile["prohibitions"],
+    )
+    if "recommendations" in capabilities:
+        prompt += (
+            "\n\nIf previous verdict context was provided, explicitly note whether prior suggestions were followed and whether they appeared to help."
+        )
+    if "recommendations" in capabilities:
+        prompt += (
+            "\n\nInclude a `key_recommendations` array with 3–5 concrete next-step ideas."
+        )
+    if "citations" in capabilities:
+        prompt += (
+            "\n\nIf you referenced specific models by name in `synthesized_feedback`, also include a `cited_models` array listing the exact names, the BIC values you cited, and a one-line mechanism description."
+        )
+    if persona_suffix:
+        prompt += f"\n\nPersona guidance for {persona_name}:\n{persona_suffix}"
+    if is_stuck and persona_name != "exploit":
+        prompt += (
+            "\n\nBecause search is stuck, your synthesized feedback MUST include "
+            "a directive to abandon the current best model and implement from scratch "
+            "with a mechanistically-novel approach."
+        )
+    return prompt
 
 # ===== Persona-specific synthesis profiles =====
 # Each profile customizes the analytical angles, terminology, and format for a specific persona.
@@ -1601,13 +1641,18 @@ class ToolUsingJudge:
                 # For short-circuit, we still need to return analysis structure
                 return {
                     "iteration": iteration,
-                    "analysis_text": shortcut.synthesized_feedback,
+                    "analysis_text": shortcut.get("analysis_text", ""),
+                    "synthesized_feedback": shortcut.get("synthesized_feedback", {}),
                     "trace": [],
                     "full_trace": [],
-                    "best_bic": best_metric,
+                    "best_bic": shortcut.get("best_bic", best_metric),
                     "is_stuck": False,
                     "trajectory": [],
                     "wall_time": 0.0,
+                    "metadata": shortcut.get("metadata", {}),
+                    "shortcut_verdict_payload": shortcut.get(
+                        "shortcut_verdict_payload", {}
+                    ),
                     "short_circuit": True,  # Flag to skip re-synthesis
                 }
 
@@ -1656,6 +1701,25 @@ class ToolUsingJudge:
             trajectory_str=trajectory_str,
         )
 
+        if "citations" in self.capabilities:
+            user_message += (
+                "\n\nIMPORTANT — database conventions:\n"
+                f"- \"iteration\" and \"run_idx\" are different fields.  \"iteration\" is the search step "
+                f"(currently {iteration}); \"run_idx\" is the client/run identifier ({run_idx}).  Do NOT "
+                "pass the iteration number as run_idx.  Most tools do not require run_idx — omit it "
+                "to query across all runs.\n"
+                f"- The best model is identified by its BIC value ({best_bic_str}).  Use get_best_models() "
+                "to find it in the database and obtain its model_id.  Do not search by name.\n\n"
+                "Model naming convention: Each model has a `name` field (e.g., \"rwg_alpha_beta\") "
+                "set by the LLM that generated it. Names are NOT guaranteed unique across "
+                "iterations. When referring to models in your synthesized_feedback, describe "
+                "them by their mechanism AND include their name + BIC in parentheses, "
+                "e.g., \"the model with separate learning rates for gains and losses "
+                "(separate_lr_gain_loss, BIC=2847)\". The BIC disambiguates models that "
+                "share a name. Never use the numeric model_id (e.g., \"model 5\", \"ID 11\") — "
+                "the generator LLM cannot look up IDs."
+            )
+
         # --- Stuck-search directive (R3: generic form for reuse across personas) ---
         if is_stuck:
             user_message += (
@@ -1676,12 +1740,27 @@ class ToolUsingJudge:
                 prev_recs = prev_verdict.get("key_recommendations", [])
                 # R8: Drop synthesized_feedback to avoid rhetorical carryover bias
                 rec_bullets = "".join(f"\n  - {r}" for r in prev_recs)
+                guidance_label = (
+                    "Key recommendations given"
+                    if "recommendations" in self.capabilities
+                    else "Prior guidance tracked"
+                )
+                guidance_text = (
+                    f":{rec_bullets}"
+                    if "recommendations" in self.capabilities
+                    else f": {len(prev_recs)} items"
+                )
                 user_message += (
                     f"\n\nPrevious iteration ({prev_iter}) verdict:\n"
                     f"- Best BIC at that time: {prev_bic_str}\n"
-                    f"- Key recommendations given:{rec_bullets}\n\n"
-                    "Use this to assess whether prior recommendations were followed, "
-                    "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
+                    f"- {guidance_label}{guidance_text}\n\n"
+                    + (
+                        "Use this to assess whether prior recommendations were followed, "
+                        "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
+                        if "recommendations" in self.capabilities
+                        else "Use this to assess whether prior guidance was followed, "
+                        "whether BIC improved/stagnated/regressed, and to avoid repeating ideas."
+                    )
                 )
 
         if _is_summary_only_capability_set(self.capabilities):
@@ -1720,9 +1799,10 @@ class ToolUsingJudge:
             )
 
         if self._tool_loop is not None:
+            system_prompt = _build_judge_system_prompt(self.capabilities)
             final_text, trace, full_trace = self._tool_loop.run(
                 self.store,
-                _JUDGE_SYSTEM_PROMPT,
+                system_prompt,
                 user_message,
                 self.max_tool_calls,
             )
@@ -1808,32 +1888,13 @@ class ToolUsingJudge:
             config_profile = getattr(persona_config, "profile", None)
             if config_profile is not None:
                 profile.update(_profile_from_config(config_profile, profile))
-        angles_list = "\n".join(
-            f"{i + 1}. {name} — {desc}"
-            for i, (name, desc) in enumerate(profile["angles"])
+        synthesis_prompt = _build_synthesis_prompt(
+            self.capabilities,
+            profile,
+            persona_name,
+            persona_suffix,
+            is_stuck,
         )
-        synthesis_prompt = _SYNTHESIS_PROMPT_TEMPLATE.format(
-            num_angles=len(profile["angles"]),
-            angles_list=angles_list,
-            metric_language=profile["metric_language"],
-            model_description_style=profile["model_description_style"],
-            feedback_format_instructions=profile["feedback_format_instructions"],
-            cited_models_format=profile["cited_models_format"],
-            prohibitions=profile["prohibitions"],
-            always_cite=profile["always_cite"],
-        )
-        if persona_suffix:
-            synthesis_prompt += (
-                f"\n\nPersona guidance for {persona_name}:\n{persona_suffix}"
-            )
-
-        # R3: If stuck, strengthen pivot directive for personas other than exploit
-        if is_stuck and persona_name != "exploit":
-            synthesis_prompt += (
-                "\n\nBecause search is stuck, your synthesized feedback MUST include "
-                "a directive to abandon the current best model and implement from scratch "
-                "with a mechanistically-novel approach."
-            )
 
         # Second pass: extract structured verdict
         if self.verbose:
@@ -1843,7 +1904,10 @@ class ToolUsingJudge:
             )
 
         structured_text = self._request_structured_verdict_with_suffix(
-            analysis_text, trace, synthesis_prompt
+            analysis_text,
+            trace,
+            synthesis_prompt,
+            _build_judge_system_prompt(self.capabilities),
         )
 
         wall_time = analysis_data.get("wall_time", 0)
@@ -1862,7 +1926,11 @@ class ToolUsingJudge:
         return verdict.synthesized_feedback, verdict.__dict__
 
     def _request_structured_verdict_with_suffix(
-        self, analysis_text: str, trace: list[dict], synthesis_prompt: str
+        self,
+        analysis_text: str,
+        trace: list[dict],
+        synthesis_prompt: str,
+        system_prompt: str,
     ) -> str:
         """R2: Ask the LLM to format analysis as structured JSON with custom synthesis prompt."""
         if self.verbose:
@@ -1871,7 +1939,7 @@ class ToolUsingJudge:
             )
 
         messages = [
-            {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "assistant", "content": analysis_text},
             {"role": "user", "content": synthesis_prompt},
         ]
@@ -1898,7 +1966,7 @@ class ToolUsingJudge:
                 from google.genai import types
             except ImportError:
                 from google.generativeai import types  # type: ignore
-            config_kwargs: dict = {"system_instruction": _JUDGE_SYSTEM_PROMPT}
+            config_kwargs: dict = {"system_instruction": system_prompt}
             if self.max_tokens:
                 config_kwargs["max_output_tokens"] = self.max_tokens
             if self.temperature is not None:
@@ -1922,7 +1990,7 @@ class ToolUsingJudge:
 
     def _load_previous_verdict(
         self, iteration: int, run_idx: int, tag: str
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Walk backwards through saved verdict files to find the most recent
         non-short-circuit verdict for this run, or return None.
 
@@ -1968,13 +2036,14 @@ class ToolUsingJudge:
         run_idx: int,
         tag: str,
         recovery_failures: list[dict],
-    ) -> JudgeVerdict | None:
+    ) -> dict[str, Any] | None:
         """Attempt to short-circuit the full judge analysis when the previous
         iteration only produced recovery failures.
 
         Walks backwards through saved judge verdict files to find the most recent
         "real" (non-short-circuit) verdict, then appends a note about the recovery
-        failures and returns a new JudgeVerdict reusing that verdict's content.
+        failures and returns a canonical shortcut payload reusing that verdict's
+        structured content.
 
         Returns None if no previous verdict can be found, or if the short-circuit
         is not applicable; the caller should fall through to the full analysis.
@@ -2033,54 +2102,55 @@ class ToolUsingJudge:
         )
         failure_note = "\n".join(failure_lines)
 
-        # --- Compose synthesised feedback ---
-        previous_feedback = source_verdict_data.get("synthesized_feedback", "")
-        combined_feedback = (
-            f"{failure_note}\n\n"
-            f"--- Previous verdict (state unchanged since iter {source_verdict_iter}) ---\n"
-            f"{previous_feedback}"
+        previous_feedback = source_verdict_data.get("synthesized_feedback", {})
+        if isinstance(previous_feedback, str):
+            previous_feedback = {"default": previous_feedback}
+        elif not isinstance(previous_feedback, dict):
+            previous_feedback = {"default": str(previous_feedback)}
+
+        combined_feedback = {
+            persona_name: (
+                f"{failure_note}\n\n"
+                f"--- Previous verdict (state unchanged since iter {source_verdict_iter}) ---\n"
+                f"{feedback_text}"
+            )
+            for persona_name, feedback_text in previous_feedback.items()
+        }
+        if not combined_feedback:
+            combined_feedback = {
+                "default": (
+                    f"{failure_note}\n\n"
+                    f"--- Previous verdict (state unchanged since iter {source_verdict_iter}) ---"
+                )
+            }
+
+        metadata = dict(source_verdict_data.get("metadata", {}) or {})
+        metadata.update(
+            {
+                "shortcut_reason": "recovery_failure",
+                "source_iteration": source_verdict_iter,
+                "recovery_failures": recovery_failures,
+            }
         )
 
-        # --- Construct verdict with source data ---
-        per_angle = [
-            AngleAnalysis(
-                angle=a.get("angle", ""),
-                findings=a.get("findings", ""),
-                supporting_tool_calls=a.get("supporting_tool_calls", []),
-                confidence=a.get("confidence", "medium"),
-            )
-            for a in source_verdict_data.get("per_angle", [])
-        ]
-
-        verdict = JudgeVerdict(
-            iteration=iteration,
-            per_angle=per_angle,
-            key_recommendations=source_verdict_data.get("key_recommendations", []),
-            synthesized_feedback=combined_feedback,
-            tool_call_count=0,
-            wall_time_seconds=0.1,  # Very small wall time for shortcut
-        )
-
-        # --- Save the shortcut trace ---
-        if self.results_dir:
-            self._save_trace(
-                verdict,
-                [],  # No tool calls
-                iteration,
-                run_idx,
-                tag,
-                extra_payload={
-                    "short_circuit": True,
-                    "source_iter": source_verdict_iter,
-                    "recovery_failures": recovery_failures,
-                },
-            )
-
-        return verdict
+        return {
+            "analysis_text": next(iter(combined_feedback.values()), ""),
+            "synthesized_feedback": combined_feedback,
+            "metadata": metadata,
+            "shortcut_verdict_payload": {
+                "per_angle": source_verdict_data.get("per_angle", []) or [],
+                "key_recommendations": source_verdict_data.get(
+                    "key_recommendations", []
+                )
+                or [],
+            },
+            "best_bic": source_verdict_data.get("best_bic"),
+        }
 
     def _fallback_generate(self, user_message: str) -> str:
         """Simple one-shot generation for backends without tool calling."""
-        context_parts = [_JUDGE_SYSTEM_PROMPT, "\n\n", user_message]
+        system_prompt = _build_judge_system_prompt(self.capabilities)
+        context_parts = [system_prompt, "\n\n", user_message]
 
         # Pull a minimal context from the store directly
         try:
@@ -2123,7 +2193,7 @@ class ToolUsingJudge:
             x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
         ):
             messages = [
-                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message_no_tools},
             ]
             kwargs = {
@@ -2155,7 +2225,7 @@ class ToolUsingJudge:
                 model=self.model_name,
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    system_instruction=_JUDGE_SYSTEM_PROMPT,
+                    system_instruction=system_prompt,
                     max_output_tokens=self.max_tokens or None,
                     temperature=self.temperature,
                 ),

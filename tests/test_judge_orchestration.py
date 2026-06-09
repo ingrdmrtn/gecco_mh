@@ -23,7 +23,7 @@ class TestBarrierPrimitives:
     def test_count_clients_at_iteration(self):
         """Test counting distinct clients at an iteration."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Add results from 2 different clients
             registry.update(client_id=0, iteration=0, results=[{"function_name": "model1"}])
@@ -41,7 +41,7 @@ class TestBarrierPrimitives:
     def test_wait_for_iteration_immediate(self):
         """Test wait_for_iteration returns immediately when clients are ready."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Add results from 2 clients before waiting
             registry.update(client_id=0, iteration=0, results=[{"function_name": "model1"}])
@@ -60,7 +60,7 @@ class TestBarrierPrimitives:
     def test_wait_for_iteration_timeout(self):
         """Test wait_for_iteration times out if clients don't arrive."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Add only 1 client but expect 2
             registry.update(client_id=0, iteration=0, results=[{"function_name": "model1"}])
@@ -78,7 +78,7 @@ class TestBarrierPrimitives:
     def test_set_and_get_judge_feedback(self):
         """Test storing and retrieving shared judge feedback."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Store judge feedback
             feedback_text = "Consider adding a learning rate parameter."
@@ -106,7 +106,7 @@ class TestBarrierPrimitives:
     def test_wait_for_judge_feedback_immediate(self):
         """Test wait_for_judge_feedback returns immediately when ready."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Store feedback before waiting
             feedback_text = "Feedback for iteration 0"
@@ -130,7 +130,7 @@ class TestBarrierPrimitives:
     def test_wait_for_judge_feedback_timeout(self):
         """Test wait_for_judge_feedback times out if feedback not available."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Don't store feedback; just wait for it
             start = time.time()
@@ -145,7 +145,7 @@ class TestBarrierPrimitives:
     def test_judge_iterations_in_registry(self):
         """Test that judge_iterations section is properly stored in registry."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            registry = SharedRegistry(str(Path(tmpdir) / "registry.json"))
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
 
             # Add some client results
             registry.update(client_id=0, iteration=0, results=[])

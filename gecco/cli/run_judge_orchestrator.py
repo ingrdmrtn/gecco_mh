@@ -10,10 +10,14 @@ from pathlib import Path
 from rich.panel import Panel
 
 from config.schema import load_config
-from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
+from gecco.construct_feedback.orchestrated import (
+    build_feedback_artifact,
+    persist_feedback_artifact,
+    run_orchestrated_judge_pipeline,
+)
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
 from gecco.coordination import SharedRegistry
-from gecco.diagnostic_store.rebuild import rebuild_from_artifacts
+from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.load_llms.model_loader import load_llm
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.prepare_data.io import load_data, split_by_participant
@@ -25,6 +29,34 @@ from gecco.utils import TimestampedConsole
 
 console = TimestampedConsole()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _build_judge_store_from_duckdb_sources(results_dir: Path) -> DiagnosticStore:
+    """Build the judge evidence store from existing diagnostic DuckDB files."""
+    unified_path = results_dir / "diagnostics_unified.duckdb"
+    source_paths = sorted(
+        path
+        for path in results_dir.glob("diagnostics*.duckdb")
+        if path.name != unified_path.name
+    )
+
+    if source_paths:
+        if unified_path.exists():
+            unified_path.unlink()
+        lock_path = Path(f"{unified_path}.lock")
+        if lock_path.exists():
+            lock_path.unlink()
+        store = DiagnosticStore(unified_path)
+        for source_path in source_paths:
+            store.import_from_source_db(source_path)
+        return store
+
+    if unified_path.exists():
+        return DiagnosticStore(unified_path)
+
+    raise FileNotFoundError(
+        f"No diagnostics DuckDB files found in {results_dir}; expected diagnostics*.duckdb"
+    )
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -101,7 +133,7 @@ def run_orchestrator(
         )
         raise SystemExit(1)
 
-    registry_path = resolved_results_dir / "shared_registry.json"
+    registry_path = resolved_results_dir / "shared_registry.duckdb"
     registry = SharedRegistry(str(registry_path))
 
     console.print("[cyan]Loading LLM model...[/]")
@@ -174,43 +206,49 @@ def run_orchestrator(
                     "default": "All models failed syntax validation after retries. "
                     "Review error messages and try a different approach."
                 }
+            artifact = build_feedback_artifact(
+                iteration=iteration,
+                run_idx=0,
+                tag="_orchestrator",
+                analysis_data={
+                    "trace": [],
+                    "full_trace": [],
+                    "best_bic": None,
+                    "wall_time": 0.0,
+                    "short_circuit": True,
+                    "metadata": {
+                        "shortcut_reason": "no_runnable_models",
+                        "n_clients": count,
+                        "clients_with_models": clients_with_models,
+                    },
+                },
+                synthesized_feedback=fallback_feedback,
+                verdict_payloads=[],
+                best_model=None,
+                best_metric=None,
+                include_best_model_code=False,
+            )
+            persist_feedback_artifact(artifact=artifact, results_dir=resolved_results_dir)
             registry.set_judge_feedback(
                 iteration=iteration,
-                synthesized_feedback=fallback_feedback,
+                synthesized_feedback=artifact.synthesized_feedback,
                 verdict_payload={"skipped": True, "reason": "all_syntax_failures"},
             )
             continue
 
-        console.print("[cyan]Updating unified diagnostic store...[/]")
+        console.print("[cyan]Loading unified diagnostic store from DuckDB sources...[/]")
         try:
-            unified_store = rebuild_from_artifacts(
-                results_dir=str(resolved_results_dir),
-                db_path=str(resolved_results_dir / "diagnostics_unified.duckdb"),
-                overwrite=False,
-                iterations=[iteration],
-            )
+            unified_store = _build_judge_store_from_duckdb_sources(resolved_results_dir)
         except Exception as exc:
             console.print(
-                f"[red]Failed to update diagnostic store incrementally: {exc}[/]\n"
-                f"[yellow]Falling back to full rebuild of all artifacts...[/]"
+                f"[red]Failed to load diagnostic DuckDB sources: {exc}[/]\n"
+                f"[red]Writing failure entry to registry; clients will halt.[/]"
             )
-            try:
-                unified_store = rebuild_from_artifacts(
-                    results_dir=str(resolved_results_dir),
-                    db_path=str(resolved_results_dir / "diagnostics_unified.duckdb"),
-                    overwrite=True,
-                )
-                console.print("[green]Full rebuild successful[/]")
-            except Exception as fallback_exc:
-                console.print(
-                    f"[red]Fallback rebuild also failed: {fallback_exc}[/]\n"
-                    f"[red]Writing failure entry to registry; clients will halt.[/]"
-                )
-                registry.set_judge_failure(
-                    iteration=iteration,
-                    error=f"Diagnostic store rebuild failed: {fallback_exc}",
-                )
-                continue
+            registry.set_judge_failure(
+                iteration=iteration,
+                error=f"Diagnostic DuckDB load failed: {exc}",
+            )
+            continue
 
         console.print("[cyan]Running centralized judge...[/]")
         max_judge_retries = 2

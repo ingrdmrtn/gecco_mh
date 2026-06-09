@@ -58,6 +58,9 @@ def test_cmg_short_circuit_feedback_keyed_by_generator():
     mock_judge_instance.get_feedback_analysis.return_value = {
         "short_circuit": True,
         "analysis_text": "Search is stuck. Revert to simpler models.",
+        "synthesized_feedback": {
+            "generator": "Search is stuck. Revert to simpler models."
+        },
         "trace": [],
         "full_trace": [],
         "best_bic": None,
@@ -139,6 +142,7 @@ def test_non_cmg_orchestrator_supports_dict_clients():
             llm=SimpleNamespace(feedback_guidance="Focus on mechanism diversity.")
         )
     }
+    cfg.judge.capabilities = ["performance_summary", "persona_synthesis"]
 
     mock_registry = MagicMock()
     mock_registry.wait_for_clients_complete.return_value = 2

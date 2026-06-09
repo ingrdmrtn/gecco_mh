@@ -9,6 +9,7 @@ import pandas as pd
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.prepare_data.data2text import narrative
 
 
@@ -60,6 +61,12 @@ class LLMConfig(GeCCoBaseModel):
     temperature: float = 0.7
     max_tokens: int = 4096
     guardrails: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_provider_key(self) -> "LLMConfig":
+        """Ensure the provider matches one exact registered registry key."""
+        get_provider_spec(self.provider)
+        return self
 
 
 class EvaluationConfig(GeCCoBaseModel):
@@ -153,7 +160,6 @@ class JudgeProfileConfig(GeCCoBaseModel):
 class JudgeConfig(GeCCoBaseModel):
     """Judge runtime configuration."""
 
-    orchestrated: bool = True
     barrier: BarrierConfig = Field(default_factory=BarrierConfig)
     max_tool_calls: int | None = None
     verbose: bool = False
@@ -172,11 +178,16 @@ class JudgeConfig(GeCCoBaseModel):
     @model_validator(mode="before")
     @classmethod
     def reject_retired_mode_field(cls, data: Any) -> Any:
-        """Reject the retired ``judge.mode`` runtime field with a clear message."""
+        """Reject retired judge runtime fields with a clear message."""
         if isinstance(data, dict) and "mode" in data:
             raise ValueError(
                 "judge.mode has been retired; remove the field. "
                 "The judge now always uses the orchestrated pipeline."
+            )
+        if isinstance(data, dict) and "orchestrated" in data:
+            raise ValueError(
+                "judge.orchestrated has been retired; remove the field. "
+                "Orchestrator launch is now inferred from the validated judge configuration."
             )
         return data
 
@@ -288,6 +299,7 @@ def load_config(path: str | Path) -> GeCCoConfig:
         cfg_dict = yaml.safe_load(file_obj) or {}
 
     try:
-        return GeCCoConfig.model_validate(cfg_dict)
+        cfg = GeCCoConfig.model_validate(cfg_dict)
+        return cfg
     except ValidationError as exc:
         raise exc

@@ -19,11 +19,11 @@ def default_results_dir(task_name: str) -> Path:
 
 
 def available_tasks() -> List[str]:
-    """Return task names that have a shared_registry.json in results/."""
+    """Return task names that have a shared_registry.duckdb in results/."""
     results = project_root() / "results"
     if not results.is_dir():
         return []
     return sorted(
         d.name for d in results.iterdir()
-        if d.is_dir() and (d / "shared_registry.json").exists()
+        if d.is_dir() and (d / "shared_registry.duckdb").exists()
     )

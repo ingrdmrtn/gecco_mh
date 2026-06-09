@@ -83,7 +83,7 @@ def main() -> None:
 
     data = load_registry_snapshot(results_dir)
     if data is None:
-        st.warning(f"Waiting for registry: {results_dir / 'shared_registry.json'}")
+        st.warning(f"Waiting for registry: {results_dir / 'shared_registry.duckdb'}")
         st.stop()
 
     if refresh_now or auto_refresh:

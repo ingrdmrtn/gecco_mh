@@ -170,7 +170,7 @@ class TestOrchestratorIntegration:
     """Test the orchestrator logic without full distributed setup."""
 
     def test_config_with_orchestration(self):
-        """Test loading a config with orchestration enabled."""
+        """Test loading a config that supports orchestrator inference."""
         from config.schema import load_config
 
         # Create test config
@@ -202,7 +202,7 @@ loop:
   n_clients: 2
 
 judge:
-  orchestrated: true
+  capabilities: ["performance_summary"]
   barrier:
     orchestrator_wait_seconds: 120
     client_wait_seconds: 120
@@ -210,24 +210,21 @@ judge:
 
             cfg = load_config(str(config_path))
             assert cfg.loop.n_clients == 2
-            assert cfg.judge.orchestrated is True
+            assert cfg.judge.capabilities == ["performance_summary"]
             assert cfg.judge.barrier.orchestrator_wait_seconds == 120
 
     def test_orchestrator_detects_orchestration(self):
-        """Test that orchestrator properly detects when it should be enabled."""
-        # This is a simple logic test
+        """Test that orchestrator launch is inferred from validated judge config."""
         cfg_raw = {
-            "judge": {"orchestrated": True},
+            "judge": {"capabilities": ["performance_summary"]},
             "loop": {"n_clients": 2},
         }
 
-        # Simulate launcher logic
-        judge_cfg = cfg_raw.get("judge", {})
-        orchestrated = judge_cfg.get("orchestrated", False)
+        judge_cfg = cfg_raw.get("judge")
         loop_cfg = cfg_raw.get("loop", {})
         n_clients = loop_cfg.get("n_clients")
 
-        assert orchestrated is True
+        assert judge_cfg is not None
         assert n_clients == 2
 
 

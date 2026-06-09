@@ -18,14 +18,12 @@ def _make_cfg(cmg_enabled=True):
         loop=SimpleNamespace(max_iterations=1),
         llm=SimpleNamespace(provider="openrouter", base_model="test-model"),
         judge=SimpleNamespace(
-            orchestrated=True,
+            capabilities=["performance_summary"],
             barrier=SimpleNamespace(
                 orchestrator_wait_seconds=1,
                 retry_wait_seconds=1,
             ),
-            diagnostic_store=SimpleNamespace(enabled=True),
             ppc=SimpleNamespace(enabled=False),
-            lesion=None,
         ),
         data=SimpleNamespace(
             path="dummy.csv",
@@ -53,19 +51,13 @@ def test_cmg_short_circuit_feedback_keyed_by_generator():
     mock_registry = MagicMock()
     mock_registry.wait_for_clients_complete.return_value = 2
     mock_registry.count_clients_with_models.return_value = 1
+    mock_registry.read.return_value = {"global_best": {}}
 
-    mock_judge_instance = MagicMock()
-    mock_judge_instance.get_feedback_analysis.return_value = {
-        "short_circuit": True,
-        "analysis_text": "Search is stuck. Revert to simpler models.",
-        "synthesized_feedback": {
+    artifact = SimpleNamespace(
+        synthesized_feedback={
             "generator": "Search is stuck. Revert to simpler models."
-        },
-        "trace": [],
-        "full_trace": [],
-        "best_bic": None,
-        "is_stuck": True,
-    }
+        }
+    )
 
     with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
         with patch("gecco.cli.run_judge_orchestrator.SharedRegistry", return_value=mock_registry):
@@ -73,10 +65,11 @@ def test_cmg_short_circuit_feedback_keyed_by_generator():
                 with patch("gecco.cli.run_judge_orchestrator.load_data", return_value=MagicMock()):
                     with patch("gecco.cli.run_judge_orchestrator.split_by_participant", return_value={"prompt": MagicMock()}):
                         with patch("gecco.cli.run_judge_orchestrator.get_data2text_function", return_value=lambda *a, **k: "data text"):
-                            with patch("gecco.cli.run_judge_orchestrator.rebuild_from_artifacts", return_value=MagicMock()):
-                                with patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge", return_value=mock_judge_instance):
-                                    with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
-                                        run_orchestrator(config="test.yaml")
+                            with patch("gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources", return_value=MagicMock()):
+                                with patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge", return_value=MagicMock()):
+                                    with patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline", return_value=artifact):
+                                        with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
+                                            run_orchestrator(config="test.yaml")
 
     set_judge_calls = mock_registry.set_judge_feedback.call_args_list
     assert len(set_judge_calls) == 1
@@ -99,16 +92,11 @@ def test_non_cmg_short_circuit_feedback_keyed_by_default():
     mock_registry = MagicMock()
     mock_registry.wait_for_clients_complete.return_value = 2
     mock_registry.count_clients_with_models.return_value = 1
+    mock_registry.read.return_value = {"global_best": {}}
 
-    mock_judge_instance = MagicMock()
-    mock_judge_instance.get_feedback_analysis.return_value = {
-        "short_circuit": True,
-        "analysis_text": "Search is stuck. Try again.",
-        "trace": [],
-        "full_trace": [],
-        "best_bic": None,
-        "is_stuck": True,
-    }
+    artifact = SimpleNamespace(
+        synthesized_feedback={"default": "Search is stuck. Try again."}
+    )
 
     with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
         with patch("gecco.cli.run_judge_orchestrator.SharedRegistry", return_value=mock_registry):
@@ -116,10 +104,11 @@ def test_non_cmg_short_circuit_feedback_keyed_by_default():
                 with patch("gecco.cli.run_judge_orchestrator.load_data", return_value=MagicMock()):
                     with patch("gecco.cli.run_judge_orchestrator.split_by_participant", return_value={"prompt": MagicMock()}):
                         with patch("gecco.cli.run_judge_orchestrator.get_data2text_function", return_value=lambda *a, **k: "data text"):
-                            with patch("gecco.cli.run_judge_orchestrator.rebuild_from_artifacts", return_value=MagicMock()):
-                                with patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge", return_value=mock_judge_instance):
-                                    with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
-                                        run_orchestrator(config="test.yaml", n_clients=2)
+                            with patch("gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources", return_value=MagicMock()):
+                                with patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge", return_value=MagicMock()):
+                                    with patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline", return_value=artifact):
+                                        with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
+                                            run_orchestrator(config="test.yaml", n_clients=2)
 
     set_judge_calls = mock_registry.set_judge_feedback.call_args_list
     assert len(set_judge_calls) == 1
@@ -147,19 +136,10 @@ def test_non_cmg_orchestrator_supports_dict_clients():
     mock_registry = MagicMock()
     mock_registry.wait_for_clients_complete.return_value = 2
     mock_registry.count_clients_with_models.return_value = 1
+    mock_registry.read.return_value = {"global_best": {}}
 
-    mock_judge_instance = MagicMock()
-    mock_judge_instance.get_feedback_analysis.return_value = {
-        "short_circuit": False,
-        "analysis_text": "analysis text",
-        "trace": [],
-        "full_trace": [],
-        "best_bic": None,
-        "is_stuck": False,
-    }
-    mock_judge_instance.synthesize_for_persona.return_value = (
-        "Use a simpler but more novel mechanism.",
-        {"key_recommendations": [], "per_angle": []},
+    artifact = SimpleNamespace(
+        synthesized_feedback={"explore": "Use a simpler but more novel mechanism."}
     )
 
     with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
@@ -178,15 +158,19 @@ def test_non_cmg_orchestrator_supports_dict_clients():
                             return_value=lambda *a, **k: "data text",
                         ):
                             with patch(
-                                "gecco.cli.run_judge_orchestrator.rebuild_from_artifacts",
+                                "gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources",
                                 return_value=MagicMock(),
                             ):
                                 with patch(
                                     "gecco.cli.run_judge_orchestrator.ToolUsingJudge",
-                                    return_value=mock_judge_instance,
+                                    return_value=MagicMock(),
                                 ):
-                                    with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
-                                        run_orchestrator(config="test.yaml", n_clients=2)
+                                    with patch(
+                                        "gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline",
+                                        return_value=artifact,
+                                    ):
+                                        with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
+                                            run_orchestrator(config="test.yaml", n_clients=2)
 
     set_judge_calls = mock_registry.set_judge_feedback.call_args_list
     assert len(set_judge_calls) == 1

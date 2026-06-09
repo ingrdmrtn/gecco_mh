@@ -77,9 +77,10 @@ Given the task instructions, participant data from cognitive tasks, model genera
 │   └── two_step_task/
 │       ├── bics/
 │       └── models/
-└── scripts/
-    ├── decision_making_demo.py
-    └── two_step_demo.py
+└── gecco/cli/
+    ├── __init__.py
+    ├── run_local_client.py
+    └── run_test_evaluation.py
 ```
 
 ## 🚀 Installation
@@ -207,14 +208,14 @@ Models are downloaded from the HuggingFace Hub on first use and loaded with `dev
 
 ```bash
 export HF_HOME=/scratch/$USER/huggingface
-python scripts/two_step_demo.py --config config/two_step_local.yaml
+python -m gecco run local-client --config two_step_local.yaml
 ```
 
 We also have models stored for lab use, in which case you can set `HF_HOME` to that path:
 
 ```bash
 export HF_HOME=/scratch/prj/bcn_neudec/huggingface
-python scripts/two_step_demo.py --config config/two_step_local.yaml
+python -m gecco run local-client --config two_step_local.yaml
 ```
 
 Note: `HF_HOME` must be set as a shell environment variable — putting it in the `.env` file will not work, as HuggingFace reads it at import time before `python-dotenv` loads.
@@ -362,7 +363,7 @@ See `config/two_step_vllm_example.yaml` for a complete example.
 #### Step 4: Run GeCCo
 
 ```bash
-python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
+python -m gecco run local-client --config two_step_vllm_example.yaml --vllm-url http://localhost:8000/v1
 ```
 
 GeCCo will connect to the running vLLM server instead of loading a model locally. The server must be running and ready before the script starts.
@@ -375,15 +376,14 @@ python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-1.5B-Instruct --port 8000
 
 # Terminal 2 — run GeCCo
-export VLLM_BASE_URL=http://localhost:8000/v1
-python scripts/two_step_psychiatry_group.py --config two_step_vllm_example.yaml
+python -m gecco run local-client --config two_step_vllm_example.yaml --vllm-url http://localhost:8000/v1
 ```
 
 Note that model generation quality with small models (1.5B–3B) will be significantly lower than with larger models (14B+). Qwen models are ungated and can be downloaded without a HuggingFace account or licence agreement, making them the quickest option to get started.
 
 ### Distributed parallel search (multiple clients)
 
-When model fitting is the bottleneck (e.g. fitting ~1000 subjects per model), you can run multiple GeCCo clients in parallel. Each client queries the same vLLM server for model generation but fits models independently. Clients share results via a JSON registry file on the shared filesystem, so each client's LLM feedback incorporates discoveries from all other clients.
+When model fitting is the bottleneck (e.g. fitting ~1000 subjects per model), you can run multiple GeCCo clients in parallel. Each client queries the same vLLM server for model generation but fits models independently. Clients share results via DuckDB-backed canonical state on the shared filesystem, so each client's LLM feedback incorporates discoveries from all other clients.
 
 ```text
             vLLM Server (GPU node)
@@ -396,7 +396,7 @@ When model fitting is the bottleneck (e.g. fitting ~1000 subjects per model), yo
         +----+-----+-----+---+
              |
       Shared filesystem
-      (shared_registry.json)
+      (DuckDB state)
 ```
 
 #### Step 1: Define client profiles in your config
@@ -447,50 +447,42 @@ Available override fields per profile:
 
 The `clients:` section is ignored by existing non-distributed scripts.
 
-#### Step 2: Launch with the launcher script
+#### Step 2: Launch with the GeCCo CLI
 
-`scripts/launch_distributed.py` reads profiles from your config, launches the vLLM server and client array, and wires up SLURM dependencies automatically:
+`python -m gecco run distributed` reads profiles from your config, launches the vLLM server and client array, and wires up SLURM dependencies automatically:
 
 ```bash
 # Launch vLLM + all profiles from config
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --launch-vllm
+python -m gecco run distributed --config two_step_factors_distributed.yaml --launch-vllm
 
 # vLLM already running — just launch clients, specifying the server URL
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml \
+python -m gecco run distributed --config two_step_factors_distributed.yaml \
     --vllm-url http://gpu-node:8000/v1
 
 # Run only a subset of profiles
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --profiles exploit,minimal
+python -m gecco run distributed --config two_step_factors_distributed.yaml --profiles exploit,minimal
 
 # Add extra clients running the base config (no profile overrides)
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --extra-clients 2
+python -m gecco run distributed --config two_step_factors_distributed.yaml --extra-clients 2
 
 # Preview commands without submitting
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml --dry-run
+python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run
 ```
 
 **Conda environment**: If your project dependencies (e.g. `pydantic`, `scipy`) are installed in a specific conda environment, pass `--conda-env` so each SLURM client job activates it before running Python:
 
 ```bash
-python scripts/launch_distributed.py --config two_step_factors_distributed.yaml \
+python -m gecco run distributed --config two_step_factors_distributed.yaml \
     --vllm-url http://gpu-node:8000/v1 \
     --conda-env my_gecco_env
 ```
 
-If running the shell script directly via `sbatch`, the conda environment is the 4th positional argument:
+Use the unified CLI rather than the removed shell entrypoint; keep the conda environment on the same command line:
+
+For local testing without SLURM, run clients directly through the CLI (ensure the correct conda environment is already active):
 
 ```bash
-sbatch --array=0-3 bash/run_gecco_distributed.sh \
-    two_step_factors_distributed.yaml \
-    "exploit,explore,diverse,minimal" \
-    "http://gpu-node:8000/v1" \
-    "my_gecco_env"
-```
-
-For local testing without SLURM, run clients directly (ensure the correct conda environment is already active):
-
-```bash
-python scripts/run_gecco_distributed.py --config two_step_factors_distributed.yaml \
+python -m gecco internal distributed-client --config two_step_factors_distributed.yaml \
     --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
 ```
 
@@ -498,10 +490,10 @@ python scripts/run_gecco_distributed.py --config two_step_factors_distributed.ya
 
 ```bash
 # One-shot status
-python scripts/monitor_distributed.py --task two_step_factors
+python -m gecco monitor --task two_step_factors
 
 # Live dashboard (refreshes every 10s, Ctrl+C to exit)
-python scripts/monitor_distributed.py --task two_step_factors --watch 10
+python -m gecco monitor --task two_step_factors --watch 10
 ```
 
 #### Step 4 (optional): Streamlit dashboard (interactive, SSH tunnel)
@@ -534,7 +526,7 @@ Then open <http://127.0.0.1:8501> locally.
 
 #### How coordination works
 
-- Clients share results via `results/<task_name>/shared_registry.json` on the shared filesystem
+- Clients share results via DuckDB-backed canonical state on the shared filesystem
 - Before each iteration, clients merge cross-client history into their feedback — the LLM judge automatically sees the full model landscape from all clients
 - The global best model is tracked across all clients
 - File locking and atomic writes prevent corruption from concurrent access
@@ -603,14 +595,14 @@ loop:
 
 ## 🎯 Usage
 
-Quick start with demo scripts:
+Quick start with the `gecco` CLI:
 
 ```bash
 # Two-step decision task
-python scripts/two_step_demo.py
+python -m gecco run local-client --config two_step.yaml
 
 # Multi-attribute decision making
-python scripts/decision_making_demo.py
+python -m gecco run local-client --config decision_making.yaml
 ```
 
 Programmatic usage:

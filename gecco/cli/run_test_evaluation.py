@@ -204,7 +204,12 @@ def run_test_evaluation(
             print(f"[test] Wrote {len(results)} entries to diagnostic store: {db_path}")
         except Exception as exc:
             print(f"[test] Warning: Could not write to diagnostic store: {exc}")
-            print("[test] Run rebuild_from_artifacts to populate the store later")
+            print("[test] Re-run with --write-store to persist the diagnostic store")
+    else:
+        print(
+            "[test] Diagnostic store persistence is disabled; pass --write-store "
+            "to persist the diagnostic store"
+        )
     return None
 
 

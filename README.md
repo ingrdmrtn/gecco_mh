@@ -27,6 +27,13 @@ Given the task instructions, participant data from cognitive tasks, model genera
 - 📈 BIC/AIC tracking to identify the best models and iteration results
 - 🔁 Iterative search loop with optional manual or LLM-generated feedback
 
+## Runtime State
+
+- DuckDB-backed registry files are the canonical runtime state.
+- JSON files under `results/...` are inspection and audit artefacts, not the source of truth.
+- The judge runs as an orchestrated analysis/synthesis pipeline.
+- When you want the test-evaluation step to persist diagnostics, pass `--write-store`.
+
 ## 📂 Repository Structure
 
 ```text
@@ -42,34 +49,32 @@ Given the task instructions, participant data from cognitive tasks, model genera
 │   ├── rlwm.csv
 │   ├── standardize_data.py
 │   └── two_step_data.csv
-├── gecco/
-│   ├── __init__.py
-│   ├── run_gecco.py
-│   ├── utils.py
-│   ├── construct_feedback/
-│   │   ├── __init__.py
-│   │   └── feedback.py
-│   ├── load_llms/
-│   │   ├── __init__.py
-│   │   ├── gpt_backend.py
-│   │   ├── llama_backend.py
-│   │   ├── model_loader.py
-│   │   ├── qwen_backend.py
-│   │   └── r1_backend.py
-│   ├── offline_evaluation/
-│   │   ├── __init__.py
-│   │   ├── data_structures.py
-│   │   ├── evaluation_functions.py
-│   │   ├── fit_generated_models.py
-│   │   └── utils.py
-│   ├── prepare_data/
-│   │   ├── __init__.py
-│   │   ├── data2text.py
-│   │   └── io.py
-│   └── prompt_builder/
-│       ├── __init__.py
-│       ├── guardrails.py
-│       └── prompt.py
+ ├── gecco/
+ │   ├── __init__.py
+ │   ├── run_gecco.py
+ │   ├── utils.py
+ │   ├── construct_feedback/
+ │   │   ├── __init__.py
+ │   │   └── feedback.py
+ │   ├── load_llms/
+ │   │   ├── __init__.py
+ │   │   ├── gpt_backend.py
+ │   │   ├── llama_backend.py
+ │   │   ├── model_loader.py
+ │   │   ├── qwen_backend.py
+ │   │   └── r1_backend.py
+ │   ├── offline_evaluation/
+ │   │   ├── __init__.py
+ │   │   ├── evaluation_functions.py
+ │   │   ├── fit_generated_models.py
+ │   │   └── utils.py
+ │   ├── prepare_data/
+ │   │   ├── __init__.py
+ │   │   ├── data2text.py
+ │   │   └── io.py
+ │   └── prompt_builder/
+ │       ├── __init__.py
+ │       └── prompt.py
 ├── results/
 │   ├── multi_attribute_decision_making/
 │   │   ├── bics/

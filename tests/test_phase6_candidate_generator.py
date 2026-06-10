@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from gecco.artifacts import ArtifactStore
-from gecco.candidate_generation import CandidateGenerator
+from gecco.candidate_generation import CandidateGenerator, CandidatePayload
 from gecco.run_context import RunContext
 
 
@@ -48,27 +48,58 @@ def test_candidate_generator_generates_and_persists_models_without_monolith(tmp_
 
     with patch("gecco.structured_output.validate_single_model") as validate_single_model:
         validate_single_model.return_value = SimpleNamespace(is_valid=True, errors=[], spec=None)
-        raw_text, models = generator.generate_models(
-            prompt="build one model",
+        result = generator.generate_non_cmg_iteration(
+            iteration=0,
+            run_idx=1,
+            feedback="build one model",
             n_models=1,
             cfg=cfg,
+            tag="",
+            prompt_builder=SimpleNamespace(
+                build_input_prompt=MagicMock(return_value="build one model")
+            ),
             generate_text=MagicMock(return_value=response),
             model=object(),
             tokenizer=object(),
         )
 
-    model_file = artifact_store.write_candidate_artifacts(
-        iteration=0,
-        run_idx=1,
-        tag="",
-        code_text=raw_text,
-        parsed_models=models,
+    assert result.parsed_models[0]["name"] == "model_a"
+    assert result.candidates[0]["name"] == "model_a"
+    assert set(result.candidates[0]) >= {
+        "index",
+        "func_name",
+        "name",
+        "code",
+        "rationale",
+        "analysis",
+        "parameters",
+        "validation_failed",
+        "validation_errors",
+    }
+    assert result.model_file.exists()
+    assert not result.model_file.with_suffix(".json").exists()
+    run_context.close()
+
+
+def test_candidate_payload_normalises_attribute_based_models():
+    """CandidatePayload should normalise attribute-backed parsed models."""
+    payload = CandidatePayload.from_parsed_model(
+        0,
+        SimpleNamespace(
+            name="model_a",
+            code="def cognitive_model1(x, model_parameters):\n    return 0.0",
+            rationale="A compact model.",
+            analysis="analysis",
+            parameters=[{"name": "alpha"}],
+            validation_failed=True,
+            validation_errors=["bad syntax"],
+        ),
     )
 
-    assert models[0]["name"] == "model_a"
-    assert model_file.exists()
-    assert not model_file.with_suffix(".json").exists()
-    run_context.close()
+    assert payload.func_name == "cognitive_model1"
+    assert payload.name == "model_a"
+    assert payload.validation_failed is True
+    assert payload.to_dict()["validation_errors"] == ["bad syntax"]
 
 
 def test_candidate_generator_persists_review_through_artifact_store(tmp_path: Path):

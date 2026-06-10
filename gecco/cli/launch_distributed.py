@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
 from pathlib import Path
 
 from config.schema import load_config
+from gecco.cli.launcher_utils import LaunchCommand, LaunchExecutor, LaunchPlan, SubmissionResult
 from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.sentry_init import init_sentry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _print_submission_result(result: SubmissionResult) -> None:
+    label_map = {
+        "vllm": "vLLM",
+        "client_array": "Client array",
+        "orchestrator": "Orchestrator",
+        "test_evaluation": "Test evaluation",
+    }
+    display_label = label_map.get(result.label, result.label)
+    if result.job_id:
+        print(f"  {display_label} job ID: {result.job_id}")
+    print()
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -43,21 +55,6 @@ def get_profiles_from_config(config_path):
     if not clients:
         return []
     return list(clients.keys())
-
-
-def run_cmd(cmd, dry_run=False):
-    """Run a shell command, or just print it if dry_run."""
-    print(f"  $ {cmd}")
-    if dry_run:
-        return None
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr.strip()}")
-        raise SystemExit(1)
-    output = result.stdout.strip()
-    if output.startswith("Submitted batch job "):
-        return output.split()[-1]
-    return output
 
 
 def run_distributed_launcher(
@@ -122,6 +119,7 @@ def run_distributed_launcher(
     slurm_cfg = getattr(cfg, "slurm", {}) or {}
     resolved_launch_orchestrator = launch_orchestrator or getattr(cfg, "judge", None) is not None
     n_clients = getattr(cfg.loop, "n_clients", None)
+    executor = LaunchExecutor()
 
     resolved_cpus_per_task = cpus_per_task or slurm_cfg.get("cpus_per_task", 48)
     resolved_mem = mem or slurm_cfg.get("mem_per_task")
@@ -154,71 +152,92 @@ def run_distributed_launcher(
     if launch_vllm and not resolved_vllm_model:
         resolved_vllm_model = cfg.llm.base_model or "Qwen/Qwen2.5-14B-Instruct"
 
-    vllm_job_id = None
-    if launch_vllm:
-        print("Launching vLLM server...")
-        cmd = (
-            f"sbatch --parsable {partition_flag} bash/launch_vllm_server.sh "
-            f'"{resolved_vllm_model}" {vllm_port} {vllm_tp}'
-        )
-        vllm_job_id = run_cmd(cmd, dry_run=dry_run)
-        if vllm_job_id:
-            print(f"  vLLM job ID: {vllm_job_id}")
-        print()
-
-    print("Launching client array...")
-    dep_flag = f"--dependency=afterok:{vllm_job_id}" if vllm_job_id else ""
     vllm_url_arg = f'"{vllm_url}"' if vllm_url else '""'
     conda_arg = f'"{conda_env}"' if conda_env else '""'
-    cmd = (
-        f"sbatch --array={array_spec} --cpus-per-task={resolved_cpus_per_task} "
-        f"{dep_flag} {partition_flag} {mem_flag} "
-        f'bash/run_gecco_distributed.sh "{config}" "{profiles_csv}" {vllm_url_arg} {conda_arg}'
-    )
-    client_job_id = run_cmd(cmd, dry_run=dry_run)
-    if client_job_id:
-        print(f"  Client array job ID: {client_job_id}")
-    print()
 
-    orchestrator_job_id = None
+    main_plan_commands: list[LaunchCommand] = []
+    if launch_vllm:
+        print("Launching vLLM server...")
+        main_plan_commands.append(
+            LaunchCommand(
+                label="vllm",
+                command=(
+                    f"sbatch --parsable {partition_flag} bash/launch_vllm_server.sh "
+                    f'"{resolved_vllm_model}" {vllm_port} {vllm_tp}'
+                ),
+            )
+        )
+
+    print("Launching client array...")
+    main_plan_commands.append(
+        LaunchCommand(
+            label="client_array",
+            command=(
+                f"sbatch --array={array_spec} --cpus-per-task={resolved_cpus_per_task} "
+                f"{{dependency}} {partition_flag} {mem_flag} "
+                f'bash/run_gecco_distributed.sh "{config}" "{profiles_csv}" {vllm_url_arg} {conda_arg}'
+            ),
+            dependency_labels=("vllm",),
+        )
+    )
+
     if resolved_launch_orchestrator:
         print("Launching centralized judge orchestrator...")
-        orch_dep_flag = f"--dependency=afterok:{vllm_job_id}" if vllm_job_id else ""
         vllm_url_arg_orch = f'"{vllm_url}"' if vllm_url else '""'
         n_clients_arg = f'"{n_clients}"' if n_clients else '""'
-        conda_arg = f'"{conda_env}"' if conda_env else '""'
-        cmd = (
-            f"sbatch {orch_dep_flag} --cpus-per-task=8 {partition_flag} --mem=16G "
-            f'bash/run_judge_orchestrator.sh "{config}" {vllm_url_arg_orch} {n_clients_arg} {conda_arg}'
+        main_plan_commands.append(
+            LaunchCommand(
+                label="orchestrator",
+                command=(
+                    f"sbatch {{dependency}} --cpus-per-task=8 {partition_flag} --mem=16G "
+                    f'bash/run_judge_orchestrator.sh "{config}" {vllm_url_arg_orch} {n_clients_arg} {conda_arg}'
+                ),
+                dependency_labels=("vllm",),
+            )
         )
-        orchestrator_job_id = run_cmd(cmd, dry_run=dry_run)
-        if orchestrator_job_id:
-            print(f"  Orchestrator job ID: {orchestrator_job_id}")
-        print()
 
-    test_eval_job_id = None
-    if client_job_id:
+    main_results = executor.execute(
+        LaunchPlan(commands=tuple(main_plan_commands)),
+        dry_run=dry_run,
+        on_result=_print_submission_result,
+    )
+    results_by_label = {result.label: result for result in main_results}
+
+    client_result = results_by_label.get("client_array")
+    if client_result and client_result.job_id:
         print("Scheduling test evaluation (post-processing)...")
-        test_dep_flag = f"--dependency=afterok:{client_job_id}"
         task_name = cfg.task.name
         fit_type = cfg.evaluation.fit_type
         results_dir = f"results/{task_name}"
         if fit_type == "individual":
             results_dir = f"results/{task_name}_individual"
-        conda_arg = f'"{conda_env}"' if conda_env else '""'
-        cmd = (
-            f"sbatch {test_dep_flag} --cpus-per-task=8 {partition_flag} --mem=16G "
-            f'bash/run_test_evaluation.sh "{config}" "{results_dir}" {conda_arg}'
+        test_plan = LaunchPlan(
+            commands=(
+                LaunchCommand(
+                    label="test_evaluation",
+                    command=(
+                        f"sbatch {{dependency}} --cpus-per-task=8 {partition_flag} --mem=16G "
+                        f'bash/run_test_evaluation.sh "{config}" "{results_dir}" {conda_arg}'
+                    ),
+                    dependency_labels=("client_array",),
+                    required_dependency_labels=("client_array",),
+                ),
+            )
         )
-        test_eval_job_id = run_cmd(cmd, dry_run=dry_run)
-        if test_eval_job_id:
-            print(f"  Test evaluation job ID: {test_eval_job_id}")
-        print()
+        test_results = executor.execute(
+            test_plan,
+            dry_run=dry_run,
+            on_result=_print_submission_result,
+            prior_results=results_by_label,
+        )
+        results_by_label.update({result.label: result for result in test_results})
 
     print("Launched successfully. Monitor with:")
     task_name = cfg.task.name
     print(f"  python -m gecco monitor --task {task_name} --watch 10")
-    if test_eval_job_id:
+    test_eval_result = results_by_label.get("test_evaluation")
+    if test_eval_result and test_eval_result.job_id:
+        test_eval_job_id = test_eval_result.job_id
         print(
             f"Test evaluation will run after all clients complete: job {test_eval_job_id}"
         )

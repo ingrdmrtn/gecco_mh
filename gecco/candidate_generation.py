@@ -8,19 +8,10 @@ from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
 from gecco.load_llms.provider_registry import get_provider_spec
-from gecco.utils import TimestampedConsole
+from gecco.utils import TimestampedConsole, mapping_get
 
 
 console = TimestampedConsole()
-
-
-def _mapping_get(obj: Any, key: str, default: Any = None) -> Any:
-    """Read a key from either a mapping or an attribute container."""
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
 
 
 @dataclass(slots=True)
@@ -31,6 +22,63 @@ class CandidateGenerationResult:
     parsed_models: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
     model_file: Path
+
+
+@dataclass(slots=True)
+class CandidatePayload:
+    """Normalised representation of one candidate model."""
+
+    index: int
+    func_name: str
+    name: str
+    code: str
+    rationale: str
+    analysis: str
+    parameters: list[dict[str, Any]]
+    validation_failed: bool
+    validation_errors: list[str]
+
+    @classmethod
+    def from_parsed_model(cls, index: int, model: Any) -> "CandidatePayload":
+        """Create a payload from a parsed model dict or attribute container."""
+        func_name = f"cognitive_model{index + 1}"
+        return cls(
+            index=index,
+            func_name=func_name,
+            name=mapping_get(model, "name", func_name),
+            code=mapping_get(model, "code", ""),
+            rationale=mapping_get(model, "rationale", ""),
+            analysis=mapping_get(model, "analysis", ""),
+            parameters=mapping_get(model, "parameters", []),
+            validation_failed=mapping_get(model, "validation_failed", False),
+            validation_errors=mapping_get(model, "validation_errors", []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the payload back to the registry-friendly dict shape."""
+        return {
+            "index": self.index,
+            "func_name": self.func_name,
+            "name": self.name,
+            "code": self.code,
+            "rationale": self.rationale,
+            "analysis": self.analysis,
+            "parameters": self.parameters,
+            "validation_failed": self.validation_failed,
+            "validation_errors": self.validation_errors,
+        }
+
+
+def _build_candidate_payloads(
+    parsed_models: list[dict[str, Any]], n_models: int
+) -> list[CandidatePayload]:
+    """Normalise parsed models and enforce the expected candidate count."""
+    if len(parsed_models) != n_models:
+        raise ValueError(
+            f"Parsed {len(parsed_models)} candidates, expected {n_models}"
+        )
+
+    return [CandidatePayload.from_parsed_model(index, model) for index, model in enumerate(parsed_models)]
 
 
 class CandidateGenerator:
@@ -64,8 +112,8 @@ class CandidateGenerator:
         if set_activity is not None:
             set_activity(f"generating centralized candidates (iter {iteration})")
 
-        clients = _mapping_get(cfg, "clients")
-        client_config = _mapping_get(clients, client_id) if client_id else None
+        clients = mapping_get(cfg, "clients")
+        client_config = mapping_get(clients, client_id) if client_id else None
 
         try:
             if naive_enabled:
@@ -105,27 +153,8 @@ class CandidateGenerator:
                 participant=participant,
             )
 
-            candidates: list[dict[str, Any]] = []
-            for index, model in enumerate(parsed_models):
-                func_name = f"cognitive_model{index + 1}"
-                candidates.append(
-                    {
-                        "index": index,
-                        "func_name": func_name,
-                        "name": model.get("name", func_name),
-                        "code": model.get("code", ""),
-                        "rationale": model.get("rationale", ""),
-                        "analysis": model.get("analysis", ""),
-                        "parameters": model.get("parameters", []),
-                        "validation_failed": model.get("validation_failed", False),
-                        "validation_errors": model.get("validation_errors", []),
-                    }
-                )
-
-            if len(candidates) != n_models:
-                raise ValueError(
-                    f"CMG generator produced {len(candidates)} candidates, expected {n_models}"
-                )
+            candidate_payloads = _build_candidate_payloads(parsed_models, n_models)
+            candidates = [payload.to_dict() for payload in candidate_payloads]
 
             shared_registry.set_candidate_models(iteration, candidates, client_id)
             shared_registry.set_generator_status(
@@ -170,12 +199,12 @@ class CandidateGenerator:
     ) -> CandidateGenerationResult:
         """Generate and persist one non-CMG candidate batch."""
 
-        clients = _mapping_get(cfg, "clients")
-        client_config = _mapping_get(clients, client_id) if client_id else None
+        clients = mapping_get(cfg, "clients")
+        client_config = mapping_get(clients, client_id) if client_id else None
 
-        naive_cfg = _mapping_get(client_config, "naive_ideation")
+        naive_cfg = mapping_get(client_config, "naive_ideation")
 
-        if naive_cfg and _mapping_get(naive_cfg, "enabled", False):
+        if naive_cfg and mapping_get(naive_cfg, "enabled", False):
             code_text, parsed_models = self.generate_models_naive(
                 feedback_text=feedback,
                 n_models=n_models,
@@ -215,27 +244,8 @@ class CandidateGenerator:
             participant=participant,
         )
 
-        candidates: list[dict[str, Any]] = []
-        for index, model_dict in enumerate(parsed_models):
-            func_name = f"cognitive_model{index + 1}"
-            candidates.append(
-                {
-                    "index": index,
-                    "func_name": func_name,
-                    "name": model_dict.get("name", func_name),
-                    "code": model_dict.get("code", ""),
-                    "rationale": model_dict.get("rationale", ""),
-                    "analysis": model_dict.get("analysis", ""),
-                    "parameters": model_dict.get("parameters", []),
-                    "validation_failed": model_dict.get("validation_failed", False),
-                    "validation_errors": model_dict.get("validation_errors", []),
-                }
-            )
-
-        if len(candidates) != n_models:
-            raise ValueError(
-                f"Generator produced {len(candidates)} candidates, expected {n_models}"
-            )
+        candidate_payloads = _build_candidate_payloads(parsed_models, n_models)
+        candidates = [payload.to_dict() for payload in candidate_payloads]
 
         return CandidateGenerationResult(
             code_text=code_text,
@@ -486,9 +496,9 @@ class CandidateGenerator:
             A ``(raw_text, models)`` pair.
         """
 
-        naive_cfg = _mapping_get(client_config, "naive_ideation") if client_config else None
+        naive_cfg = mapping_get(client_config, "naive_ideation") if client_config else None
 
-        if not naive_cfg or not _mapping_get(naive_cfg, "enabled", False):
+        if not naive_cfg or not mapping_get(naive_cfg, "enabled", False):
             prompt = prompt_builder.build_input_prompt(
                 feedback_text=feedback_text,
                 n_models=n_models,
@@ -505,8 +515,8 @@ class CandidateGenerator:
                 tag=tag,
             )
 
-        persona = _mapping_get(naive_cfg, "persona")
-        translation_preamble = _mapping_get(naive_cfg, "translation_preamble")
+        persona = mapping_get(naive_cfg, "persona")
+        translation_preamble = mapping_get(naive_cfg, "translation_preamble")
 
         if not get_provider_spec(cfg.llm.provider).supports_system_prompt:
             console.print(

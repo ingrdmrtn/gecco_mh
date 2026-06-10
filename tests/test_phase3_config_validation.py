@@ -18,6 +18,7 @@ from gecco.construct_feedback.tool_judge import (
     _apply_capability_postprocessing,
     _build_summary_only_feedback,
 )
+from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -445,10 +446,21 @@ def test_empty_capabilities_yield_explicit_empty_feedback_trace(tmp_path):
         results_dir=tmp_path,
     )
 
-    verdict = judge.get_feedback(iteration=1, run_idx=0, tag="")
+    artifact = run_orchestrated_judge_pipeline(
+        judge=judge,
+        cfg=cfg,
+        results_dir=tmp_path,
+        iteration=1,
+        run_idx=0,
+        tag="",
+        best_model=None,
+        best_metric=None,
+        recovery_failures=None,
+        prev_had_success=True,
+    )
 
-    assert verdict.synthesized_feedback == ""
-    assert verdict.key_recommendations == []
+    assert artifact.synthesized_feedback == {"default": ""}
+    assert artifact.key_recommendations == []
 
     trace_path = tmp_path / "judge" / "iter1_run0.json"
     assert trace_path.exists()
@@ -459,6 +471,65 @@ def test_empty_capabilities_yield_explicit_empty_feedback_trace(tmp_path):
     assert '"no_substantive_feedback": true' in trace_payload
 
 
+def test_run_test_evaluation_guides_write_store_when_disabled(tmp_path, monkeypatch, capsys):
+    """The test-evaluation CLI should tell users how to persist the diagnostic store."""
+    from gecco.cli.run_test_evaluation import run_test_evaluation
+
+    results_dir = tmp_path / "results" / "demo"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "shared_registry.duckdb").write_text("", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        data=SimpleNamespace(
+            path="data.csv",
+            input_columns=["choice"],
+            id_column="participant",
+            splits={},
+        ),
+        evaluation=SimpleNamespace(n_test_models=1),
+    )
+
+    monkeypatch.setattr("gecco.cli.run_test_evaluation.configure_temp_dirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gecco.cli.run_test_evaluation.load_config", lambda config_path: cfg)
+    monkeypatch.setattr(
+        "gecco.cli.run_test_evaluation.SharedRegistry.open_existing",
+        lambda path: SimpleNamespace(read=lambda: {}),
+    )
+    monkeypatch.setattr("gecco.cli.run_test_evaluation.load_splits", lambda loaded_cfg: [1])
+    monkeypatch.setattr(
+        "gecco.cli.run_test_evaluation.collect_candidates",
+        lambda registry: [
+            {
+                "client_id": 0,
+                "iteration": 1,
+                "function_name": "candidate_model",
+                "code": "def candidate_model():\n    return 1\n",
+                "val_mean_nll": 1.23,
+                "param_names": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "gecco.cli.run_test_evaluation.fit_one_on_test",
+        lambda candidate, df_test, cfg, id_eval_data=None: {
+            "model_name": candidate["function_name"],
+            "val_nll": candidate["val_mean_nll"],
+            "test_mean_BIC": 2.0,
+            "test_mean_NLL": 3.0,
+            "test_individual_BIC": [],
+            "test_individual_NLL": [],
+            "test_individual_differences": None,
+        },
+    )
+
+    run_test_evaluation(config="demo.yaml", results_dir=str(results_dir), write_store=False)
+
+    output = capsys.readouterr().out
+    assert "--write-store" in output
+    assert "Diagnostic store persistence is disabled" in output
+
+
 def test_random_feedback_only_returns_deterministic_generic_feedback(tmp_path):
     """Noise mode should return fixed feedback without tool use or synthesis."""
     judge = _build_judge(
@@ -467,10 +538,21 @@ def test_random_feedback_only_returns_deterministic_generic_feedback(tmp_path):
         store=object(),
     )
 
-    verdict = judge.get_feedback(iteration=2, run_idx=0, tag="")
+    artifact = run_orchestrated_judge_pipeline(
+        judge=judge,
+        cfg=judge.cfg,
+        results_dir=tmp_path,
+        iteration=2,
+        run_idx=0,
+        tag="",
+        best_model=None,
+        best_metric=None,
+        recovery_failures=None,
+        prev_had_success=True,
+    )
 
-    assert verdict.synthesized_feedback == _RANDOM_FEEDBACK_TEXT
-    assert verdict.key_recommendations == []
+    assert artifact.synthesized_feedback == {"default": _RANDOM_FEEDBACK_TEXT}
+    assert artifact.key_recommendations == []
     trace_payload = (tmp_path / "judge" / "iter2_run0.json").read_text(encoding="utf-8")
     assert '"random_feedback_only": true' in trace_payload
     assert '"tool_call_trace": []' in trace_payload

@@ -1,7 +1,7 @@
 import ast
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import sentry_sdk
 from rich.console import Console
@@ -26,6 +26,15 @@ def log(msg: str, level: str = "info") -> None:
         level=level,
         timestamp=datetime.now(),
     )
+
+
+def mapping_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a key from either a mapping or an attribute container."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 class TimestampedConsole(Console):

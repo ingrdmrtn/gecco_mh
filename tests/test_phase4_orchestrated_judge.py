@@ -9,6 +9,7 @@ import pytest
 
 from gecco.artifacts import ArtifactStore
 import gecco.run_gecco as run_gecco_module
+import gecco.cli.run_judge_orchestrator as run_judge_orchestrator_module
 from gecco.cli.run_judge_orchestrator import run_orchestrator
 from gecco.construct_feedback.orchestrated import (
     FeedbackArtifact,
@@ -624,7 +625,7 @@ def test_single_worker_run_uses_local_orchestrated_runner_when_registry_missing(
 
 
 def test_single_worker_run_surfaces_local_orchestrated_runner_failures(tmp_path):
-    """Missing shared registry should not revive the direct get_feedback() bypass."""
+    """Missing shared registry should not revive the local judge bypass."""
     search = _make_single_worker_search(tmp_path, MagicMock())
 
     with patch(
@@ -682,10 +683,6 @@ def test_orchestrator_uses_shared_orchestrated_runner(tmp_path, monkeypatch):
     results_dir = tmp_path / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(
-        "gecco.diagnostic_store.rebuild.rebuild_from_artifacts",
-        MagicMock(side_effect=AssertionError("JSON rebuild path should not be used")),
-    )
     original_glob = Path.glob
 
     def _guarded_glob(self, pattern):
@@ -789,43 +786,48 @@ def test_orchestrator_uses_shared_orchestrated_runner(tmp_path, monkeypatch):
         best_model_code_included=False,
     )
 
-    with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
-        with patch(
-            "gecco.cli.run_judge_orchestrator.SharedRegistry",
-            return_value=mock_registry,
-        ):
+    with patch(
+        "gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources",
+        wraps=run_judge_orchestrator_module._build_judge_store_from_duckdb_sources,
+    ) as build_store_mock:
+        with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
             with patch(
-                "gecco.cli.run_judge_orchestrator.load_llm",
-                return_value=(None, None),
+                "gecco.cli.run_judge_orchestrator.SharedRegistry",
+                return_value=mock_registry,
             ):
                 with patch(
-                    "gecco.cli.run_judge_orchestrator.load_data",
-                    return_value=MagicMock(),
+                    "gecco.cli.run_judge_orchestrator.load_llm",
+                    return_value=(None, None),
                 ):
                     with patch(
-                        "gecco.cli.run_judge_orchestrator.split_by_participant",
-                        return_value={"prompt": MagicMock()},
+                        "gecco.cli.run_judge_orchestrator.load_data",
+                        return_value=MagicMock(),
                     ):
                         with patch(
-                            "gecco.cli.run_judge_orchestrator.get_data2text_function",
-                            return_value=lambda *args, **kwargs: "data text",
+                            "gecco.cli.run_judge_orchestrator.split_by_participant",
+                            return_value={"prompt": MagicMock()},
                         ):
                             with patch(
-                                "gecco.cli.run_judge_orchestrator.ToolUsingJudge",
-                                return_value=MagicMock(),
-                            ) as judge_cls:
+                                "gecco.cli.run_judge_orchestrator.get_data2text_function",
+                                return_value=lambda *args, **kwargs: "data text",
+                            ):
                                 with patch(
-                                    "gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline",
-                                    return_value=artifact,
-                                ) as runner:
-                                    with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
-                                        run_orchestrator(
-                                            config="test.yaml",
-                                            results_dir=str(results_dir),
-                                            n_clients=2,
-                                        )
+                                    "gecco.cli.run_judge_orchestrator.ToolUsingJudge",
+                                    return_value=MagicMock(),
+                                ) as judge_cls:
+                                    with patch(
+                                        "gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline",
+                                        return_value=artifact,
+                                    ) as runner:
+                                        with patch("gecco.cli.run_judge_orchestrator.init_sentry"):
+                                            run_orchestrator(
+                                                config="test.yaml",
+                                                results_dir=str(results_dir),
+                                                n_clients=2,
+                                            )
 
     runner.assert_called_once()
+    build_store_mock.assert_called_once_with(results_dir)
     assert runner.call_args.kwargs["best_model"] == "def distributed_best_model(x):\n    return x"
     assert runner.call_args.kwargs["best_metric"] == 98.0
     diagnostic_store = judge_cls.call_args.kwargs["diagnostic_store"]

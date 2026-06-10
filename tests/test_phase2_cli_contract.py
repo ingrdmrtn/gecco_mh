@@ -130,6 +130,7 @@ def test_run_distributed_handler_passes_typed_arguments_directly():
 def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_path):
     """The launcher should infer orchestrator mode from validated config state."""
     from gecco.cli.launch_distributed import run_distributed_launcher
+    from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
 
     project_root = tmp_path
     config_dir = project_root / "config"
@@ -147,17 +148,92 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
         evaluation=SimpleNamespace(fit_type="group"),
     )
 
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        if "launch_vllm_server.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="12345;cluster\n", stderr="")
+        if "run_gecco_distributed.sh" in command and "--array=" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2001\n", stderr="")
+        if "run_judge_orchestrator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2002\n", stderr="")
+        if "run_test_evaluation.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2003\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+
     with patch("gecco.cli.launch_distributed.PROJECT_ROOT", project_root):
         with patch("gecco.cli.launch_distributed.load_config", return_value=cfg) as load_config_mock:
             with patch("gecco.cli.launch_distributed.get_provider_spec") as provider_spec_mock:
                 provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
                 with patch("gecco.cli.launch_distributed.init_sentry"):
-                    with patch("gecco.cli.launch_distributed.run_cmd", return_value=None) as run_cmd_mock:
-                        run_distributed_launcher(config="demo.yaml", dry_run=True)
+                    with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
+                        run_distributed_launcher(config="demo.yaml", launch_vllm=True)
 
     load_config_mock.assert_called_once_with(project_root / "config" / "demo.yaml")
-    commands = [call.args[0] for call in run_cmd_mock.call_args_list]
-    assert any("run_judge_orchestrator.sh" in command for command in commands)
+    assert seen_commands[0] == 'sbatch --parsable  bash/launch_vllm_server.sh "demo-model" 8000 1'
+    assert seen_commands[1].startswith('sbatch --array=0-1 --cpus-per-task=48 --dependency=afterok:12345')
+    assert seen_commands[1].endswith('bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" ""')
+    assert seen_commands[2].startswith('sbatch --dependency=afterok:12345 --cpus-per-task=8')
+    assert seen_commands[2].endswith('bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""')
+    assert seen_commands[3].startswith('sbatch --dependency=afterok:2001 --cpus-per-task=8')
+    assert seen_commands[3].endswith('bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""')
+    assert len(seen_commands) == 4
+
+
+def test_run_cmg_distributed_builds_expected_commands(tmp_path):
+    """The CMG launcher should preserve its sbatch command strings."""
+    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
+    from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
+
+    project_root = tmp_path
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "demo.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group"),
+        centralized_model_generation=SimpleNamespace(
+            enabled=True,
+            generator_client="generator",
+            n_models=2,
+            run_final_evaluation=True,
+        ),
+        slurm={},
+    )
+
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        if "run_cmg_generator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 5001\n", stderr="")
+        if "run_gecco_distributed.sh" in command and "--array=0-1" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 5002\n", stderr="")
+        if "run_judge_orchestrator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 5003\n", stderr="")
+        if "run_test_evaluation.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 5004\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+
+    with patch("gecco.cli.launch_cmg_distributed.PROJECT_ROOT", project_root):
+        with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=cfg):
+            with patch("gecco.cli.launch_cmg_distributed.console.print"):
+                with patch("gecco.cli.launch_cmg_distributed.LaunchExecutor", return_value=real_executor):
+                    run_cmg_distributed_launcher(config="demo.yaml", dry_run=False)
+
+    assert seen_commands[0].startswith("sbatch --job-name=gecco-cmg-generator")
+    assert seen_commands[1].startswith("sbatch --array=0-1 --job-name=gecco-cmg-evaluator")
+    assert seen_commands[2].startswith("sbatch --job-name=gecco-cmg-orchestrator")
+    assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
+    assert len(seen_commands) == 4
 
 
 def test_cli_entrypoint_functions_are_importable_and_callable():

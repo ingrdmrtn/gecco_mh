@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 from pathlib import Path
 
 import yaml
@@ -12,10 +11,22 @@ from rich.console import Console
 from rich.panel import Panel
 
 from config.schema import load_config
+from gecco.cli.launcher_utils import (
+    LaunchCommand,
+    LaunchExecutor,
+    LaunchPlan,
+    SubmissionResult,
+)
 
 
 console = Console()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _print_final_eval_result(result: SubmissionResult) -> None:
+    if result.job_id:
+        print(f"  Final evaluation job ID: {result.job_id}")
+    print()
 
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
@@ -59,28 +70,6 @@ def _get_results_dir(project_root, cfg):
     if fit_type == "individual":
         return project_root / "results" / f"{task_name}_individual"
     return project_root / "results" / task_name
-
-
-def _format_dependency(job_ids):
-    ids = [str(job_id) for job_id in job_ids if job_id]
-    return f"--dependency=afterok:{':'.join(ids)}" if ids else ""
-
-
-def run_cmd(cmd, dry_run=False):
-    """Run a shell command, or just print it if dry_run."""
-    print(f"  $ {cmd}")
-    if dry_run:
-        return None
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr.strip()}")
-        raise SystemExit(1)
-    output = result.stdout.strip()
-    if output.startswith("Submitted batch job "):
-        return output.split()[-1]
-    return output
-
-
 def run_cmg_distributed_launcher(
     *,
     config: str,
@@ -130,6 +119,7 @@ def run_cmg_distributed_launcher(
         final_eval_enabled = run_final_eval
 
     conda_arg = f'"{conda_env}"' if conda_env else '""'
+    executor = LaunchExecutor()
 
     slurm_defaults = _get_slurm_defaults(config_path)
     resolved_cpus_per_task = cpus_per_task or slurm_defaults.get("cpus_per_task") or 48
@@ -199,65 +189,72 @@ def run_cmg_distributed_launcher(
 
     if not local:
         print("Submitting generator job...")
-        gen_job_cmd = (
-            f"sbatch "
-            f"--job-name=gecco-cmg-generator "
-            f"--cpus-per-task={resolved_cpus_per_task} "
-            f"{partition_flag} "
-            f"{mem_flag} "
-            f"--output=logs/gecco-cmg-generator-%j.out "
-            f"--error=logs/gecco-cmg-generator-%j.err "
-            f'{PROJECT_ROOT / "bash/run_cmg_generator.sh"} '
-            f'"{config}" "{generator_client}" "{resolved_vllm_url}" {conda_arg}'
-        )
-        gen_job_id = run_cmd(gen_job_cmd, dry_run=dry_run)
-
-        print("Submitting evaluator array job...")
-        eval_job_cmd = (
-            f"sbatch "
-            f"--array=0-{n_models - 1} "
-            f"--job-name=gecco-cmg-evaluator "
-            f"--cpus-per-task={resolved_cpus_per_task} "
-            f"{partition_flag} "
-            f"{mem_flag} "
-            f"--output=logs/gecco-cmg-evaluator-%A_%a.out "
-            f"--error=logs/gecco-cmg-evaluator-%A_%a.err "
-            f'{PROJECT_ROOT / "bash/run_gecco_distributed.sh"} '
-            f'"{config}" "" "{resolved_vllm_url}" {conda_arg}'
-        )
-        eval_job_id = run_cmd(eval_job_cmd, dry_run=dry_run)
-
-        print("Submitting orchestrator job...")
-        orch_job_cmd = (
-            f"sbatch "
-            f"--job-name=gecco-cmg-orchestrator "
-            f"--cpus-per-task=8 "
-            f"{partition_flag} "
-            f"--mem=16G "
-            f"--output=logs/gecco-cmg-orchestrator-%j.out "
-            f"--error=logs/gecco-cmg-orchestrator-%j.err "
-            f'{PROJECT_ROOT / "bash/run_judge_orchestrator.sh"} '
-            f'"{config}" "{resolved_vllm_url}" "{n_models}" {conda_arg}'
-        )
-        orch_job_id = run_cmd(orch_job_cmd, dry_run=dry_run)
-
+        final_eval_dep_fallback = "--dependency=afterok:<generator_job_id>:<evaluator_job_id>:<orchestrator_job_id>"
+        plan_commands = [
+            LaunchCommand(
+                label="generator",
+                command=(
+                    f"sbatch "
+                    f"--job-name=gecco-cmg-generator "
+                    f"--cpus-per-task={resolved_cpus_per_task} "
+                    f"{partition_flag} "
+                    f"{mem_flag} "
+                    f"--output=logs/gecco-cmg-generator-%j.out "
+                    f"--error=logs/gecco-cmg-generator-%j.err "
+                    f'{PROJECT_ROOT / "bash/run_cmg_generator.sh"} '
+                    f'"{config}" "{generator_client}" "{resolved_vllm_url}" {conda_arg}'
+                ),
+            ),
+            LaunchCommand(
+                label="evaluator",
+                command=(
+                    f"sbatch "
+                    f"--array=0-{n_models - 1} "
+                    f"--job-name=gecco-cmg-evaluator "
+                    f"--cpus-per-task={resolved_cpus_per_task} "
+                    f"{partition_flag} "
+                    f"{mem_flag} "
+                    f"--output=logs/gecco-cmg-evaluator-%A_%a.out "
+                    f"--error=logs/gecco-cmg-evaluator-%A_%a.err "
+                    f'{PROJECT_ROOT / "bash/run_gecco_distributed.sh"} '
+                    f'"{config}" "" "{resolved_vllm_url}" {conda_arg}'
+                ),
+            ),
+            LaunchCommand(
+                label="orchestrator",
+                command=(
+                    f"sbatch "
+                    f"--job-name=gecco-cmg-orchestrator "
+                    f"--cpus-per-task=8 "
+                    f"{partition_flag} "
+                    f"--mem=16G "
+                    f"--output=logs/gecco-cmg-orchestrator-%j.out "
+                    f"--error=logs/gecco-cmg-orchestrator-%j.err "
+                    f'{PROJECT_ROOT / "bash/run_judge_orchestrator.sh"} '
+                    f'"{config}" "{resolved_vllm_url}" "{n_models}" {conda_arg}'
+                ),
+            ),
+        ]
         if final_eval_enabled:
-            print("Scheduling final test evaluation (post-processing)...")
-            dep_flag = (
-                "--dependency=afterok:<generator_job_id>:<evaluator_job_id>:<orchestrator_job_id>"
-                if dry_run
-                else _format_dependency([gen_job_id, eval_job_id, orch_job_id])
+            plan_commands.append(
+                LaunchCommand(
+                    label="final_eval",
+                    command=(
+                        f"sbatch {{dependency}} --cpus-per-task=8 {partition_flag} --mem=16G "
+                        f'{PROJECT_ROOT / "bash/run_test_evaluation.sh"} '
+                        f'"{config}" "{results_dir_rel}" {conda_arg}'
+                    ),
+                    dependency_labels=("generator", "evaluator", "orchestrator"),
+                    dependency_fallback=final_eval_dep_fallback,
+                )
             )
-            final_eval_job_cmd = (
-                f"sbatch {dep_flag} --cpus-per-task=8 {partition_flag} --mem=16G "
-                f'{PROJECT_ROOT / "bash/run_test_evaluation.sh"} '
-                f'"{config}" "{results_dir_rel}" {conda_arg}'
-            )
-            final_eval_job_id = run_cmd(final_eval_job_cmd, dry_run=dry_run)
-            if final_eval_job_id:
-                print(f"  Final evaluation job ID: {final_eval_job_id}")
-            print()
-
+        submission_results = executor.execute(
+            LaunchPlan(commands=tuple(plan_commands)),
+            dry_run=dry_run,
+            on_result=_print_final_eval_result,
+        )
+        gen_result = submission_results[0]
+        gen_job_id = gen_result.job_id
         if not dry_run:
             print(f"\nGenerator job ID: {gen_job_id}")
         else:

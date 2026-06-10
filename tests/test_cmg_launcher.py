@@ -44,6 +44,7 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
     # Evaluator array should be 0-(n_models-1) = 0-1
     assert "--array=0-1" in output
     assert "gecco-cmg-evaluator" in output
+    assert "run_cmg_evaluator.sh" in output
 
     # Should NOT contain --array=0-2 (would be off-by-one)
     assert "--array=0-2" not in output

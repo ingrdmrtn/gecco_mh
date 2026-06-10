@@ -213,7 +213,7 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
         seen_commands.append(command)
         if "run_cmg_generator.sh" in command:
             return SimpleNamespace(returncode=0, stdout="Submitted batch job 5001\n", stderr="")
-        if "run_gecco_distributed.sh" in command and "--array=0-1" in command:
+        if "run_cmg_evaluator.sh" in command and "--array=0-1" in command:
             return SimpleNamespace(returncode=0, stdout="Submitted batch job 5002\n", stderr="")
         if "run_judge_orchestrator.sh" in command:
             return SimpleNamespace(returncode=0, stdout="Submitted batch job 5003\n", stderr="")
@@ -231,6 +231,7 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
 
     assert seen_commands[0].startswith("sbatch --job-name=gecco-cmg-generator")
     assert seen_commands[1].startswith("sbatch --array=0-1 --job-name=gecco-cmg-evaluator")
+    assert seen_commands[1].endswith('bash/run_cmg_evaluator.sh "demo.yaml" "" ""')
     assert seen_commands[2].startswith("sbatch --job-name=gecco-cmg-orchestrator")
     assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
     assert len(seen_commands) == 4

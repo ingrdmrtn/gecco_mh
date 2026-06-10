@@ -216,8 +216,8 @@ def run_cmg_distributed_launcher(
                     f"{mem_flag} "
                     f"--output=logs/gecco-cmg-evaluator-%A_%a.out "
                     f"--error=logs/gecco-cmg-evaluator-%A_%a.err "
-                    f'{PROJECT_ROOT / "bash/run_gecco_distributed.sh"} '
-                    f'"{config}" "" "{resolved_vllm_url}" {conda_arg}'
+                    f'{PROJECT_ROOT / "bash/run_cmg_evaluator.sh"} '
+                    f'"{config}" "{resolved_vllm_url}" {conda_arg}'
                 ),
             ),
             LaunchCommand(

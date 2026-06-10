@@ -34,7 +34,6 @@ def test_cli_help_smoke_runs_real_entrypoint():
 
     assert "GeCCo command line interface" in completed.stdout
     assert "run" in completed.stdout
-    assert "judge" in completed.stdout
     assert "monitor" in completed.stdout
 
 

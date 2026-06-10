@@ -18,25 +18,28 @@ def test_run_distributed_routes_to_launcher():
 
 
 def test_run_cmg_distributed_routes_to_cmg_launcher():
-    """The CMG launch path should live under the unified CLI."""
+    """The removed CMG subcommand should no longer parse."""
     from gecco.cli import build_parser
-    from gecco.cli.launch_cmg_distributed import main as launch_cmg_distributed_main
 
-    args = build_parser().parse_args(
-        ["run", "cmg-distributed", "--config", "demo.yaml"]
-    )
-
-    assert args.handler is launch_cmg_distributed_main
-    assert args.config == "demo.yaml"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "cmg-distributed", "--config", "demo.yaml"])
 
 
-def test_judge_orchestrate_routes_to_orchestrator():
-    """The judge orchestrator should be reachable through the CLI family."""
+def test_judge_orchestrate_is_not_public_command():
+    """The judge orchestrator should not remain a public CLI command."""
+    from gecco.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["judge", "orchestrate", "--config", "demo.yaml"])
+
+
+def test_internal_judge_orchestrate_routes_to_orchestrator():
+    """The internal judge orchestrator should remain reachable."""
     from gecco.cli import build_parser
     from gecco.cli.run_judge_orchestrator import main as orchestrator_main
 
     args = build_parser().parse_args(
-        ["judge", "orchestrate", "--config", "demo.yaml"]
+        ["internal", "judge-orchestrate", "--config", "demo.yaml"]
     )
 
     assert args.handler is orchestrator_main
@@ -249,7 +252,6 @@ def test_cli_entrypoint_functions_are_importable_and_callable():
     from gecco.cli.run_test_evaluation import run_test_evaluation
 
     assert callable(run_distributed_launcher)
-    assert callable(run_cmg_distributed_launcher)
     assert callable(run_local_client)
     assert callable(run_monitor)
     assert callable(run_reset)
@@ -262,8 +264,10 @@ def test_cli_entrypoint_functions_are_importable_and_callable():
     "legacy_name",
     [
         "launch_distributed",
+        "cmg-distributed",
         "run_gecco_distributed",
         "run_judge_orchestrator",
+        "judge",
         "launch_cmg_distributed",
         "monitor_distributed",
         "reset_distributed",

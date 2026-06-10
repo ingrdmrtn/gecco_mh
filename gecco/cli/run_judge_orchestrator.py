@@ -61,7 +61,9 @@ def _build_judge_store_from_duckdb_sources(results_dir: Path) -> DiagnosticStore
 
 def register_parser(subparsers) -> argparse.ArgumentParser:
     """Register the orchestrator subcommand."""
-    parser = subparsers.add_parser("orchestrate", help="Run the central judge orchestrator")
+    parser = subparsers.add_parser(
+        "judge-orchestrate", help=argparse.SUPPRESS, description=argparse.SUPPRESS
+    )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--vllm-url", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default=None)

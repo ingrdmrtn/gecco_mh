@@ -10,7 +10,7 @@
 # Centralized judge orchestrator for distributed GeCCo runs.
 #
 # Usage (via launcher):
-#   python -m gecco run distributed --config <yaml> --launch-orchestrator
+#   python -m gecco internal judge-orchestrate --config <yaml>
 #
 # Manual usage:
 #   sbatch bash/run_judge_orchestrator.sh two_step_factors.yaml "http://gpu-node:8000/v1" "4" "my_env"
@@ -97,7 +97,7 @@ fi
 
 # Run the orchestrator
 echo "[Orchestrator] Starting centralized judge orchestrator..."
-python -m gecco judge orchestrate \
+python -m gecco internal judge-orchestrate \
     --config "$CONFIG" \
     $VLLM_ARG \
     $N_CLIENTS_ARG

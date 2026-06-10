@@ -103,9 +103,9 @@ def test_run_distributed_handler_passes_typed_arguments_directly():
             "distributed",
             "--config",
             "x.yaml",
-            "--vllm-tp",
-            "4",
-            "--launch-vllm",
+            "--vllm-url",
+            "http://localhost:8000/v1",
+            "--local",
         ]
     )
 
@@ -116,22 +116,19 @@ def test_run_distributed_handler_passes_typed_arguments_directly():
         config="x.yaml",
         profiles=None,
         extra_clients=0,
-        launch_vllm=True,
-        vllm_model=None,
-        vllm_tp=4,
-        vllm_port=8000,
-        vllm_url=None,
+        vllm_url="http://localhost:8000/v1",
         conda_env=None,
         partition=None,
         cpus_per_task=None,
         mem=None,
         dry_run=False,
+        local=True,
         launch_orchestrator=False,
     )
 
 
 def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_path):
-    """The launcher should infer orchestrator mode from validated config state."""
+    """The unified distributed launcher should keep the regular sbatch plan."""
     from gecco.cli.launch_distributed import run_distributed_launcher
     from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
 
@@ -155,8 +152,6 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
 
     def fake_runner(command: str):
         seen_commands.append(command)
-        if "launch_vllm_server.sh" in command:
-            return SimpleNamespace(returncode=0, stdout="12345;cluster\n", stderr="")
         if "run_gecco_distributed.sh" in command and "--array=" in command:
             return SimpleNamespace(returncode=0, stdout="Submitted batch job 2001\n", stderr="")
         if "run_judge_orchestrator.sh" in command:
@@ -173,22 +168,21 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
                 provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                        run_distributed_launcher(config="demo.yaml", launch_vllm=True)
+                        run_distributed_launcher(config="demo.yaml")
 
     load_config_mock.assert_called_once_with(project_root / "config" / "demo.yaml")
-    assert seen_commands[0] == 'sbatch --parsable  bash/launch_vllm_server.sh "demo-model" 8000 1'
-    assert seen_commands[1].startswith('sbatch --array=0-1 --cpus-per-task=48 --dependency=afterok:12345')
-    assert seen_commands[1].endswith('bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" ""')
-    assert seen_commands[2].startswith('sbatch --dependency=afterok:12345 --cpus-per-task=8')
-    assert seen_commands[2].endswith('bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""')
-    assert seen_commands[3].startswith('sbatch --dependency=afterok:2001 --cpus-per-task=8')
-    assert seen_commands[3].endswith('bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""')
-    assert len(seen_commands) == 4
+    assert seen_commands[0].startswith("sbatch --array=0-1 --cpus-per-task=48")
+    assert "bash/run_gecco_distributed.sh \"demo.yaml\" \"alpha,beta\"" in seen_commands[0]
+    assert seen_commands[1].startswith("sbatch --cpus-per-task=8")
+    assert "bash/run_judge_orchestrator.sh \"demo.yaml\"" in seen_commands[1]
+    assert seen_commands[2].startswith("sbatch --dependency=afterok:2001 --cpus-per-task=8")
+    assert "bash/run_test_evaluation.sh \"demo.yaml\" \"results/demo-task\"" in seen_commands[2]
+    assert len(seen_commands) == 3
 
 
 def test_run_cmg_distributed_builds_expected_commands(tmp_path):
-    """The CMG launcher should preserve its sbatch command strings."""
-    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
+    """The unified distributed launcher should preserve the CMG sbatch plan."""
+    from gecco.cli.launch_distributed import run_distributed_launcher
     from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
 
     project_root = tmp_path
@@ -226,15 +220,15 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
 
     real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
 
-    with patch("gecco.cli.launch_cmg_distributed.PROJECT_ROOT", project_root):
-        with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=cfg):
-            with patch("gecco.cli.launch_cmg_distributed.console.print"):
-                with patch("gecco.cli.launch_cmg_distributed.LaunchExecutor", return_value=real_executor):
-                    run_cmg_distributed_launcher(config="demo.yaml", dry_run=False)
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", project_root):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
+            with patch("gecco.cli.launch_distributed.init_sentry"):
+                with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
+                    run_distributed_launcher(config="demo.yaml")
 
     assert seen_commands[0].startswith("sbatch --job-name=gecco-cmg-generator")
     assert seen_commands[1].startswith("sbatch --array=0-1 --job-name=gecco-cmg-evaluator")
-    assert seen_commands[1].endswith('bash/run_cmg_evaluator.sh "demo.yaml" "" ""')
+    assert "bash/run_cmg_evaluator.sh \"demo.yaml\" \"\"" in seen_commands[1]
     assert seen_commands[2].startswith("sbatch --job-name=gecco-cmg-orchestrator")
     assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
     assert len(seen_commands) == 4
@@ -242,7 +236,6 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
 
 def test_cli_entrypoint_functions_are_importable_and_callable():
     """Extracted runtime entrypoints should be exposed as direct callables."""
-    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
     from gecco.cli.launch_distributed import run_distributed_launcher
     from gecco.cli.monitor_distributed import run_monitor
     from gecco.cli.reset_distributed import run_reset

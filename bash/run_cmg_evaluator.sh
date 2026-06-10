@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH -J gecco-cmg-evaluator
 #SBATCH -N 1
-# --cpus-per-task is set dynamically by `gecco run cmg-distributed`
+# --cpus-per-task is set dynamically by `gecco run distributed`
 #SBATCH --mem=64G
 #SBATCH -t 8:00:00
 #SBATCH --output=logs/gecco-cmg-evaluator-%A_%a.out
@@ -10,7 +10,7 @@
 # CMG evaluator client for distributed GeCCo runs.
 #
 # Usage (via launcher):
-#   python -m gecco run cmg-distributed --config <yaml>
+#   python -m gecco run distributed --config <yaml>  # with centralized_model_generation.enabled: true
 #
 # Manual usage:
 #   sbatch --array=0-1 bash/run_cmg_evaluator.sh two_step_factors_cmg.yaml "http://gpu-node:8000/v1" "my_env"

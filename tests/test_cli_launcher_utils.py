@@ -17,18 +17,16 @@ def test_launch_plan_executes_in_order_and_propagates_dependencies():
 
     def fake_runner(command: str):
         seen_commands.append(command)
-        if "launch_vllm_server.sh" in command:
-            return SimpleNamespace(returncode=0, stdout="12345;cluster\n", stderr="")
         job_id = str(100 + len(seen_commands))
         return SimpleNamespace(returncode=0, stdout=f"Submitted batch job {job_id}\n", stderr="")
 
     executor = LaunchExecutor(runner=fake_runner, printer=lambda *_: None)
     plan = LaunchPlan(
         commands=(
-            LaunchCommand(label="server", command="sbatch bash/launch_vllm_server.sh"),
+            LaunchCommand(label="server", command="sbatch bash/run_generator.sh"),
             LaunchCommand(
                 label="clients",
-                command="sbatch {dependency} bash/run_gecco_distributed.sh",
+                command="sbatch {dependency} bash/run_clients.sh",
                 dependency_labels=("server",),
             ),
         )
@@ -37,10 +35,10 @@ def test_launch_plan_executes_in_order_and_propagates_dependencies():
     results = plan.execute(executor)
 
     assert seen_commands == [
-        "sbatch bash/launch_vllm_server.sh",
-        "sbatch --dependency=afterok:12345 bash/run_gecco_distributed.sh",
+        "sbatch bash/run_generator.sh",
+        "sbatch --dependency=afterok:101 bash/run_clients.sh",
     ]
-    assert [result.job_id for result in results] == ["12345", "102"]
+    assert [result.job_id for result in results] == ["101", "102"]
     assert results[1].submitted is True
 
 

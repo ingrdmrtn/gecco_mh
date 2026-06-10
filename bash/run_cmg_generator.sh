@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH -J gecco-cmg-generator
 #SBATCH -N 1
-# --cpus-per-task is set dynamically by `gecco run cmg-distributed`
+# --cpus-per-task is set dynamically by `gecco run distributed`
 #SBATCH -t 8:00:00
 #SBATCH --output=logs/gecco-cmg-generator-%j.out
 #SBATCH --error=logs/gecco-cmg-generator-%j.err
@@ -9,7 +9,7 @@
 # CMG generator client for distributed GeCCo runs.
 #
 # Usage (via launcher):
-#   python -m gecco run cmg-distributed --config <yaml>
+#   python -m gecco run distributed --config <yaml>  # with centralized_model_generation.enabled: true
 #
 # Manual usage:
 #   sbatch bash/run_cmg_generator.sh two_step_factors_cmg.yaml "generator" "http://gpu-node:8000/v1" "my_env"

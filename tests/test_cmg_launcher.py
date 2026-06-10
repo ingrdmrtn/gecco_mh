@@ -13,7 +13,9 @@ def mock_cmg_cfg():
     """Return a minimal CMG-enabled config for launcher tests."""
     return SimpleNamespace(
         task=SimpleNamespace(name="test_cmg"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
         evaluation=SimpleNamespace(fit_type="group"),
+        slurm={},
         centralized_model_generation=SimpleNamespace(
             enabled=True,
             generator_client="generator",
@@ -23,12 +25,18 @@ def mock_cmg_cfg():
     )
 
 
-def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
+def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys, tmp_path):
     """Default (SLURM) with --dry-run should print actual sbatch commands without submitting."""
-    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
+    from gecco.cli.launch_distributed import run_distributed_launcher
 
-    with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
-        run_cmg_distributed_launcher(config="two_step_factors_cmg.yaml", dry_run=True)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "two_step_factors_cmg.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", tmp_path):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=mock_cmg_cfg):
+            with patch("gecco.cli.launch_distributed.init_sentry"):
+                run_distributed_launcher(config="two_step_factors_cmg.yaml", dry_run=True)
 
     captured = capsys.readouterr()
     output = captured.out
@@ -56,36 +64,52 @@ def test_slurm_dry_run_shows_sbatch_commands(mock_cmg_cfg, capsys):
 
     # Orchestrator job should be present
     assert "gecco-cmg-orchestrator" in output
+    assert "run_judge_orchestrator.sh" in output
 
-    # Final evaluation job should be scheduled by default
-    assert "gecco-cmg-test-eval" in output
+    # Final evaluation command should be scheduled by default
     assert "run_test_evaluation.sh" in output
     assert "results/test_cmg" in output
 
     # Dry-run marker
-    assert "[Dry run] No jobs were submitted." in output
+    assert "[Dry run]" not in output
 
     # No Rich object repr should leak into stdout
     assert "<rich.panel.Panel object" not in output
 
     # Readable panel fields should be present
-    assert "Generator Client" in output
-    assert "Evaluators" in output
+    assert "Generator client:" in output
+    assert "Evaluators:" in output
 
 
-def test_slurm_dry_run_can_disable_final_eval(mock_cmg_cfg, capsys):
+def test_slurm_dry_run_can_disable_final_eval(mock_cmg_cfg, capsys, tmp_path):
     """CLI override should suppress the final evaluation job."""
-    from gecco.cli.launch_cmg_distributed import run_cmg_distributed_launcher
+    from gecco.cli.launch_distributed import run_distributed_launcher
 
-    with patch("gecco.cli.launch_cmg_distributed.load_config", return_value=mock_cmg_cfg):
-        run_cmg_distributed_launcher(
-            config="two_step_factors_cmg.yaml",
-            dry_run=True,
-            run_final_eval=False,
-        )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "two_step_factors_cmg.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    disabled_cfg = SimpleNamespace(
+        task=mock_cmg_cfg.task,
+        llm=mock_cmg_cfg.llm,
+        evaluation=mock_cmg_cfg.evaluation,
+        slurm=mock_cmg_cfg.slurm,
+        centralized_model_generation=SimpleNamespace(
+            enabled=True,
+            generator_client="generator",
+            n_models=2,
+            run_final_evaluation=False,
+        ),
+    )
+
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", tmp_path):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=disabled_cfg):
+            with patch("gecco.cli.launch_distributed.init_sentry"):
+                run_distributed_launcher(config="two_step_factors_cmg.yaml", dry_run=True)
 
     captured = capsys.readouterr()
     output = captured.out
 
-    assert "Final Eval: disabled" in output
-    assert "gecco-cmg-test-eval" not in output
+    assert "Final eval:" in output
+    assert "disabled" in output
+    assert "run_test_evaluation.sh" not in output

@@ -65,7 +65,7 @@ def test_cmg_distributed_dry_run_smoke_does_not_require_slurm(tmp_path):
 
     completed = _run_gecco(
         "run",
-        "cmg-distributed",
+        "distributed",
         "--config",
         "two_step_factors_cmg.yaml",
         "--dry-run",
@@ -78,6 +78,5 @@ def test_cmg_distributed_dry_run_smoke_does_not_require_slurm(tmp_path):
     assert "--array=0-1" in completed.stdout
     assert "run_judge_orchestrator.sh" in completed.stdout
     assert "run_test_evaluation.sh" in completed.stdout
-    assert "[Dry run]" in completed.stdout
     assert "<rich.panel.Panel object" not in completed.stdout
     assert "Submitted batch job" not in completed.stdout

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gecco.artifacts import ArtifactStore
+from config.schema import load_config
 import gecco.run_gecco as run_gecco_module
 import gecco.cli.run_judge_orchestrator as run_judge_orchestrator_module
 from gecco.cli.run_judge_orchestrator import run_orchestrator
@@ -21,6 +22,29 @@ from gecco.construct_feedback.tool_judge import ToolUsingJudge
 from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.run_gecco import GeCCoModelSearch
+
+
+class _SummaryOnlyStore:
+    """Store stub that exposes duplicate attempted models and a short trajectory."""
+
+    def fetchone(self, query, params=None):
+        if "MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter" in query:
+            return {"best_iter": 98.5}
+        return None
+
+    def fetchall(self, query, params=None):
+        if "GROUP BY m.iteration" in query:
+            return [
+                {"iteration": 0, "best_metric": 110.0, "n_models_total": 2, "n_ok": 2},
+                {"iteration": 1, "best_metric": 98.5, "n_models_total": 4, "n_ok": 3},
+            ]
+        if "iteration =" in query:
+            return [
+                {"name": "alpha_model"},
+                {"name": "beta_model"},
+                {"name": "alpha_model"},
+            ]
+        return []
 
 
 def _make_single_worker_search(tmp_path: Path, judge_mock: MagicMock) -> GeCCoModelSearch:
@@ -272,6 +296,43 @@ def test_local_single_worker_without_client_id_uses_default_feedback(tmp_path):
     )
     assert artifact.synthesized_feedback == {"default": "Default feedback only."}
     assert artifact.feedback_for_persona("explore") == "Default feedback only."
+
+
+def test_deterministic_synthesis_is_persisted_unchanged(tmp_path):
+    """Narrow deterministic synthesis should persist exactly as returned."""
+    cfg = load_config(
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "archive"
+        / "two_step_factors_gemini3flash_capabilities_summary_only.yaml"
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_SummaryOnlyStore(),
+        model=object(),
+        tokenizer=None,
+        results_dir=tmp_path,
+    )
+
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="", best_metric=95.0)
+
+    artifact = run_orchestrated_judge_pipeline(
+        judge=judge,
+        cfg=cfg,
+        results_dir=tmp_path,
+        iteration=0,
+        run_idx=0,
+        tag="",
+        best_model=None,
+        best_metric=95.0,
+        recovery_failures=None,
+        prev_had_success=True,
+    )
+
+    assert analysis["narrow_deterministic"] is True
+    assert artifact.synthesized_feedback == {"default": analysis["analysis_text"]}
+    assert artifact.key_recommendations == []
+    assert artifact.personas == ["default"]
 
 
 def test_persona_synthesis_fanout_only_runs_when_enabled(tmp_path):

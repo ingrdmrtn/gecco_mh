@@ -21,17 +21,15 @@ from gecco.construct_feedback.tool_judge import (
 from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = PROJECT_ROOT / "config"
+CONFIG_DIR = PROJECT_ROOT / "config" / "archive"
 NON_PRODUCTION_CONFIGS = {"judge_tool_example.yaml", "test_orchestrator.yaml"}
 FULL_CAPABILITIES = [
     "attempted_models_overview",
     "performance_summary",
     "best_model_code",
+    "diagnostic_detail",
     "recommendations",
-    "mechanistic_coherence",
     "tools",
-    "citations",
-    "coverage",
 ]
 PRODUCTION_CONFIGS = sorted(
     p.name for p in CONFIG_DIR.glob("*.yaml") if p.name not in NON_PRODUCTION_CONFIGS
@@ -574,8 +572,8 @@ def test_random_feedback_only_short_circuits_orchestrated_analysis(tmp_path):
     assert analysis["trace"] == []
 
 
-def test_summary_only_feedback_is_concise_and_quantitative():
-    """Summary-only helper should emit deterministic progress feedback only."""
+def test_summary_only_feedback_is_metric_only():
+    """Summary-only helper should emit deterministic metric-only feedback."""
     analysis_data = {
         "n_total": 4,
         "n_ok": 3,
@@ -585,13 +583,26 @@ def test_summary_only_feedback_is_concise_and_quantitative():
         "trajectory_str": "iter 0: 110.00 → iter 1: 98.50",
     }
 
-    feedback = _build_summary_only_feedback(analysis_data)
+    feedback = _build_summary_only_feedback(
+        analysis_data, capabilities=["performance_summary"]
+    )
 
-    assert "Iteration summary" in feedback
-    assert "Models evaluated this iteration: 4 total, 3 successful, 1 failed" in feedback
+    assert "Performance summary" in feedback
     assert "Best BIC this iteration: 98.50" in feedback
-    assert "recommend" not in feedback.lower()
-    assert "ppc" not in feedback.lower()
+    for forbidden in [
+        "recommend",
+        "ppc",
+        "residual",
+        "diagnostic",
+        "improving",
+        "regressed",
+        "plateaued",
+        "total",
+        "status",
+        "alpha_model",
+    ]:
+        assert forbidden not in feedback.lower()
+    assert "iter 0" not in feedback.lower()
 
 
 def test_summary_only_config_short_circuits_persona_synthesis(tmp_path, monkeypatch):
@@ -622,10 +633,31 @@ def test_summary_only_config_short_circuits_persona_synthesis(tmp_path, monkeypa
 
     feedback, verdict_dict = judge.synthesize_for_persona(analysis, persona_name="default")
 
-    assert feedback == verdict_dict["synthesized_feedback"]
+    assert feedback == analysis["analysis_text"]
+    assert verdict_dict["synthesized_feedback"] == analysis["analysis_text"]
     assert verdict_dict["key_recommendations"] == []
-    assert "Iteration summary" in feedback
-    assert "unused analysis text" not in feedback
+    assert feedback == analysis["analysis_text"]
+
+
+def test_summary_only_config_preserves_analysis_text_in_composed_synthesis(tmp_path, monkeypatch):
+    """Composed narrow synthesis should preserve both deterministic sections unchanged."""
+    judge = _build_judge(
+        "two_step_factors_gemini3flash_capabilities_summary_only.yaml",
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        judge,
+        "_request_structured_verdict_with_suffix",
+        lambda *args, **kwargs: pytest.fail("summary-only synthesis should not call verdict extraction"),
+    )
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    feedback, verdict_dict = judge.synthesize_for_persona(analysis, persona_name="default")
+
+    assert feedback == analysis["analysis_text"]
+    assert verdict_dict["synthesized_feedback"] == analysis["analysis_text"]
+    assert "Models attempted" in feedback or "No models attempted" in feedback
+    assert "Performance summary" in feedback
 
 
 def test_summary_only_analysis_skips_fallback_generation(tmp_path, monkeypatch):
@@ -642,7 +674,7 @@ def test_summary_only_analysis_skips_fallback_generation(tmp_path, monkeypatch):
 
     analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
 
-    assert analysis["summary_only"] is True
+    assert analysis["narrow_deterministic"] is True
     assert analysis["trace"] == []
 
 
@@ -728,11 +760,37 @@ def test_get_feedback_analysis_captures_no_recommendations_analysis_messages(
                 "improve the next iteration",
                 "suggestions",
                 "next-step ideas",
+                "coverage",
+                "citations",
+                "cited_models",
+                "cited models",
+                "mechanistic_coherence",
+                "mechanistic coherence",
+                "six angles",
+                "all six angles",
             ],
         ),
         (
-            "two_step_factors_gemini3flash_capabilities_no_citations.yaml",
-            ["cite model names", "bic values", "r values", "cited_models"],
+            "two_step_factors_gemini3flash_capabilities_no_diagnostics.yaml",
+            [
+                "predictive adequacy",
+                "ppc",
+                "posterior predictive",
+                "residual",
+                "individual differences",
+                "parameter recovery",
+                "recovery",
+                "r²",
+                "r2",
+                "coverage",
+                "citations",
+                "cited_models",
+                "cited models",
+                "mechanistic_coherence",
+                "mechanistic coherence",
+                "six angles",
+                "all six angles",
+            ],
         ),
     ],
 )
@@ -783,11 +841,58 @@ def test_orchestrated_persona_synthesis_captures_capability_limited_llm_messages
     if "no_recommendations" in config_name:
         assert verdict_dict["key_recommendations"] == []
         assert "Recommendations:" not in feedback
-    if "no_citations" in config_name:
-        assert "BIC=2847" not in feedback
+    if "no_diagnostics" in config_name:
+        assert "PPC diagnostics" not in feedback
 
 
-def test_capability_postprocessing_suppresses_recommendations_citations_and_diagnostics():
+def test_orchestrated_persona_synthesis_includes_diagnostic_detail_angles(tmp_path):
+    """diagnostic_detail should keep core angles and add detailed diagnostics."""
+    judge = _build_judge("two_step_factors_gemini3flash.yaml", tmp_path)
+    judge.provider = "openai"
+    judge.model_name = "gpt-test"
+    chat_create = MagicMock(
+        return_value=_make_openai_response(
+            '{"per_angle":[],"key_recommendations":["Try a simpler model next."],'
+            '"synthesized_feedback":"Performance summary: the model with separate '
+            'learning rates (separate_lr_gain_loss, BIC=2847) improved over iteration '
+            '3 run 1.\\n\\nRecommendations: Try a simpler model next.\\n\\nPPC '
+            'diagnostics showed residual misfit in late trials."}'
+        )
+    )
+    judge.model = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=chat_create))
+    )
+    analysis = {
+        "iteration": 1,
+        "analysis_text": "analysis text",
+        "trace": [],
+        "full_trace": [],
+        "best_bic": 95.0,
+        "trajectory": [],
+        "is_stuck": False,
+        "wall_time": 0.0,
+    }
+
+    judge.synthesize_for_persona(analysis, persona_name="default")
+
+    system_prompt = chat_create.call_args.kwargs["messages"][0]["content"].lower()
+
+    for phrase in [
+        "statistical fit quality",
+        "parameter identifiability",
+        "parameter recovery",
+        "predictive adequacy",
+        "ppc",
+        "residual",
+        "individual differences",
+        "r²",
+        "mechanistic interpretability",
+        "search breadth",
+    ]:
+        assert phrase in system_prompt
+
+
+def test_capability_postprocessing_suppresses_recommendations_and_diagnostics():
     """Capability post-processing should remove disallowed feedback content."""
     verdict = JudgeVerdict(
         iteration=1,
@@ -797,7 +902,10 @@ def test_capability_postprocessing_suppresses_recommendations_citations_and_diag
             "Performance summary: the model with separate learning rates "
             "(separate_lr_gain_loss, BIC=2847) improved over iteration 3 run 1.\n\n"
             "Recommendations: Try a simpler model next.\n\n"
-            "PPC diagnostics showed residual misfit in late trials."
+            "PPC diagnostics showed residual misfit in late trials.\n\n"
+            "Parameter recovery diagnostics showed low r² for one parameter.\n\n"
+            "Recovery was weak for alpha.\n\n"
+            "Individual differences suggested subgroup variability."
         ),
         tool_call_count=0,
         wall_time_seconds=0.0,
@@ -814,6 +922,38 @@ def test_capability_postprocessing_suppresses_recommendations_citations_and_diag
     assert "BIC=2847" not in processed.synthesized_feedback
     assert "iteration 3 run 1" not in processed.synthesized_feedback.lower()
     assert "PPC diagnostics" not in processed.synthesized_feedback
+    assert "recovery" not in processed.synthesized_feedback.lower()
+    assert "r²" not in processed.synthesized_feedback.lower()
+    assert "individual differences" not in processed.synthesized_feedback.lower()
+
+
+def test_postprocessing_preserves_diagnostics_when_diagnostic_detail_enabled():
+    """diagnostic_detail should preserve diagnostic sections."""
+    verdict = JudgeVerdict(
+        iteration=1,
+        per_angle=[],
+        key_recommendations=[],
+        synthesized_feedback=(
+            "Performance summary: best BIC improved.\n\n"
+            "PPC diagnostics showed residual misfit in late trials.\n\n"
+            "Parameter recovery diagnostics showed low r² for one parameter.\n\n"
+            "Recovery was weak for alpha.\n\n"
+            "Individual differences suggested subgroup variability."
+        ),
+        tool_call_count=0,
+        wall_time_seconds=0.0,
+        best_bic=100.0,
+    )
+
+    processed = _apply_capability_postprocessing(
+        verdict,
+        ["attempted_models_overview", "diagnostic_detail"],
+    )
+
+    assert "PPC diagnostics" in processed.synthesized_feedback
+    assert "recovery" in processed.synthesized_feedback.lower()
+    assert "r²" in processed.synthesized_feedback.lower()
+    assert "individual differences" in processed.synthesized_feedback.lower()
 
 
 @pytest.mark.parametrize(
@@ -822,10 +962,6 @@ def test_capability_postprocessing_suppresses_recommendations_citations_and_diag
         (
             "two_step_factors_gemini3flash_capabilities_no_recommendations.yaml",
             "Recommendations:",
-        ),
-        (
-            "two_step_factors_gemini3flash_capabilities_no_citations.yaml",
-            "BIC=2847",
         ),
         (
             "two_step_factors_gemini3flash_capabilities_no_diagnostics.yaml",
@@ -856,3 +992,231 @@ def test_real_capability_config_shapes_feedback(config_name, expected_absent):
     assert expected_absent not in processed.synthesized_feedback
     if "no_recommendations" in config_name:
         assert processed.key_recommendations == []
+
+
+def test_schema_accepts_diagnostic_detail_capability(tmp_path):
+    """diagnostic_detail should be accepted by the schema as a valid capability."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  capabilities:
+    - attempted_models_overview
+    - diagnostic_detail
+"""
+        ),
+    )
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.judge is not None
+    assert "diagnostic_detail" in cfg.judge.capabilities
+
+
+def test_schema_rejects_retired_citations(tmp_path):
+    """citations should be rejected with a validation error."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  capabilities:
+    - citations
+"""
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="citations"):
+        load_config(str(config_path))
+
+
+def test_schema_rejects_retired_coverage(tmp_path):
+    """coverage should be rejected with a validation error."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  capabilities:
+    - coverage
+"""
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="coverage"):
+        load_config(str(config_path))
+
+
+def test_schema_rejects_retired_mechanistic_coherence(tmp_path):
+    """mechanistic_coherence should be rejected with a validation error."""
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config(
+            """  capabilities:
+    - mechanistic_coherence
+"""
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="mechanistic_coherence"):
+        load_config(str(config_path))
+
+
+class _NamesDedupeStore:
+    """Store stub with duplicate model names and hidden metrics/statuses."""
+
+    def fetchone(self, query, params=None):
+        return {"n_total": 3, "n_ok": 2, "n_failed": 1, "best_iter": 100.0}
+
+    def fetchall(self, query, params=None):
+        name = params[0] if params else 0
+        if "GROUP BY m.iteration" in query:
+            return [
+                {"iteration": name - 1, "best_metric": 110.0, "n_models_total": 2, "n_ok": 2},
+            ]
+        if "iteration =" in query:
+            assert "ORDER BY model_id" in query
+            return [
+                {"name": "alpha_model"},
+                {"name": "beta_model"},
+                {"name": "alpha_model"},
+                {"name": "gamma_model"},
+                {"name": "beta_model"},
+            ]
+        return []
+
+
+def test_attempted_models_overview_dedupes_names(tmp_path):
+    """Attempted-models overview should list unique names in first-seen order."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["attempted_models_overview"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    assert "alpha_model" in text
+    assert "beta_model" in text
+    assert "gamma_model" in text
+    assert text.index("alpha_model") < text.index("beta_model")
+    assert text.index("beta_model") < text.index("gamma_model")
+    assert text.count("alpha_model") == 1
+    assert text.count("beta_model") == 1
+    assert text.count("gamma_model") == 1
+
+
+def test_attempted_models_overview_contains_no_forbidden_terms(tmp_path):
+    """Attempted-models overview should contain no metrics, statuses, etc."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["attempted_models_overview"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    forbidden = ["BIC", "bic", "metric", "total", "ok", "failed", "status",
+                 "diagnostic", "ppc", "residual", "recommend", "trajectory",
+                 "recovery", "r²", "r2", "model_id", "id"]
+    for term in forbidden:
+        assert term.lower() not in text.lower()
+
+
+def test_attempted_models_overview_synthesis_preserves_analysis_text(tmp_path, monkeypatch):
+    """Synthesised attempted-models feedback should preserve the deterministic analysis text."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["attempted_models_overview"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+    monkeypatch.setattr(
+        judge,
+        "_request_structured_verdict_with_suffix",
+        lambda *args, **kwargs: pytest.fail("narrow deterministic synthesis should not call verdict extraction"),
+    )
+    monkeypatch.setattr(
+        judge,
+        "_fallback_generate",
+        lambda *args, **kwargs: pytest.fail("narrow deterministic synthesis should not call fallback generation"),
+    )
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    feedback, verdict_dict = judge.synthesize_for_persona(analysis, persona_name="default")
+
+    assert feedback == analysis["analysis_text"]
+    assert verdict_dict["synthesized_feedback"] == analysis["analysis_text"]
+    assert "alpha_model" in feedback
+    assert "beta_model" in feedback
+    assert "gamma_model" in feedback
+    assert feedback.count("alpha_model") == 1
+    assert feedback.count("beta_model") == 1
+    assert feedback.count("gamma_model") == 1
+
+
+def test_performance_summary_contains_metric_values_only(tmp_path):
+    """Performance summary should contain metric values but no model names, counts, etc."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["performance_summary"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    forbidden = ["alpha_model", "beta_model", "gamma_model", "total", "ok",
+                 "failed", "diagnostic", "ppc", "residual", "recommend",
+                 "model_id", "id", "improving", "regressed", "plateaued",
+                 "recovery", "r²", "r2"]
+    for term in forbidden:
+        assert term.lower() not in text.lower()
+    assert "BIC" in text or "bic" in text
+
+
+def test_composed_deterministic_emits_both_sections(tmp_path):
+    """Composed attempted_models_overview + performance_summary should emit both."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["attempted_models_overview", "performance_summary"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    assert "Models attempted" in text
+    assert "alpha_model" in text
+    assert "beta_model" in text
+    assert "BIC" in text or "bic" in text.lower()
+    assert "improving" not in text.lower()
+    assert "regressed" not in text.lower()
+    assert "plateaued" not in text.lower()
+
+
+def test_composed_deterministic_does_not_call_llm_or_fallback(tmp_path, monkeypatch):
+    """Composed mode should bypass LLM/fallback paths entirely."""
+    from types import SimpleNamespace
+    judge = ToolUsingJudge.__new__(ToolUsingJudge)
+    judge.capabilities = ["attempted_models_overview", "performance_summary"]
+    judge.store = _NamesDedupeStore()
+    judge.results_dir = tmp_path
+    judge.max_tool_calls = 20
+    judge.stuck_search_cfg = SimpleNamespace(tolerance=10.0, window=2)
+    monkeypatch.setattr(
+        judge,
+        "_fallback_generate",
+        lambda *args: pytest.fail("fallback should not be called"),
+    )
+
+    analysis = judge.get_feedback_analysis(iteration=1, run_idx=0, tag="")
+
+    assert "Models attempted" in analysis["analysis_text"]

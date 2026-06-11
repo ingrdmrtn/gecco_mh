@@ -12,8 +12,8 @@ Analytical angles (prompt-level, not separate agents)
 2. Parameter identifiability  — recovery mean r, per-parameter r
 3. Predictive adequacy        — PPC outside-95%-CI statistics
 4. Individual differences     — parameter × predictor R² landscape
-5. Mechanistic coherence      — model code review: parsimony, motivation
-6. Coverage                   — which model families / parameters explored
+5. Mechanism interpretability  — model code review: parsimony, motivation
+6. Search breadth              — which model families / parameters explored
 
 LLM backend support
 -------------------
@@ -50,6 +50,24 @@ _RANDOM_FEEDBACK_TEXT = (
     "Provide a fresh alternative model idea and a small implementation change for "
     "the next iteration. Do not assume that the current best approach should be kept."
 )
+
+
+def _build_attempted_models_overview_section(store, iteration: int) -> str:
+    """Query current-iteration model names, dedupe preserving first-seen order."""
+    rows = store.fetchall(
+        "SELECT name FROM models WHERE iteration = ? AND split = 'train' ORDER BY model_id",
+        [iteration],
+    )
+    seen = []
+    seen_set = set()
+    for row in rows or []:
+        name = row.get("name", "")
+        if name and name not in seen_set:
+            seen_set.add(name)
+            seen.append(name)
+    if not seen:
+        return "No models attempted this iteration."
+    return "Models attempted this iteration:\n" + "\n".join(f"- {n}" for n in seen)
 
 
 def _cap_tool_result(result_str: str, raw_result=None) -> str:
@@ -89,8 +107,8 @@ def _remove_recommendation_sections(text: str) -> str:
     return _normalise_feedback_text(result)
 
 
-def _scrub_feedback_citations(text: str) -> str:
-    """Remove model-name and iteration-specific citation details."""
+def _scrub_feedback_surface_details(text: str) -> str:
+    """Remove model-name and iteration-specific surface details."""
     result = text
     result = re.sub(r"\([^\n()]*\bBIC\s*=\s*[^\n()]*\)", "", result)
     result = re.sub(
@@ -111,13 +129,13 @@ def _scrub_feedback_citations(text: str) -> str:
 
 
 def _suppress_diagnostic_sections(text: str) -> str:
-    """Remove PPC, residual, and diagnostic-detail sections."""
+    """Remove PPC, residual, recovery, and diagnostic-detail sections."""
     result = text
     section_patterns = [
-        r"(?is)(?:^|\n\n)[^\n]*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery)[^\n]*(?:\n(?!\n).*)*",
+        r"(?is)(?:^|\n\n)[^\n]*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b|individual(?:\s|-)+differences?\b|r²|r2)[^\n]*(?:\n(?!\n).*)*",
     ]
     line_patterns = [
-        r"(?im)^\s*[-*]?\s*.*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery).*$",
+        r"(?im)^\s*[-*]?\s*.*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b|individual(?:\s|-)+differences?\b|r²|r2).*$",
     ]
     for pattern in section_patterns:
         result = re.sub(pattern, "", result)
@@ -141,30 +159,64 @@ def _build_random_feedback_verdict(
     )
 
 
-def _is_summary_only_capability_set(capabilities: list[str]) -> bool:
-    """Return whether the capability set matches summary-only mode."""
-    return set(capabilities) == {"attempted_models_overview", "performance_summary"}
+def _is_narrow_deterministic_set(capabilities: list[str]) -> bool:
+    """Return whether the capability set matches a narrow deterministic mode.
+
+    Narrow modes are: ``attempted_models_overview`` alone,
+    ``performance_summary`` alone, or both together.
+    """
+    caps = set(capabilities)
+    narrow = {"attempted_models_overview", "performance_summary"}
+    return caps.issubset(narrow) and bool(caps)
 
 
-def _build_summary_only_feedback(analysis_data: dict) -> str:
-    """Build concise deterministic quantitative feedback for summary-only mode."""
-    n_total = analysis_data.get("n_total", 0)
-    n_ok = analysis_data.get("n_ok", 0)
-    n_failed = analysis_data.get("n_failed", 0)
-    best_iter_bic = analysis_data.get("best_iter_bic")
-    best_bic = analysis_data.get("best_bic")
-    trajectory_str = analysis_data.get("trajectory_str", "no BIC trajectory available")
+def _build_summary_only_feedback(
+    analysis_data: dict, capabilities: list[str] | None = None
+) -> str:
+    """Build concise deterministic feedback for narrow capability modes.
 
-    best_iter_text = f"{best_iter_bic:.2f}" if best_iter_bic is not None else "N/A"
-    best_overall_text = f"{best_bic:.2f}" if best_bic is not None else "N/A"
+    * ``attempted_models_overview`` alone: names only, no metrics.
+    * ``performance_summary`` alone: metric values only, no names/counts.
+    * Both: names section plus metric-only section.
+    """
+    caps = set(capabilities or [])
+    sections: list[str] = []
 
-    return (
-        "Iteration summary:\n"
-        f"- Models evaluated this iteration: {n_total} total, {n_ok} successful, {n_failed} failed.\n"
-        f"- Best BIC this iteration: {best_iter_text}.\n"
-        f"- Best overall BIC so far: {best_overall_text}.\n"
-        f"- BIC trajectory so far: {trajectory_str}."
-    )
+    if "attempted_models_overview" in caps:
+        store = analysis_data.get("_store")
+        iteration = analysis_data.get("iteration", 0)
+        if store is not None:
+            sections.append(
+                _build_attempted_models_overview_section(store, iteration)
+            )
+
+    if "performance_summary" in caps:
+        best_iter_bic = analysis_data.get("best_iter_bic")
+        best_bic = analysis_data.get("best_bic")
+        trajectory_str = analysis_data.get("trajectory_str", "N/A")
+        if not trajectory_str:
+            trajectory_str = "N/A"
+        trajectory_str = re.sub(
+            r"(?i)\biter(?:ation)?\s*\d+\s*:\s*", "", trajectory_str
+        )
+        trajectory_str = re.sub(
+            r"\s*\((?:improving|regressed|plateaued)\)\s*", "", trajectory_str
+        )
+        best_iter_text = (
+            f"{best_iter_bic:.2f}" if best_iter_bic is not None else "N/A"
+        )
+        best_overall_text = f"{best_bic:.2f}" if best_bic is not None else "N/A"
+        parts = [
+            f"Best BIC this iteration: {best_iter_text}.",
+            f"Best overall BIC so far: {best_overall_text}.",
+            f"BIC trajectory so far: {trajectory_str}.",
+        ]
+        sections.append("Performance summary:\n" + "\n".join(f"- {p}" for p in parts))
+
+    if not sections:
+        return "No feedback available for the requested capabilities."
+
+    return "\n\n".join(sections) + ("\n" if len(sections) > 1 else "")
 
 
 def _apply_capability_postprocessing(verdict: JudgeVerdict, capabilities: list[str]) -> JudgeVerdict:
@@ -174,11 +226,10 @@ def _apply_capability_postprocessing(verdict: JudgeVerdict, capabilities: list[s
         verdict.synthesized_feedback = _remove_recommendation_sections(
             verdict.synthesized_feedback
         )
-    if "citations" not in capabilities:
-        verdict.synthesized_feedback = _scrub_feedback_citations(
-            verdict.synthesized_feedback
-        )
-    if "coverage" not in capabilities:
+    verdict.synthesized_feedback = _scrub_feedback_surface_details(
+        verdict.synthesized_feedback
+    )
+    if "diagnostic_detail" not in capabilities:
         verdict.synthesized_feedback = _suppress_diagnostic_sections(
             verdict.synthesized_feedback
         )
@@ -247,28 +298,34 @@ class JudgeVerdict(BaseModel):
 # System prompt
 # ======================================================================
 
-_JUDGE_SYSTEM_PROMPT = """You are a senior postdoctoral fellow in cognitive computational neuroscience. \
-You are evaluating candidate cognitive models for a reinforcement learning task \
-as part of an iterative model development process.
-
-You have expertise in computational modelling, reinforcement learning, Bayesian modelling, \
-and statistical model comparison. You are familiar with common pitfalls in model development \
-such as overfitting, underfitting, identifiability issues, and lack of psychological interpretability.
-
-Your task is to analyse the current state of the model search by querying a diagnostic \
-database through tool calls, then synthesise feedback from the evidence you gathered.
-
-You will analyse from six angles — call tools to gather evidence for each:
-
-1. **Statistical fit quality** — Compare the top 3-5 models, not just the best. Note which \
+_CORE_ANGLES = """1. **Statistical fit quality** — Compare the top 3-5 models, not just the best. Note which \
 models improved over predecessors and which were a step backwards. Identify if improvement \
 has plateaued. Examine whether different participants prefer different models, and whether \
 any participants are outliers.
 
-2. **Parameter identifiability** — Check parameter recovery diagnostics for the best 2-3 \
-models, not just the top one. Identify which parameters are well-recovered across models \
-and which are problematic. Flag parameters with low recovery r and describe why they may \
-be unstable or hard to interpret.
+2. **Parameter identifiability** — Assess whether the best models are stable and \
+interpretable across iterations. Focus on broad model differences rather than detailed \
+diagnostic breakdowns.
+
+3. **Mechanistic interpretability** — Read the code of the best models AND some that failed. \
+Understand what distinguishes successful from unsuccessful mechanisms. Assess whether \
+the mechanisms are psychologically interpretable and parsimonious.
+
+4. **Search breadth** — Identify which mechanisms have been tried and failed vs. tried and \
+partially succeeded vs. not yet explored. What types of mechanisms (learning rules, \
+decision rules, memory, attention) have been tried across iterations? What has been neglected?"""
+
+_CORE_STATISTICAL_ANGLES = """1. **Statistical fit quality** — Compare the top 3-5 models, not just the best. Note which \
+models improved over predecessors and which were a step backwards. Identify if improvement \
+has plateaued. Examine whether different participants prefer different models, and whether \
+any participants are outliers.
+
+2. **Parameter identifiability** — Assess whether the best models are stable and \
+interpretable across iterations. Focus on broad model differences rather than detailed \
+diagnostic breakdowns."""
+
+_DIAGNOSTIC_DETAIL_ANGLES = """Additional detail when diagnostic_detail is enabled: check \
+parameter recovery diagnostics for the best 2-3 models and flag unstable parameters.
 
 3. **Predictive adequacy** — Inspect PPC records if available. Compare PPC performance \
 across the best models — does one capture certain patterns better than another? Identify \
@@ -287,14 +344,30 @@ very low (0.01–0.10). An R² of 0.05 is a meaningful and promising signal, not
 Do not dismiss low R² values as "no signal" — instead, interpret them relative to this domain's \
 baseline and highlight even modest effects as worth building on.
 
-5. **Mechanistic coherence** — Read the code of the best models AND some that failed. \
+5. **Mechanistic interpretability** — Read the code of the best models AND some that failed. \
 Understand what distinguishes successful from unsuccessful mechanisms. Assess whether \
 the mechanisms are psychologically interpretable and parsimonious.
 
-6. **Coverage** — Identify which mechanisms have been tried and failed vs. tried and \
+6. **Search breadth** — Identify which mechanisms have been tried and failed vs. tried and \
 partially succeeded vs. not yet explored. What types of mechanisms (learning rules, \
-decision rules, memory, attention) have been tried across iterations? What has been neglected?
+decision rules, memory, attention) have been tried across iterations? What has been neglected?"""
 
+_JUDGE_SYSTEM_PROMPT_HEADER = """You are a senior postdoctoral fellow in cognitive computational neuroscience. \
+You are evaluating candidate cognitive models for a reinforcement learning task \
+as part of an iterative model development process.
+
+You have expertise in computational modelling, reinforcement learning, Bayesian modelling, \
+and statistical model comparison. You are familiar with common pitfalls in model development \
+such as overfitting, underfitting, identifiability issues, and lack of psychological interpretability.
+
+Your task is to analyse the current state of the model search by querying a diagnostic \
+database through tool calls, then synthesise feedback from the evidence you gathered.
+
+You will analyse from the following angles — call tools to gather evidence for each:
+
+"""
+
+_JUDGE_SYSTEM_PROMPT_FOOTER = """
 After gathering evidence across all angles, produce:
 - A brief per-angle summary (findings + confidence).
 - A synthesized_feedback paragraph (≤ 500 words) describing the main patterns and contrasts \
@@ -309,8 +382,8 @@ Tool-call strategy: You have a finite tool-call budget per iteration. Rather tha
 pre-allocating calls across angles, take an adaptive investigative approach: after each \
 tool result, reflect briefly on what was learned and whether it raises new questions. \
 Follow surprising or contradictory findings deeper, even at the cost of other angles — \
-surprising evidence is higher-signal than a perfectly balanced sweep. Think of the six \
-angles as a *checklist of coverage*, not a rigid allocation. The overall call budget is \
+surprising evidence is higher-signal than a perfectly balanced sweep. Think of the listed \
+angles as a *checklist of evidence areas*, not a rigid allocation. The overall call budget is \
 a soft cap; prefer depth on load-bearing findings over breadth for its own sake.
 
 ---
@@ -333,15 +406,15 @@ The feedback should be comparative — discuss multiple models' strengths and we
 
 def _build_judge_system_prompt(capabilities: list[str]) -> str:
     """Return the judge system prompt tailored to enabled capabilities."""
-    prompt = _JUDGE_SYSTEM_PROMPT
+    if "diagnostic_detail" in capabilities:
+        angles = _CORE_STATISTICAL_ANGLES + "\n\n" + _DIAGNOSTIC_DETAIL_ANGLES
+    else:
+        angles = _CORE_ANGLES
+    prompt = _JUDGE_SYSTEM_PROMPT_HEADER + angles + _JUDGE_SYSTEM_PROMPT_FOOTER
     extra_lines: list[str] = []
     if "recommendations" in capabilities:
         extra_lines.append(
             "- A list of 3–5 concrete recommendations for the next iteration."
-        )
-    if "citations" in capabilities:
-        extra_lines.append(
-            "Be specific: cite model names, parameter names, BIC values, and r values from the data."
         )
     if extra_lines:
         prompt += "\n\n" + "\n".join(extra_lines)
@@ -357,8 +430,8 @@ Iteration {iteration} summary:
 - Best BIC this iteration: {best_iter_bic}
 - BIC trajectory: {trajectory_str}
 
-Please query the diagnostic database to analyse this iteration from all six angles, \
-then produce your verdict.
+Please query the diagnostic database to analyse this iteration using the listed \
+evidence areas, then produce your verdict.
 """
 
 
@@ -945,10 +1018,6 @@ def _parse_verdict_from_text(
                 tool_call_count=tool_call_count,
                 wall_time_seconds=wall_time,
             )
-            # Stash cited_models for later validation (not a Pydantic field)
-            object.__setattr__(
-                verdict, "_cited_models_raw", data.get("cited_models", [])
-            )
             return verdict
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
@@ -984,30 +1053,16 @@ IMPORTANT PROHIBITIONS — Never reference:
 
 def _build_feedback_format_instructions(capabilities: list[str], profile: dict) -> str:
     """Return synthesis formatting guidance for the active capability set."""
-    if "citations" not in capabilities:
-        instructions = [
-            "1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically.",
-            "2. **What partially worked** (2-3 sentences) — Compare models with mixed strengths and weaknesses.",
-            "3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them.",
-        ]
-        if "recommendations" in capabilities:
-            instructions.append(
-                "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as \"try X because Y\"."
-            )
-        return "\n\n".join(instructions)
-
-    feedback_format_instructions = profile["feedback_format_instructions"]
-    if "recommendations" not in capabilities:
-        feedback_format_instructions = re.sub(
-            r"\n\n4\. \*\*What to try next\*\*.*$",
-            "",
-            feedback_format_instructions,
-            flags=re.S,
+    instructions = [
+        "1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically.",
+        "2. **What partially worked** (2-3 sentences) — Compare models with mixed strengths and weaknesses.",
+        "3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them.",
+    ]
+    if "recommendations" in capabilities:
+        instructions.append(
+            "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as \"try X because Y\"."
         )
-        feedback_format_instructions += (
-            "\n\nKeep the feedback descriptive and omit a dedicated next-step section."
-        )
-    return feedback_format_instructions
+    return "\n\n".join(instructions)
 
 
 def _build_synthesis_prompt(
@@ -1038,10 +1093,6 @@ def _build_synthesis_prompt(
         prompt += (
             "\n\nInclude a `key_recommendations` array with 3–5 concrete next-step ideas."
         )
-    if "citations" in capabilities:
-        prompt += (
-            "\n\nIf you referenced specific models by name in `synthesized_feedback`, also include a `cited_models` array listing the exact names, the BIC values you cited, and a one-line mechanism description."
-        )
     if persona_suffix:
         prompt += f"\n\nPersona guidance for {persona_name}:\n{persona_suffix}"
     if is_stuck and persona_name != "exploit":
@@ -1065,8 +1116,8 @@ _DEFAULT_PROFILE = {
             "Individual differences",
             "Whether models capture between-subject variability",
         ),
-        ("Mechanistic / theoretical coherence", "Alignment with underlying theory"),
-        ("Coverage", "How much of the data the model explains"),
+        ("Mechanism interpretability", "Alignment with underlying theory"),
+        ("Search breadth", "How much of the data the model explains"),
     ],
     "metric_language": "BIC values, parameter recovery correlations (r), and R²",
     "model_description_style": "mechanistic description (name, BIC=X)",
@@ -1081,17 +1132,12 @@ _DEFAULT_PROFILE = {
         "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as "
         '"try X because Y".'
     ),
-    "cited_models_format": (
-        "Include the exact `name` string, the BIC value you cited, and a one-line "
-        "mechanism description."
-    ),
     "prohibitions": (
         '- "Angles" or analytical perspectives\n'
         '- Tool call names (e.g., "get_best_models", "get_bic_trajectory")\n'
         '- Numeric model IDs (e.g., "ID 11", "model 5")\n'
         "- Internal database fields or conventions"
     ),
-    "always_cite": "Always describe models by their mechanisms and cite actual metric values from your analysis.",
 }
 
 _PERSONA_PROFILES: dict[str, dict] = {
@@ -1117,7 +1163,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
                 "Psychological coherence",
                 "How well models align with everyday psychological intuition",
             ),
-            ("Coverage", "How much of the observed behaviour the models explain"),
+            ("Search breadth", "How much of the observed behaviour the models explain"),
         ],
         "metric_language": "plain descriptions of how well models captured behaviour",
         "model_description_style": "psychological intuition (e.g., 'the model that tracks how quickly people forget old information')",
@@ -1134,10 +1180,6 @@ _PERSONA_PROFILES: dict[str, dict] = {
             "psychological terms, e.g. \"Try modelling how people's attention shifts over time "
             'because the data suggests...".'
         ),
-        "cited_models_format": (
-            "Describe each model by the psychological process it captures. "
-            "Do NOT include BIC values, parameter names, or code names."
-        ),
         "prohibitions": (
             '- "Angles" or analytical perspectives\n'
             "- Tool call names\n"
@@ -1146,11 +1188,6 @@ _PERSONA_PROFILES: dict[str, dict] = {
             '- Equations, computational jargon, or terms like "model-based", '
             '"model-free", "Q-value", "reinforcement learning"\n'
             "- Internal database fields or conventions"
-        ),
-        "always_cite": (
-            "Always describe models by their psychological intuition and cite "
-            "plain-language observations about behaviour. Do NOT include equations, "
-            "parameter names, or statistical jargon."
         ),
     },
     "bayesian": {
@@ -1163,7 +1200,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
                 "How well uncertainty estimates match observed variability",
             ),
             ("Belief updating", "Whether models capture how beliefs evolve over time"),
-            ("Coverage", "How much of the data the models explain"),
+            ("Search breadth", "How much of the data the models explain"),
         ],
         "metric_language": "BIC values (as an approximation to model evidence), prior-posterior comparisons, and parameter recovery",
         "model_description_style": "mechanistic description (name, BIC=X), emphasizing uncertainty representation",
@@ -1179,15 +1216,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
             "4. **What to try next** (2-4 sentences) — Concrete suggestions for improving "
             "uncertainty tracking, prior specification, or belief updating."
         ),
-        "cited_models_format": (
-            "Include the exact `name` string, the BIC value, and a description of how "
-            "the model represents and updates uncertainty."
-        ),
         "prohibitions": _DEFAULT_PROFILE["prohibitions"],
-        "always_cite": (
-            "Always describe models by how they represent and update uncertainty, "
-            "and cite BIC values and prior-posterior comparisons from your analysis."
-        ),
     },
     "latent_mixture": {
         "angles": [
@@ -1205,11 +1234,11 @@ _PERSONA_PROFILES: dict[str, dict] = {
                 "Whether the proportion of each class is well-estimated",
             ),
             (
-                "Mechanistic coherence",
+                "Mechanism interpretability",
                 "Whether each class represents a coherent computational strategy",
             ),
             (
-                "Coverage",
+                "Search breadth",
                 "How much of the between-subject variability the mixture explains",
             ),
         ],
@@ -1228,15 +1257,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
             "class separation, trying different numbers of components, or alternative "
             "mechanisms per class."
         ),
-        "cited_models_format": (
-            "Include the exact `name` string, the BIC value, the number of classes, "
-            "and a description of what each class represents."
-        ),
         "prohibitions": _DEFAULT_PROFILE["prohibitions"],
-        "always_cite": (
-            "Always describe models by their class structure and cite BIC values, "
-            "class separation quality, and mixing proportion estimates from your analysis."
-        ),
     },
     "latent_state_inference": {
         "angles": [
@@ -1254,7 +1275,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
                 "Whether latent states are recoverable from data",
             ),
             ("Choice influence", "How well belief states predict first-stage choices"),
-            ("Coverage", "How much of the data the models explain"),
+            ("Search breadth", "How much of the data the models explain"),
         ],
         "metric_language": "BIC values, belief state recovery correlations, and prediction accuracy",
         "model_description_style": "mechanistic description (name, BIC=X), emphasizing belief state structure",
@@ -1270,15 +1291,7 @@ _PERSONA_PROFILES: dict[str, dict] = {
             "4. **What to try next** (2-4 sentences) — Concrete suggestions for improving "
             "belief updating, state representation, or the influence of beliefs on choices."
         ),
-        "cited_models_format": (
-            "Include the exact `name` string, the BIC value, and a description of "
-            "what latent states the model infers and how beliefs are updated."
-        ),
         "prohibitions": _DEFAULT_PROFILE["prohibitions"],
-        "always_cite": (
-            "Always describe models by their belief state structure and cite BIC values, "
-            "belief recovery quality, and state-choice correlations from your analysis."
-        ),
     },
 }
 
@@ -1339,10 +1352,7 @@ def _parse_angles(value) -> list[tuple[str, str]]:
 
 
 def _format_trajectory(traj: list[dict]) -> str:
-    """Format a BIC trajectory list as a compact string with a trend label.
-
-    Example: "3102 → 2950 → 2847 (improving)"
-    """
+    """Format a BIC trajectory list as a compact metric-only string."""
     if not traj:
         return "N/A"
     values = [
@@ -1350,18 +1360,7 @@ def _format_trajectory(traj: list[dict]) -> str:
     ]
     if not values:
         return "N/A"
-    arrow_str = " → ".join(f"{v:.0f}" for v in values)
-    # Trend label
-    if len(values) >= 2:
-        delta = values[-1] - values[-2]
-        if delta < -1.0:
-            trend = "improving"
-        elif delta > 1.0:
-            trend = "regressed"
-        else:
-            trend = "plateaued"
-        return f"{arrow_str} ({trend})"
-    return arrow_str
+    return " → ".join(f"{v:.0f}" for v in values)
 
 
 def _detect_stuck(trajectory: list[dict], tol: float = 10.0, window: int = 2) -> bool:
@@ -1558,8 +1557,6 @@ class ToolUsingJudge:
                 "random_feedback_only": True,
             }
 
-        t0 = time.time()
-
         # --- Attempt to short-circuit if previous iteration had only recovery failures ---
         if recovery_failures and not prev_had_success and self.results_dir:
             shortcut = self._try_shortcut_from_recovery_failure(
@@ -1591,6 +1588,53 @@ class ToolUsingJudge:
                     ),
                     "short_circuit": True,  # Flag to skip re-synthesis
                 }
+
+        if _is_narrow_deterministic_set(self.capabilities):
+            analysis_data = {
+                "iteration": iteration,
+                "_store": self.store,
+                "best_bic": best_metric,
+            }
+            trajectory: list[dict] = []
+            if "performance_summary" in self.capabilities:
+                from gecco.diagnostic_store.tools import (
+                    get_bic_trajectory as _get_bic_traj,
+                )
+
+                iter_row = self.store.fetchone(
+                    "SELECT MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
+                    "FROM models WHERE iteration = ? AND split = 'train'",
+                    [iteration],
+                )
+                best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
+                trajectory = _get_bic_traj(self.store)
+                analysis_data.update(
+                    {
+                        "best_iter_bic": best_iter_bic_raw,
+                        "trajectory_str": _format_trajectory(trajectory),
+                    }
+                )
+
+            return {
+                "iteration": iteration,
+                "analysis_text": _build_summary_only_feedback(
+                    analysis_data, capabilities=self.capabilities
+                ),
+                "trace": [],
+                "full_trace": [],
+                "best_bic": best_metric,
+                "best_iter_bic": analysis_data.get("best_iter_bic"),
+                "is_stuck": False,
+                "trajectory": trajectory,
+                "best_bic_str": (
+                    f"{best_metric:.2f}" if best_metric is not None else "N/A"
+                ),
+                "trajectory_str": analysis_data.get("trajectory_str", "N/A"),
+                "wall_time": 0.0,
+                "narrow_deterministic": True,
+            }
+
+        t0 = time.time()
 
         # --- Pre-compute iteration delta context ---
         from gecco.diagnostic_store.tools import get_bic_trajectory as _get_bic_traj
@@ -1637,24 +1681,7 @@ class ToolUsingJudge:
             trajectory_str=trajectory_str,
         )
 
-        if "citations" in self.capabilities:
-            user_message += (
-                "\n\nIMPORTANT — database conventions:\n"
-                f"- \"iteration\" and \"run_idx\" are different fields.  \"iteration\" is the search step "
-                f"(currently {iteration}); \"run_idx\" is the client/run identifier ({run_idx}).  Do NOT "
-                "pass the iteration number as run_idx.  Most tools do not require run_idx — omit it "
-                "to query across all runs.\n"
-                f"- The best model is identified by its BIC value ({best_bic_str}).  Use get_best_models() "
-                "to find it in the database and obtain its model_id.  Do not search by name.\n\n"
-                "Model naming convention: Each model has a `name` field (e.g., \"rwg_alpha_beta\") "
-                "set by the LLM that generated it. Names are NOT guaranteed unique across "
-                "iterations. When referring to models in your synthesized_feedback, describe "
-                "them by their mechanism AND include their name + BIC in parentheses, "
-                "e.g., \"the model with separate learning rates for gains and losses "
-                "(separate_lr_gain_loss, BIC=2847)\". The BIC disambiguates models that "
-                "share a name. Never use the numeric model_id (e.g., \"model 5\", \"ID 11\") — "
-                "the generator LLM cannot look up IDs."
-            )
+
 
         # --- Stuck-search directive (R3: generic form for reuse across personas) ---
         if is_stuck:
@@ -1698,34 +1725,6 @@ class ToolUsingJudge:
                         "whether BIC improved/stagnated/regressed, and to avoid repeating ideas."
                     )
                 )
-
-        if _is_summary_only_capability_set(self.capabilities):
-            return {
-                "iteration": iteration,
-                "analysis_text": _build_summary_only_feedback(
-                    {
-                        "n_total": n_total,
-                        "n_ok": n_ok,
-                        "n_failed": n_failed,
-                        "best_iter_bic": best_iter_bic_raw,
-                        "best_bic": best_metric,
-                        "trajectory_str": trajectory_str,
-                    }
-                ),
-                "trace": [],
-                "full_trace": [],
-                "best_bic": best_metric,
-                "best_iter_bic": best_iter_bic_raw,
-                "is_stuck": is_stuck,
-                "trajectory": traj,
-                "best_bic_str": best_bic_str,
-                "trajectory_str": trajectory_str,
-                "n_total": n_total,
-                "n_ok": n_ok,
-                "n_failed": n_failed,
-                "wall_time": 0.0,
-                "summary_only": True,
-            }
 
         # --- Run tool loop (analysis phase) ---
         if self.verbose:
@@ -1805,17 +1804,17 @@ class ToolUsingJudge:
         best_bic = analysis_data["best_bic"]
         is_stuck = analysis_data["is_stuck"]
 
-        if _is_summary_only_capability_set(self.capabilities):
+        if _is_narrow_deterministic_set(self.capabilities):
             verdict = JudgeVerdict(
                 iteration=iteration,
                 per_angle=[],
                 key_recommendations=[],
-                synthesized_feedback=_build_summary_only_feedback(analysis_data),
+                synthesized_feedback=analysis_text,
                 tool_call_count=len(trace),
                 wall_time_seconds=analysis_data.get("wall_time", 0.0),
                 best_bic=best_bic,
             )
-            return verdict.synthesized_feedback, verdict.__dict__
+            return analysis_text, verdict.__dict__
 
         # Build persona-specific synthesis prompt from profile
         profile = _PERSONA_PROFILES.get(persona_name, _DEFAULT_PROFILE).copy()
@@ -1824,6 +1823,17 @@ class ToolUsingJudge:
             config_profile = getattr(persona_config, "profile", None)
             if config_profile is not None:
                 profile.update(_profile_from_config(config_profile, profile))
+        # Gate diagnostic angles on diagnostic_detail capability
+        if "diagnostic_detail" not in self.capabilities:
+            diagnostic_angle_names = {
+                "predictive adequacy", "individual differences",
+            }
+            filtered_angles = [
+                (name, desc) for name, desc in profile.get("angles", [])
+                if name.lower() not in diagnostic_angle_names
+            ]
+            if filtered_angles:
+                profile["angles"] = filtered_angles
         synthesis_prompt = _build_synthesis_prompt(
             self.capabilities,
             profile,
@@ -1948,23 +1958,6 @@ class ToolUsingJudge:
                 except (json.JSONDecodeError, IOError):
                     pass
         return None
-
-    def _validate_cited_models(self, cited_models: list[dict]) -> list[dict]:
-        """Check each cited model's name against the store.
-
-        Returns the subset that could NOT be verified (for audit logging).
-        """
-        unverified = []
-        for cm in cited_models:
-            name = cm.get("name", "")
-            if not name:
-                continue
-            rows = self.store.fetchall(
-                "SELECT metric_value FROM models WHERE name = ? LIMIT 5", [name]
-            )
-            if not rows:
-                unverified.append(cm)
-        return unverified
 
     def _try_shortcut_from_recovery_failure(
         self,
@@ -2118,7 +2111,7 @@ class ToolUsingJudge:
         # no-tools case so the LLM doesn't attempt queries it can't make.
         user_message_no_tools = user_message.replace(
             "Please query the diagnostic database to analyse this iteration "
-            "from all six angles, then produce your verdict.",
+            "using the listed evidence areas, then produce your verdict.",
             "You do NOT have access to diagnostic tool calls.  Use the "
             "pre-computed statistics and trajectory printed above to "
             "analyse this iteration, then produce your verdict.",

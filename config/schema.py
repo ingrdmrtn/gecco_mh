@@ -17,12 +17,10 @@ JudgeCapability = Literal[
     "attempted_models_overview",
     "performance_summary",
     "best_model_code",
+    "diagnostic_detail",
     "recommendations",
-    "mechanistic_coherence",
     "tools",
-    "citations",
     "persona_synthesis",
-    "coverage",
     "random_feedback",
 ]
 

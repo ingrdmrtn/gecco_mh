@@ -202,7 +202,14 @@ loop:
   n_clients: 2
 
 judge:
-  capabilities: ["performance_summary"]
+  mode: "static"
+  context:
+    attempted_models: false
+    performance: true
+    best_model_code: false
+    diagnostic: false
+  output:
+    persona_synthesis: false
   barrier:
     orchestrator_wait_seconds: 120
     client_wait_seconds: 120
@@ -210,13 +217,17 @@ judge:
 
             cfg = load_config(str(config_path))
             assert cfg.loop.n_clients == 2
-            assert cfg.judge.capabilities == ["performance_summary"]
+            assert cfg.judge.mode == "static"
             assert cfg.judge.barrier.orchestrator_wait_seconds == 120
 
     def test_orchestrator_detects_orchestration(self):
         """Test that orchestrator launch is inferred from validated judge config."""
         cfg_raw = {
-            "judge": {"capabilities": ["performance_summary"]},
+            "judge": {
+                "mode": "static",
+                "context": {"attempted_models": False, "performance": True, "best_model_code": False, "diagnostic": False},
+                "output": {"persona_synthesis": False},
+            },
             "loop": {"n_clients": 2},
         }
 
@@ -225,6 +236,7 @@ judge:
         n_clients = loop_cfg.get("n_clients")
 
         assert judge_cfg is not None
+        assert judge_cfg["mode"] == "static"
         assert n_clients == 2
 
 

@@ -57,7 +57,14 @@ def _make_single_worker_search(tmp_path: Path, judge_mock: MagicMock) -> GeCCoMo
         loop=SimpleNamespace(max_iterations=1),
         judge=SimpleNamespace(
             barrier=SimpleNamespace(client_wait_seconds=1),
-            capabilities=["performance_summary", "best_model_code"],
+            mode="static",
+            context=SimpleNamespace(
+                attempted_models=False,
+                performance=True,
+                best_model_code=True,
+                diagnostic=False,
+            ),
+            output=SimpleNamespace(persona_synthesis=False),
         ),
         evaluation=SimpleNamespace(fit_type="group", metric="bic"),
     )
@@ -210,7 +217,7 @@ def test_recovery_failure_preserves_metadata_per_angle_and_recommendations(tmp_p
     )
 
     judge = ToolUsingJudge.__new__(ToolUsingJudge)
-    judge.capabilities = ["performance_summary"]
+    judge.mode = "llm"
     judge.results_dir = tmp_path
     judge.verbose = False
     judge.cfg = SimpleNamespace(centralized_model_generation=SimpleNamespace(enabled=False))
@@ -247,6 +254,81 @@ def test_recovery_failure_preserves_metadata_per_angle_and_recommendations(tmp_p
     assert '"default":' not in artifact.synthesized_feedback["default"]
 
 
+def test_static_mode_ignores_recovery_shortcut_verdict_prose(tmp_path):
+    """Static mode should not reuse shortcut verdict text from old recovery failures."""
+    judge_dir = tmp_path / "judge"
+    judge_dir.mkdir(parents=True, exist_ok=True)
+    (judge_dir / "iter0_run0.json").write_text(
+        json.dumps(
+            {
+                "iteration": 0,
+                "run_idx": 0,
+                "tag": "",
+                "timestamp": "2026-06-04T12:00:00+00:00",
+                "tool_call_count": 1,
+                "wall_time_seconds": 1.0,
+                "best_bic": 91.2,
+                "tool_call_trace": [],
+                "full_trace": [],
+                "metadata": {"shortcut_reason": "recovery_failure"},
+                "per_angle": [{"angle": "mechanism", "findings": "Too similar"}],
+                "key_recommendations": ["Try a different mechanism family."],
+                "synthesized_feedback": {
+                    "default": (
+                        "Update — previous iteration candidate(s) rejected for poor parameter recovery:\n"
+                        "- candidate_a: mean r=0.10\n"
+                        "Do not repropose these mechanisms without addressing the identifiability issues."
+                    )
+                },
+                "personas": ["default"],
+                "stuck_search": False,
+                "short_circuit": True,
+                "no_substantive_feedback": False,
+                "random_feedback_only": False,
+                "best_model_code_included": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = SimpleNamespace(
+        llm=SimpleNamespace(provider="openai", base_model="gpt-test"),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(
+                attempted_models=False,
+                performance=True,
+                best_model_code=False,
+                diagnostic=False,
+            ),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_SummaryOnlyStore(),
+        model=object(),
+        tokenizer=None,
+        results_dir=tmp_path,
+    )
+    judge._try_shortcut_from_recovery_failure = MagicMock(
+        side_effect=AssertionError("static mode should not reuse recovery shortcut prose")
+    )
+
+    analysis = judge.get_feedback_analysis(
+        iteration=1,
+        run_idx=0,
+        tag="",
+        best_metric=77.7,
+        recovery_failures=[{"name": "candidate_b", "mean_r": 0.12, "per_param_r": {}}],
+        prev_had_success=False,
+    )
+
+    assert "short_circuit" not in analysis
+    assert "Update — previous iteration candidate(s) rejected for poor parameter recovery" not in analysis["analysis_text"]
+    assert "Previous verdict (state unchanged since iter 0)" not in analysis["analysis_text"]
+
+
 def test_local_single_worker_without_client_id_uses_default_feedback(tmp_path):
     """Single-worker synthesis should fall back to default feedback when no client id exists."""
     judge = MagicMock()
@@ -266,7 +348,16 @@ def test_local_single_worker_without_client_id_uses_default_feedback(tmp_path):
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=["performance_summary"]),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(
+                attempted_models=False,
+                performance=True,
+                best_model_code=False,
+                diagnostic=False,
+            ),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
         clients={
             "explore": SimpleNamespace(
                 llm=SimpleNamespace(feedback_guidance="Explore broadly.")
@@ -354,7 +445,11 @@ def test_persona_synthesis_fanout_only_runs_when_enabled(tmp_path):
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=["performance_summary"]),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(attempted_models=False, performance=True, best_model_code=False, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
         clients={
             "explore": SimpleNamespace(llm=SimpleNamespace(feedback_guidance="Explore.")),
             "exploit": SimpleNamespace(llm=SimpleNamespace(feedback_guidance="Exploit.")),
@@ -399,7 +494,11 @@ def test_persona_synthesis_fanout_runs_for_cmg_generator_compatibility(tmp_path)
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=["performance_summary", "persona_synthesis"]),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(attempted_models=False, performance=True, best_model_code=False, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=True),
+        ),
         clients={
             "generator": SimpleNamespace(
                 llm=SimpleNamespace(feedback_guidance="Focus on diversity.")
@@ -449,7 +548,11 @@ def test_persona_synthesis_uses_dict_backed_client_suffix(tmp_path):
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=["performance_summary"]),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(attempted_models=False, performance=True, best_model_code=False, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
         clients={
             "generator": {
                 "llm": {
@@ -504,7 +607,11 @@ def test_empty_capabilities_produces_explicit_no_feedback_trace(tmp_path):
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=[]),
+        judge=SimpleNamespace(
+            mode="off",
+            context=SimpleNamespace(attempted_models=False, performance=False, best_model_code=False, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
         clients={
             "explore": SimpleNamespace(llm=SimpleNamespace(feedback_guidance="Explore."))
         },
@@ -561,7 +668,7 @@ def test_shortcut_path_does_not_write_competing_trace_schema(tmp_path):
     )
 
     judge = ToolUsingJudge.__new__(ToolUsingJudge)
-    judge.capabilities = ["performance_summary"]
+    judge.mode = "llm"
     judge.results_dir = tmp_path
     judge.verbose = False
     judge.cfg = SimpleNamespace(centralized_model_generation=SimpleNamespace(enabled=False))
@@ -619,7 +726,11 @@ def test_run_orchestrated_judge_pipeline_persists_best_model_code_inside_artifac
     )
 
     cfg = SimpleNamespace(
-        judge=SimpleNamespace(capabilities=["performance_summary", "best_model_code"]),
+        judge=SimpleNamespace(
+            mode="static",
+            context=SimpleNamespace(attempted_models=False, performance=True, best_model_code=True, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
         clients={},
         centralized_model_generation=SimpleNamespace(enabled=False),
     )
@@ -645,6 +756,85 @@ def test_run_orchestrated_judge_pipeline_persists_best_model_code_inside_artifac
     assert feedback_text.count("def best_model(x):") == 1
     assert persisted["synthesized_feedback"]["default"] == feedback_text
     assert persisted["best_model_code_included"] is True
+
+
+def test_build_feedback_artifact_omits_bic_when_best_code_has_no_performance_context():
+    """Code-only best-model appendices should stay free of metric wording."""
+    cfg = SimpleNamespace(
+        judge=SimpleNamespace(
+            context=SimpleNamespace(
+                attempted_models=False,
+                performance=False,
+                best_model_code=True,
+                diagnostic=False,
+            )
+        )
+    )
+
+    artifact = build_feedback_artifact(
+        iteration=1,
+        run_idx=0,
+        tag="",
+        analysis_data={
+            "trace": [],
+            "full_trace": [],
+            "best_bic": 77.7,
+            "wall_time": 2.0,
+            "is_stuck": False,
+        },
+        synthesized_feedback={"default": "Try a more mechanistically distinct update."},
+        verdict_payloads=[],
+        best_model="def best_model(x):\n    return x",
+        best_metric=77.7,
+        include_best_model_code=False,
+        cfg=cfg,
+    )
+
+    feedback_text = artifact.synthesized_feedback["default"]
+
+    assert artifact.best_bic is None
+    assert artifact.best_model_code_included is True
+    assert "Best model code so far:" in feedback_text
+    assert "BIC" not in feedback_text
+    assert "metric" not in feedback_text.lower()
+    assert "performance" not in feedback_text.lower()
+    assert "def best_model(x):" in feedback_text
+
+
+def test_build_feedback_artifact_disables_best_bic_for_attempted_only_context():
+    """Attempted-only artifacts should not persist performance metadata."""
+    cfg = SimpleNamespace(
+        judge=SimpleNamespace(
+            context=SimpleNamespace(
+                attempted_models=True,
+                performance=False,
+                best_model_code=False,
+                diagnostic=False,
+            )
+        )
+    )
+
+    artifact = build_feedback_artifact(
+        iteration=1,
+        run_idx=0,
+        tag="",
+        analysis_data={
+            "trace": [],
+            "full_trace": [],
+            "best_bic": 77.7,
+            "wall_time": 2.0,
+            "is_stuck": False,
+        },
+        synthesized_feedback={"default": "Models attempted this iteration."},
+        verdict_payloads=[],
+        best_model=None,
+        best_metric=None,
+        include_best_model_code=False,
+        cfg=cfg,
+    )
+
+    assert artifact.best_bic is None
+    assert artifact.model_dump()["best_bic"] is None
 
 
 def test_single_worker_run_uses_local_orchestrated_runner_when_registry_missing(tmp_path):
@@ -799,7 +989,9 @@ def test_orchestrator_uses_shared_orchestrated_runner(tmp_path, monkeypatch):
                 orchestrator_wait_seconds=1,
                 retry_wait_seconds=1,
             ),
-            capabilities=["performance_summary", "best_model_code"],
+            mode="static",
+            context=SimpleNamespace(attempted_models=False, performance=True, best_model_code=True, diagnostic=False),
+            output=SimpleNamespace(persona_synthesis=False),
         ),
         data=SimpleNamespace(
             path="dummy.csv",

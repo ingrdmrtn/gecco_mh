@@ -37,8 +37,8 @@ from typing import Any, Literal
 from pydantic import BaseModel
 from rich.console import Console
 
-from config.schema import get_judge_capabilities, judge_has_capability
-from gecco.diagnostic_store.tools import TOOL_SCHEMAS, dispatch_tool
+from config.schema import get_judge_mode, judge_context_enabled
+from gecco.diagnostic_store.tools import dispatch_tool, get_judge_tool_names, get_judge_tool_schemas
 from gecco.utils import TimestampedConsole
 
 _console = TimestampedConsole()
@@ -74,17 +74,14 @@ def _cap_tool_result(result_str: str, raw_result=None) -> str:
     """Truncate *result_str* if it exceeds _MAX_TOOL_RESULT_CHARS.
 
     When truncating, includes a row count (if *raw_result* is a list) and
-    a hint about which filters can narrow the query.
+    a neutral hint about narrowing the result size.
     """
     if len(result_str) <= _MAX_TOOL_RESULT_CHARS:
         return result_str
     suffix_parts = ["[truncated: result too large"]
     if isinstance(raw_result, list):
         suffix_parts.append(f"{len(raw_result)} rows total")
-    suffix_parts.append(
-        "use more specific filters (iteration=, status=, limit=, "
-        "param_contains=, code_contains=) to narrow]"
-    )
+    suffix_parts.append("use narrower allowed filters to reduce result size]")
     return result_str[:_MAX_TOOL_RESULT_CHARS] + " ... " + "; ".join(suffix_parts)
 
 
@@ -213,27 +210,342 @@ def _build_summary_only_feedback(
         ]
         sections.append("Performance summary:\n" + "\n".join(f"- {p}" for p in parts))
 
+    if "diagnostic_summary" in caps:
+        diagnostic_summary = analysis_data.get("diagnostic_summary", "")
+        if diagnostic_summary:
+            sections.append(diagnostic_summary)
+
     if not sections:
-        return "No feedback available for the requested capabilities."
+        return ""
 
     return "\n\n".join(sections) + ("\n" if len(sections) > 1 else "")
 
 
-def _apply_capability_postprocessing(verdict: JudgeVerdict, capabilities: list[str]) -> JudgeVerdict:
-    """Apply deterministic capability-specific feedback shaping."""
-    if "recommendations" not in capabilities:
+def _apply_capability_postprocessing(verdict: JudgeVerdict, cfg_or_judge: Any) -> JudgeVerdict:
+    """Apply deterministic mode/context-specific feedback shaping."""
+    verdict.synthesized_feedback = _scrub_feedback_surface_details(
+        verdict.synthesized_feedback
+    )
+    mode = get_judge_mode(cfg_or_judge)
+    if mode not in ("llm", "agent"):
         verdict.key_recommendations = []
         verdict.synthesized_feedback = _remove_recommendation_sections(
             verdict.synthesized_feedback
         )
-    verdict.synthesized_feedback = _scrub_feedback_surface_details(
-        verdict.synthesized_feedback
-    )
-    if "diagnostic_detail" not in capabilities:
+    if not judge_context_enabled(cfg_or_judge, "diagnostic"):
         verdict.synthesized_feedback = _suppress_diagnostic_sections(
             verdict.synthesized_feedback
         )
     return verdict
+
+
+def _judge_context_flags(cfg_or_judge: Any) -> dict[str, bool]:
+    """Return the active judge mode/context flags as a plain mapping."""
+    return {
+        "attempted_models": judge_context_enabled(cfg_or_judge, "attempted_models"),
+        "performance": judge_context_enabled(cfg_or_judge, "performance"),
+        "best_model_code": judge_context_enabled(cfg_or_judge, "best_model_code"),
+        "diagnostic": judge_context_enabled(cfg_or_judge, "diagnostic"),
+    }
+
+
+def _scrub_non_performance_prompt_language(text: str) -> str:
+    """Remove performance/comparison language when performance context is disabled."""
+    replacements = [
+        (r"(?i)\bstatistical model comparison\b", "diagnostic assessment"),
+        (r"(?i)\bcomparative\b", "contextual"),
+        (r"(?i)\bcomparison\b", "analysis"),
+        (r"(?i)\bperformance\b", "diagnostic"),
+        (r"(?i)\bBIC\b", "fit evidence"),
+        (r"(?i)\bmetric\b", "signal"),
+        (r"(?i)\branking\b", "ordering"),
+        (r"(?i)\bstatus\b", "state"),
+    ]
+    result = text
+    for pattern, repl in replacements:
+        result = re.sub(pattern, repl, result)
+    return result
+
+
+def _build_static_diagnostic_summary(
+    store,
+    iteration: int,
+    run_idx: int | None,
+    performance_enabled: bool,
+) -> str:
+    """Build a deterministic diagnostic context block for static/llm modes.
+
+    Uses direct store queries rather than importing from
+    ``gecco.diagnostic_store.tools`` so that these modes do not call
+    the diagnostic tool layer (Contracts B and D).
+    """
+    if not performance_enabled:
+        try:
+            model_row = store.fetchone(
+                "SELECT model_id FROM models WHERE iteration = ? AND split = 'train' ORDER BY model_id LIMIT 1",
+                [iteration],
+            )
+        except Exception:
+            model_row = None
+
+        if not model_row or model_row.get("model_id") is None:
+            return "Diagnostic context:\n- No diagnostic-ready models available."
+
+        model_id = model_row["model_id"]
+        diagnostic_rows = ["Diagnostic context:"]
+
+        # Parameter recovery
+        try:
+            recovery_row = store.fetchone(
+                "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
+            )
+            label = "available" if recovery_row is not None else "unavailable"
+        except Exception:
+            label = "unavailable"
+        diagnostic_rows.append(f"- Parameter recovery: {label}")
+
+        # PPC
+        try:
+            ppc_check = store.fetchone(
+                "SELECT 1 FROM ppc WHERE model_id = ? LIMIT 1", [model_id]
+            )
+            label = "available" if ppc_check is not None else "unavailable"
+        except Exception:
+            label = "unavailable"
+        diagnostic_rows.append(f"- PPC: {label}")
+
+        # Block residuals
+        try:
+            br_check = store.fetchone(
+                "SELECT 1 FROM block_residuals WHERE model_id = ? LIMIT 1", [model_id]
+            )
+            label = "available" if br_check is not None else "unavailable"
+        except Exception:
+            label = "unavailable"
+        diagnostic_rows.append(f"- Block residuals: {label}")
+
+        # Individual differences
+        try:
+            id_row = store.fetchone(
+                "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
+            )
+            label = "available" if id_row is not None else "unavailable"
+        except Exception:
+            label = "unavailable"
+        diagnostic_rows.append(f"- Individual differences: {label}")
+
+        return "\n".join(diagnostic_rows)
+
+    # --- performance_enabled branch ---
+    sections: list[str] = []
+    try:
+        best_models = store.fetchall(
+            "SELECT m.model_id, m.run_idx, m.iteration, m.name, "
+            "m.metric_name, m.metric_value, m.param_names, m.status "
+            "FROM models m "
+            "WHERE m.status = 'ok' "
+            "AND m.metric_value IS NOT NULL "
+            "AND m.split = 'train' "
+            "ORDER BY m.metric_value ASC "
+            "LIMIT ?",
+            [3],
+        )
+    except Exception:
+        best_models = []
+
+    if best_models:
+        top_model = best_models[0]
+        lines = ["Diagnostic context:", "- Top fitted models:"]
+        for row in best_models:
+            metric_value = row.get("metric_value")
+            metric_text = f"{metric_value:.2f}" if metric_value is not None else "N/A"
+            lines.append(
+                f"  - {row.get('name', 'unknown')} (BIC={metric_text}, iteration={row.get('iteration', '?')})"
+            )
+        sections.append("\n".join(lines))
+
+        model_id = top_model.get("model_id")
+        if model_id is not None:
+            diagnostic_rows: list[str] = []
+
+            # Parameter recovery
+            try:
+                recovery_row = store.fetchone(
+                    "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
+                )
+                if recovery_row is not None:
+                    worst_params = recovery_row.get("worst_params") or []
+                    worst_text = ", ".join(
+                        p.get("name", str(p)) if isinstance(p, dict) else str(p)
+                        for p in worst_params[:3]
+                    )
+                    mean_r = recovery_row.get("mean_r")
+                    if isinstance(mean_r, (int, float)):
+                        diagnostic_rows.append(
+                            f"- Parameter recovery: mean r={mean_r:.2f}"
+                        )
+                    else:
+                        diagnostic_rows.append(
+                            f"- Parameter recovery: mean r={mean_r}"
+                        )
+                    if worst_text:
+                        diagnostic_rows.append(f"  - Worst parameters: {worst_text}")
+                else:
+                    diagnostic_rows.append("- Parameter recovery: unavailable")
+            except Exception:
+                diagnostic_rows.append("- Parameter recovery: unavailable")
+
+            # PPC
+            try:
+                ppc_rows = store.fetchall(
+                    "SELECT statistic_name, condition, "
+                    "COUNT(DISTINCT participant_id) AS n_participants, "
+                    "SUM(CASE WHEN observed < simulated_q025 "
+                    "OR observed > simulated_q975 THEN 1 ELSE 0 END) AS n_outside_95ci, "
+                    "AVG(CASE WHEN observed < simulated_q025 "
+                    "OR observed > simulated_q975 THEN 1.0 ELSE 0.0 END) AS frac_outside_95ci, "
+                    "AVG(observed) AS mean_observed, "
+                    "AVG(simulated_mean) AS mean_simulated_mean, "
+                    "AVG(ABS((observed - simulated_mean) "
+                    "/ NULLIF((simulated_q975 - simulated_q025) / 3.92, 0))) AS mean_abs_zscore "
+                    "FROM ppc "
+                    "WHERE model_id = ? "
+                    "GROUP BY statistic_name, condition "
+                    "ORDER BY frac_outside_95ci DESC",
+                    [model_id],
+                )
+                if ppc_rows:
+                    worst_ppc = ppc_rows[:3]
+                    parts = []
+                    for row in worst_ppc:
+                        frac = row.get("frac_outside_95ci")
+                        frac_text = f"{frac:.2f}" if isinstance(frac, (int, float)) else "N/A"
+                        parts.append(
+                            f"{row.get('statistic_name', 'stat')}[{row.get('condition', 'default')}]: {frac_text} outside 95% CI"
+                        )
+                    diagnostic_rows.append("- PPC: " + "; ".join(parts))
+                else:
+                    diagnostic_rows.append("- PPC: no rows available")
+            except Exception:
+                diagnostic_rows.append("- PPC: unavailable")
+
+            # Block residuals
+            try:
+                block_rows = store.fetchall(
+                    "SELECT block_idx, "
+                    "MIN(block_start) AS block_start, MAX(block_end) AS block_end, "
+                    "AVG(mean_nll_per_trial) AS mean_nll_per_trial_mean, "
+                    "STDDEV_SAMP(mean_nll_per_trial) AS mean_nll_per_trial_std, "
+                    "MIN(mean_nll_per_trial) AS mean_nll_per_trial_min, "
+                    "MAX(mean_nll_per_trial) AS mean_nll_per_trial_max, "
+                    "COUNT(DISTINCT participant_id) AS n_participants "
+                    "FROM block_residuals "
+                    "WHERE model_id = ? "
+                    "GROUP BY block_idx "
+                    "ORDER BY block_idx",
+                    [model_id],
+                )
+                if block_rows:
+                    block_parts = []
+                    for block in block_rows[:3]:
+                        mean_nll = block.get("mean_nll_per_trial_mean")
+                        mean_text = f"{mean_nll:.2f}" if isinstance(mean_nll, (int, float)) else "N/A"
+                        block_parts.append(f"block {block.get('block_idx', '?')}: {mean_text}")
+                    diagnostic_rows.append("- Block residuals: " + "; ".join(block_parts))
+                else:
+                    diagnostic_rows.append("- Block residuals: no rows available")
+            except Exception:
+                diagnostic_rows.append("- Block residuals: unavailable")
+
+            # Individual differences
+            try:
+                id_row = store.fetchone(
+                    "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
+                )
+                if id_row is not None:
+                    mean_r2 = id_row.get("mean_r2")
+                    mean_r2_text = f"{mean_r2:.2f}" if isinstance(mean_r2, (int, float)) else "N/A"
+                    diagnostic_rows.append(f"- Individual differences: mean R²={mean_r2_text}")
+                else:
+                    diagnostic_rows.append("- Individual differences: unavailable")
+            except Exception:
+                diagnostic_rows.append("- Individual differences: unavailable")
+
+            # Participant heterogeneity
+            if run_idx is not None:
+                try:
+                    participant_rows = store.fetchall(
+                        "WITH ranked AS ("
+                        "SELECT mp.participant_idx, m.model_id, m.name, m.iteration, m.run_idx, mp.bic, "
+                        "ROW_NUMBER() OVER ("
+                        "PARTITION BY mp.participant_idx "
+                        "ORDER BY mp.bic ASC, m.iteration ASC, m.model_id ASC"
+                        ") AS rn "
+                        "FROM model_participants mp "
+                        "JOIN models m ON mp.model_id = m.model_id "
+                        "WHERE m.status = 'ok' AND mp.bic IS NOT NULL AND m.run_idx = ? "
+                        ") "
+                        "SELECT participant_idx, model_id, name, iteration, run_idx, bic "
+                        "FROM ranked WHERE rn = 1 ORDER BY participant_idx",
+                        [run_idx],
+                    )
+                    if participant_rows:
+                        model_counts: dict[str, int] = {}
+                        for row in participant_rows:
+                            name = row.get("name", "")
+                            if name:
+                                model_counts[name] = model_counts.get(name, 0) + 1
+                        n_participants = len(participant_rows)
+                        max_count = max(model_counts.values(), default=0)
+                        modal_model = (
+                            sorted(model_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+                            if model_counts else None
+                        )
+                        heterogeneity_index = (
+                            1.0 - (max_count / n_participants) if n_participants > 0 else 0.0
+                        )
+                        diagnostic_rows.append(
+                            "- Participant heterogeneity: "
+                            f"modal={modal_model or 'N/A'}, "
+                            f"heterogeneity={heterogeneity_index:.2f}"
+                        )
+                except Exception:
+                    pass
+
+            # Model comparison
+            try:
+                comparison_params = [
+                    r.get("model_id") for r in best_models if r.get("model_id") is not None
+                ]
+                if comparison_params:
+                    placeholders = ",".join(["?"] * len(comparison_params))
+                    comparison_rows = store.fetchall(
+                        "SELECT m.model_id, m.name, m.iteration, m.metric_name, m.metric_value, "
+                        "m.param_names, m.status, "
+                        "pr.mean_r AS recovery_mean_r, pr.passed AS recovery_passed, "
+                        "id.mean_r2 AS id_mean_r2, id.max_r2 AS id_max_r2, "
+                        "id.best_param AS id_best_param "
+                        "FROM models m "
+                        "LEFT JOIN parameter_recovery pr ON pr.model_id = m.model_id "
+                        "LEFT JOIN individual_differences id ON id.model_id = m.model_id "
+                        f"WHERE m.model_id IN ({placeholders}) "
+                        "ORDER BY m.metric_value ASC NULLS LAST",
+                        comparison_params,
+                    )
+                    if comparison_rows:
+                        comparison_bits = []
+                        for row in comparison_rows[:3]:
+                            metric_value = row.get("metric_value")
+                            metric_text = f"{metric_value:.2f}" if isinstance(metric_value, (int, float)) else "N/A"
+                            comparison_bits.append(f"{row.get('name', 'unknown')}={metric_text}")
+                        diagnostic_rows.append("- Model comparison: " + "; ".join(comparison_bits))
+            except Exception:
+                pass
+
+            if diagnostic_rows:
+                sections.append("\n".join(diagnostic_rows))
+
+    return "\n\n".join(sections)
 
 
 # ======================================================================
@@ -360,78 +672,109 @@ You have expertise in computational modelling, reinforcement learning, Bayesian 
 and statistical model comparison. You are familiar with common pitfalls in model development \
 such as overfitting, underfitting, identifiability issues, and lack of psychological interpretability.
 
-Your task is to analyse the current state of the model search by querying a diagnostic \
-database through tool calls, then synthesise feedback from the evidence you gathered.
+Your task is to review the current model search using only the context provided below.
 
-You will analyse from the following angles — call tools to gather evidence for each:
+You will analyse from the following enabled angles:
 
 """
 
-_JUDGE_SYSTEM_PROMPT_FOOTER = """
-After gathering evidence across all angles, produce:
+_JUDGE_SYSTEM_PROMPT_FOOTER = """After reviewing the enabled context, produce:
 - A brief per-angle summary (findings + confidence).
-- A synthesized_feedback paragraph (≤ 500 words) describing the main patterns and contrasts \
-in the current search.
+- A synthesized_feedback paragraph (≤ 500 words) describing the main patterns and contrasts in the current search.
 
 Quantify your confidence: If you do not have much data to support an angle, say so and \
 give a low confidence rating. If the evidence is strong, give a high confidence rating.
 
 ---
 
-Tool-call strategy: You have a finite tool-call budget per iteration. Rather than \
-pre-allocating calls across angles, take an adaptive investigative approach: after each \
-tool result, reflect briefly on what was learned and whether it raises new questions. \
-Follow surprising or contradictory findings deeper, even at the cost of other angles — \
-surprising evidence is higher-signal than a perfectly balanced sweep. Think of the listed \
-angles as a *checklist of evidence areas*, not a rigid allocation. The overall call budget is \
-a soft cap; prefer depth on load-bearing findings over breadth for its own sake.
-
----
-
 If a previous iteration's verdict is included below, use it to:
 - Assess whether your prior guidance was followed
-- Identify whether BIC improved, stagnated, or regressed
 - Avoid repeating ideas that were already given
 - Focus on what's new or different this iteration
 
 ---
 
 AUDIENCE SEPARATION — IMPORTANT: The `synthesized_feedback` you produce will be read by \
-a different LLM that writes Python model code. That LLM knows nothing about "angles", \
-tool calls, or internal model IDs. Models must be described by their mechanisms \
-(e.g., "the model with separate learning rates for gains and losses") not by ID. \
-The feedback should be comparative — discuss multiple models' strengths and weaknesses.
+a different LLM that generates the next candidate model. That LLM knows nothing about \
+the angle labels or internal model IDs. Models must be described by their \
+mechanisms (e.g., "the model with separate learning rates for gains and losses") not by \
+ID. The feedback should be comparative — discuss multiple models' strengths and weaknesses.
 """
 
 
-def _build_judge_system_prompt(capabilities: list[str]) -> str:
-    """Return the judge system prompt tailored to enabled capabilities."""
-    if "diagnostic_detail" in capabilities:
-        angles = _CORE_STATISTICAL_ANGLES + "\n\n" + _DIAGNOSTIC_DETAIL_ANGLES
-    else:
-        angles = _CORE_ANGLES
-    prompt = _JUDGE_SYSTEM_PROMPT_HEADER + angles + _JUDGE_SYSTEM_PROMPT_FOOTER
-    extra_lines: list[str] = []
-    if "recommendations" in capabilities:
-        extra_lines.append(
-            "- A list of 3–5 concrete recommendations for the next iteration."
+def _build_active_prompt_angles(cfg_or_judge: Any) -> list[tuple[str, str]]:
+    """Return the enabled judge angles in prompt-safe order."""
+    flags = _judge_context_flags(cfg_or_judge)
+    angles: list[tuple[str, str]] = []
+    if flags["attempted_models"]:
+        angles.append(
+            (
+                "Search breadth",
+                "Which model families or mechanisms have been tried, and what remains unexplored.",
+            )
         )
-    if extra_lines:
-        prompt += "\n\n" + "\n".join(extra_lines)
+    if flags["performance"]:
+        angles.append(
+            (
+                "Statistical fit quality",
+                "How the enabled fit evidence compares across the best candidates.",
+            )
+        )
+    if flags["best_model_code"]:
+        angles.append(
+            (
+                "Mechanistic interpretability",
+                "What the available code shows about how the best candidates work.",
+            )
+        )
+    if flags["diagnostic"]:
+        angles.append(
+            (
+                "Diagnostic evidence",
+                "What the recovery, PPC, block residual, and individual-differences checks show.",
+            )
+        )
+    return angles
+
+
+def _build_judge_system_prompt(*, cfg=None) -> str:
+    """Return the judge system prompt tailored to enabled mode/context."""
+    mode = get_judge_mode(cfg) if cfg is not None else "llm"
+    angles = _build_active_prompt_angles(cfg)
+    if not angles:
+        angles = [
+            (
+                "Enabled context only",
+                "Use only the judge context explicitly enabled in the configuration.",
+            )
+        ]
+    angle_text = "\n\n".join(
+        f"{i + 1}. **{name}** — {desc}" for i, (name, desc) in enumerate(angles)
+    )
+    prompt = _JUDGE_SYSTEM_PROMPT_HEADER + angle_text + _JUDGE_SYSTEM_PROMPT_FOOTER
+    if mode in ("llm", "agent"):
+        prompt += (
+            "\n\nA list of 3–5 concrete recommendations for the next iteration should be included in the final verdict."
+        )
+    if mode == "agent":
+        prompt += (
+            "\n\nTool strategy: use a small number of allowed judge tools, reflect on each result before making the next call, and favour the evidence that is most informative for the enabled context."
+        )
+        allowed_tools = ", ".join(get_judge_tool_names(cfg)) or "none"
+        prompt += (
+            f"\n\nAllowed judge tools for this run: {allowed_tools}. Use only tools enabled by the current context."
+        )
+    if not _judge_context_flags(cfg)["performance"]:
+        prompt = _scrub_non_performance_prompt_language(prompt)
     return prompt
 
+
 _JUDGE_USER_TEMPLATE = """The model search has just completed iteration {iteration}.
-Current best BIC: {best_bic}
-Total iterations so far: {n_iterations}
 Run index (run_idx) for this client: {run_idx}
 
-Iteration {iteration} summary:
-- Models this iteration: {n_total} total ({n_ok} fit, {n_failed} failed)
-- Best BIC this iteration: {best_iter_bic}
-- BIC trajectory: {trajectory_str}
+{context_sections}
 
-Please query the diagnostic database to analyse this iteration using the listed \
-evidence areas, then produce your verdict.
+Use only the enabled judge context and produce your verdict.
 """
 
 
@@ -449,12 +792,16 @@ class _OpenAIToolLoop:
         model_name: str,
         max_tokens: int,
         temperature: float | None,
+        tool_schemas: list[dict],
+        allowed_tool_names: set[str],
         verbose: bool = False,
     ):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.tool_schemas = tool_schemas
+        self.allowed_tool_names = allowed_tool_names
         self.verbose = verbose
 
     def run(
@@ -465,7 +812,8 @@ class _OpenAIToolLoop:
             f"Before calling any tools, briefly list the 3–6 specific questions "
             f"you most want answered this iteration. Keep it short. These are starting "
             f"points — you are free to adapt as results come in. You have a soft budget "
-            f"of {max_tool_calls} tool calls total. Do not call tools in this message."
+            f"of {max_tool_calls} tool calls total. Do not call tools in this message. "
+            f"Use only the allowed judge tools for the current context."
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -485,7 +833,7 @@ class _OpenAIToolLoop:
             kwargs: dict = {
                 "model": self.model_name,
                 "messages": messages,
-                "tools": TOOL_SCHEMAS,
+                "tools": self.tool_schemas,
                 "tool_choice": tool_choice,
                 "max_tokens": self.max_tokens,
                 "parallel_tool_calls": False,
@@ -526,7 +874,7 @@ class _OpenAIToolLoop:
                     {
                         "role": "user",
                         "content": (
-                            "Good. Now proceed: call the diagnostic tools one at a time "
+                            "Good. Now proceed: call the allowed judge tools one at a time "
                             "to gather the evidence you need."
                         ),
                     }
@@ -548,7 +896,12 @@ class _OpenAIToolLoop:
                 except json.JSONDecodeError:
                     args = {}
 
-                result = dispatch_tool(store, tool_name, args)
+                result = dispatch_tool(
+                    store,
+                    tool_name,
+                    args,
+                    allowed_tool_names=self.allowed_tool_names,
+                )
                 result_str = _cap_tool_result(
                     json.dumps(result, default=str), raw_result=result
                 )
@@ -656,23 +1009,27 @@ class _GeminiToolLoop:
         model_name: str,
         max_tokens: int,
         temperature: float | None,
+        tool_schemas: list[dict],
+        allowed_tool_names: set[str],
         verbose: bool = False,
     ):
         self.client = client
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.tool_schemas = tool_schemas
+        self.allowed_tool_names = allowed_tool_names
         self.verbose = verbose
 
     def _build_gemini_tools(self):
-        """Convert TOOL_SCHEMAS to Gemini FunctionDeclaration objects."""
+        """Convert the filtered tool schemas to Gemini FunctionDeclaration objects."""
         try:
             from google.genai import types
         except ImportError:
             from google.generativeai import types  # type: ignore
 
         declarations = []
-        for schema in TOOL_SCHEMAS:
+        for schema in self.tool_schemas:
             fn = schema["function"]
             declarations.append(
                 types.FunctionDeclaration(
@@ -697,7 +1054,8 @@ class _GeminiToolLoop:
             f"Before calling any tools, briefly list the 3–6 specific questions "
             f"you most want answered this iteration. Keep it short. These are starting "
             f"points — you are free to adapt as results come in. You have a soft budget "
-            f"of {max_tool_calls} tool calls total. Do not call tools in this message."
+            f"of {max_tool_calls} tool calls total. Do not call tools in this message. "
+            f"Use only the allowed judge tools for the current context."
         )
         contents = [
             {
@@ -730,6 +1088,7 @@ class _GeminiToolLoop:
                 system_instruction=system_prompt,
                 max_output_tokens=self.max_tokens or None,
                 temperature=self.temperature,
+                tools=tools,
             ),
         )
 
@@ -761,7 +1120,7 @@ class _GeminiToolLoop:
                 "parts": [
                     {
                         "text": (
-                            "Good. Now proceed: call the diagnostic tools one at a time "
+                            "Good. Now proceed: call the allowed judge tools one at a time "
                             "to gather the evidence you need."
                         )
                     }
@@ -803,7 +1162,12 @@ class _GeminiToolLoop:
                     has_function_calls = True
                     fc = part.function_call
                     args = dict(fc.args) if fc.args else {}
-                    result = dispatch_tool(store, fc.name, args)
+                    result = dispatch_tool(
+                        store,
+                        fc.name,
+                        args,
+                        allowed_tool_names=self.allowed_tool_names,
+                    )
                     result_str = _cap_tool_result(
                         json.dumps(result, default=str), raw_result=result
                     )
@@ -1051,45 +1415,100 @@ IMPORTANT PROHIBITIONS — Never reference:
 """
 
 
-def _build_feedback_format_instructions(capabilities: list[str], profile: dict) -> str:
-    """Return synthesis formatting guidance for the active capability set."""
-    instructions = [
-        "1. **What worked** (1-2 sentences) — Describe the best model(s) mechanistically.",
-        "2. **What partially worked** (2-3 sentences) — Compare models with mixed strengths and weaknesses.",
-        "3. **What didn't work** (1-2 sentences) — Describe failed approaches so the generator avoids repeating them.",
-    ]
-    if "recommendations" in capabilities:
+def _build_feedback_format_instructions(cfg_or_judge: Any, profile: dict, *, mode: str | None = None) -> str:
+    """Return synthesis formatting guidance for the active mode/context."""
+    angles = _build_active_prompt_angles(cfg_or_judge)
+    instructions: list[str] = []
+    for idx, (name, desc) in enumerate(angles, start=1):
+        instructions.append(f"{idx}. **{name}** (1-3 sentences) — {desc}")
+    if not instructions:
         instructions.append(
-            "4. **What to try next** (2-4 sentences) — Concrete suggestions framed as \"try X because Y\"."
+            "1. **Enabled context only** (1-3 sentences) — Summarise only the evidence explicitly enabled by the configuration."
+        )
+    if mode in ("llm", "agent"):
+        instructions.append(
+            f"{len(instructions) + 1}. **What to try next** (2-4 sentences) — Concrete suggestions framed as \"try X because Y\"."
         )
     return "\n\n".join(instructions)
 
 
+def _filter_prohibitions_for_context(
+    prohibitions: str,
+    cfg_or_judge: Any,
+    *,
+    mode: str | None = None,
+) -> str:
+    """Remove prohibition lines that mention disabled context areas."""
+    flags = _judge_context_flags(cfg_or_judge)
+    blocked_terms: list[str] = []
+    if not flags["performance"]:
+        blocked_terms.extend(
+            ["bic", "metric", "trajectory", "improved", "regressed", "plateaued", "status"]
+        )
+    if not flags["best_model_code"]:
+        blocked_terms.append("code")
+    if not flags["diagnostic"]:
+        blocked_terms.extend(
+            [
+                "diagnostic",
+                "ppc",
+                "recovery",
+                "residual",
+                "individual differences",
+                "heterogeneity",
+                "parameter distribution",
+            ]
+        )
+    if mode == "llm":
+        blocked_terms.append("tool")
+
+    kept_lines: list[str] = []
+    for line in prohibitions.splitlines():
+        lower = line.lower()
+        if any(term in lower for term in blocked_terms):
+            continue
+        kept_lines.append(line)
+
+    filtered = "\n".join(kept_lines).strip()
+    if not filtered:
+        filtered = "- Internal identifiers or database fields outside the enabled context"
+    return filtered
+
+
 def _build_synthesis_prompt(
-    capabilities: list[str],
+    cfg_or_judge: Any,
     profile: dict,
     persona_name: str,
     persona_suffix: str,
     is_stuck: bool,
+    *,
+    mode: str | None = None,
 ) -> str:
-    """Build the second-pass synthesis prompt for the active capability set."""
+    """Build the second-pass synthesis prompt for the active mode/context."""
+    active_angles = _build_active_prompt_angles(cfg_or_judge)
+    prohibitions = _filter_prohibitions_for_context(
+        profile["prohibitions"], cfg_or_judge, mode=mode
+    )
     angles_list = "\n".join(
         f"{i + 1}. {name} — {desc}"
-        for i, (name, desc) in enumerate(profile["angles"])
+        for i, (name, desc) in enumerate(active_angles)
     )
+    if not angles_list:
+        angles_list = "1. Enabled context only — Summarise only the evidence explicitly enabled by the configuration."
+    has_recommendations = mode in ("llm", "agent")
     prompt = _SYNTHESIS_PROMPT_TEMPLATE.format(
-        num_angles=len(profile["angles"]),
+        num_angles=max(len(active_angles), 1),
         angles_list=angles_list,
         feedback_format_instructions=_build_feedback_format_instructions(
-            capabilities, profile
+            cfg_or_judge, profile, mode=mode
         ),
-        prohibitions=profile["prohibitions"],
+        prohibitions=prohibitions,
     )
-    if "recommendations" in capabilities:
+    if has_recommendations:
         prompt += (
             "\n\nIf previous verdict context was provided, explicitly note whether prior suggestions were followed and whether they appeared to help."
         )
-    if "recommendations" in capabilities:
+    if has_recommendations:
         prompt += (
             "\n\nInclude a `key_recommendations` array with 3–5 concrete next-step ideas."
         )
@@ -1101,6 +1520,8 @@ def _build_synthesis_prompt(
             "a directive to abandon the current best model and implement from scratch "
             "with a mechanistically-novel approach."
         )
+    if not _judge_context_flags(cfg_or_judge)["performance"]:
+        prompt = _scrub_non_performance_prompt_language(prompt)
     return prompt
 
 # ===== Persona-specific synthesis profiles =====
@@ -1418,7 +1839,8 @@ class ToolUsingJudge:
         self.results_dir = Path(results_dir) if results_dir else None
 
         judge_cfg = getattr(cfg, "judge", None)
-        self.capabilities: list[str] = get_judge_capabilities(cfg)
+        self.capabilities: list[str] = []
+        self.mode: str = get_judge_mode(cfg)
         self.max_tool_calls: int = (
             getattr(judge_cfg, "max_tool_calls", 20) if judge_cfg else 20
         )
@@ -1448,8 +1870,11 @@ class ToolUsingJudge:
         if judge_cfg and hasattr(judge_cfg, "model"):
             self.model_name = judge_cfg.model
 
+        self.tool_schemas: list[dict] = get_judge_tool_schemas(cfg)
+        self.allowed_tool_names: set[str] = set(get_judge_tool_names(cfg))
+
         self._tool_loop = self._build_tool_loop()
-        if not judge_has_capability(cfg, "tools"):
+        if self.mode != "agent":
             self._tool_loop = None
 
     def _build_tool_loop(self):
@@ -1463,6 +1888,8 @@ class ToolUsingJudge:
                 self.model_name,
                 self.max_tokens,
                 self.temperature,
+                self.tool_schemas,
+                self.allowed_tool_names,
                 verbose=self.verbose,
             )
         elif "gemini" in p:
@@ -1471,6 +1898,8 @@ class ToolUsingJudge:
                 self.model_name,
                 self.max_tokens,
                 self.temperature,
+                self.tool_schemas,
+                self.allowed_tool_names,
                 verbose=self.verbose,
             )
         else:
@@ -1479,8 +1908,8 @@ class ToolUsingJudge:
             return None
 
     def _capabilities_enabled(self) -> bool:
-        """Return whether any judge capabilities are enabled."""
-        return bool(self.capabilities)
+        """Return whether the judge mode produces any feedback."""
+        return self.mode not in ("off",)
 
     def _empty_verdict(self, iteration: int, best_metric: float | None) -> JudgeVerdict:
         """Build an explicit empty-feedback verdict."""
@@ -1540,7 +1969,7 @@ class ToolUsingJudge:
                 "no_capabilities": True,
             }
 
-        if self.capabilities == ["random_feedback"]:
+        if self.mode == "random":
             return {
                 "iteration": iteration,
                 "analysis_text": _RANDOM_FEEDBACK_TEXT,
@@ -1558,7 +1987,8 @@ class ToolUsingJudge:
             }
 
         # --- Attempt to short-circuit if previous iteration had only recovery failures ---
-        if recovery_failures and not prev_had_success and self.results_dir:
+        # Only allowed for llm/agent modes; static must not reuse previous verdict prose.
+        if self.mode in ("llm", "agent") and recovery_failures and not prev_had_success and self.results_dir:
             shortcut = self._try_shortcut_from_recovery_failure(
                 iteration=iteration,
                 run_idx=run_idx,
@@ -1589,25 +2019,29 @@ class ToolUsingJudge:
                     "short_circuit": True,  # Flag to skip re-synthesis
                 }
 
-        if _is_narrow_deterministic_set(self.capabilities):
+        if self.mode == "static":
             analysis_data = {
                 "iteration": iteration,
                 "_store": self.store,
                 "best_bic": best_metric,
             }
             trajectory: list[dict] = []
-            if "performance_summary" in self.capabilities:
-                from gecco.diagnostic_store.tools import (
-                    get_bic_trajectory as _get_bic_traj,
-                )
-
+            if judge_context_enabled(self.cfg, "performance"):
                 iter_row = self.store.fetchone(
                     "SELECT MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
                     "FROM models WHERE iteration = ? AND split = 'train'",
                     [iteration],
                 )
                 best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
-                trajectory = _get_bic_traj(self.store)
+                trajectory = self.store.fetchall(
+                    "SELECT m.iteration, MIN(m.metric_value) AS best_metric, "
+                    "COUNT(*) AS n_models_total, "
+                    "COUNT(CASE WHEN m.status = 'ok' THEN 1 END) AS n_ok "
+                    "FROM models m "
+                    "WHERE m.split = 'train' "
+                    "GROUP BY m.iteration "
+                    "ORDER BY m.iteration",
+                )
                 analysis_data.update(
                     {
                         "best_iter_bic": best_iter_bic_raw,
@@ -1615,10 +2049,24 @@ class ToolUsingJudge:
                     }
                 )
 
+            context_caps = []
+            if judge_context_enabled(self.cfg, "attempted_models"):
+                context_caps.append("attempted_models_overview")
+            if judge_context_enabled(self.cfg, "performance"):
+                context_caps.append("performance_summary")
+            if judge_context_enabled(self.cfg, "diagnostic"):
+                analysis_data["diagnostic_summary"] = _build_static_diagnostic_summary(
+                    self.store,
+                    iteration,
+                    run_idx,
+                    judge_context_enabled(self.cfg, "performance"),
+                )
+                if analysis_data["diagnostic_summary"]:
+                    context_caps.append("diagnostic_summary")
             return {
                 "iteration": iteration,
                 "analysis_text": _build_summary_only_feedback(
-                    analysis_data, capabilities=self.capabilities
+                    analysis_data, capabilities=context_caps
                 ),
                 "trace": [],
                 "full_trace": [],
@@ -1636,55 +2084,108 @@ class ToolUsingJudge:
 
         t0 = time.time()
 
-        # --- Pre-compute iteration delta context ---
-        from gecco.diagnostic_store.tools import get_bic_trajectory as _get_bic_traj
+        flags = _judge_context_flags(self.cfg)
+        n_total = 0
+        n_ok = 0
+        n_failed = 0
+        best_iter_bic_raw = None
+        best_iter_bic = "N/A"
+        traj: list[dict] = []
+        trajectory_str = "N/A"
+        is_stuck = False
+        if flags["performance"]:
+            # --- Pre-compute iteration delta context ---
+            iter_row = self.store.fetchone(
+                "SELECT COUNT(*) AS n_total, "
+                "COUNT(CASE WHEN status='ok' THEN 1 END) AS n_ok, "
+                "COUNT(CASE WHEN status!='ok' THEN 1 END) AS n_failed, "
+                "MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
+                "FROM models WHERE iteration = ? AND split = 'train'",
+                [iteration],
+            )
+            n_total = iter_row.get("n_total", 0) if iter_row else 0
+            n_ok = iter_row.get("n_ok", 0) if iter_row else 0
+            n_failed = iter_row.get("n_failed", 0) if iter_row else 0
+            best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
+            best_iter_bic = (
+                f"{best_iter_bic_raw:.2f}" if best_iter_bic_raw is not None else "N/A"
+            )
 
-        iter_row = self.store.fetchone(
-            "SELECT COUNT(*) AS n_total, "
-            "COUNT(CASE WHEN status='ok' THEN 1 END) AS n_ok, "
-            "COUNT(CASE WHEN status!='ok' THEN 1 END) AS n_failed, "
-            "MIN(CASE WHEN status='ok' THEN metric_value END) AS best_iter "
-            "FROM models WHERE iteration = ? AND split = 'train'",
-            [iteration],
-        )
-        n_total = iter_row.get("n_total", 0) if iter_row else 0
-        n_ok = iter_row.get("n_ok", 0) if iter_row else 0
-        n_failed = iter_row.get("n_failed", 0) if iter_row else 0
-        best_iter_bic_raw = iter_row.get("best_iter") if iter_row else None
-        best_iter_bic = (
-            f"{best_iter_bic_raw:.2f}" if best_iter_bic_raw is not None else "N/A"
-        )
+            traj = self.store.fetchall(
+                "SELECT m.iteration, MIN(m.metric_value) AS best_metric, "
+                "COUNT(*) AS n_models_total, "
+                "COUNT(CASE WHEN m.status = 'ok' THEN 1 END) AS n_ok "
+                "FROM models m "
+                "WHERE m.split = 'train' "
+                "GROUP BY m.iteration "
+                "ORDER BY m.iteration"
+            )
+            trajectory_str = _format_trajectory(traj)
 
-        traj = _get_bic_traj(self.store)
-        trajectory_str = _format_trajectory(traj)
-
-        # --- Stuck-search detection (R3: use configurable thresholds) ---
-        is_stuck = _detect_stuck(
-            traj,
-            tol=self.stuck_search_cfg.tolerance,
-            window=self.stuck_search_cfg.window,
-        )
+            # --- Stuck-search detection (R3: use configurable thresholds) ---
+            is_stuck = _detect_stuck(
+                traj,
+                tol=self.stuck_search_cfg.tolerance,
+                window=self.stuck_search_cfg.window,
+            )
 
         # --- Build analysis context ---
         best_bic_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
         n_iterations = iteration + 1  # iterations seen so far (0-indexed)
+        context_sections: list[str] = []
+
+        if flags["attempted_models"]:
+            context_sections.append(_build_attempted_models_overview_section(self.store, iteration))
+
+        if flags["performance"]:
+            performance_lines = [
+                f"Current best BIC: {best_bic_str}",
+                f"Total iterations so far: {n_iterations}",
+                f"Run index (run_idx) for this client: {run_idx}",
+                f"Models this iteration: {n_total} total ({n_ok} fit, {n_failed} failed)",
+                f"Best BIC this iteration: {best_iter_bic}",
+                f"BIC trajectory: {trajectory_str}",
+            ]
+            context_sections.append("Performance context:\n" + "\n".join(f"- {line}" for line in performance_lines))
+
+        if flags["diagnostic"]:
+            diagnostic_summary = _build_static_diagnostic_summary(
+                self.store,
+                iteration,
+                run_idx,
+                flags["performance"],
+            )
+            if diagnostic_summary:
+                context_sections.append(diagnostic_summary)
 
         user_message = _JUDGE_USER_TEMPLATE.format(
             iteration=iteration,
-            best_bic=best_bic_str,
-            n_iterations=n_iterations,
             run_idx=run_idx,
-            n_total=n_total,
-            n_ok=n_ok,
-            n_failed=n_failed,
-            best_iter_bic=best_iter_bic,
-            trajectory_str=trajectory_str,
+            context_sections="\n\n".join(context_sections),
         )
 
+        if self.results_dir:
+            prev_verdict = self._load_previous_verdict(iteration, run_idx, tag)
+            if prev_verdict is not None:
+                prev_iter = prev_verdict.get("iteration", "?")
+                prev_sections: list[str] = [f"- Previous iteration: {prev_iter}"]
+                if flags["performance"]:
+                    prev_bic = prev_verdict.get("best_bic")
+                    prev_bic_str = f"{prev_bic:.2f}" if prev_bic is not None else "N/A"
+                    prev_sections.append(f"- Best BIC at that time: {prev_bic_str}")
+                if flags["performance"] and self.mode in ("llm", "agent") and prev_verdict.get("key_recommendations"):
+                    prev_sections.append("- Previous recommendations:")
+                    prev_sections.extend(
+                        f"  - {recommendation}"
+                        for recommendation in prev_verdict.get("key_recommendations", [])
+                    )
+                if len(prev_sections) > 1:
+                    user_message += (
+                        "\n\nPrevious iteration context:\n"
+                        + "\n".join(prev_sections)
+                    )
 
-
-        # --- Stuck-search directive (R3: generic form for reuse across personas) ---
-        if is_stuck:
+        if is_stuck and flags["performance"]:
             user_message += (
                 f"\n\n\u26a0 Search appears stuck: best BIC has not improved by >{self.stuck_search_cfg.tolerance} "
                 f"points over the last {self.stuck_search_cfg.window} iterations. "
@@ -1693,38 +2194,13 @@ class ToolUsingJudge:
                 "in the data that current mechanisms miss."
             )
 
-        # --- Previous verdict context (R8: truncate to avoid compounding bias) ---
-        if self.results_dir:
-            prev_verdict = self._load_previous_verdict(iteration, run_idx, tag)
-            if prev_verdict is not None:
-                prev_iter = prev_verdict.get("iteration", "?")
-                prev_bic = prev_verdict.get("best_bic")
-                prev_bic_str = f"{prev_bic:.2f}" if prev_bic is not None else "N/A"
-                prev_recs = prev_verdict.get("key_recommendations", [])
-                # R8: Drop synthesized_feedback to avoid rhetorical carryover bias
-                rec_bullets = "".join(f"\n  - {r}" for r in prev_recs)
-                guidance_label = (
-                    "Key recommendations given"
-                    if "recommendations" in self.capabilities
-                    else "Prior guidance tracked"
-                )
-                guidance_text = (
-                    f":{rec_bullets}"
-                    if "recommendations" in self.capabilities
-                    else f": {len(prev_recs)} items"
-                )
-                user_message += (
-                    f"\n\nPrevious iteration ({prev_iter}) verdict:\n"
-                    f"- Best BIC at that time: {prev_bic_str}\n"
-                    f"- {guidance_label}{guidance_text}\n\n"
-                    + (
-                        "Use this to assess whether prior recommendations were followed, "
-                        "whether BIC improved/stagnated/regressed, and to avoid repeating suggestions."
-                        if "recommendations" in self.capabilities
-                        else "Use this to assess whether prior guidance was followed, "
-                        "whether BIC improved/stagnated/regressed, and to avoid repeating ideas."
-                    )
-                )
+        if self.mode == "agent":
+            user_message += (
+                "\n\nUse only the allowed judge tools to gather any additional evidence permitted by the current context."
+            )
+
+        if not flags["performance"]:
+            user_message = _scrub_non_performance_prompt_language(user_message)
 
         # --- Run tool loop (analysis phase) ---
         if self.verbose:
@@ -1734,7 +2210,7 @@ class ToolUsingJudge:
             )
 
         if self._tool_loop is not None:
-            system_prompt = _build_judge_system_prompt(self.capabilities)
+            system_prompt = _build_judge_system_prompt(cfg=self.cfg)
             final_text, trace, full_trace = self._tool_loop.run(
                 self.store,
                 system_prompt,
@@ -1804,7 +2280,7 @@ class ToolUsingJudge:
         best_bic = analysis_data["best_bic"]
         is_stuck = analysis_data["is_stuck"]
 
-        if _is_narrow_deterministic_set(self.capabilities):
+        if self.mode in ("static", "off", "random"):
             verdict = JudgeVerdict(
                 iteration=iteration,
                 per_angle=[],
@@ -1823,23 +2299,13 @@ class ToolUsingJudge:
             config_profile = getattr(persona_config, "profile", None)
             if config_profile is not None:
                 profile.update(_profile_from_config(config_profile, profile))
-        # Gate diagnostic angles on diagnostic_detail capability
-        if "diagnostic_detail" not in self.capabilities:
-            diagnostic_angle_names = {
-                "predictive adequacy", "individual differences",
-            }
-            filtered_angles = [
-                (name, desc) for name, desc in profile.get("angles", [])
-                if name.lower() not in diagnostic_angle_names
-            ]
-            if filtered_angles:
-                profile["angles"] = filtered_angles
         synthesis_prompt = _build_synthesis_prompt(
-            self.capabilities,
+            self.cfg,
             profile,
             persona_name,
             persona_suffix,
             is_stuck,
+            mode=self.mode,
         )
 
         # Second pass: extract structured verdict
@@ -1853,7 +2319,7 @@ class ToolUsingJudge:
             analysis_text,
             trace,
             synthesis_prompt,
-            _build_judge_system_prompt(self.capabilities),
+            _build_judge_system_prompt(cfg=self.cfg),
         )
 
         wall_time = analysis_data.get("wall_time", 0)
@@ -1861,7 +2327,7 @@ class ToolUsingJudge:
             structured_text, iteration, len(trace), wall_time
         )
         verdict.best_bic = best_bic
-        verdict = _apply_capability_postprocessing(verdict, self.capabilities)
+        verdict = _apply_capability_postprocessing(verdict, self.cfg)
 
         if self.verbose:
             _console.print(
@@ -2078,21 +2544,8 @@ class ToolUsingJudge:
 
     def _fallback_generate(self, user_message: str) -> str:
         """Simple one-shot generation for backends without tool calling."""
-        system_prompt = _build_judge_system_prompt(self.capabilities)
-        context_parts = [system_prompt, "\n\n", user_message]
-
-        # Pull a minimal context from the store directly
-        try:
-            from gecco.diagnostic_store.tools import get_bic_trajectory, get_best_models
-
-            traj = get_bic_trajectory(self.store)
-            best = get_best_models(self.store, k=5)
-            context_parts.append(f"\n\nBIC trajectory: {json.dumps(traj, default=str)}")
-            context_parts.append(f"\n\nTop models: {json.dumps(best, default=str)}")
-        except Exception:
-            pass
-
-        prompt = "".join(context_parts)
+        system_prompt = _build_judge_system_prompt(cfg=self.cfg)
+        prompt = "".join([system_prompt, "\n\n", user_message])
 
         if self.tokenizer is not None:
             # HuggingFace
@@ -2107,23 +2560,13 @@ class ToolUsingJudge:
             )
             return self.tokenizer.decode(output[0], skip_special_tokens=True)
 
-        # Rewrite tool-dependent instructions in the user message for the
-        # no-tools case so the LLM doesn't attempt queries it can't make.
-        user_message_no_tools = user_message.replace(
-            "Please query the diagnostic database to analyse this iteration "
-            "using the listed evidence areas, then produce your verdict.",
-            "You do NOT have access to diagnostic tool calls.  Use the "
-            "pre-computed statistics and trajectory printed above to "
-            "analyse this iteration, then produce your verdict.",
-        )
-
         p = self.provider
         if any(
             x in p for x in ("openai", "gpt", "vllm", "kcl", "opencode", "openrouter")
         ):
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message_no_tools},
+                {"role": "user", "content": user_message},
             ]
             kwargs = {
                 "model": self.model_name,
@@ -2149,7 +2592,7 @@ class ToolUsingJudge:
                 from google.genai import types
             except ImportError:
                 from google.generativeai import types
-            contents = [{"role": "user", "parts": [{"text": user_message_no_tools}]}]
+            contents = [{"role": "user", "parts": [{"text": user_message}]}]
             resp = self.model.models.generate_content(
                 model=self.model_name,
                 contents=contents,

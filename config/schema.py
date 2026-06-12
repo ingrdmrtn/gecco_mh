@@ -13,16 +13,7 @@ from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.prepare_data.data2text import narrative
 
 
-JudgeCapability = Literal[
-    "attempted_models_overview",
-    "performance_summary",
-    "best_model_code",
-    "diagnostic_detail",
-    "recommendations",
-    "tools",
-    "persona_synthesis",
-    "random_feedback",
-]
+JudgeMode = Literal["off", "random", "static", "llm", "agent"]
 
 
 class GeCCoBaseModel(BaseModel):
@@ -155,6 +146,23 @@ class JudgeProfileConfig(GeCCoBaseModel):
     """Persona profile overrides used during synthesis."""
 
 
+class JudgeContextConfig(BaseModel):
+    """Controls which context sections are available to the judge."""
+
+    attempted_models: bool = False
+    performance: bool = False
+    best_model_code: bool = False
+    diagnostic: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+
+class JudgeOutputConfig(BaseModel):
+    """Controls judge output formatting."""
+
+    persona_synthesis: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+
 class JudgeConfig(GeCCoBaseModel):
     """Judge runtime configuration."""
 
@@ -162,7 +170,9 @@ class JudgeConfig(GeCCoBaseModel):
     max_tool_calls: int | None = None
     verbose: bool = False
     stuck_search: JudgeStuckSearchConfig = Field(default_factory=JudgeStuckSearchConfig)
-    capabilities: list[JudgeCapability] = Field(default_factory=list)
+    mode: JudgeMode = "llm"
+    context: JudgeContextConfig = Field(default_factory=JudgeContextConfig)
+    output: JudgeOutputConfig = Field(default_factory=JudgeOutputConfig)
     diagnostic_store: JudgeDiagnosticStoreConfig = Field(
         default_factory=JudgeDiagnosticStoreConfig
     )
@@ -175,13 +185,21 @@ class JudgeConfig(GeCCoBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def reject_retired_mode_field(cls, data: Any) -> Any:
-        """Reject retired judge runtime fields with a clear message."""
-        if isinstance(data, dict) and "mode" in data:
+    def reject_retired_capabilities_field(cls, data: Any) -> Any:
+        """Reject retired judge.capabilities with a clear migration message."""
+        if isinstance(data, dict) and "capabilities" in data:
             raise ValueError(
-                "judge.mode has been retired; remove the field. "
-                "The judge now always uses the orchestrated pipeline."
+                "judge.capabilities has been retired. Use judge.mode, judge.context, "
+                "and judge.output instead. "
+                "See docs/index.html for the new schema."
             )
+        if isinstance(data, dict) and "mode" in data:
+            old_mode = data.get("mode")
+            if old_mode in ("manual", "tool_using"):
+                raise ValueError(
+                    f"judge.mode={old_mode!r} has been retired. "
+                    "Use judge.mode: llm or judge.mode: agent instead."
+                )
         if isinstance(data, dict) and "orchestrated" in data:
             raise ValueError(
                 "judge.orchestrated has been retired; remove the field. "
@@ -190,13 +208,27 @@ class JudgeConfig(GeCCoBaseModel):
         return data
 
     @model_validator(mode="after")
-    def validate_capabilities(self) -> "JudgeConfig":
-        """Reject invalid or duplicated capability combinations."""
-        if len(self.capabilities) != len(set(self.capabilities)):
-            raise ValueError("judge.capabilities must not contain duplicates")
-        if "random_feedback" in self.capabilities and len(self.capabilities) != 1:
+    def validate_mode_context(self) -> "JudgeConfig":
+        """Reject invalid mode/context/output combinations."""
+        has_context = any([
+            self.context.attempted_models,
+            self.context.performance,
+            self.context.best_model_code,
+            self.context.diagnostic,
+        ])
+        if self.mode in ("off", "random") and has_context:
             raise ValueError(
-                "judge.capabilities must use random_feedback as an exclusive mode"
+                f"judge.mode={self.mode!r} must not have any enabled context. "
+                f"Set all judge.context fields to false when using mode={self.mode!r}."
+            )
+        if self.mode in ("off", "random") and self.output.persona_synthesis:
+            raise ValueError(
+                f"judge.mode={self.mode!r} must not have persona_synthesis enabled."
+            )
+        if self.mode == "agent" and not has_context:
+            raise ValueError(
+                "judge.mode=agent requires at least one enabled context field "
+                "(judge.context.attempted_models, performance, best_model_code, or diagnostic)."
             )
         return self
 
@@ -226,14 +258,13 @@ class GeCCoConfig(GeCCoBaseModel):
 
     @model_validator(mode="after")
     def validate_judge_dependencies(self) -> "GeCCoConfig":
-        """Validate cross-section judge capability requirements."""
+        """Validate cross-section judge mode/context/output requirements."""
         if self.judge is None:
             return self
 
-        capabilities = set(self.judge.capabilities)
-        if "persona_synthesis" in capabilities and not self._has_persona_configuration():
+        if self.judge.output.persona_synthesis and not self._has_persona_configuration():
             raise ValueError(
-                "judge.capabilities includes persona_synthesis but no multiple "
+                "judge.output.persona_synthesis is enabled but no multiple "
                 "configured personas or explicit judge.persona_profiles were provided"
             )
         return self
@@ -262,16 +293,68 @@ def _get_mapping_value(obj: Any, key: str) -> Any:
     return getattr(obj, key, None)
 
 
-def get_judge_capabilities(cfg_or_judge: Any) -> list[str]:
-    """Return the configured judge capabilities as a stable list."""
+def get_judge_mode(cfg_or_judge: Any) -> str:
+    """Return the configured judge mode."""
     judge_cfg = getattr(cfg_or_judge, "judge", cfg_or_judge)
-    capabilities = getattr(judge_cfg, "capabilities", []) if judge_cfg else []
-    return list(capabilities or [])
+    if judge_cfg is None:
+        return "off"
+    return getattr(judge_cfg, "mode", "llm") or "llm"
+
+
+def judge_context_enabled(cfg_or_judge: Any, context_field: str) -> bool:
+    """Return whether a specific judge context field is enabled."""
+    judge_cfg = getattr(cfg_or_judge, "judge", cfg_or_judge)
+    if judge_cfg is None:
+        return False
+    context = getattr(judge_cfg, "context", None)
+    if context is None:
+        return False
+    return bool(getattr(context, context_field, False))
+
+
+def judge_output_enabled(cfg_or_judge: Any, output_field: str) -> bool:
+    """Return whether a specific judge output field is enabled."""
+    judge_cfg = getattr(cfg_or_judge, "judge", cfg_or_judge)
+    if judge_cfg is None:
+        return False
+    output = getattr(judge_cfg, "output", None)
+    if output is None:
+        return False
+    return bool(getattr(output, output_field, False))
+
+
+def get_judge_capabilities(cfg_or_judge: Any) -> list[str]:
+    """DEPRECATED: Return the configured judge capabilities as a stable list.
+
+    This is maintained only for backward compatibility during the migration
+    from capabilities to mode/context/output. New code should use
+    get_judge_mode(), judge_context_enabled(), and judge_output_enabled().
+    """
+    judge_cfg = getattr(cfg_or_judge, "judge", cfg_or_judge)
+    if judge_cfg is None:
+        return []
+    capabilities = getattr(judge_cfg, "capabilities", None)
+    if capabilities is not None:
+        return list(capabilities)
+    return []
 
 
 def judge_has_capability(cfg_or_judge: Any, capability: str) -> bool:
-    """Return whether the named judge capability is enabled."""
-    return capability in set(get_judge_capabilities(cfg_or_judge))
+    """DEPRECATED: Return whether the named judge capability is enabled.
+
+    This is maintained only for backward compatibility during the migration
+    from capabilities to mode/context/output. New code should use
+    judge_context_enabled() and judge_output_enabled().
+    """
+    judge_cfg = getattr(cfg_or_judge, "judge", cfg_or_judge)
+    if judge_cfg is None:
+        return False
+    capabilities = getattr(judge_cfg, "capabilities", None)
+    if capabilities is not None:
+        return capability in set(capabilities)
+    if hasattr(judge_cfg, "output") and capability == "persona_synthesis":
+        return judge_output_enabled(judge_cfg, "persona_synthesis")
+    return False
 
 
 def load_data_from_config(cfg: GeCCoConfig | dict[str, Any]) -> Any:

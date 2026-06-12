@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from config.schema import judge_has_capability
+from config.schema import judge_has_capability, judge_output_enabled, judge_context_enabled
 
 
 class FeedbackArtifact(BaseModel):
@@ -112,7 +112,7 @@ def _resolve_synthesis_personas(cfg: Any) -> dict[str, Any | None]:
     if getattr(cmg_cfg, "enabled", False):
         generator_name = getattr(cmg_cfg, "generator_client", "generator")
         return {generator_name: clients.get(generator_name)}
-    if judge_has_capability(cfg, "persona_synthesis") and clients:
+    if judge_output_enabled(cfg, "persona_synthesis") and clients:
         return clients
     return {"default": None}
 
@@ -150,7 +150,8 @@ def build_feedback_artifact(
     verdict_payloads: list[dict[str, Any]],
     best_model: str | None,
     best_metric: float | None,
-    include_best_model_code: bool,
+    include_best_model_code: bool = False,
+    cfg: Any = None,
 ) -> FeedbackArtifact:
     """Build the canonical feedback artifact for any orchestrated judge run.
 
@@ -168,13 +169,19 @@ def build_feedback_artifact(
     Returns:
         The canonical ``FeedbackArtifact``.
     """
+    if cfg is not None:
+        include_best_model_code = judge_context_enabled(cfg, "best_model_code")
+        performance_enabled = judge_context_enabled(cfg, "performance")
+    else:
+        performance_enabled = True
     final_feedback = dict(synthesized_feedback)
     if include_best_model_code and best_model is not None:
-        best_metric_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
-        appendix = (
-            f"\n\n---\nBest model code so far (BIC={best_metric_str}):\n"
-            f"```python\n{best_model}\n```"
-        )
+        if performance_enabled:
+            best_metric_str = f"{best_metric:.2f}" if best_metric is not None else "N/A"
+            appendix_heading = f"Best model code so far (BIC={best_metric_str}):"
+        else:
+            appendix_heading = "Best model code so far:"
+        appendix = f"\n\n---\n{appendix_heading}\n```python\n{best_model}\n```"
         final_feedback = {
             persona_name: f"{feedback_text}{appendix}"
             for persona_name, feedback_text in final_feedback.items()
@@ -202,7 +209,7 @@ def build_feedback_artifact(
         timestamp=datetime.now(timezone.utc).isoformat(),
         tool_call_count=len(analysis_data.get("trace", [])),
         wall_time_seconds=float(analysis_data.get("wall_time", 0.0)),
-        best_bic=analysis_data.get("best_bic"),
+        best_bic=analysis_data.get("best_bic") if performance_enabled else None,
         tool_call_trace=analysis_data.get("trace", []),
         full_trace=analysis_data.get("full_trace", []),
         metadata=dict(analysis_data.get("metadata", {}) or {}),
@@ -312,7 +319,8 @@ def run_orchestrated_judge_pipeline(
         verdict_payloads=verdict_payloads,
         best_model=best_model,
         best_metric=best_metric,
-        include_best_model_code=judge_has_capability(cfg, "best_model_code"),
+        include_best_model_code=False,
+        cfg=cfg,
     )
     persist_feedback_artifact(artifact=artifact, results_dir=results_dir)
     return artifact

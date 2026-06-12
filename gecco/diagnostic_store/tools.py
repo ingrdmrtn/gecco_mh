@@ -12,7 +12,9 @@ as ``tools=[...]``.
 
 from __future__ import annotations
 
+import copy
 import json
+import re
 from typing import Any
 
 from gecco.diagnostic_store.store import DiagnosticStore
@@ -191,6 +193,39 @@ def get_model(store: DiagnosticStore, model_id: int,
             code = str(result["code"])
             if len(code) > 6000:
                 result["code"] = code[:6000] + "\n... [truncated]"
+    return result
+
+
+def get_best_model_code(store: DiagnosticStore) -> dict | None:
+    """Return the source code for one selected model.
+
+    The selection is performed internally; the returned record only includes
+    the source code plus a minimal identity payload.
+    """
+    sql = """
+        SELECT m.model_id, m.name, m.code, i.iteration, i.run_idx
+        FROM models m
+        JOIN iterations i ON i.iteration_id = m.iteration_id
+        WHERE m.status = 'ok'
+          AND m.metric_value IS NOT NULL
+          AND m.split = 'train'
+        ORDER BY m.metric_value ASC
+        LIMIT 1
+    """
+    row = store.fetchone(sql)
+    if row is None:
+        return None
+    result = {
+        "model_id": row.get("model_id"),
+        "name": row.get("name"),
+        "iteration": row.get("iteration"),
+        "run_idx": row.get("run_idx"),
+        "code": row.get("code"),
+    }
+    if result["code"]:
+        code = str(result["code"])
+        if len(code) > 6000:
+            result["code"] = code[:6000] + "\n... [truncated]"
     return result
 
 
@@ -812,11 +847,179 @@ def get_bic_trajectory(store: DiagnosticStore,
         return store.fetchall(sql)
 
 
+def list_attempted_models(
+    store: DiagnosticStore,
+    iteration: int,
+    run_idx: int | None = None,
+) -> dict:
+    """Return the unique model names attempted in one iteration.
+
+    This is the narrowest judge-facing tool and intentionally returns names
+    only, without metrics, status labels, code, or diagnostic summaries.
+    """
+    params: list[Any] = [iteration]
+    run_filter = ""
+    if run_idx is not None:
+        run_filter = "AND run_idx = ?"
+        params.append(run_idx)
+
+    rows = store.fetchall(
+        f"""
+            SELECT name
+            FROM models
+            WHERE iteration = ?
+              AND split = 'train'
+              {run_filter}
+            ORDER BY model_id
+        """,
+        params,
+    )
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        name = row.get("name", "")
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return {"iteration": iteration, "run_idx": run_idx, "models": names}
+
+
 # ======================================================================
 # OpenAI-style tool schemas
 # ======================================================================
 
+
+_ATTEMPTED_TOOL_NAMES = {"list_attempted_models"}
+_PERFORMANCE_TOOL_NAMES = {
+    "list_iterations",
+    "get_best_models",
+    "get_bic_trajectory",
+    "get_participant_best_models",
+    "get_per_participant_fit",
+    "list_failed_models",
+}
+_BEST_MODEL_CODE_SAFE_TOOL_NAMES = {"get_best_model_code"}
+_BEST_MODEL_CODE_TOOL_NAMES = {"get_model", "search_models"}
+_DIAGNOSTIC_TOOL_NAMES = {
+    "get_recovery",
+    "get_individual_differences",
+    "get_ppc",
+    "get_block_residuals",
+    "get_parameter_distribution",
+}
+_DIAGNOSTIC_PERFORMANCE_TOOL_NAMES = {"compare_models"}
+
+
+def _scrub_diagnostic_only_text(text: str) -> str:
+    """Remove performance/comparison wording from diagnostic-only tool text."""
+    replacements = [
+        (r"(?i)\bstatistical model comparison\b", "diagnostic assessment"),
+        (r"(?i)\bcomparative\b", "contextual"),
+        (r"(?i)\bcomparison\b", "analysis"),
+        (r"(?i)\bperformance\b", "diagnostic"),
+        (r"(?i)\bBIC\b", "fit evidence"),
+        (r"(?i)\bmetric\b", "signal"),
+        (r"(?i)\branking\b", "ordering"),
+        (r"(?i)\bstatus\b", "state"),
+    ]
+    result = text
+    for pattern, repl in replacements:
+        result = re.sub(pattern, repl, result)
+    return result
+
+
+def _scrub_schema_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _scrub_diagnostic_only_text(value)
+    if isinstance(value, list):
+        return [_scrub_schema_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _scrub_schema_value(item) for key, item in value.items()}
+    return value
+
+
+def _unique_tool_names(names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def _enabled_agent_tool_names(cfg_or_judge: Any) -> list[str]:
+    from config.schema import get_judge_mode, judge_context_enabled
+
+    if get_judge_mode(cfg_or_judge) != "agent":
+        return []
+
+    enabled_names: list[str] = []
+    if judge_context_enabled(cfg_or_judge, "attempted_models"):
+        enabled_names.extend(sorted(_ATTEMPTED_TOOL_NAMES))
+    if judge_context_enabled(cfg_or_judge, "performance"):
+        enabled_names.extend(sorted(_PERFORMANCE_TOOL_NAMES))
+    if judge_context_enabled(cfg_or_judge, "best_model_code"):
+        if judge_context_enabled(cfg_or_judge, "performance"):
+            enabled_names.extend(sorted(_BEST_MODEL_CODE_TOOL_NAMES))
+        else:
+            enabled_names.extend(sorted(_BEST_MODEL_CODE_SAFE_TOOL_NAMES))
+    if judge_context_enabled(cfg_or_judge, "diagnostic"):
+        enabled_names.extend(sorted(_DIAGNOSTIC_TOOL_NAMES))
+        if judge_context_enabled(cfg_or_judge, "performance"):
+            enabled_names.extend(sorted(_DIAGNOSTIC_PERFORMANCE_TOOL_NAMES))
+
+    return _unique_tool_names(enabled_names)
+
+
+def get_judge_tool_names(cfg_or_judge: Any) -> list[str]:
+    """Return the allowed judge tool names for the active agent context."""
+    return _enabled_agent_tool_names(cfg_or_judge)
+
+
+def get_judge_tool_schemas(cfg_or_judge: Any) -> list[dict]:
+    """Return the allowed OpenAI-style tool schemas for the active context."""
+    allowed = set(get_judge_tool_names(cfg_or_judge))
+    if not allowed:
+        return []
+    schemas = [
+        copy.deepcopy(schema)
+        for schema in TOOL_SCHEMAS
+        if schema["function"]["name"] in allowed
+    ]
+    from config.schema import judge_context_enabled
+
+    if judge_context_enabled(cfg_or_judge, "diagnostic") and not judge_context_enabled(
+        cfg_or_judge, "performance"
+    ):
+        schemas = [_scrub_schema_value(schema) for schema in schemas]
+    return schemas
+
 TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_attempted_models",
+            "description": (
+                "List the unique model names attempted in a given iteration. "
+                "Returns names only; no metrics, status labels, code, or diagnostics."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iteration": {
+                        "type": "integer",
+                        "description": "Iteration index to inspect."
+                    },
+                    "run_idx": {
+                        "type": "integer",
+                        "description": "Optional: restrict to one run index."
+                    }
+                },
+                "required": ["iteration"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -844,6 +1047,21 @@ TOOL_SCHEMAS: list[dict] = [
                         "default": 50
                     }
                 },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_best_model_code",
+            "description": (
+                "Return source code for one selected model along with a minimal identity record. "
+                "The model is chosen internally; the output contains code only, not fit details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "required": []
             }
         }
@@ -1252,8 +1470,10 @@ TOOL_SCHEMAS: list[dict] = [
 # ======================================================================
 
 _TOOL_FUNCTIONS = {
+    "list_attempted_models": list_attempted_models,
     "list_iterations": list_iterations,
     "get_best_models": get_best_models,
+    "get_best_model_code": get_best_model_code,
     "get_model": get_model,
     "get_per_participant_fit": get_per_participant_fit,
     "get_recovery": get_recovery,
@@ -1269,12 +1489,19 @@ _TOOL_FUNCTIONS = {
 }
 
 
-def dispatch_tool(store: DiagnosticStore, tool_name: str, args: dict) -> Any:
+def dispatch_tool(
+    store: DiagnosticStore,
+    tool_name: str,
+    args: dict,
+    allowed_tool_names: set[str] | frozenset[str] | None = None,
+) -> Any:
     """Call the tool function matching *tool_name* with *args*.
 
     Returns the result, or a dict ``{"error": "..."}`` if the tool is
-    unknown or raises an exception.
+    unknown, forbidden by context, or raises an exception.
     """
+    if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+        return {"error": f"Forbidden tool: {tool_name}"}
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if fn is None:
         return {"error": f"Unknown tool: {tool_name}"}

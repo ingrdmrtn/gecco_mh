@@ -28,7 +28,7 @@ from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.run_context import RunContext
 from gecco.utils import log as _log, TimestampedConsole
-from config.schema import get_judge_capabilities
+from config.schema import get_judge_capabilities, get_judge_mode
 from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 from pathlib import Path
 
@@ -167,15 +167,16 @@ class GeCCoModelSearch:
         # --- Unified judge pipeline ---
         self.tool_judge = None
         self.judge_enabled = bool(judge_cfg is not None)
-        judge_capabilities = get_judge_capabilities(cfg)
+        judge_mode = get_judge_mode(cfg)
+        judge_needs_store = judge_mode not in ("off", "random")
         if judge_cfg:
             if shared_registry is not None:
                 console.print(
                     "[dim]Orchestrated mode: per-client tool judge skipped.[/]"
                 )
-            elif self.diagnostic_store is None and judge_capabilities:
+            elif self.diagnostic_store is None and judge_needs_store:
                 raise ValueError(
-                    "Judge capabilities require judge.diagnostic_store.enabled=true"
+                    "Judge requires judge.diagnostic_store.enabled=true"
                 )
             else:
                 from gecco.construct_feedback.tool_judge import ToolUsingJudge

@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import sys
 import types as pytypes
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from config.schema import load_config
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
-from gecco.diagnostic_store.tools import dispatch_tool
+from gecco.diagnostic_store.tools import dispatch_tool, get_judge_tool_names
 
 
 class _AgentStore:
@@ -136,7 +138,7 @@ class _DiagnosticStore(_AgentStore):
                     "bic": 12.1,
                 },
             ]
-        if "LEFT JOIN parameter_recovery" in query and "LEFT JOIN individual_differences" in query:
+        if "LEFT JOIN parameter_recovery pr" in query and "WHERE m.model_id IN" in query:
             return [
                 {
                     "model_id": 11,
@@ -144,7 +146,6 @@ class _DiagnosticStore(_AgentStore):
                     "iteration": 0,
                     "metric_value": 10.0,
                     "recovery_mean_r": 0.42,
-                    "id_mean_r2": 0.12,
                 }
             ]
         return super().fetchall(query, params)
@@ -166,6 +167,50 @@ def _make_cfg(provider: str, context: dict[str, bool], mode: str = "agent") -> S
             verbose=False,
         ),
     )
+
+
+def _write_real_config(tmp_path: Path, context: dict[str, bool], mode: str = "agent") -> Path:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+task:
+  name: "test_task"
+  description: "Test"
+  goal: "Validate config loading"
+
+data:
+  path: "data.csv"
+  id_column: "participant"
+  input_columns: ["choice"]
+
+llm:
+  provider: "openai"
+  base_model: "gpt-test"
+  temperature: 0.1
+  max_tokens: 128
+  system_prompt: "Be concise"
+  models_per_iteration: 1
+  guardrails: []
+
+evaluation:
+  metric: "bic"
+  fit_type: "group"
+
+loop:
+  max_iterations: 1
+
+judge:
+  mode: "{mode}"
+  context:
+    attempted_models: {str(context['attempted_models']).lower()}
+    performance: {str(context['performance']).lower()}
+    best_model_code: {str(context['best_model_code']).lower()}
+    diagnostic: {str(context['diagnostic']).lower()}
+    individual_differences: {str(context['individual_differences']).lower()}
+""",
+        encoding="utf-8",
+    )
+    return config_path
 
 
 def _openai_response(content: str = "", tool_calls: list[SimpleNamespace] | None = None):
@@ -289,6 +334,7 @@ _CONTEXT_CASES = [
             "performance": False,
             "best_model_code": False,
             "diagnostic": False,
+            "individual_differences": False,
         },
         {"list_attempted_models"},
     ),
@@ -299,12 +345,12 @@ _CONTEXT_CASES = [
             "performance": True,
             "best_model_code": False,
             "diagnostic": False,
+            "individual_differences": False,
         },
         {
             "list_iterations",
             "get_best_models",
             "get_bic_trajectory",
-            "get_participant_best_models",
             "get_per_participant_fit",
             "list_failed_models",
         },
@@ -316,6 +362,7 @@ _CONTEXT_CASES = [
             "performance": False,
             "best_model_code": True,
             "diagnostic": False,
+            "individual_differences": False,
         },
         {"get_best_model_code"},
     ),
@@ -326,10 +373,10 @@ _CONTEXT_CASES = [
             "performance": False,
             "best_model_code": False,
             "diagnostic": True,
+            "individual_differences": False,
         },
         {
             "get_recovery",
-            "get_individual_differences",
             "get_ppc",
             "get_block_residuals",
             "get_parameter_distribution",
@@ -342,17 +389,16 @@ _CONTEXT_CASES = [
             "performance": True,
             "best_model_code": False,
             "diagnostic": True,
+            "individual_differences": False,
         },
         {
             "list_iterations",
             "get_best_models",
             "get_bic_trajectory",
-            "get_participant_best_models",
             "get_per_participant_fit",
             "list_failed_models",
             "compare_models",
             "get_recovery",
-            "get_individual_differences",
             "get_ppc",
             "get_block_residuals",
             "get_parameter_distribution",
@@ -365,23 +411,81 @@ _CONTEXT_CASES = [
             "performance": True,
             "best_model_code": True,
             "diagnostic": True,
+            "individual_differences": False,
         },
         {
             "list_attempted_models",
             "list_iterations",
             "get_best_models",
             "get_bic_trajectory",
-            "get_participant_best_models",
             "get_per_participant_fit",
             "list_failed_models",
             "get_model",
             "search_models",
             "get_recovery",
-            "get_individual_differences",
             "get_ppc",
             "get_block_residuals",
             "compare_models",
             "get_parameter_distribution",
+        },
+    ),
+    (
+        "individual_differences_only",
+        {
+            "attempted_models": False,
+            "performance": False,
+            "best_model_code": False,
+            "diagnostic": False,
+            "individual_differences": True,
+        },
+        {
+            "get_individual_differences",
+            "get_participant_best_models",
+        },
+    ),
+    (
+        "diagnostic_and_id",
+        {
+            "attempted_models": False,
+            "performance": False,
+            "best_model_code": False,
+            "diagnostic": True,
+            "individual_differences": True,
+        },
+        {
+            "get_recovery",
+            "get_ppc",
+            "get_block_residuals",
+            "get_parameter_distribution",
+            "get_individual_differences",
+            "get_participant_best_models",
+        },
+    ),
+    (
+        "full_agent_with_id",
+        {
+            "attempted_models": True,
+            "performance": True,
+            "best_model_code": True,
+            "diagnostic": True,
+            "individual_differences": True,
+        },
+        {
+            "list_attempted_models",
+            "list_iterations",
+            "get_best_models",
+            "get_bic_trajectory",
+            "get_per_participant_fit",
+            "list_failed_models",
+            "get_model",
+            "search_models",
+            "get_recovery",
+            "get_ppc",
+            "get_block_residuals",
+            "compare_models",
+            "get_parameter_distribution",
+            "get_individual_differences",
+            "get_participant_best_models",
         },
     ),
 ]
@@ -412,7 +516,11 @@ def test_agent_tool_schemas_are_context_filtered(provider, case_name, context, e
         assert "code" not in system_prompt.lower()
         assert "code" not in user_prompt.lower()
     if not context["diagnostic"]:
-        for forbidden in ["PPC", "recovery", "residual", "individual differences", "r²", "r2"]:
+        for forbidden in ["PPC", "recovery", "residual", "r²", "r2"]:
+            assert forbidden.lower() not in system_prompt.lower()
+            assert forbidden.lower() not in user_prompt.lower()
+    if not context["diagnostic"] and not context.get("individual_differences", False):
+        for forbidden in ["individual differences"]:
             assert forbidden.lower() not in system_prompt.lower()
             assert forbidden.lower() not in user_prompt.lower()
     assert "allowed judge tools" in user_prompt.lower()
@@ -486,6 +594,51 @@ def test_forbidden_tool_dispatch_returns_error(provider, monkeypatch):
             for declaration in tool.function_declarations
         ]
     assert captured_names == ["list_attempted_models"]
+
+
+@pytest.mark.parametrize("provider", ["openai", "gemini"])
+@pytest.mark.parametrize("forbidden_tool", ["get_individual_differences", "get_participant_best_models"])
+def test_agent_loop_blocks_forbidden_individual_differences_tools(provider, forbidden_tool, monkeypatch):
+    context = {
+        "attempted_models": True,
+        "performance": False,
+        "best_model_code": False,
+        "diagnostic": False,
+        "individual_differences": False,
+    }
+
+    def _fail_if_called(*args, **kwargs):
+        pytest.fail(f"{forbidden_tool} should not execute when forbidden")
+
+    monkeypatch.setattr("gecco.diagnostic_store.tools.get_individual_differences", _fail_if_called)
+    monkeypatch.setattr("gecco.diagnostic_store.tools.get_participant_best_models", _fail_if_called)
+
+    if provider == "openai":
+        requested_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(name=forbidden_tool, arguments="{}"),
+        )
+        responses = [
+            _openai_response("planning"),
+            _openai_response("", [requested_call]),
+            _openai_response("forbidden handled"),
+        ]
+    else:
+        _install_fake_gemini_modules(monkeypatch)
+        responses = [
+            _gemini_response("planning"),
+            _gemini_response("", SimpleNamespace(name=forbidden_tool, args={})),
+            _gemini_response("forbidden handled"),
+        ]
+
+    analysis, client = _run_agent_judge(provider, context, responses, monkeypatch)
+
+    assert analysis["trace"][0]["tool"] == forbidden_tool
+    assert "Forbidden tool" in analysis["trace"][0]["result_summary"]
+
+    calls_dump = json.dumps(client.calls, default=lambda obj: getattr(obj, "__dict__", str(obj)), sort_keys=True)
+    assert forbidden_tool in calls_dump
+    assert "Forbidden tool" in calls_dump
 
 
 @pytest.mark.parametrize("provider", ["openai", "gemini"])
@@ -807,8 +960,8 @@ def test_static_diagnostic_context_is_deterministic(tmp_path, monkeypatch):
     assert "Parameter recovery: available" in text
     assert "PPC: available" in text
     assert "Block residuals: available" in text
-    assert "Individual differences: available" in text
     for forbidden in [
+        "individual differences",
         "comparison",
         "comparative",
         "performance",
@@ -851,6 +1004,231 @@ def test_static_diagnostic_context_allows_richer_performance_details(tmp_path, m
     assert "BIC=" in text
     assert "Model comparison:" in text
     assert "Parameter recovery:" in text
+
+
+def test_static_diagnostic_only_excludes_individual_differences(tmp_path, monkeypatch):
+    """With diagnostic: true and individual_differences: false,
+    recovery/PPC/residual remain but ID/heterogeneity/regression text is absent."""
+    cfg = _make_cfg(
+        "openai",
+        {
+            "attempted_models": False,
+            "performance": False,
+            "best_model_code": False,
+            "diagnostic": True,
+            "individual_differences": False,
+        },
+        mode="static",
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_DiagnosticStore(),
+        model=object(),
+        tokenizer=None,
+        results_dir=tmp_path,
+    )
+    monkeypatch.setattr(judge, "_fallback_generate", lambda *args, **kwargs: pytest.fail("fallback should not be called"))
+
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    assert "Diagnostic context:" in text
+    assert "Parameter recovery: available" in text
+    assert "PPC: available" in text
+    assert "Block residuals: available" in text
+    for forbidden in [
+        "individual differences",
+        "r²",
+        "r2",
+        "self-report",
+        "heterogeneity",
+    ]:
+        assert forbidden.lower() not in text.lower()
+
+
+def test_static_individual_differences_only_includes_id_evidence(tmp_path, monkeypatch):
+    """With diagnostic: false and individual_differences: true,
+    static output still includes ID evidence but no diagnostic evidence."""
+    cfg = _make_cfg(
+        "openai",
+        {
+            "attempted_models": False,
+            "performance": False,
+            "best_model_code": False,
+            "diagnostic": False,
+            "individual_differences": True,
+        },
+        mode="static",
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_DiagnosticStore(),
+        model=object(),
+        tokenizer=None,
+        results_dir=tmp_path,
+    )
+    monkeypatch.setattr(judge, "_fallback_generate", lambda *args, **kwargs: pytest.fail("fallback should not be called"))
+
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    assert "Individual differences context:" in text
+    assert "Individual differences: mean R²=" in text
+    assert "heterogeneity=" in text
+    for forbidden in ["PPC", "recovery", "residual"]:
+        assert forbidden.lower() not in text.lower()
+
+
+def test_static_performance_diagnostic_with_id_includes_heterogeneity(tmp_path, monkeypatch):
+    """With performance+diagnostic+ID enabled, heterogeneity and R² appear."""
+    cfg = _make_cfg(
+        "openai",
+        {
+            "attempted_models": False,
+            "performance": True,
+            "best_model_code": False,
+            "diagnostic": True,
+            "individual_differences": True,
+        },
+        mode="static",
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_DiagnosticStore(),
+        model=object(),
+        tokenizer=None,
+        results_dir=tmp_path,
+    )
+    monkeypatch.setattr(judge, "_fallback_generate", lambda *args, **kwargs: pytest.fail("fallback should not be called"))
+
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+
+    text = analysis["analysis_text"]
+    assert "Individual differences: mean R²=" in text
+
+
+def test_llm_prompt_excludes_id_when_only_diagnostic_enabled(monkeypatch):
+    """LLM mode with diagnostic: true, individual_differences: false
+    should not include individual differences in prompts."""
+    context = {
+        "attempted_models": True,
+        "performance": False,
+        "best_model_code": False,
+        "diagnostic": True,
+        "individual_differences": False,
+    }
+    cfg = _make_cfg("openai", context, mode="llm")
+    client = _OpenAIClient(
+        [
+            _openai_response("analysis text"),
+            _openai_response(
+                '{"per_angle": [], "key_recommendations": ["Explore broader search."], "synthesized_feedback": "done"}'
+            ),
+        ]
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_DiagnosticStore(),
+        model=client,
+        tokenizer=None,
+        results_dir=None,
+    )
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+    assert analysis["analysis_text"] == "analysis text"
+
+    first_call = client.calls[0]
+    system_prompt = first_call["messages"][0]["content"]
+    user_prompt = first_call["messages"][1]["content"]
+    assert "Diagnostic evidence" in system_prompt
+    for forbidden in ["individual differences", "r²", "r2", "self-report", "heterogeneity"]:
+        assert forbidden.lower() not in system_prompt.lower()
+        assert forbidden.lower() not in user_prompt.lower()
+
+
+def test_llm_prompt_includes_id_when_id_enabled(monkeypatch):
+    """LLM mode with individual_differences: true includes ID angle and text."""
+    context = {
+        "attempted_models": False,
+        "performance": False,
+        "best_model_code": False,
+        "diagnostic": False,
+        "individual_differences": True,
+    }
+    cfg = _make_cfg("openai", context, mode="llm")
+    client = _OpenAIClient(
+        [
+            _openai_response("analysis text"),
+            _openai_response(
+                '{"per_angle": [], "key_recommendations": ["Explore broader search."], "synthesized_feedback": "done"}'
+            ),
+        ]
+    )
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_DiagnosticStore(),
+        model=client,
+        tokenizer=None,
+        results_dir=None,
+    )
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+    assert analysis["analysis_text"] == "analysis text"
+
+    first_call = client.calls[0]
+    user_prompt = first_call["messages"][1]["content"]
+    assert "Individual differences" in user_prompt
+    assert "heterogeneity" in user_prompt.lower()
+    for forbidden in ["PPC", "recovery", "residual"]:
+        assert forbidden.lower() not in user_prompt.lower()
+
+
+def test_forbidden_id_tool_dispatch_uses_real_allowlist(tmp_path):
+    disabled_cfg = load_config(
+        str(
+            _write_real_config(
+                tmp_path,
+                {
+                    "attempted_models": True,
+                    "performance": False,
+                    "best_model_code": False,
+                    "diagnostic": False,
+                    "individual_differences": False,
+                },
+                mode="agent",
+            )
+        )
+    )
+    disabled_tool_names = set(get_judge_tool_names(disabled_cfg))
+    assert "list_attempted_models" in disabled_tool_names
+    assert "get_individual_differences" not in disabled_tool_names
+    assert "get_participant_best_models" not in disabled_tool_names
+
+    for forbidden_tool in ["get_individual_differences", "get_participant_best_models"]:
+        result = dispatch_tool(
+            _DiagnosticStore(),
+            forbidden_tool,
+            {"model_id": 11} if forbidden_tool == "get_individual_differences" else {},
+            allowed_tool_names=disabled_tool_names,
+        )
+        assert result["error"] == f"Forbidden tool: {forbidden_tool}"
+
+    enabled_cfg = load_config(
+        str(
+            _write_real_config(
+                tmp_path,
+                {
+                    "attempted_models": True,
+                    "performance": False,
+                    "best_model_code": False,
+                    "diagnostic": False,
+                    "individual_differences": True,
+                },
+                mode="agent",
+            )
+        )
+    )
+    enabled_tool_names = set(get_judge_tool_names(enabled_cfg))
+    assert "get_individual_differences" in enabled_tool_names
+    assert "get_participant_best_models" in enabled_tool_names
 
 
 def test_llm_prompt_includes_diagnostic_context_without_performance_leak(monkeypatch):

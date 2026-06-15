@@ -647,7 +647,7 @@ def get_participant_best_models(
 
 
 def compare_models(store: DiagnosticStore,
-                   model_ids: list[int]) -> list[dict]:
+                    model_ids: list[int]) -> list[dict]:
     """Side-by-side comparison of key metrics for the given model IDs."""
     if not model_ids:
         return []
@@ -656,12 +656,9 @@ def compare_models(store: DiagnosticStore,
         SELECT
             m.model_id, m.name, m.iteration, m.metric_name, m.metric_value,
             m.param_names, m.status,
-            pr.mean_r AS recovery_mean_r, pr.passed AS recovery_passed,
-            id.mean_r2 AS id_mean_r2, id.max_r2 AS id_max_r2,
-            id.best_param AS id_best_param
+            pr.mean_r AS recovery_mean_r, pr.passed AS recovery_passed
         FROM models m
         LEFT JOIN parameter_recovery pr ON pr.model_id = m.model_id
-        LEFT JOIN individual_differences id ON id.model_id = m.model_id
         WHERE m.model_id IN ({placeholders})
         ORDER BY m.metric_value ASC NULLS LAST
     """
@@ -894,7 +891,6 @@ _PERFORMANCE_TOOL_NAMES = {
     "list_iterations",
     "get_best_models",
     "get_bic_trajectory",
-    "get_participant_best_models",
     "get_per_participant_fit",
     "list_failed_models",
 }
@@ -902,12 +898,15 @@ _BEST_MODEL_CODE_SAFE_TOOL_NAMES = {"get_best_model_code"}
 _BEST_MODEL_CODE_TOOL_NAMES = {"get_model", "search_models"}
 _DIAGNOSTIC_TOOL_NAMES = {
     "get_recovery",
-    "get_individual_differences",
     "get_ppc",
     "get_block_residuals",
     "get_parameter_distribution",
 }
 _DIAGNOSTIC_PERFORMANCE_TOOL_NAMES = {"compare_models"}
+_INDIVIDUAL_DIFFERENCES_TOOL_NAMES = {
+    "get_individual_differences",
+    "get_participant_best_models",
+}
 
 
 def _scrub_diagnostic_only_text(text: str) -> str:
@@ -968,6 +967,8 @@ def _enabled_agent_tool_names(cfg_or_judge: Any) -> list[str]:
         enabled_names.extend(sorted(_DIAGNOSTIC_TOOL_NAMES))
         if judge_context_enabled(cfg_or_judge, "performance"):
             enabled_names.extend(sorted(_DIAGNOSTIC_PERFORMANCE_TOOL_NAMES))
+    if judge_context_enabled(cfg_or_judge, "individual_differences"):
+        enabled_names.extend(sorted(_INDIVIDUAL_DIFFERENCES_TOOL_NAMES))
 
     return _unique_tool_names(enabled_names)
 
@@ -1288,8 +1289,8 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "compare_models",
             "description": (
-                "Side-by-side comparison of key metrics (BIC, recovery, individual "
-                "differences) for a list of model IDs."
+                "Side-by-side comparison of key metrics (BIC, recovery) for a list "
+                "of model IDs."
             ),
             "parameters": {
                 "type": "object",

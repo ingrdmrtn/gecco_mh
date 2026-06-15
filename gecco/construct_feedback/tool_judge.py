@@ -129,15 +129,42 @@ def _suppress_diagnostic_sections(text: str) -> str:
     """Remove PPC, residual, recovery, and diagnostic-detail sections."""
     result = text
     section_patterns = [
-        r"(?is)(?:^|\n\n)[^\n]*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b|individual(?:\s|-)+differences?\b|r²|r2)[^\n]*(?:\n(?!\n).*)*",
+        r"(?is)(?:^|\n\n)[^\n]*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b)[^\n]*(?:\n(?!\n).*)*",
     ]
     line_patterns = [
-        r"(?im)^\s*[-*]?\s*.*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b|individual(?:\s|-)+differences?\b|r²|r2).*$",
+        r"(?im)^\s*[-*]?\s*.*(?:ppc|posterior predictive|residual|diagnostic|parameter recovery|\brecovery\b).*$",
     ]
     for pattern in section_patterns:
         result = re.sub(pattern, "", result)
     for pattern in line_patterns:
         result = re.sub(pattern, "", result)
+    return _normalise_feedback_text(result)
+
+
+def _suppress_individual_differences_sections(text: str) -> str:
+    """Remove individual-differences and participant-heterogeneity sections,
+    while preserving recovery, PPC, and block residual diagnostic content."""
+    result = text
+    section_patterns = [
+        r"(?is)(?:^|\n\n)[^\n]*(?:individual(?:\s|-)+differences?\b|r²|r2|self.?report|participant heterogeneit)[^\n]*(?:\n(?!\n).*)*",
+    ]
+    line_patterns = [
+        r"(?im)^\s*[-*]?\s*.*(?:individual(?:\s|-)+differences?\b|r²|r2|self.?report|participant heterogeneit).*$",
+    ]
+    for pattern in section_patterns:
+        result = re.sub(pattern, "", result)
+    for pattern in line_patterns:
+        result = re.sub(pattern, "", result)
+    result = re.sub(
+        r"(?im)^\s*[-*]?\s*.*\bheterogeneity\b.*$",
+        lambda match: ""
+        if not re.search(
+            r"(?i)\b(?:ppc|posterior predictive|residual|block residual|parameter recovery|recovery|diagnostic)\b",
+            match.group(0),
+        )
+        else match.group(0),
+        result,
+    )
     return _normalise_feedback_text(result)
 
 
@@ -236,6 +263,10 @@ def _apply_capability_postprocessing(verdict: JudgeVerdict, cfg_or_judge: Any) -
         verdict.synthesized_feedback = _suppress_diagnostic_sections(
             verdict.synthesized_feedback
         )
+    if not judge_context_enabled(cfg_or_judge, "individual_differences"):
+        verdict.synthesized_feedback = _suppress_individual_differences_sections(
+            verdict.synthesized_feedback
+        )
     return verdict
 
 
@@ -246,6 +277,7 @@ def _judge_context_flags(cfg_or_judge: Any) -> dict[str, bool]:
         "performance": judge_context_enabled(cfg_or_judge, "performance"),
         "best_model_code": judge_context_enabled(cfg_or_judge, "best_model_code"),
         "diagnostic": judge_context_enabled(cfg_or_judge, "diagnostic"),
+        "individual_differences": judge_context_enabled(cfg_or_judge, "individual_differences"),
     }
 
 
@@ -272,6 +304,8 @@ def _build_static_diagnostic_summary(
     iteration: int,
     run_idx: int | None,
     performance_enabled: bool,
+    diagnostic_enabled: bool = True,
+    individual_differences_enabled: bool = False,
 ) -> str:
     """Build a deterministic diagnostic context block for static/llm modes.
 
@@ -279,6 +313,9 @@ def _build_static_diagnostic_summary(
     ``gecco.diagnostic_store.tools`` so that these modes do not call
     the diagnostic tool layer (Contracts B and D).
     """
+    if not diagnostic_enabled and not individual_differences_enabled:
+        return ""
+
     if not performance_enabled:
         try:
             model_row = store.fetchone(
@@ -289,50 +326,99 @@ def _build_static_diagnostic_summary(
             model_row = None
 
         if not model_row or model_row.get("model_id") is None:
+            if individual_differences_enabled and not diagnostic_enabled:
+                return "Individual differences context:\n- No individual-differences-ready models available."
             return "Diagnostic context:\n- No diagnostic-ready models available."
 
         model_id = model_row["model_id"]
-        diagnostic_rows = ["Diagnostic context:"]
+        diagnostic_rows = [
+            "Diagnostic context:" if diagnostic_enabled else "Individual differences context:"
+        ]
 
-        # Parameter recovery
-        try:
-            recovery_row = store.fetchone(
-                "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
-            )
-            label = "available" if recovery_row is not None else "unavailable"
-        except Exception:
-            label = "unavailable"
-        diagnostic_rows.append(f"- Parameter recovery: {label}")
+        if diagnostic_enabled:
+            # Parameter recovery
+            try:
+                recovery_row = store.fetchone(
+                    "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
+                )
+                label = "available" if recovery_row is not None else "unavailable"
+            except Exception:
+                label = "unavailable"
+            diagnostic_rows.append(f"- Parameter recovery: {label}")
 
-        # PPC
-        try:
-            ppc_check = store.fetchone(
-                "SELECT 1 FROM ppc WHERE model_id = ? LIMIT 1", [model_id]
-            )
-            label = "available" if ppc_check is not None else "unavailable"
-        except Exception:
-            label = "unavailable"
-        diagnostic_rows.append(f"- PPC: {label}")
+            # PPC
+            try:
+                ppc_check = store.fetchone(
+                    "SELECT 1 FROM ppc WHERE model_id = ? LIMIT 1", [model_id]
+                )
+                label = "available" if ppc_check is not None else "unavailable"
+            except Exception:
+                label = "unavailable"
+            diagnostic_rows.append(f"- PPC: {label}")
 
-        # Block residuals
-        try:
-            br_check = store.fetchone(
-                "SELECT 1 FROM block_residuals WHERE model_id = ? LIMIT 1", [model_id]
-            )
-            label = "available" if br_check is not None else "unavailable"
-        except Exception:
-            label = "unavailable"
-        diagnostic_rows.append(f"- Block residuals: {label}")
+            # Block residuals
+            try:
+                br_check = store.fetchone(
+                    "SELECT 1 FROM block_residuals WHERE model_id = ? LIMIT 1", [model_id]
+                )
+                label = "available" if br_check is not None else "unavailable"
+            except Exception:
+                label = "unavailable"
+            diagnostic_rows.append(f"- Block residuals: {label}")
 
-        # Individual differences
-        try:
-            id_row = store.fetchone(
-                "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
-            )
-            label = "available" if id_row is not None else "unavailable"
-        except Exception:
-            label = "unavailable"
-        diagnostic_rows.append(f"- Individual differences: {label}")
+        if individual_differences_enabled:
+            try:
+                id_row = store.fetchone(
+                    "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
+                )
+                if id_row is not None:
+                    mean_r2 = id_row.get("mean_r2")
+                    mean_r2_text = f"{mean_r2:.2f}" if isinstance(mean_r2, (int, float)) else "N/A"
+                    diagnostic_rows.append(f"- Individual differences: mean R²={mean_r2_text}")
+                else:
+                    diagnostic_rows.append("- Individual differences: unavailable")
+            except Exception:
+                diagnostic_rows.append("- Individual differences: unavailable")
+
+        if individual_differences_enabled and run_idx is not None:
+            try:
+                participant_rows = store.fetchall(
+                    "WITH ranked AS ("
+                    "SELECT mp.participant_idx, m.model_id, m.name, m.iteration, m.run_idx, mp.bic, "
+                    "ROW_NUMBER() OVER ("
+                    "PARTITION BY mp.participant_idx "
+                    "ORDER BY mp.bic ASC, m.iteration ASC, m.model_id ASC"
+                    ") AS rn "
+                    "FROM model_participants mp "
+                    "JOIN models m ON mp.model_id = m.model_id "
+                    "WHERE m.status = 'ok' AND mp.bic IS NOT NULL AND m.run_idx = ? "
+                    ") "
+                    "SELECT participant_idx, model_id, name, iteration, run_idx, bic "
+                    "FROM ranked WHERE rn = 1 ORDER BY participant_idx",
+                    [run_idx],
+                )
+                if participant_rows:
+                    model_counts: dict[str, int] = {}
+                    for row in participant_rows:
+                        name = row.get("name", "")
+                        if name:
+                            model_counts[name] = model_counts.get(name, 0) + 1
+                    n_participants = len(participant_rows)
+                    max_count = max(model_counts.values(), default=0)
+                    modal_model = (
+                        sorted(model_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+                        if model_counts else None
+                    )
+                    heterogeneity_index = (
+                        1.0 - (max_count / n_participants) if n_participants > 0 else 0.0
+                    )
+                    diagnostic_rows.append(
+                        "- Participant heterogeneity: "
+                        f"modal={modal_model or 'N/A'}, "
+                        f"heterogeneity={heterogeneity_index:.2f}"
+                    )
+            except Exception:
+                pass
 
         return "\n".join(diagnostic_rows)
 
@@ -368,111 +454,111 @@ def _build_static_diagnostic_summary(
         if model_id is not None:
             diagnostic_rows: list[str] = []
 
-            # Parameter recovery
-            try:
-                recovery_row = store.fetchone(
-                    "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
-                )
-                if recovery_row is not None:
-                    worst_params = recovery_row.get("worst_params") or []
-                    worst_text = ", ".join(
-                        p.get("name", str(p)) if isinstance(p, dict) else str(p)
-                        for p in worst_params[:3]
+            if diagnostic_enabled:
+                # Parameter recovery
+                try:
+                    recovery_row = store.fetchone(
+                        "SELECT * FROM parameter_recovery WHERE model_id = ?", [model_id]
                     )
-                    mean_r = recovery_row.get("mean_r")
-                    if isinstance(mean_r, (int, float)):
-                        diagnostic_rows.append(
-                            f"- Parameter recovery: mean r={mean_r:.2f}"
+                    if recovery_row is not None:
+                        worst_params = recovery_row.get("worst_params") or []
+                        worst_text = ", ".join(
+                            p.get("name", str(p)) if isinstance(p, dict) else str(p)
+                            for p in worst_params[:3]
                         )
+                        mean_r = recovery_row.get("mean_r")
+                        if isinstance(mean_r, (int, float)):
+                            diagnostic_rows.append(
+                                f"- Parameter recovery: mean r={mean_r:.2f}"
+                            )
+                        else:
+                            diagnostic_rows.append(
+                                f"- Parameter recovery: mean r={mean_r}"
+                            )
+                        if worst_text:
+                            diagnostic_rows.append(f"  - Worst parameters: {worst_text}")
                     else:
-                        diagnostic_rows.append(
-                            f"- Parameter recovery: mean r={mean_r}"
-                        )
-                    if worst_text:
-                        diagnostic_rows.append(f"  - Worst parameters: {worst_text}")
-                else:
+                        diagnostic_rows.append("- Parameter recovery: unavailable")
+                except Exception:
                     diagnostic_rows.append("- Parameter recovery: unavailable")
-            except Exception:
-                diagnostic_rows.append("- Parameter recovery: unavailable")
 
-            # PPC
-            try:
-                ppc_rows = store.fetchall(
-                    "SELECT statistic_name, condition, "
-                    "COUNT(DISTINCT participant_id) AS n_participants, "
-                    "SUM(CASE WHEN observed < simulated_q025 "
-                    "OR observed > simulated_q975 THEN 1 ELSE 0 END) AS n_outside_95ci, "
-                    "AVG(CASE WHEN observed < simulated_q025 "
-                    "OR observed > simulated_q975 THEN 1.0 ELSE 0.0 END) AS frac_outside_95ci, "
-                    "AVG(observed) AS mean_observed, "
-                    "AVG(simulated_mean) AS mean_simulated_mean, "
-                    "AVG(ABS((observed - simulated_mean) "
-                    "/ NULLIF((simulated_q975 - simulated_q025) / 3.92, 0))) AS mean_abs_zscore "
-                    "FROM ppc "
-                    "WHERE model_id = ? "
-                    "GROUP BY statistic_name, condition "
-                    "ORDER BY frac_outside_95ci DESC",
-                    [model_id],
-                )
-                if ppc_rows:
-                    worst_ppc = ppc_rows[:3]
-                    parts = []
-                    for row in worst_ppc:
-                        frac = row.get("frac_outside_95ci")
-                        frac_text = f"{frac:.2f}" if isinstance(frac, (int, float)) else "N/A"
-                        parts.append(
-                            f"{row.get('statistic_name', 'stat')}[{row.get('condition', 'default')}]: {frac_text} outside 95% CI"
-                        )
-                    diagnostic_rows.append("- PPC: " + "; ".join(parts))
-                else:
-                    diagnostic_rows.append("- PPC: no rows available")
-            except Exception:
-                diagnostic_rows.append("- PPC: unavailable")
+                # PPC
+                try:
+                    ppc_rows = store.fetchall(
+                        "SELECT statistic_name, condition, "
+                        "COUNT(DISTINCT participant_id) AS n_participants, "
+                        "SUM(CASE WHEN observed < simulated_q025 "
+                        "OR observed > simulated_q975 THEN 1 ELSE 0 END) AS n_outside_95ci, "
+                        "AVG(CASE WHEN observed < simulated_q025 "
+                        "OR observed > simulated_q975 THEN 1.0 ELSE 0.0 END) AS frac_outside_95ci, "
+                        "AVG(observed) AS mean_observed, "
+                        "AVG(simulated_mean) AS mean_simulated_mean, "
+                        "AVG(ABS((observed - simulated_mean) "
+                        "/ NULLIF((simulated_q975 - simulated_q025) / 3.92, 0))) AS mean_abs_zscore "
+                        "FROM ppc "
+                        "WHERE model_id = ? "
+                        "GROUP BY statistic_name, condition "
+                        "ORDER BY frac_outside_95ci DESC",
+                        [model_id],
+                    )
+                    if ppc_rows:
+                        worst_ppc = ppc_rows[:3]
+                        parts = []
+                        for row in worst_ppc:
+                            frac = row.get("frac_outside_95ci")
+                            frac_text = f"{frac:.2f}" if isinstance(frac, (int, float)) else "N/A"
+                            parts.append(
+                                f"{row.get('statistic_name', 'stat')}[{row.get('condition', 'default')}]: {frac_text} outside 95% CI"
+                            )
+                        diagnostic_rows.append("- PPC: " + "; ".join(parts))
+                    else:
+                        diagnostic_rows.append("- PPC: no rows available")
+                except Exception:
+                    diagnostic_rows.append("- PPC: unavailable")
 
-            # Block residuals
-            try:
-                block_rows = store.fetchall(
-                    "SELECT block_idx, "
-                    "MIN(block_start) AS block_start, MAX(block_end) AS block_end, "
-                    "AVG(mean_nll_per_trial) AS mean_nll_per_trial_mean, "
-                    "STDDEV_SAMP(mean_nll_per_trial) AS mean_nll_per_trial_std, "
-                    "MIN(mean_nll_per_trial) AS mean_nll_per_trial_min, "
-                    "MAX(mean_nll_per_trial) AS mean_nll_per_trial_max, "
-                    "COUNT(DISTINCT participant_id) AS n_participants "
-                    "FROM block_residuals "
-                    "WHERE model_id = ? "
-                    "GROUP BY block_idx "
-                    "ORDER BY block_idx",
-                    [model_id],
-                )
-                if block_rows:
-                    block_parts = []
-                    for block in block_rows[:3]:
-                        mean_nll = block.get("mean_nll_per_trial_mean")
-                        mean_text = f"{mean_nll:.2f}" if isinstance(mean_nll, (int, float)) else "N/A"
-                        block_parts.append(f"block {block.get('block_idx', '?')}: {mean_text}")
-                    diagnostic_rows.append("- Block residuals: " + "; ".join(block_parts))
-                else:
-                    diagnostic_rows.append("- Block residuals: no rows available")
-            except Exception:
-                diagnostic_rows.append("- Block residuals: unavailable")
+                # Block residuals
+                try:
+                    block_rows = store.fetchall(
+                        "SELECT block_idx, "
+                        "MIN(block_start) AS block_start, MAX(block_end) AS block_end, "
+                        "AVG(mean_nll_per_trial) AS mean_nll_per_trial_mean, "
+                        "STDDEV_SAMP(mean_nll_per_trial) AS mean_nll_per_trial_std, "
+                        "MIN(mean_nll_per_trial) AS mean_nll_per_trial_min, "
+                        "MAX(mean_nll_per_trial) AS mean_nll_per_trial_max, "
+                        "COUNT(DISTINCT participant_id) AS n_participants "
+                        "FROM block_residuals "
+                        "WHERE model_id = ? "
+                        "GROUP BY block_idx "
+                        "ORDER BY block_idx",
+                        [model_id],
+                    )
+                    if block_rows:
+                        block_parts = []
+                        for block in block_rows[:3]:
+                            mean_nll = block.get("mean_nll_per_trial_mean")
+                            mean_text = f"{mean_nll:.2f}" if isinstance(mean_nll, (int, float)) else "N/A"
+                            block_parts.append(f"block {block.get('block_idx', '?')}: {mean_text}")
+                        diagnostic_rows.append("- Block residuals: " + "; ".join(block_parts))
+                    else:
+                        diagnostic_rows.append("- Block residuals: no rows available")
+                except Exception:
+                    diagnostic_rows.append("- Block residuals: unavailable")
 
-            # Individual differences
-            try:
-                id_row = store.fetchone(
-                    "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
-                )
-                if id_row is not None:
-                    mean_r2 = id_row.get("mean_r2")
-                    mean_r2_text = f"{mean_r2:.2f}" if isinstance(mean_r2, (int, float)) else "N/A"
-                    diagnostic_rows.append(f"- Individual differences: mean R²={mean_r2_text}")
-                else:
+            if individual_differences_enabled:
+                try:
+                    id_row = store.fetchone(
+                        "SELECT * FROM individual_differences WHERE model_id = ?", [model_id]
+                    )
+                    if id_row is not None:
+                        mean_r2 = id_row.get("mean_r2")
+                        mean_r2_text = f"{mean_r2:.2f}" if isinstance(mean_r2, (int, float)) else "N/A"
+                        diagnostic_rows.append(f"- Individual differences: mean R²={mean_r2_text}")
+                    else:
+                        diagnostic_rows.append("- Individual differences: unavailable")
+                except Exception:
                     diagnostic_rows.append("- Individual differences: unavailable")
-            except Exception:
-                diagnostic_rows.append("- Individual differences: unavailable")
 
-            # Participant heterogeneity
-            if run_idx is not None:
+            if individual_differences_enabled and run_idx is not None:
                 try:
                     participant_rows = store.fetchall(
                         "WITH ranked AS ("
@@ -522,12 +608,9 @@ def _build_static_diagnostic_summary(
                     comparison_rows = store.fetchall(
                         "SELECT m.model_id, m.name, m.iteration, m.metric_name, m.metric_value, "
                         "m.param_names, m.status, "
-                        "pr.mean_r AS recovery_mean_r, pr.passed AS recovery_passed, "
-                        "id.mean_r2 AS id_mean_r2, id.max_r2 AS id_max_r2, "
-                        "id.best_param AS id_best_param "
+                        "pr.mean_r AS recovery_mean_r, pr.passed AS recovery_passed "
                         "FROM models m "
                         "LEFT JOIN parameter_recovery pr ON pr.model_id = m.model_id "
-                        "LEFT JOIN individual_differences id ON id.model_id = m.model_id "
                         f"WHERE m.model_id IN ({placeholders}) "
                         "ORDER BY m.metric_value ASC NULLS LAST",
                         comparison_params,
@@ -731,7 +814,14 @@ def _build_active_prompt_angles(cfg_or_judge: Any) -> list[tuple[str, str]]:
         angles.append(
             (
                 "Diagnostic evidence",
-                "What the recovery, PPC, block residual, and individual-differences checks show.",
+                "What the recovery, PPC, and block residual checks show.",
+            )
+        )
+    if flags["individual_differences"]:
+        angles.append(
+            (
+                "Individual differences",
+                "How parameters predict self-report scores and whether different participants favour different models.",
             )
         )
     return angles
@@ -1454,9 +1544,14 @@ def _filter_prohibitions_for_context(
                 "ppc",
                 "recovery",
                 "residual",
+                "parameter distribution",
+            ]
+        )
+    if not flags["individual_differences"]:
+        blocked_terms.extend(
+            [
                 "individual differences",
                 "heterogeneity",
-                "parameter distribution",
             ]
         )
     if mode == "llm":
@@ -2054,12 +2149,14 @@ class ToolUsingJudge:
                 context_caps.append("attempted_models_overview")
             if judge_context_enabled(self.cfg, "performance"):
                 context_caps.append("performance_summary")
-            if judge_context_enabled(self.cfg, "diagnostic"):
+            if judge_context_enabled(self.cfg, "diagnostic") or judge_context_enabled(self.cfg, "individual_differences"):
                 analysis_data["diagnostic_summary"] = _build_static_diagnostic_summary(
                     self.store,
                     iteration,
                     run_idx,
                     judge_context_enabled(self.cfg, "performance"),
+                    diagnostic_enabled=judge_context_enabled(self.cfg, "diagnostic"),
+                    individual_differences_enabled=judge_context_enabled(self.cfg, "individual_differences"),
                 )
                 if analysis_data["diagnostic_summary"]:
                     context_caps.append("diagnostic_summary")
@@ -2148,12 +2245,14 @@ class ToolUsingJudge:
             ]
             context_sections.append("Performance context:\n" + "\n".join(f"- {line}" for line in performance_lines))
 
-        if flags["diagnostic"]:
+        if flags["diagnostic"] or flags["individual_differences"]:
             diagnostic_summary = _build_static_diagnostic_summary(
                 self.store,
                 iteration,
                 run_idx,
                 flags["performance"],
+                diagnostic_enabled=flags["diagnostic"],
+                individual_differences_enabled=flags["individual_differences"],
             )
             if diagnostic_summary:
                 context_sections.append(diagnostic_summary)

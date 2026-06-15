@@ -153,6 +153,7 @@ class JudgeContextConfig(BaseModel):
     performance: bool = False
     best_model_code: bool = False
     diagnostic: bool = False
+    individual_differences: bool = False
     model_config = ConfigDict(extra="forbid")
 
 
@@ -215,6 +216,7 @@ class JudgeConfig(GeCCoBaseModel):
             self.context.performance,
             self.context.best_model_code,
             self.context.diagnostic,
+            self.context.individual_differences,
         ])
         if self.mode in ("off", "random") and has_context:
             raise ValueError(
@@ -228,7 +230,8 @@ class JudgeConfig(GeCCoBaseModel):
         if self.mode == "agent" and not has_context:
             raise ValueError(
                 "judge.mode=agent requires at least one enabled context field "
-                "(judge.context.attempted_models, performance, best_model_code, or diagnostic)."
+                "(judge.context.attempted_models, performance, best_model_code, "
+                "diagnostic, or individual_differences)."
             )
         return self
 

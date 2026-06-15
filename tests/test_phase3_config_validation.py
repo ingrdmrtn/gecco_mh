@@ -280,6 +280,75 @@ def test_schema_rejects_persona_synthesis_without_personas(tmp_path):
         load_config(str(config_path))
 
 
+def test_schema_accepts_individual_differences_with_static(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "static"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: true
+"""))
+    cfg = load_config(str(config_path))
+    assert cfg.judge.mode == "static"
+    assert cfg.judge.context.individual_differences is True
+
+
+def test_schema_accepts_individual_differences_with_llm(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "llm"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: true
+"""))
+    cfg = load_config(str(config_path))
+    assert cfg.judge.mode == "llm"
+    assert cfg.judge.context.individual_differences is True
+
+
+def test_schema_accepts_individual_differences_with_agent(tmp_path):
+    """Agent is valid with only individual_differences enabled."""
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "agent"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: true
+"""))
+    cfg = load_config(str(config_path))
+    assert cfg.judge.mode == "agent"
+    assert cfg.judge.context.individual_differences is True
+
+
+def test_schema_rejects_off_with_individual_differences(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "off"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: true
+"""))
+    with pytest.raises(ValidationError, match="off"):
+        load_config(str(config_path))
+
+
+def test_schema_rejects_random_with_individual_differences(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "random"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: true
+"""))
+    with pytest.raises(ValidationError, match="random"):
+        load_config(str(config_path))
+
+
 def test_schema_rejects_unknown_judge_context_key(tmp_path):
     config_path = _write_config(tmp_path, _minimal_config("""  mode: "llm"
   context:
@@ -598,18 +667,83 @@ def test_diagnostic_detail_preserved_in_postprocessing(tmp_path):
     attempted_models: true
     performance: false
     best_model_code: false
-    diagnostic: true
+    diagnostic: false
+    individual_differences: true
 """))
     cfg = load_config(str(config_path))
     verdict = JudgeVerdict(
         iteration=1, per_angle=[], key_recommendations=[],
         synthesized_feedback=(
-            "Performance summary: best BIC improved.\n\n"
-            "PPC diagnostics showed residual misfit.\n\n"
-            "Individual differences suggested subgroup variability."
+            "PPC diagnostics showed residual misfit and parameter recovery issues.\n\n"
+            "Individual differences showed mean R²=0.42 and r2 evidence for heterogeneity.\n\n"
+            "Self-report heterogeneity supported the regression pattern."
         ),
         tool_call_count=0, wall_time_seconds=0.0, best_bic=100.0,
     )
     processed = _apply_capability_postprocessing(verdict, cfg.judge)
-    assert "PPC diagnostics" in processed.synthesized_feedback
-    assert "individual differences" in processed.synthesized_feedback.lower()
+    assert "PPC diagnostics" not in processed.synthesized_feedback
+    assert "residual misfit" not in processed.synthesized_feedback
+    assert "parameter recovery" not in processed.synthesized_feedback
+    assert "Individual differences" in processed.synthesized_feedback
+    assert "R²=0.42" in processed.synthesized_feedback
+    assert "r2 evidence" in processed.synthesized_feedback.lower()
+    assert "heterogeneity" in processed.synthesized_feedback.lower()
+    assert "self-report" in processed.synthesized_feedback.lower()
+
+
+def test_individual_differences_postprocessing_removes_generic_heterogeneity_bullets(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "llm"
+  context:
+    attempted_models: true
+    performance: false
+    best_model_code: false
+    diagnostic: false
+    individual_differences: false
+"""))
+    cfg = load_config(str(config_path))
+    verdict = JudgeVerdict(
+        iteration=1,
+        per_angle=[],
+        key_recommendations=[],
+        synthesized_feedback=(
+            "Findings:\n"
+            "- Model fit is stable.\n"
+            "- Heterogeneity was high across participants."
+        ),
+        tool_call_count=0,
+        wall_time_seconds=0.0,
+        best_bic=100.0,
+    )
+    processed = _apply_capability_postprocessing(verdict, cfg.judge)
+    assert "Model fit is stable." in processed.synthesized_feedback
+    assert "Heterogeneity was high across participants." not in processed.synthesized_feedback
+
+
+def test_individual_differences_postprocessing_preserves_diagnostic_heterogeneity_lines(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "llm"
+  context:
+    attempted_models: true
+    performance: false
+    best_model_code: false
+    diagnostic: true
+    individual_differences: false
+"""))
+    cfg = load_config(str(config_path))
+    verdict = JudgeVerdict(
+        iteration=1,
+        per_angle=[],
+        key_recommendations=[],
+        synthesized_feedback=(
+            "Findings:\n"
+            "- Heterogeneity was high across participants.\n"
+            "- PPC heterogeneity across posterior predictive checks was reviewed.\n"
+            "- Model fit is stable."
+        ),
+        tool_call_count=0,
+        wall_time_seconds=0.0,
+        best_bic=100.0,
+    )
+    processed = _apply_capability_postprocessing(verdict, cfg.judge)
+    assert "Heterogeneity was high across participants." not in processed.synthesized_feedback
+    assert "PPC heterogeneity across posterior predictive checks was reviewed." in processed.synthesized_feedback
+    assert "Model fit is stable." in processed.synthesized_feedback

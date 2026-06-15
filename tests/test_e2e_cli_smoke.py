@@ -46,7 +46,7 @@ def test_distributed_dry_run_smoke_does_not_require_slurm(tmp_path):
         "run",
         "distributed",
         "--config",
-        "two_step_factors_distributed.yaml",
+        "archive/two_step_factors_distributed.yaml",
         "--dry-run",
         env=env,
     )
@@ -67,7 +67,7 @@ def test_cmg_distributed_dry_run_smoke_does_not_require_slurm(tmp_path):
         "run",
         "distributed",
         "--config",
-        "two_step_factors_cmg.yaml",
+        "archive/two_step_factors_cmg.yaml",
         "--dry-run",
         env=env,
     )

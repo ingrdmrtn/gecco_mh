@@ -5,20 +5,20 @@ Test-fit a candidate cognitive model exactly as GeCCo would.
 Usage examples:
 
   # Fit a model from a Python file:
-  python scripts/test_fit_model.py --config two_step_factors.yaml --code model.py
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --code model.py
 
   # Fit a model from the shared registry (by name or index):
-  python scripts/test_fit_model.py --config two_step_factors.yaml --registry --model-name dual_lr_perseveration
-  python scripts/test_fit_model.py --config two_step_factors.yaml --registry --model-index 0
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --registry --model-name dual_lr_perseveration
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --registry --model-index 0
 
   # Fit on test split instead of eval (default):
-  python scripts/test_fit_model.py --config two_step_factors.yaml --code model.py --split test
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --code model.py --split test
 
   # Use plain MLE instead of hierarchical fitting:
-  python scripts/test_fit_model.py --config two_step_factors.yaml --code model.py --fit-type mle
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --code model.py --fit-type mle
 
   # Override function name (default: cognitive_model1):
-  python scripts/test_fit_model.py --config two_step_factors.yaml --code model.py --func-name cognitive_model2
+  python scripts/test_fit_model.py --config two_step_factors/deepseekv4flash/judge_off.yaml --code model.py --func-name cognitive_model2
 """
 
 import os, sys

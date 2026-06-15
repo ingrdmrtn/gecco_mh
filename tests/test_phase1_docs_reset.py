@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ACTIVE_DOCS = [
     PROJECT_ROOT / "README.md",
     PROJECT_ROOT / "docs" / "centralised_judge_implementation.md",
-    *sorted((PROJECT_ROOT / "config").glob("*.yaml")),
+    *sorted((PROJECT_ROOT / "config").glob("**/*.yaml")),
 ]
 STALE_ENTRYPOINTS = [
     "scripts/launch_distributed.py",

@@ -478,26 +478,26 @@ The `clients:` section is ignored by existing non-distributed scripts.
 
 ```bash
 # Launch all profiles from config through uv
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml
 
 # vLLM already running — just launch clients, specifying the server URL
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml \
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml \
     --vllm-url http://gpu-node:8000/v1
 
 # Run only a subset of profiles
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --profiles exploit,minimal
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml --profiles exploit,minimal
 
 # Add extra clients running the base config (no profile overrides)
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --extra-clients 2
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml --extra-clients 2
 
 # Preview commands without submitting
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml --dry-run
 ```
 
 **Conda environment**: If your project dependencies (e.g. `pydantic`, `scipy`) are installed in a specific conda environment, pass `--conda-env` so each SLURM client job activates conda before running Python instead of using `uv`:
 
 ```bash
-uv run python -m gecco run distributed --config two_step_factors_distributed.yaml \
+uv run python -m gecco run distributed --config two_step_factors/distributed.yaml \
     --vllm-url http://gpu-node:8000/v1 \
     --conda-env my_gecco_env
 ```
@@ -508,11 +508,11 @@ For local testing without SLURM, run clients directly through the CLI (ensure th
 
 ```bash
 # uv
-uv run python -m gecco internal distributed-client --config two_step_factors_distributed.yaml \
+uv run python -m gecco internal distributed-client --config two_step_factors/distributed.yaml \
     --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
 
 # pip/conda
-python -m gecco internal distributed-client --config two_step_factors_distributed.yaml \
+python -m gecco internal distributed-client --config two_step_factors/distributed.yaml \
     --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
 ```
 

@@ -9,13 +9,13 @@
 # NOTE: --array is set dynamically by `gecco run distributed` (or override with sbatch --array=...)
 
 # Usage (preferred — reads profiles from config automatically):
-#   python -m gecco run distributed --config two_step_factors_distributed.yaml
+#   python -m gecco run distributed --config archive/two_step_factors_distributed.yaml
 #
 # Manual usage:
 #   sbatch --array=0-4 --dependency=afterok:$VLLM_JOB \
-#       bash/run_gecco_distributed.sh two_step_factors_distributed.yaml "exploit,explore,diverse,minimal,hybrid" "http://gpu-node:8000/v1"
+#       bash/run_gecco_distributed.sh archive/two_step_factors_distributed.yaml "exploit,explore,diverse,minimal,hybrid" "http://gpu-node:8000/v1"
 
-CONFIG=${1:-"two_step_factors_distributed.yaml"}
+CONFIG=${1:-"two_step_factors/distributed.yaml"}
 PROFILES_CSV=${2:-""}
 VLLM_URL_ARG=${3:-""}
 CONDA_ENV=${4:-""}

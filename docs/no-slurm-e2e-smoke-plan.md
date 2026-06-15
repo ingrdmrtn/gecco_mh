@@ -27,9 +27,9 @@ Forbidden files/directories:
 
 Production surfaces under test:
 - `python -m gecco --help`
-- `python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run`
-- `python -m gecco run cmg-distributed --config two_step_factors_cmg.yaml --dry-run`
+- `python -m gecco run distributed --config archive/two_step_factors_distributed.yaml --dry-run`
 
+- `python -m gecco run cmg-distributed --config archive/two_step_factors_cmg.yaml --dry-run`
 Explicit non-goals:
 - Do not add real Slurm E2E tests in this pass.
 - Do not require `sbatch`, a scheduler, queued jobs, GPUs, model servers, or network access.

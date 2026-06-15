@@ -9,7 +9,7 @@
 - The plan specifies the distributed E2E surface as:
 
   ```bash
-  python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run
+  python -m gecco run distributed --config archive/two_step_factors_distributed.yaml --dry-run
   ```
 
   The implemented test adds `--launch-vllm`:

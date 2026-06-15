@@ -93,15 +93,25 @@ Given the task instructions, participant data from cognitive tasks, model genera
 ### Prerequisites
 
 - Python ≥ 3.10
-- pip or conda
+- [uv](https://docs.astral.sh/uv/) (recommended), pip, or conda
 
-### Install dependencies
+### Install dependencies (uv — recommended)
 
 ```bash
 git clone https://github.com/MilenaCCNlab/gecco.git
 cd gecco
+uv sync
+```
+
+### Alternative: pip + requirements.txt
+
+If you prefer pip or conda, the `requirements.txt` file is kept in sync with the project's runtime dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
+
+HPC users on SLURM clusters can use conda; see the distributed launch section for details.
 
 ## 🧰 Requirements
 
@@ -114,9 +124,19 @@ See `requirements.txt` for full list. Core packages include:
 
 Optional (for local LLMs): vllm, accelerate
 
-### API keys
+### Running GeCCo
 
-GeCCo reads API keys from environment variables or a `.env` file in the project root (`.env` is gitignored). Create a `.env` file and add whichever keys you need:
+Use `uv run` (when installed via `uv sync`) or `python -m` (when installed via pip/conda):
+
+```bash
+# uv (default)
+uv run python -m gecco run local-client --config two_step.yaml
+
+# pip/conda
+python -m gecco run local-client --config two_step.yaml
+```
+
+### API keys
 
 ```bash
 # OpenAI (required if using provider: "openai")
@@ -454,39 +474,44 @@ The `clients:` section is ignored by existing non-distributed scripts.
 
 #### Step 2: Launch with the GeCCo CLI
 
-`python -m gecco run distributed` reads profiles from your config, launches the vLLM server and client array, and wires up SLURM dependencies automatically:
+`uv run python -m gecco run distributed` (or `python -m gecco run distributed` via pip/conda) reads profiles from your config and wires up SLURM dependencies automatically. Use `--vllm-url` to point at an already running server:
 
 ```bash
-# Launch vLLM + all profiles from config
-python -m gecco run distributed --config two_step_factors_distributed.yaml --launch-vllm
+# Launch all profiles from config through uv
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml
 
 # vLLM already running — just launch clients, specifying the server URL
-python -m gecco run distributed --config two_step_factors_distributed.yaml \
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml \
     --vllm-url http://gpu-node:8000/v1
 
 # Run only a subset of profiles
-python -m gecco run distributed --config two_step_factors_distributed.yaml --profiles exploit,minimal
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --profiles exploit,minimal
 
 # Add extra clients running the base config (no profile overrides)
-python -m gecco run distributed --config two_step_factors_distributed.yaml --extra-clients 2
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --extra-clients 2
 
 # Preview commands without submitting
-python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml --dry-run
 ```
 
-**Conda environment**: If your project dependencies (e.g. `pydantic`, `scipy`) are installed in a specific conda environment, pass `--conda-env` so each SLURM client job activates it before running Python:
+**Conda environment**: If your project dependencies (e.g. `pydantic`, `scipy`) are installed in a specific conda environment, pass `--conda-env` so each SLURM client job activates conda before running Python instead of using `uv`:
 
 ```bash
-python -m gecco run distributed --config two_step_factors_distributed.yaml \
+uv run python -m gecco run distributed --config two_step_factors_distributed.yaml \
     --vllm-url http://gpu-node:8000/v1 \
     --conda-env my_gecco_env
 ```
 
-Use the unified CLI rather than the removed shell entrypoint; keep the conda environment on the same command line:
+By default (no `--conda-env`), generated SLURM jobs execute through `uv run`. Pass `--conda-env <name>` to switch to conda activation. The `requirements.txt` file is kept in sync for conda/pip compatibility.
 
-For local testing without SLURM, run clients directly through the CLI (ensure the correct conda environment is already active):
+For local testing without SLURM, run clients directly through the CLI (ensure the correct environment is already active):
 
 ```bash
+# uv
+uv run python -m gecco internal distributed-client --config two_step_factors_distributed.yaml \
+    --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
+
+# pip/conda
 python -m gecco internal distributed-client --config two_step_factors_distributed.yaml \
     --client-id 0 --client-profile exploit --vllm-url http://localhost:8000/v1
 ```
@@ -508,6 +533,10 @@ An interactive web dashboard is available in `gecco-mh-dashboard/`.
 Install dashboard dependencies:
 
 ```bash
+# uv (from repo root)
+uv sync --extra dashboard
+
+# pip/conda (compatibility)
 pip install -r gecco-mh-dashboard/requirements.txt
 ```
 
@@ -600,14 +629,14 @@ loop:
 
 ## 🎯 Usage
 
-Quick start with the `gecco` CLI:
+Quick start with the `gecco` CLI (run from the repo root):
 
 ```bash
-# Two-step decision task
-python -m gecco run local-client --config two_step.yaml
+# uv (default)
+uv run python -m gecco run local-client --config two_step.yaml
 
-# Multi-attribute decision making
-python -m gecco run local-client --config decision_making.yaml
+# pip/conda
+python -m gecco run local-client --config two_step.yaml
 ```
 
 Programmatic usage:

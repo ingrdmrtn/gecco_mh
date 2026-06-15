@@ -30,19 +30,26 @@ mkdir -p "$JOBLIB_TEMP_FOLDER"
 echo "[test-eval] Temp dir: $TMPDIR"
 echo "[test-eval] Joblib/loky temp dir: $JOBLIB_TEMP_FOLDER"
 
-# Activate conda environment if specified
+# Resolve environment manager: conda when CONDA_ENV is set, otherwise uv
 if [ -n "$CONDA_ENV" ]; then
     echo "[test-eval] Activating conda env: $CONDA_ENV"
     conda activate "$CONDA_ENV"
+    PYTHON_CMD="python"
+    ENV_MANAGER="conda"
+else
+    echo "[test-eval] Using uv environment"
+    PYTHON_CMD="uv run python"
+    ENV_MANAGER="uv"
 fi
 
 echo "[test-eval] Starting test evaluation"
 echo "[test-eval] Config: $CONFIG"
 echo "[test-eval] Results dir: $RESULTS_DIR"
-echo "[test-eval] Python: $(which python)"
+echo "[test-eval] Env manager: $ENV_MANAGER"
+echo "[test-eval] Python: $($PYTHON_CMD -c "import sys; print(sys.executable)" 2>/dev/null || echo "uv run")"
 
 # Run the test evaluation script
-python -m gecco internal test-evaluation \
+$PYTHON_CMD -m gecco internal test-evaluation \
     --config "$CONFIG" \
     --results-dir "$RESULTS_DIR" \
     --write-store

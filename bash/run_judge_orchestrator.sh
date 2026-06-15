@@ -34,22 +34,36 @@ mkdir -p "$JOBLIB_TEMP_FOLDER"
 echo "[Orchestrator] Temp dir: $TMPDIR"
 echo "[Orchestrator] Joblib/loky temp dir: $JOBLIB_TEMP_FOLDER"
 
-# Activate conda environment if specified
+# Resolve environment manager: conda when CONDA_ENV is set, otherwise uv
 if [ -n "$CONDA_ENV" ]; then
     echo "[Orchestrator] Activating conda env: $CONDA_ENV"
     conda activate "$CONDA_ENV"
+    PYTHON_CMD="python"
+    ENV_MANAGER="conda"
+else
+    echo "[Orchestrator] Using uv environment"
+    PYTHON_CMD="uv run python"
+    ENV_MANAGER="uv"
 fi
 
 echo "[Orchestrator] Config: $CONFIG"
-echo "[Orchestrator] Python: $(which python)"
+echo "[Orchestrator] Env manager: $ENV_MANAGER"
+if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
+    echo "[Orchestrator] ERROR: Failed to run Python via $ENV_MANAGER"
+    exit 1
+fi
+echo "[Orchestrator] Python: $PYTHON_EXECUTABLE"
 
 # Detect provider from config to skip vLLM setup for API-based providers
-PROVIDER=$(python -c "
+if ! PROVIDER=$($PYTHON_CMD -c "
 import yaml, sys
 with open('config/$CONFIG' if '/' not in '$CONFIG' else '$CONFIG') as f:
     cfg = yaml.safe_load(f)
 print(cfg.get('llm', {}).get('provider', 'vllm'))
-" 2>/dev/null || echo "vllm")
+" ); then
+    echo "[Orchestrator] ERROR: Failed to detect provider from config via $ENV_MANAGER"
+    exit 1
+fi
 echo "[Orchestrator] Provider: $PROVIDER"
 
 VLLM_ARG=""
@@ -97,7 +111,7 @@ fi
 
 # Run the orchestrator
 echo "[Orchestrator] Starting centralized judge orchestrator..."
-python -m gecco internal judge-orchestrate \
+$PYTHON_CMD -m gecco internal judge-orchestrate \
     --config "$CONFIG" \
     $VLLM_ARG \
     $N_CLIENTS_ARG

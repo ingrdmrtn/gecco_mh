@@ -33,23 +33,37 @@ mkdir -p "$JOBLIB_TEMP_FOLDER"
 echo "[CMG evaluator] Temp dir: $TMPDIR"
 echo "[CMG evaluator] Joblib/loky temp dir: $JOBLIB_TEMP_FOLDER"
 
-# Activate conda environment if specified
+# Resolve environment manager: conda when CONDA_ENV is set, otherwise uv
 if [ -n "$CONDA_ENV" ]; then
     echo "[CMG evaluator] Activating conda env: $CONDA_ENV"
     conda activate "$CONDA_ENV"
+    PYTHON_CMD="python"
+    ENV_MANAGER="conda"
+else
+    echo "[CMG evaluator] Using uv environment"
+    PYTHON_CMD="uv run python"
+    ENV_MANAGER="uv"
 fi
 
 echo "[CMG evaluator] Client $SLURM_ARRAY_TASK_ID starting"
 echo "[CMG evaluator] Config: $CONFIG"
-echo "[CMG evaluator] Python: $(which python)"
+echo "[CMG evaluator] Env manager: $ENV_MANAGER"
+if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
+    echo "[CMG evaluator] ERROR: Failed to run Python via $ENV_MANAGER"
+    exit 1
+fi
+echo "[CMG evaluator] Python: $PYTHON_EXECUTABLE"
 
 # Detect provider from config to skip vLLM setup for API-based providers
-PROVIDER=$(python -c "
+if ! PROVIDER=$($PYTHON_CMD -c "
 import yaml, sys
 with open('config/$CONFIG' if '/' not in '$CONFIG' else '$CONFIG') as f:
     cfg = yaml.safe_load(f)
 print(cfg.get('llm', {}).get('provider', 'vllm'))
-" 2>/dev/null || echo "vllm")
+" ); then
+    echo "[CMG evaluator] ERROR: Failed to detect provider from config via $ENV_MANAGER"
+    exit 1
+fi
 echo "[CMG evaluator] Provider: $PROVIDER"
 
 VLLM_ARG=""
@@ -93,7 +107,7 @@ fi
 
 # Run the CMG evaluator client
 echo "[CMG evaluator] Starting CMG evaluator client..."
-python -m gecco internal distributed-client \
+$PYTHON_CMD -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
     $VLLM_ARG

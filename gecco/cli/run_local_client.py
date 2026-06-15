@@ -23,7 +23,7 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-cmd", action="store_true")
-    parser.add_argument("--conda-env", type=str, default="gecco_mh")
+    parser.add_argument("--conda-env", type=str, default=None)
     parser.set_defaults(handler=main)
     return parser
 
@@ -37,7 +37,7 @@ def run_local_client(
     test: bool = False,
     dry_run: bool = False,
     print_cmd: bool = False,
-    conda_env: str = "gecco_mh",
+    conda_env: str | None = None,
 ) -> int | None:
     """Run a GeCCo client locally for testing and debugging."""
     os.environ["PYTHONUNBUFFERED"] = "1"
@@ -88,13 +88,14 @@ def run_local_client(
         print("(Dry run - command not executed)")
         return None
 
-    current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
-    if current_env != conda_env:
-        print(
-            f"WARNING: Current conda environment is '{current_env}', expected '{conda_env}'"
-        )
-        print(f"         Activate with: conda activate {conda_env}")
-        print()
+    if conda_env is not None:
+        current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+        if current_env != conda_env:
+            print(
+                f"WARNING: Current conda environment is '{current_env}', expected '{conda_env}'"
+            )
+            print(f"         Activate with: conda activate {conda_env}")
+            print()
 
     original_cwd = Path.cwd()
     try:

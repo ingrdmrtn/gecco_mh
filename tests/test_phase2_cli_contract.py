@@ -172,12 +172,73 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
 
     load_config_mock.assert_called_once_with(project_root / "config" / "demo.yaml")
     assert seen_commands[0].startswith("sbatch --array=0-1 --cpus-per-task=48")
-    assert "bash/run_gecco_distributed.sh \"demo.yaml\" \"alpha,beta\"" in seen_commands[0]
+    assert seen_commands[0].endswith(
+        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" ""'
+    )
     assert seen_commands[1].startswith("sbatch --cpus-per-task=8")
-    assert "bash/run_judge_orchestrator.sh \"demo.yaml\"" in seen_commands[1]
+    assert seen_commands[1].endswith(
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""'
+    )
     assert seen_commands[2].startswith("sbatch --dependency=afterok:2001 --cpus-per-task=8")
-    assert "bash/run_test_evaluation.sh \"demo.yaml\" \"results/demo-task\"" in seen_commands[2]
+    assert seen_commands[2].endswith(
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""'
+    )
     assert len(seen_commands) == 3
+
+
+def test_run_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
+    """With --conda-env, sbatch commands should include the conda env name."""
+    from gecco.cli.launch_distributed import run_distributed_launcher
+    from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
+
+    project_root = tmp_path
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "demo.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1, n_clients=2),
+        judge=SimpleNamespace(capabilities=["performance_summary"]),
+        centralized_model_generation=SimpleNamespace(enabled=False),
+        clients={"alpha": SimpleNamespace(), "beta": SimpleNamespace()},
+        slurm={},
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        if "run_gecco_distributed.sh" in command and "--array=" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2001\n", stderr="")
+        if "run_judge_orchestrator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2002\n", stderr="")
+        if "run_test_evaluation.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2003\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", project_root):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
+            with patch("gecco.cli.launch_distributed.get_provider_spec") as provider_spec_mock:
+                provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
+                with patch("gecco.cli.launch_distributed.init_sentry"):
+                    with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
+                        run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh")
+
+    assert seen_commands[0].endswith(
+        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" "gecco_mh"'
+    )
+    assert seen_commands[1].endswith(
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
+    )
+    assert seen_commands[2].endswith(
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" "gecco_mh"'
+    )
+    assert all("uv run" not in command for command in seen_commands)
 
 
 def test_run_cmg_distributed_builds_expected_commands(tmp_path):
@@ -227,11 +288,81 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
                     run_distributed_launcher(config="demo.yaml")
 
     assert seen_commands[0].startswith("sbatch --job-name=gecco-cmg-generator")
+    assert seen_commands[0].endswith(
+        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" ""'
+    )
     assert seen_commands[1].startswith("sbatch --array=0-1 --job-name=gecco-cmg-evaluator")
-    assert "bash/run_cmg_evaluator.sh \"demo.yaml\" \"\"" in seen_commands[1]
+    assert seen_commands[1].endswith('bash/run_cmg_evaluator.sh "demo.yaml" "" ""')
     assert seen_commands[2].startswith("sbatch --job-name=gecco-cmg-orchestrator")
+    assert seen_commands[2].endswith(
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""'
+    )
     assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
+    assert seen_commands[3].endswith(
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""'
+    )
     assert len(seen_commands) == 4
+
+
+def test_run_cmg_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
+    """CMG sbatch commands should keep the conda env in the final positional slot."""
+    from gecco.cli.launch_distributed import run_distributed_launcher
+    from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
+
+    project_root = tmp_path
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "demo.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1),
+        evaluation=SimpleNamespace(fit_type="group"),
+        centralized_model_generation=SimpleNamespace(
+            enabled=True,
+            generator_client="generator",
+            n_models=2,
+            run_final_evaluation=True,
+        ),
+        slurm={},
+    )
+
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        if "run_cmg_generator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 6001\n", stderr="")
+        if "run_cmg_evaluator.sh" in command and "--array=0-1" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 6002\n", stderr="")
+        if "run_judge_orchestrator.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 6003\n", stderr="")
+        if "run_test_evaluation.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 6004\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", project_root):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
+            with patch("gecco.cli.launch_distributed.init_sentry"):
+                with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
+                    run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh")
+
+    assert seen_commands[0].endswith(
+        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" "gecco_mh"'
+    )
+    assert seen_commands[1].endswith(
+        'bash/run_cmg_evaluator.sh "demo.yaml" "" "gecco_mh"'
+    )
+    assert seen_commands[2].endswith(
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
+    )
+    assert seen_commands[3].endswith(
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" "gecco_mh"'
+    )
+    assert all("uv run" not in command for command in seen_commands)
 
 
 def test_cli_entrypoint_functions_are_importable_and_callable():

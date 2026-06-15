@@ -49,23 +49,37 @@ mkdir -p "$JOBLIB_TEMP_FOLDER"
 echo "[GeCCo] Temp dir: $TMPDIR"
 echo "[GeCCo] Joblib/loky temp dir: $JOBLIB_TEMP_FOLDER"
 
-# Activate conda environment if specified
+# Resolve environment manager: conda when CONDA_ENV is set, otherwise uv
 if [ -n "$CONDA_ENV" ]; then
     echo "[GeCCo] Activating conda env: $CONDA_ENV"
     conda activate "$CONDA_ENV"
+    PYTHON_CMD="python"
+    ENV_MANAGER="conda"
+else
+    echo "[GeCCo] Using uv environment"
+    PYTHON_CMD="uv run python"
+    ENV_MANAGER="uv"
 fi
 
 echo "[GeCCo] Client $SLURM_ARRAY_TASK_ID starting (profile: ${PROFILE:-default})"
 echo "[GeCCo] Config: $CONFIG"
-echo "[GeCCo] Python: $(which python)"
+echo "[GeCCo] Env manager: $ENV_MANAGER"
+if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
+    echo "[GeCCo] ERROR: Failed to run Python via $ENV_MANAGER"
+    exit 1
+fi
+echo "[GeCCo] Python: $PYTHON_EXECUTABLE"
 
 # Detect provider from config to skip vLLM setup for API-based providers
-PROVIDER=$(python -c "
+if ! PROVIDER=$($PYTHON_CMD -c "
 import yaml, sys
 with open('config/$CONFIG' if '/' not in '$CONFIG' else '$CONFIG') as f:
     cfg = yaml.safe_load(f)
 print(cfg.get('llm', {}).get('provider', 'vllm'))
-" 2>/dev/null || echo "vllm")
+" ); then
+    echo "[GeCCo] ERROR: Failed to detect provider from config via $ENV_MANAGER"
+    exit 1
+fi
 echo "[GeCCo] Provider: $PROVIDER"
 
 VLLM_ARG=""
@@ -108,7 +122,7 @@ else
 fi
 
 # Run the distributed client
-python -m gecco internal distributed-client \
+$PYTHON_CMD -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
     $PROFILE_ARG \

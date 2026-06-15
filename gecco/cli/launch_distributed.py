@@ -37,8 +37,12 @@ def _optional_vllm_flag(vllm_url: str | None) -> str:
     return f'--vllm-url "{vllm_url}"' if vllm_url else ""
 
 
-def _optional_conda_arg(conda_env: str | None) -> str:
-    return f'"{conda_env}"' if conda_env else ""
+def _positional_arg(value: str | None) -> str:
+    return f'"{value}"' if value is not None else '""'
+
+
+def _resolve_env_manager(conda_env: str | None) -> str:
+    return "conda" if conda_env else "uv"
 
 
 def _print_local_command(label: str, command: str) -> None:
@@ -64,8 +68,8 @@ def _build_regular_launch_plan(
     resolved_launch_orchestrator: bool,
     n_clients: int | None,
 ) -> LaunchPlan:
-    vllm_arg = _optional_vllm_flag(vllm_url)
-    conda_arg = _optional_conda_arg(conda_env)
+    vllm_arg = _positional_arg(vllm_url)
+    conda_arg = _positional_arg(conda_env)
     commands: list[LaunchCommand] = [
         LaunchCommand(
             label="client_array",
@@ -87,7 +91,7 @@ def _build_regular_launch_plan(
     ]
 
     if resolved_launch_orchestrator:
-        n_clients_arg = f'"{n_clients}"' if n_clients is not None else ""
+        n_clients_arg = _positional_arg(str(n_clients) if n_clients is not None else None)
         commands.append(
             LaunchCommand(
                 label="orchestrator",
@@ -144,7 +148,8 @@ def _build_cmg_launch_plan(
     conda_env: str | None,
     final_eval_enabled: bool,
 ) -> LaunchPlan:
-    conda_arg = _optional_conda_arg(conda_env)
+    conda_arg = _positional_arg(conda_env)
+    resolved_vllm_arg = _positional_arg(resolved_vllm_url or None)
     commands: list[LaunchCommand] = [
         LaunchCommand(
             label="generator",
@@ -160,7 +165,7 @@ def _build_cmg_launch_plan(
                     str(PROJECT_ROOT / "bash/run_cmg_generator.sh"),
                     f'"{config}"',
                     f'"{generator_client}"',
-                    f'"{resolved_vllm_url}"',
+                    resolved_vllm_arg,
                     conda_arg,
                 ]
             ),
@@ -179,7 +184,7 @@ def _build_cmg_launch_plan(
                     "--error=logs/gecco-cmg-evaluator-%A_%a.err",
                     str(PROJECT_ROOT / "bash/run_cmg_evaluator.sh"),
                     f'"{config}"',
-                    f'"{resolved_vllm_url}"',
+                    resolved_vllm_arg,
                     conda_arg,
                 ]
             ),
@@ -197,7 +202,7 @@ def _build_cmg_launch_plan(
                     "--error=logs/gecco-cmg-orchestrator-%j.err",
                     str(PROJECT_ROOT / "bash/run_judge_orchestrator.sh"),
                     f'"{config}"',
-                    f'"{resolved_vllm_url}"',
+                    resolved_vllm_arg,
                     f'"{n_models}"',
                     conda_arg,
                 ]
@@ -212,16 +217,16 @@ def _build_cmg_launch_plan(
                 command=_join_command(
                     [
                         "sbatch",
-                    "{dependency}",
-                    "--cpus-per-task=8",
-                    partition_flag,
-                    "--mem=16G",
-                    str(PROJECT_ROOT / "bash/run_test_evaluation.sh"),
-                    f'"{config}"',
-                    f'"{results_dir_rel}"',
-                    conda_arg,
-                ]
-            ),
+                        "{dependency}",
+                        "--cpus-per-task=8",
+                        partition_flag,
+                        "--mem=16G",
+                        str(PROJECT_ROOT / "bash/run_test_evaluation.sh"),
+                        f'"{config}"',
+                        f'"{results_dir_rel}"',
+                        conda_arg,
+                    ]
+                ),
                 dependency_labels=("generator", "evaluator", "orchestrator"),
                 dependency_fallback="--dependency=afterok:<generator_job_id>:<evaluator_job_id>:<orchestrator_job_id>",
             )
@@ -406,7 +411,7 @@ def run_distributed_launcher(
 
     cmg_enabled, cmg_cfg = _get_cmg_state(cfg)
     resolved_launch_orchestrator = launch_orchestrator or getattr(cfg, "judge", None) is not None
-    conda_arg = _optional_conda_arg(conda_env)
+    env_manager = _resolve_env_manager(conda_env)
 
     if cmg_enabled:
         generator_client = str(getattr(cmg_cfg, "generator_client", ""))
@@ -441,6 +446,7 @@ def run_distributed_launcher(
         print(f"Evaluators:        {n_models}")
         print(f"Final eval:        {'enabled' if final_eval_enabled else 'disabled'}")
         print(f"vLLM URL:          {resolved_vllm_url or '(from env / .vllm_env)'}")
+        print(f"Env manager:       {env_manager}")
         print()
 
         if local:
@@ -510,6 +516,7 @@ def run_distributed_launcher(
         print(f"Partition:         {resolved_partition}")
     if provider_spec.key == "vllm":
         print(f"vLLM URL:          {vllm_url or '(from env / .vllm_env)'}")
+    print(f"Env manager:       {env_manager}")
     if resolved_launch_orchestrator:
         print("[Orchestrator]     ENABLED (centralized judge)")
         if n_clients:

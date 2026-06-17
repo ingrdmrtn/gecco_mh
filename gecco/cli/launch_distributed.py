@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
+
+from rich import box
+from rich.console import Console
+from rich.table import Table
 
 from config.schema import load_config
 from gecco.cli.launcher_utils import LaunchCommand, LaunchExecutor, LaunchPlan, SubmissionResult
@@ -12,6 +16,7 @@ from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.sentry_init import init_sentry
 
 
+console = Console()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -25,8 +30,15 @@ def _print_submission_result(result: SubmissionResult) -> None:
     }
     display_label = label_map.get(result.label, result.label)
     if result.job_id:
-        print(f"  {display_label} job ID: {result.job_id}")
+        console.print(f"  [bold]{display_label}[/bold] job ID: [yellow]{result.job_id}[/yellow]")
     print()
+
+
+def _command_printer(text: str) -> None:
+    if text.startswith("  $ "):
+        console.print(f"  [dim]$[/dim] [green]{text[4:]}[/green]")
+    else:
+        console.print(text)
 
 
 def _join_command(parts: Sequence[str]) -> str:
@@ -367,6 +379,15 @@ def get_profiles_from_config(config_path):
     return list(clients.keys())
 
 
+def _print_config_table(rows: list[tuple[str, str]]) -> None:
+    table = Table(show_header=False, box=box.ROUNDED, title="Configuration Summary", title_style="bold")
+    table.add_column(style="bold cyan", width=18)
+    table.add_column(style="white")
+    for label, value in rows:
+        table.add_row(label, value)
+    console.print(table)
+
+
 def run_distributed_launcher(
     *,
     config: str,
@@ -437,16 +458,21 @@ def run_distributed_launcher(
             results_dir = PROJECT_ROOT / "results" / f"{task_name}_individual"
         results_dir_rel = results_dir.relative_to(PROJECT_ROOT)
 
-        print(f"Config:            {config}")
-        print(f"Provider:          {provider_spec.label} ({provider_spec.key})")
-        print(f"CPUs/task:         {resolved_cpus_per_task}")
-        if resolved_mem:
-            print(f"Memory:            {resolved_mem}")
-        print(f"Generator client:  {generator_client}")
-        print(f"Evaluators:        {n_models}")
-        print(f"Final eval:        {'enabled' if final_eval_enabled else 'disabled'}")
-        print(f"vLLM URL:          {resolved_vllm_url or '(from env / .vllm_env)'}")
-        print(f"Env manager:       {env_manager}")
+        _print_config_table(
+            [
+                ("Config", config),
+                ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
+                ("CPUs/task", str(resolved_cpus_per_task)),
+                *([("Memory", resolved_mem)] if resolved_mem else []),
+                ("Generator client", generator_client),
+                ("Evaluators", str(n_models)),
+                ("Final eval", "enabled" if final_eval_enabled else "disabled"),
+                ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
+                ("Env manager", env_manager),
+                ("Logs dir", "logs/ (SLURM stdout/stderr)"),
+                ("Results dir", str(results_dir_rel)),
+            ]
+        )
         print()
 
         if local:
@@ -460,7 +486,7 @@ def run_distributed_launcher(
             )
             return None
 
-        executor = LaunchExecutor()
+        executor = LaunchExecutor(printer=_command_printer)
         plan = _build_cmg_launch_plan(
             config=config,
             generator_client=generator_client,
@@ -476,11 +502,11 @@ def run_distributed_launcher(
         submission_results = executor.execute(plan, dry_run=dry_run, on_result=_print_submission_result)
         results_by_label = {result.label: result for result in submission_results}
         if final_eval_enabled and results_by_label.get("final_eval") and results_by_label["final_eval"].job_id:
-            print(
-                f"Final evaluation will run after all CMG jobs complete: job {results_by_label['final_eval'].job_id}"
+            console.print(
+                f"[bold]Final evaluation[/bold] will run after all CMG jobs complete: job [yellow]{results_by_label['final_eval'].job_id}[/yellow]"
             )
-        print("Launched successfully. Monitor with:")
-        print(f"  python -m gecco monitor --task {task_name} --watch 10")
+        console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
+        console.print(f"  [cyan]python -m gecco monitor --task {task_name} --watch 10[/cyan]")
         return None
 
     resolved_profiles = profiles.split(",") if profiles else list((cfg.clients or {}).keys())
@@ -502,25 +528,25 @@ def run_distributed_launcher(
         results_dir = PROJECT_ROOT / "results" / f"{task_name}_individual"
     results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
 
-    print(f"Config:            {config}")
-    print(f"Provider:          {provider_spec.label} ({provider_spec.key})")
-    print(f"CPUs/task:         {resolved_cpus_per_task}")
-    if resolved_mem:
-        print(f"Memory:            {resolved_mem}")
-    print(f"Profiles:          {resolved_profiles if resolved_profiles else '(none)'}")
-    print(f"Extra clients:     {extra_clients}")
-    print(f"Total clients:     {n_total}")
-    print(f"Array spec:        --array={array_spec}")
-    print(f"Profiles CSV:      {profiles_csv}")
-    if resolved_partition:
-        print(f"Partition:         {resolved_partition}")
-    if provider_spec.key == "vllm":
-        print(f"vLLM URL:          {vllm_url or '(from env / .vllm_env)'}")
-    print(f"Env manager:       {env_manager}")
-    if resolved_launch_orchestrator:
-        print("[Orchestrator]     ENABLED (centralized judge)")
-        if n_clients:
-            print(f"[Orchestrator]     n_clients: {n_clients}")
+    rows = [
+        ("Config", config),
+        ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
+        ("CPUs/task", str(resolved_cpus_per_task)),
+        *([("Memory", resolved_mem)] if resolved_mem else []),
+        ("Profiles", str(resolved_profiles if resolved_profiles else "(none)")),
+        ("Extra clients", str(extra_clients)),
+        ("Total clients", str(n_total)),
+        ("Array spec", f"--array={array_spec}"),
+        ("Profiles CSV", profiles_csv),
+        *([("Partition", resolved_partition)] if resolved_partition else []),
+        *([("vLLM URL", vllm_url or "(from env / .vllm_env)")] if provider_spec.key == "vllm" else []),
+        ("Env manager", env_manager),
+        *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
+        *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
+        ("Logs dir", "logs/ (SLURM stdout/stderr)"),
+        ("Results dir", f"results/{task_name}/"),
+    ]
+    _print_config_table(rows)
     print()
 
     if local:
@@ -534,7 +560,7 @@ def run_distributed_launcher(
         )
         return None
 
-    executor = LaunchExecutor()
+    executor = LaunchExecutor(printer=_command_printer)
     plan = _build_regular_launch_plan(
         config=config,
         profiles_csv=profiles_csv,
@@ -551,14 +577,14 @@ def run_distributed_launcher(
     main_results = executor.execute(plan, dry_run=dry_run, on_result=_print_submission_result)
     results_by_label = {result.label: result for result in main_results}
 
-    print("Launched successfully. Monitor with:")
+    console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
     task_name = cfg.task.name
-    print(f"  python -m gecco monitor --task {task_name} --watch 10")
+    console.print(f"  [cyan]python -m gecco monitor --task {task_name} --watch 10[/cyan]")
     test_eval_result = results_by_label.get("test_evaluation")
     if test_eval_result and test_eval_result.job_id:
         test_eval_job_id = test_eval_result.job_id
-        print(
-            f"Test evaluation will run after all clients complete: job {test_eval_job_id}"
+        console.print(
+            f"[bold]Test evaluation[/bold] will run after all clients complete: job [yellow]{test_eval_job_id}[/yellow]"
         )
     return None
 

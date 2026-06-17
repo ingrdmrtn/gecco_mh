@@ -297,7 +297,11 @@ def summary_stats(data: dict[str, Any]) -> dict[str, int]:
     return {
         "n_clients": len(entries),
         "running": sum(1 for e in entries.values() if e.get("status") == "running"),
-        "complete": sum(1 for e in entries.values() if e.get("status") == "complete"),
+        "complete": sum(
+            1
+            for e in entries.values()
+            if e.get("status") in ("complete", "complete_no_success")
+        ),
         "iterations": len(history),
         "models": total_models,
         "recovery_failed": recovery_failed,
@@ -445,6 +449,242 @@ def list_judge_traces(results_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return traces
+
+
+# ============================================================
+# Diagnostics adapter helpers (read-only)
+# ============================================================
+
+
+def _is_diagnostics_db(filename: str) -> bool:
+    return filename.startswith("diagnostics") and filename.endswith(".duckdb")
+
+
+def _open_diagnostics_read_only(db_path: Path):
+    """Open a diagnostics DuckDB read-only without initialising schema."""
+    import duckdb
+
+    return duckdb.connect(str(db_path), read_only=True)
+
+
+def find_diagnostics_dbs(results_dir: Path) -> list[Path]:
+    """Return sorted list of diagnostics*.duckdb paths in results_dir."""
+    if not results_dir.is_dir():
+        return []
+    return sorted(
+        results_dir / f
+        for f in sorted(results_dir.iterdir())
+        if _is_diagnostics_db(f.name)
+    )
+
+
+def load_diagnostics_summary(results_dir: Path) -> pd.DataFrame | None:
+    """Return a split-aware model summary from diagnostics*.duckdb.
+
+    Returns None when no diagnostics DuckDB is found (JSON-only results dirs).
+    """
+    dbs = find_diagnostics_dbs(results_dir)
+    if not dbs:
+        return None
+
+    rows: list[dict] = []
+    for db_path in dbs:
+        conn = None
+        try:
+            conn = _open_diagnostics_read_only(db_path)
+            cursor = conn.execute(
+                """
+                SELECT
+                    m.model_id,
+                    m.iteration,
+                    m.name,
+                    m.metric_name,
+                    m.metric_value,
+                    m.split,
+                    m.status,
+                    m.mean_nll,
+                    id.mean_r2,
+                    id.max_r2,
+                    id.best_param,
+                    id.per_param_r2,
+                    pr.passed AS recovery_passed,
+                    pr.mean_r AS recovery_mean_r
+                FROM models m
+                LEFT JOIN individual_differences id ON m.model_id = id.model_id AND m.split = id.split
+                LEFT JOIN parameter_recovery pr ON m.model_id = pr.model_id
+                ORDER BY m.model_id
+                """
+            )
+            cols = [d[0] for d in cursor.description]
+            for row in cursor.fetchall():
+                row_dict = dict(zip(cols, row))
+                row_dict["db_path"] = str(db_path)
+                row_dict["source_db"] = db_path.name
+                row_dict["dashboard_model_key"] = (
+                    f"{db_path.name}::{row_dict.get('model_id')}::{row_dict.get('split')}"
+                )
+                rows.append(row_dict)
+        except Exception:
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    df = pd.DataFrame(rows)
+    if "_duckdb_internal" in df.columns:
+        df = df.drop(columns=["_duckdb_internal"])
+    return df
+
+
+class DiagnosticsModelRowsState:
+    __slots__ = ("available", "rows")
+
+    def __init__(self, available: bool, rows: list[dict[str, Any]]):
+        self.available = available
+        self.rows = rows
+
+
+def load_model_detail(
+    results_dir: Path,
+    model_id: int,
+    db_path: str | Path | None = None,
+    split: str | None = None,
+) -> dict | None:
+    """Load full detail for a specific diagnostics model.
+
+    When db_path is provided, the lookup is restricted to that diagnostics DB
+    so colliding model_id values across sharded databases remain stable.
+    """
+    dbs = [Path(db_path)] if db_path is not None else find_diagnostics_dbs(results_dir)
+    if not dbs:
+        return None
+
+    for db_file in dbs:
+        db_file = Path(db_file)
+        if not db_file.is_absolute():
+            db_file = results_dir / db_file
+        conn = _open_diagnostics_read_only(db_file)
+        try:
+            query = """
+                SELECT
+                    m.model_id,
+                    m.iteration,
+                    m.name,
+                    m.code,
+                    m.metric_name,
+                    m.metric_value,
+                    m.split,
+                    m.status,
+                    m.param_names,
+                    m.mean_nll,
+                    id.mean_r2,
+                    id.max_r2,
+                    id.best_param,
+                    id.per_param_r2,
+                    pr.passed AS recovery_passed,
+                    pr.mean_r AS recovery_mean_r,
+                    pr.per_param_r AS recovery_per_param_r,
+                    pr.simulation_error
+                FROM models m
+                LEFT JOIN individual_differences id ON m.model_id = id.model_id AND m.split = id.split
+                LEFT JOIN parameter_recovery pr ON m.model_id = pr.model_id
+                WHERE m.model_id = ?
+            """
+            params: list[Any] = [model_id]
+            if split is not None:
+                query += " AND m.split = ?"
+                params.append(split)
+            cursor = conn.execute(
+                query,
+                params,
+            )
+            row = cursor.fetchone()
+            if row:
+                cols = [d[0] for d in cursor.description]
+                detail = dict(zip(cols, row))
+                detail["db_path"] = str(db_file)
+                detail["source_db"] = db_file.name
+                detail["dashboard_model_key"] = (
+                    f"{db_file.name}::{detail.get('model_id')}::{detail.get('split')}"
+                )
+                return detail
+        finally:
+            conn.close()
+
+    return None
+
+
+def load_diagnostics_model_rows(
+    results_dir: Path, iteration: int | None = None
+) -> list[dict[str, Any]]:
+    """Prepare diagnostics-backed model rows with stable identity and details."""
+    return load_diagnostics_model_rows_state(results_dir, iteration).rows
+
+
+def load_diagnostics_model_rows_state(
+    results_dir: Path, iteration: int | None = None
+) -> DiagnosticsModelRowsState:
+    """Return diagnostics availability plus resolved model rows.
+
+    available=True means diagnostics DuckDBs were found and read successfully,
+    even if no rows match the current iteration/filter selection.
+    """
+    summary = load_diagnostics_summary(results_dir)
+    if summary is None:
+        return DiagnosticsModelRowsState(available=False, rows=[])
+
+    if iteration is not None:
+        summary = summary[summary["iteration"] == iteration]
+
+    if summary.empty:
+        return DiagnosticsModelRowsState(available=True, rows=[])
+
+    rows: list[dict[str, Any]] = []
+    for _, row in summary.iterrows():
+        row_dict = row.to_dict()
+        detail = load_model_detail(
+            results_dir,
+            int(row_dict["model_id"]),
+            db_path=row_dict.get("db_path"),
+            split=row_dict.get("split"),
+        )
+        row_dict["detail"] = detail
+        rows.append(row_dict)
+    return DiagnosticsModelRowsState(available=True, rows=rows)
+
+
+# ============================================================
+# Judge registry adapter helpers
+# ============================================================
+
+
+def normalize_judge_iterations(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalise registry judge_iterations into display rows.
+
+    Works entirely from the DuckDB registry snapshot — no JSON trace files required.
+    """
+    judge_data = data.get("judge_iterations", {})
+    rows: list[dict[str, Any]] = []
+    for iter_key, entry in judge_data.items():
+        try:
+            iteration = int(iter_key)
+        except (ValueError, TypeError):
+            continue
+        feedback = entry.get("synthesized_feedback")
+        rows.append(
+            {
+                "iteration": iteration,
+                "failed": bool(entry.get("failed", False)),
+                "has_feedback": feedback is not None,
+                "verdict": entry.get("verdict"),
+                "error": entry.get("error"),
+                "timestamp": entry.get("timestamp"),
+            }
+        )
+    return sorted(rows, key=lambda r: r["iteration"])
 
 
 def load_judge_trace(

@@ -18,9 +18,11 @@ from dashboard.data_adapter import (
     get_model_code,
     list_iterations,
     list_judge_traces,
+    load_diagnostics_model_rows_state,
     load_judge_trace,
     load_json_file,
     load_text_file,
+    normalize_judge_iterations,
     summary_stats,
 )
 
@@ -285,7 +287,87 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
     # --- Models ---
     st.subheader("Models")
 
-    # Load structured metadata if available
+    # --- Diagnostics-backed model rows (preferred when available) ---
+    diag_state = load_diagnostics_model_rows_state(results_dir, selected_iter)
+    diag_rows = diag_state.rows
+    if diag_state.available and diag_rows:
+        st.caption("Diagnostics store (stable source_db + model_id)")
+        diag_display_rows: list[dict[str, Any]] = []
+        for row in diag_rows:
+            detail = row.get("detail") or {}
+            display_row = {
+                "Model": row.get("name", "?"),
+                "Status": row.get("status", detail.get("status", "unknown")),
+                "BIC": row.get("metric_value", detail.get("metric_value")),
+                "Max R²": row.get("max_r2", detail.get("max_r2")),
+                "Best Param": row.get("best_param", detail.get("best_param")),
+                "Mean R²": row.get("mean_r2", detail.get("mean_r2")),
+                "Params": ", ".join(detail.get("param_names", row.get("param_names", [])) or []),
+                "Split": row.get("split", detail.get("split")),
+                "Model ID": row.get("model_id"),
+                "Source DB": row.get("source_db"),
+            }
+            diag_display_rows.append(display_row)
+
+        styled_df = pd.DataFrame(diag_display_rows)
+        styled_df["Status"] = styled_df["Status"].map(
+            {
+                "success": "🟢 Success",
+                "recovery_failed": "🟠 Recovery Failed",
+                "error": "🔴 Error",
+            }
+        ).fillna(styled_df["Status"])
+
+        display_cols = [
+            "Model",
+            "Status",
+            "BIC",
+            "Max R²",
+            "Best Param",
+            "Mean R²",
+            "Params",
+            "Split",
+            "Model ID",
+            "Source DB",
+        ]
+        display_df = styled_df[display_cols]
+        event = st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+
+        if event.selection.rows:
+            row = diag_rows[event.selection.rows[0]]
+            detail = row.get("detail") or {}
+            name = row.get("name", "model")
+            st.subheader(f"Code: {name}")
+            st.caption(
+                f"Model ID {row.get('model_id')} · {row.get('source_db')} · {row.get('split')}"
+            )
+
+            code = detail.get("code")
+            if code:
+                st.code(code, language="python")
+            else:
+                st.caption("Code not available for this model.")
+
+            status = row.get("status") or detail.get("status")
+            if status != "success":
+                if status == "recovery_failed" and row.get("recovery_mean_r") is not None:
+                    st.warning(
+                        f"Parameter recovery failed (r={row.get('recovery_mean_r'):.2f})"
+                    )
+                elif status == "error" and row.get("metric_name"):
+                    st.error(f"Error: {row.get('metric_name')}")
+    elif diag_state.available:
+        st.info("Diagnostics are available for this run, but none match the current iteration/filter.")
+    else:
+        diag_df = None
+
+    # Load structured metadata if available (optional audit fallback)
     structured_meta = load_json_file(
         results_dir, "models", _file_pattern(selected_iter, client_id_typed, ".json")
     )
@@ -295,9 +377,9 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
             if isinstance(m, dict):
                 meta_by_idx[idx] = m
 
-    if not results:
+    if not diag_state.available and not results:
         st.caption("No model results for this iteration.")
-    else:
+    elif not diag_state.available:
         for i, r in enumerate(results):
             name = r.get("function_name", f"model_{i + 1}")
             bic = r.get("metric_value")
@@ -333,6 +415,13 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                 f"{icon} **{name}** — {metric_name}: {bic_str}{status_note}"
             ):
                 meta = meta_by_idx.get(i, {})
+
+                # Show diagnostics model_id link
+                if diag_df is not None and not diag_df.empty:
+                    name_rows = diag_df[diag_df["name"] == name]
+                    if not name_rows.empty:
+                        mids = name_rows["model_id"].unique().tolist()
+                        st.caption(f"Diagnostics model_id(s): {mids}")
 
                 # Error details for failed models
                 error_msg = r.get("error")
@@ -385,7 +474,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
                 if code:
                     st.code(code, language="python")
 
-    # --- Feedback ---
+    # --- Feedback (optional audit) ---
     st.subheader("Feedback")
     feedback_text = load_text_file(
         results_dir, "feedback", _file_pattern(selected_iter, client_id_typed, ".txt")
@@ -396,7 +485,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
     else:
         st.caption("No feedback file found for this iteration.")
 
-    # --- Raw LLM output ---
+    # --- Raw LLM output (optional audit) ---
     raw_output = load_text_file(
         results_dir, "models", _file_pattern(selected_iter, client_id_typed, ".txt")
     )
@@ -404,7 +493,7 @@ def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
         with st.expander("Raw LLM response", expanded=False):
             st.code(raw_output, language="text")
 
-    # --- Raw registry JSON (moved from old Advanced tab) ---
+    # --- Raw registry JSON ---
     with st.expander("Raw shared registry JSON"):
         st.json(data)
 
@@ -413,15 +502,27 @@ _CONFIDENCE_ICONS = {"high": "🟢", "medium": "🟡", "low": "🔴"}
 
 
 def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
-    """Render the Judge tab with trace browser."""
+    """Render the Judge tab with registry state first, trace JSON as secondary."""
+    st.subheader("Registry judge state")
+
+    judge_rows = normalize_judge_iterations(data)
+    if judge_rows:
+        jdf = pd.DataFrame(judge_rows)
+        st.dataframe(jdf, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No judge iterations in registry snapshot.")
+
     traces = list_judge_traces(results_dir)
     if not traces:
-        st.info(
-            "No judge traces available. Judge traces appear once the orchestrated "
-            "judge pipeline has produced a feedback artifact for this run."
-        )
+        if judge_rows:
+            st.caption(
+                "No judge trace JSON files — registry state shown above is the "
+                "canonical source. Trace files appear once the orchestrated "
+                "judge pipeline has produced a feedback artifact for this run."
+            )
         return
 
+    st.subheader("Trace file drill-down (optional audit)")
     iterations = list_iterations(data)
     if not iterations:
         st.info("No iteration data available.")

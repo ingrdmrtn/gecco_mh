@@ -18,12 +18,24 @@ def default_results_dir(task_name: str) -> Path:
     return project_root() / "results" / task_name
 
 
+def _is_task_dir(d: Path) -> bool:
+    """True if directory contains any recognised DuckDB coordination/diagnostics file."""
+    if not d.is_dir():
+        return False
+    if (d / "shared_registry.duckdb").exists():
+        return True
+    try:
+        return any(
+            f.name.startswith("diagnostics") and f.suffix == ".duckdb"
+            for f in d.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def available_tasks() -> List[str]:
-    """Return task names that have a shared_registry.duckdb in results/."""
+    """Return task names that have a recognised DuckDB store in results/."""
     results = project_root() / "results"
     if not results.is_dir():
         return []
-    return sorted(
-        d.name for d in results.iterdir()
-        if d.is_dir() and (d / "shared_registry.duckdb").exists()
-    )
+    return sorted(d.name for d in results.iterdir() if _is_task_dir(d))

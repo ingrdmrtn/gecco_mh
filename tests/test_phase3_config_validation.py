@@ -159,6 +159,36 @@ def test_schema_accepts_valid_mode_agent(tmp_path):
     assert cfg.judge.mode == "agent"
 
 
+def test_schema_parses_individual_differences_eval_section(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config("""  mode: "off"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+  output:
+    persona_synthesis: false
+""")
+        + """
+individual_differences_eval:
+  data_path: "self_report.csv"
+  id_column: "subj"
+  behavioral_id_column: "subject_id"
+  predictors: ["Factor1", "Factor2"]
+  covariates: ["age"]
+""",
+    )
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.individual_differences_eval is not None
+    assert cfg.individual_differences_eval.data_path == "self_report.csv"
+    assert cfg.individual_differences_eval.predictors == ["Factor1", "Factor2"]
+    assert cfg.individual_differences_eval.covariates == ["age"]
+
+
 def test_schema_rejects_random_with_context(tmp_path):
     config_path = _write_config(tmp_path, _minimal_config("""  mode: "random"
   context:

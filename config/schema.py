@@ -84,6 +84,16 @@ class EvaluationConfig(GeCCoBaseModel):
         return self
 
 
+class IndividualDifferencesEvalConfig(GeCCoBaseModel):
+    """Optional questionnaire-based individual differences evaluation settings."""
+
+    data_path: str
+    id_column: str
+    behavioral_id_column: str | None = None
+    predictors: list[str] = Field(default_factory=list)
+    covariates: list[str] = Field(default_factory=list)
+
+
 class LoopConfig(GeCCoBaseModel):
     """Top-level search loop configuration."""
 
@@ -257,6 +267,7 @@ class GeCCoConfig(GeCCoBaseModel):
     sentry: SentryConfig | None = None
     validation: ValidationConfig | None = None
     centralized_model_generation: CentralizedModelGenerationConfig | None = None
+    individual_differences_eval: IndividualDifferencesEvalConfig | None = None
     clients: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

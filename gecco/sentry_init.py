@@ -8,6 +8,13 @@ import sentry_sdk
 ALLOWLIST_FIELDS = {"iteration", "run", "model_name", "task_name", "client_id", "config_name"}
 
 
+def _safe_capture_exception(error: Exception, *, fingerprint, extras) -> None:
+    try:
+        sentry_sdk.capture_exception(error, fingerprint=fingerprint, extras=extras)
+    except Exception:
+        return
+
+
 def _scrub_event(event, hint):
     """Strip sensitive data from Sentry events while preserving debugging context.
 
@@ -196,10 +203,18 @@ def capture_fit_error(
     **extra
         Additional context to attach to the event.
     """
-    sentry_sdk.capture_exception(
+    _safe_capture_exception(
         error,
         fingerprint=["fit-error", str(iteration), model_name],
-        extras={"iteration": iteration, "model_name": model_name, **extra},
+        extras={
+            **extra,
+            "component": "candidate_evaluation",
+            "operation": "fit",
+            "severity": "expected",
+            "failure_class": "expected_search_domain",
+            "iteration": iteration,
+            "model_name": model_name,
+        },
     )
 
 
@@ -222,10 +237,47 @@ def capture_recovery_failed(
     **extra
         Additional context to attach to the event.
     """
-    sentry_sdk.capture_exception(
+    _safe_capture_exception(
         error,
         fingerprint=["recovery-failed", str(iteration), model_name],
-        extras={"iteration": iteration, "model_name": model_name, **extra},
+        extras={
+            **extra,
+            "component": "candidate_evaluation",
+            "operation": "recovery",
+            "severity": "expected",
+            "failure_class": "expected_search_domain",
+            "iteration": iteration,
+            "model_name": model_name,
+        },
+    )
+
+
+def capture_operational_error(
+    error: Exception,
+    component: str,
+    operation: str,
+    severity: str = "error",
+    **extra,
+) -> None:
+    """Report a caught operational exception with structured context.
+
+    Parameters
+    ----------
+    error : Exception
+        The exception that was caught.
+    component : str
+        System component identifier (e.g. ``"judge_orchestrator"``, ``"cli"``).
+    operation : str
+        Specific operation being performed (e.g. ``"load_duckdb_store"``).
+    severity : str
+        Severity label (e.g. ``"error"``, ``"warning"``, ``"expected"``).
+    **extra
+        Additional context to attach to the event.
+    """
+    _safe_capture_exception(
+        error,
+        fingerprint=["operational-error", component, operation],
+        extras={**extra, "component": component, "operation": operation, "severity": severity},
     )
 
 
@@ -245,8 +297,8 @@ def capture_coordination_error(
     **extra
         Additional context to attach to the event.
     """
-    sentry_sdk.capture_exception(
+    _safe_capture_exception(
         error,
         fingerprint=["coordination-error", operation],
-        extras={"operation": operation, **extra},
+        extras={**extra, "operation": operation},
     )

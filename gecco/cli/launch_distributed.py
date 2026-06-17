@@ -36,9 +36,9 @@ def _print_submission_result(result: SubmissionResult) -> None:
 
 def _command_printer(text: str) -> None:
     if text.startswith("  $ "):
-        console.print(f"  [dim]$[/dim] [green]{text[4:]}[/green]")
+        print(text)
     else:
-        console.print(text)
+        print(text)
 
 
 def _join_command(parts: Sequence[str]) -> str:
@@ -380,12 +380,9 @@ def get_profiles_from_config(config_path):
 
 
 def _print_config_table(rows: list[tuple[str, str]]) -> None:
-    table = Table(show_header=False, box=box.ROUNDED, title="Configuration Summary", title_style="bold")
-    table.add_column(style="bold cyan", width=18)
-    table.add_column(style="white")
+    print("Configuration Summary")
     for label, value in rows:
-        table.add_row(label, value)
-    console.print(table)
+        print(f"{label}: {value}")
 
 
 def run_distributed_launcher(

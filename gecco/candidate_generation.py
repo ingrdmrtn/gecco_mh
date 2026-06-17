@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from gecco.artifacts import ArtifactStore
 from gecco.load_llms.provider_registry import get_provider_spec
+from gecco.sentry_init import capture_operational_error
 from gecco.utils import TimestampedConsole, mapping_get
 
 
@@ -170,6 +171,16 @@ class CandidateGenerator:
                 model_file=model_file,
             )
         except Exception as exc:
+            capture_operational_error(
+                exc,
+                component="candidate_generation",
+                operation="generate_iteration",
+                severity="error",
+                iteration=iteration,
+                run=run_idx,
+                client_id=str(client_id) if client_id is not None else None,
+                tag=tag,
+            )
             if shared_registry is not None:
                 shared_registry.set_generator_status(
                     iteration=iteration,

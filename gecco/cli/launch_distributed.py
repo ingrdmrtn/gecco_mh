@@ -411,10 +411,12 @@ def run_distributed_launcher(
 
     cfg = load_config(config_path)
 
-    init_sentry(
+    sentry_connected = init_sentry(
+        cfg=cfg,
         task_name=cfg.task.name,
         config_name=config,
     )
+    sentry_label = "connected" if sentry_connected else "disabled (SENTRY_DSN not set)"
 
     provider = cfg.llm.provider
     try:
@@ -469,6 +471,7 @@ def run_distributed_launcher(
                 ("Final eval", "enabled" if final_eval_enabled else "disabled"),
                 ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
                 ("Env manager", env_manager),
+                ("Sentry", sentry_label),
                 ("Logs dir", "logs/ (SLURM stdout/stderr)"),
                 ("Results dir", str(results_dir_rel)),
             ]
@@ -543,6 +546,7 @@ def run_distributed_launcher(
         ("Env manager", env_manager),
         *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
         *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
+        ("Sentry", sentry_label),
         ("Logs dir", "logs/ (SLURM stdout/stderr)"),
         ("Results dir", f"results/{task_name}/"),
     ]

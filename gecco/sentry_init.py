@@ -123,12 +123,12 @@ def init_sentry(
 
     Returns
     -------
-    None
-        If SENTRY_DSN is not set, this function is a no-op.
+    bool
+        True if Sentry was initialized, False if SENTRY_DSN is not set.
     """
     dsn = os.environ.get("SENTRY_DSN")
     if not dsn:
-        return
+        return False
 
     sentry_cfg = getattr(cfg, "sentry", None) if cfg else None
 
@@ -170,6 +170,8 @@ def init_sentry(
 
     for key, value in sentry_tags.items():
         sentry_sdk.set_tag(key, value)
+
+    return True
 
 
 def capture_fit_error(

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from . import launch_distributed
 from . import monitor_distributed
@@ -38,8 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 def main(argv: Sequence[str] | None = None) -> int | None:
     """Run the GeCCo CLI."""
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     return args.handler(args)

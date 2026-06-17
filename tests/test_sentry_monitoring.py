@@ -233,6 +233,7 @@ class TestOrchestratorCapture:
             patch("gecco.cli.run_judge_orchestrator.PromptBuilderWrapper"),
             patch("gecco.cli.run_judge_orchestrator.SharedRegistry") as mock_registry_cls,
             patch("gecco.cli.run_judge_orchestrator.configure_temp_dirs"),
+            patch("gecco.cli.run_judge_orchestrator.init_sentry"),
             patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline") as mock_pipeline,
             patch.object(sentry_sdk, "capture_exception") as mock_capture,
         ):
@@ -284,6 +285,7 @@ class TestOrchestratorCapture:
             patch("gecco.cli.run_judge_orchestrator.PromptBuilderWrapper"),
             patch("gecco.cli.run_judge_orchestrator.SharedRegistry") as mock_registry_cls,
             patch("gecco.cli.run_judge_orchestrator.configure_temp_dirs"),
+            patch("gecco.cli.run_judge_orchestrator.init_sentry"),
             patch("gecco.cli.run_judge_orchestrator.DiagnosticStore") as mock_ds,
             patch("gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources") as mock_build,
             patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline") as mock_pipeline,
@@ -337,6 +339,7 @@ class TestOrchestratorCapture:
             patch("gecco.cli.run_judge_orchestrator.PromptBuilderWrapper"),
             patch("gecco.cli.run_judge_orchestrator.SharedRegistry") as mock_registry_cls,
             patch("gecco.cli.run_judge_orchestrator.configure_temp_dirs"),
+            patch("gecco.cli.run_judge_orchestrator.init_sentry"),
             patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline") as mock_pipeline,
         ):
             cfg = _mock_orchestrator_config()

@@ -122,7 +122,7 @@ class BarrierConfig(GeCCoBaseModel):
     """Barrier timing settings for distributed orchestration."""
 
     orchestrator_wait_seconds: float = 1800
-    client_wait_seconds: float = 1800
+    client_wait_seconds: float = 2400
     retry_wait_seconds: float = 300
 
 

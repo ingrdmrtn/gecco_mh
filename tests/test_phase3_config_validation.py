@@ -108,6 +108,22 @@ def test_schema_accepts_valid_mode_off(tmp_path):
     assert cfg.judge.mode == "off"
 
 
+def test_barrier_defaults_let_orchestrator_write_before_client_timeout(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "llm"
+  context:
+    attempted_models: true
+    performance: false
+    best_model_code: false
+    diagnostic: false
+"""))
+
+    cfg = load_config(config_path)
+
+    assert cfg.judge.barrier.client_wait_seconds > (
+        cfg.judge.barrier.orchestrator_wait_seconds + cfg.judge.barrier.retry_wait_seconds
+    )
+
+
 def test_schema_accepts_valid_mode_random(tmp_path):
     config_path = _write_config(tmp_path, _minimal_config("""  mode: "random"
   context:

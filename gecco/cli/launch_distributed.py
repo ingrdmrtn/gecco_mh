@@ -10,7 +10,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from config.schema import load_config
+from config.schema import get_judge_mode, load_config
 from gecco.cli.launcher_utils import LaunchCommand, LaunchExecutor, LaunchPlan, SubmissionResult
 from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.sentry_init import init_sentry
@@ -430,7 +430,8 @@ def run_distributed_launcher(
     partition_flag = f"--partition={resolved_partition}" if resolved_partition else ""
 
     cmg_enabled, cmg_cfg = _get_cmg_state(cfg)
-    resolved_launch_orchestrator = launch_orchestrator or getattr(cfg, "judge", None) is not None
+    judge_enabled = getattr(cfg, "judge", None) is not None and get_judge_mode(cfg) != "off"
+    resolved_launch_orchestrator = launch_orchestrator or judge_enabled
     env_manager = _resolve_env_manager(conda_env)
 
     if cmg_enabled:

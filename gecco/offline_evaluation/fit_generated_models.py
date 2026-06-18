@@ -79,19 +79,50 @@ def run_fit(
         input_cols = list(data_cfg.input_columns)
         inputs = [df_p[c].to_numpy() for c in input_cols]
 
+        def _objective(x):
+            try:
+                val = model_func(*inputs, x)
+                if val is None:
+                    return float("inf")
+                val = float(val)
+                if not np.isfinite(val):
+                    return float("inf")
+                return val
+            except (ZeroDivisionError, FloatingPointError, OverflowError):
+                return float("inf")
+
         min_ll = np.inf
         best_parameter_values = []
+        found_valid_start = False
         for _ in range(n_starts):
             x0 = [np.random.uniform(lo, hi) for lo, hi in parameter_bounds]
             res = minimize(
-                lambda x: float(model_func(*inputs, x)),
+                _objective,
                 x0,
                 method="L-BFGS-B",
                 bounds=parameter_bounds,
             )
-            if res.fun < min_ll:
+            if np.isfinite(res.fun) and res.fun < min_ll:
                 min_ll = res.fun
-                best_parameter_values = res.x
+                best_parameter_values = list(np.asarray(res.x, dtype=float))
+                found_valid_start = True
+
+        if not found_valid_start:
+            _log(
+                f"[GeCCo] No valid objective evaluation found for participant {p} "
+                f"while fitting {expected_func_name}"
+            )
+            return {
+                "metric_name": metric_name,
+                "metric_value": float("inf"),
+                "param_names": list(spec.param_names),
+                "model_name": spec.name,
+                "parameter_values": [],
+                "eval_metrics": [],
+                "participant_n_trials": participant_n_trials,
+                "per_participant_nll": [],
+                "mean_nll": float("inf"),
+            }
 
         eval_metrics.append(metric_func(min_ll, len(parameter_bounds), len(df_p)))
         parameter_estimates.append(best_parameter_values)

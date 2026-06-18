@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +14,27 @@ from gecco.utils import TimestampedConsole
 
 
 console = TimestampedConsole()
+
+
+def _has_usable_parameter_values(
+    parameter_values: Any, expected_param_count: int
+) -> bool:
+    """Return True when fitted parameters are complete and finite."""
+
+    if not parameter_values:
+        return False
+
+    for values in parameter_values:
+        if values is None or len(values) != expected_param_count:
+            return False
+        for value in values:
+            try:
+                if not math.isfinite(float(value)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+    return True
 
 
 @dataclass(slots=True)
@@ -779,7 +801,7 @@ class CandidateEvaluator:
 
         from gecco.offline_evaluation.exceptions import ModelValidationError
         from gecco.offline_evaluation.fit_generated_models import (
-            run_fit as run_fit_model,
+            run_fit_hierarchical as run_fit_model,
         )
 
         func_name = model_dict.get("func_name", f"cognitive_model{model_idx + 1}")
@@ -929,6 +951,10 @@ class CandidateEvaluator:
             mean_metric = float(fit_res["metric_value"])
             metric_name = fit_res["metric_name"]
             params = fit_res["param_names"]
+            has_usable_parameter_values = _has_usable_parameter_values(
+                fit_res.get("parameter_values"),
+                len(params),
+            )
             if tried_param_sets is not None:
                 tried_param_sets.append(list(params))
 
@@ -992,7 +1018,7 @@ class CandidateEvaluator:
             ppc_result = None
             block_residuals_result = None
             needs_diagnostic_spec = bool(
-                fit_res.get("parameter_values")
+                has_usable_parameter_values
                 and ((ppc_enabled and ppc_simulator is not None) or block_residuals_enabled)
             )
             diagnostic_spec = None
@@ -1011,7 +1037,12 @@ class CandidateEvaluator:
                         f"  [yellow]Diagnostic spec build failed for {display_name}:[/] {exc}"
                     )
 
-            if ppc_enabled and ppc_simulator is not None and fit_res.get("parameter_values") and diagnostic_spec is not None:
+            if (
+                ppc_enabled
+                and ppc_simulator is not None
+                and has_usable_parameter_values
+                and diagnostic_spec is not None
+            ):
                 try:
                     from gecco.offline_evaluation.ppc import compute_ppc, _get_participants
 
@@ -1047,7 +1078,11 @@ class CandidateEvaluator:
                 except Exception as exc:
                     console.print(f"  [yellow]PPC failed for {display_name}:[/] {exc}")
 
-            if block_residuals_enabled and fit_res.get("parameter_values") and diagnostic_spec is not None:
+            if (
+                block_residuals_enabled
+                and has_usable_parameter_values
+                and diagnostic_spec is not None
+            ):
                 try:
                     from gecco.offline_evaluation.ppc import compute_block_residuals
 

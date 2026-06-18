@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
+import numpy as np
+import pandas as pd
+
 import pytest
 
 from gecco.artifacts import ArtifactStore
@@ -28,8 +31,8 @@ def test_candidate_evaluator_fits_and_finalises_without_monolith(tmp_path: Path)
     artifact_store = ArtifactStore(run_context, diagnostic_store)
     evaluator = CandidateEvaluator(artifact_store)
 
-    with patch("gecco.offline_evaluation.fit_generated_models.run_fit") as run_fit:
-        run_fit.return_value = {
+    with patch("gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical") as run_fit_hierarchical:
+        run_fit_hierarchical.return_value = {
             "function_name": "model_a",
             "metric_name": "BIC",
             "metric_value": 12.3,
@@ -563,4 +566,240 @@ def test_candidate_evaluator_finalisation_write_failure_is_surfaced(tmp_path: Pa
                 )
 
     feedback_record.assert_not_called()
+    run_context.close()
+
+
+def test_candidate_evaluation_uses_hierarchical_fitter(tmp_path: Path):
+    """Candidate scoring should use run_fit_hierarchical, not plain run_fit."""
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=[]),
+        task=SimpleNamespace(name="phase6_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
+    artifact_store = ArtifactStore(run_context, diagnostic_store)
+    evaluator = CandidateEvaluator(artifact_store)
+
+    fake_result = {
+        "function_name": "model_a",
+        "metric_name": "BIC",
+        "metric_value": 5.0,
+        "param_names": ["alpha"],
+        "eval_metrics": [5.0],
+        "participant_n_trials": [3],
+        "parameter_values": [[0.5]],
+        "mean_nll": 2.0,
+        "per_participant_nll": [2.0],
+        "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+    }
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit",
+        side_effect=RuntimeError("plain fitter should not be called"),
+    ) as plain_run_fit, patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        return_value=fake_result,
+    ) as run_fit_hierarchical:
+        result, should_stop = evaluator.fit_candidate_model(
+            model_dict={
+                "func_name": "cognitive_model1",
+                "name": "model_a",
+                "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+                "parameters": [{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
+            },
+            model_idx=0,
+            n_models=1,
+            it=0,
+            run_idx=1,
+            tag="",
+            model_file=artifact_store.candidate_model_path(iteration=0, run_idx=1, tag=""),
+            baseline_bic=None,
+            df=SimpleNamespace(),
+            cfg=cfg,
+        )
+
+    assert should_stop is False
+    assert result["metric_name"] == "BIC"
+    assert result["metric_value"] == 5.0
+    plain_run_fit.assert_not_called()
+    run_fit_hierarchical.assert_called_once()
+
+    diagnostic_store.close()
+    run_context.close()
+
+
+def test_run_fit_handles_zero_division_error(tmp_path: Path):
+    """Plain run_fit should catch ZeroDivisionError from objective evaluation."""
+
+    from gecco.offline_evaluation.fit_generated_models import run_fit
+
+    code = "@njit\ndef cognitive_model(x, model_parameters):\n    return 0.0\n"
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(id_column="subject", input_columns=["trial"]),
+        evaluation=SimpleNamespace(metric="BIC", n_starts=3),
+    )
+
+    n_trials = 10
+    df = pd.DataFrame(
+        {
+            "subject": ["sub1"] * n_trials,
+            "trial": np.arange(n_trials, dtype=float),
+        }
+    )
+
+    fake_spec = SimpleNamespace(
+        func=lambda *args: (_ for _ in ()).throw(ZeroDivisionError("bad objective")),
+        param_names=["alpha"],
+        bounds={"alpha": (-1.0, 1.0)},
+        name="cognitive_model",
+    )
+
+    def fake_minimize(objective, x0, method, bounds):
+        assert objective(np.array([0.0])) == float("inf")
+        return SimpleNamespace(fun=float("inf"), x=np.array([0.0]))
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.build_model_spec",
+        return_value=fake_spec,
+    ), patch(
+        "gecco.offline_evaluation.fit_generated_models.minimize",
+        side_effect=fake_minimize,
+    ):
+        result = run_fit(
+            df,
+            code,
+            cfg,
+            expected_func_name="cognitive_model",
+            structured_params=[{"name": "alpha", "lower_bound": -1.0, "upper_bound": 1.0}],
+        )
+
+    assert result["metric_name"] == "BIC"
+    assert result["metric_value"] == float("inf")
+    assert result["param_names"] == ["alpha"]
+    assert result["parameter_values"] == []
+    assert result["eval_metrics"] == []
+    assert result["per_participant_nll"] == []
+    assert result["mean_nll"] == float("inf")
+
+
+def test_run_fit_handles_non_finite_output(tmp_path: Path):
+    """Plain run_fit should catch non-finite return values from objective evaluation."""
+
+    from gecco.offline_evaluation.fit_generated_models import run_fit
+
+    code = "@njit\ndef cognitive_model(x, model_parameters):\n    return 0.0\n"
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(id_column="subject", input_columns=["trial"]),
+        evaluation=SimpleNamespace(metric="BIC", n_starts=3),
+    )
+
+    n_trials = 10
+    df = pd.DataFrame(
+        {
+            "subject": ["sub1"] * n_trials,
+            "trial": np.arange(n_trials, dtype=float),
+        }
+    )
+
+    fake_spec = SimpleNamespace(
+        func=lambda *args: np.nan,
+        param_names=["alpha"],
+        bounds={"alpha": (0.0, 1.0)},
+        name="cognitive_model",
+    )
+
+    def fake_minimize(objective, x0, method, bounds):
+        assert objective(np.array([0.5])) == float("inf")
+        return SimpleNamespace(fun=float("inf"), x=np.array([0.5]))
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.build_model_spec",
+        return_value=fake_spec,
+    ), patch(
+        "gecco.offline_evaluation.fit_generated_models.minimize",
+        side_effect=fake_minimize,
+    ):
+        result = run_fit(
+            df,
+            code,
+            cfg,
+            expected_func_name="cognitive_model",
+            structured_params=[{"name": "alpha", "lower_bound": 0.0, "upper_bound": 1.0}],
+        )
+
+    assert result["metric_name"] == "BIC"
+    assert result["metric_value"] == float("inf")
+    assert result["param_names"] == ["alpha"]
+    assert result["parameter_values"] == []
+
+
+def test_candidate_evaluation_skips_diagnostics_for_invalid_parameter_payload(
+    tmp_path: Path,
+):
+    """Malformed parameter payloads should not trigger PPC or residual diagnostics."""
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=[]),
+        task=SimpleNamespace(name="phase6_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
+    artifact_store = ArtifactStore(run_context, diagnostic_store)
+    evaluator = CandidateEvaluator(artifact_store)
+
+    invalid_result = {
+        "function_name": "model_a",
+        "metric_name": "BIC",
+        "metric_value": float("inf"),
+        "param_names": ["alpha"],
+        "eval_metrics": [],
+        "participant_n_trials": [3],
+        "parameter_values": [[]],
+        "mean_nll": float("inf"),
+        "per_participant_nll": [],
+        "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+    }
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        return_value=invalid_result,
+    ), patch(
+        "gecco.offline_evaluation.ppc.compute_ppc",
+        side_effect=RuntimeError("ppc should not run"),
+    ) as compute_ppc, patch(
+        "gecco.offline_evaluation.ppc.compute_block_residuals",
+        side_effect=RuntimeError("block residuals should not run"),
+    ) as compute_block_residuals:
+        result, should_stop = evaluator.fit_candidate_model(
+            model_dict={
+                "func_name": "cognitive_model1",
+                "name": "model_a",
+                "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+                "parameters": [{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
+            },
+            model_idx=0,
+            n_models=1,
+            it=0,
+            run_idx=1,
+            tag="",
+            model_file=artifact_store.candidate_model_path(iteration=0, run_idx=1, tag=""),
+            baseline_bic=None,
+            df=SimpleNamespace(),
+            cfg=cfg,
+            ppc_enabled=True,
+            ppc_simulator=object(),
+            block_residuals_enabled=True,
+        )
+
+    assert should_stop is False
+    assert result["metric_value"] == float("inf")
+    assert "ppc" not in result
+    assert "block_residuals" not in result
+    compute_ppc.assert_not_called()
+    compute_block_residuals.assert_not_called()
+
+    diagnostic_store.close()
     run_context.close()

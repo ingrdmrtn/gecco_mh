@@ -1,120 +1,204 @@
-#!/usr/bin/env python
+"""Streamlit entrypoint for the GeCCo-MH dashboard."""
+
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
-import streamlit as st
+try:  # pragma: no cover - streamlit is optional in the test environment
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    st = None
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from dashboard.config import DashboardConfig, available_tasks, default_results_dir
-from dashboard.data_adapter import load_registry_snapshot
-from dashboard.history_store import append_snapshot, init_history_state
+from dashboard.config import DashboardConfig, available_tasks, default_results_dir, project_root
+from dashboard.components import sidebar_section
+from dashboard.data_adapter import (
+    load_feedback_artifacts,
+    load_diagnostics_model_rows,
+    load_diagnostics_summary,
+    load_judge_trace_artifacts,
+    load_registry_snapshot,
+    normalize_judge_iterations,
+    summary_stats,
+)
+from dashboard.history_store import append_snapshot, get_history
+from dashboard.theme import apply_dashboard_theme
 from dashboard.views import (
-    render_clients,
-    render_header,
-    render_history,
+    render_clients_tab,
     render_judge_tab,
-    render_models,
-    render_overview,
-    render_r2,
-    render_results_browser,
-    render_trajectory,
+    render_models_tab,
+    render_overview_tab,
+    render_results_tab,
+    render_waiting_state,
 )
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title="GeCCo Dashboard",
-        page_icon="🧠",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+class SidebarSelection:
+    def __init__(
+        self,
+        *,
+        task_name: str,
+        results_dir: Path,
+        auto_refresh: bool,
+        refresh_seconds: float,
+        max_history_points: int,
+        top_n: int,
+        manual_refresh: bool,
+    ) -> None:
+        self.task_name = task_name
+        self.results_dir = results_dir
+        self.auto_refresh = auto_refresh
+        self.refresh_seconds = refresh_seconds
+        self.max_history_points = max_history_points
+        self.top_n = top_n
+        self.manual_refresh = manual_refresh
 
-    # Print the port on startup (only once per session)
-    if "port_printed" not in st.session_state:
-        port = st.get_option("server.port")
-        address = st.get_option("server.address")
-        print(f"🚀 Dashboard running on http://{address}:{port}")
-        st.session_state.port_printed = True
 
+def _ensure_streamlit() -> None:
+    if st is None:
+        raise ImportError("Streamlit is not installed. Install the dashboard extra to run the app.")
+
+
+def _read_sidebar() -> SidebarSelection:
     cfg = DashboardConfig()
-    init_history_state()
+    tasks = available_tasks() or [cfg.default_task]
+    with sidebar_section("Data source"):
+        task_name = st.sidebar.selectbox("Result task", tasks, index=0)
+        results_dir_text = st.sidebar.text_input("Results directory", value=str(default_results_dir(task_name)))
 
-    with st.sidebar:
-        st.header("Controls")
-        tasks = available_tasks()
-        if tasks:
-            default_idx = (
-                tasks.index(cfg.default_task) if cfg.default_task in tasks else 0
-            )
-            task = st.selectbox("Task", options=tasks, index=default_idx)
-        else:
-            task = st.text_input("Task name", value=cfg.default_task)
-        results_override = st.text_input("Results directory (optional)", value="")
-        refresh_seconds = st.slider(
+    with sidebar_section("Refresh"):
+        auto_refresh = st.sidebar.checkbox("Auto refresh", value=True)
+        refresh_seconds = st.sidebar.number_input(
             "Refresh interval (seconds)",
-            min_value=2,
-            max_value=120,
-            value=cfg.default_refresh_seconds,
+            min_value=0.5,
+            max_value=120.0,
+            value=float(cfg.default_refresh_seconds),
+            step=0.5,
         )
-        max_history_points = st.slider(
-            "Max session history points",
-            min_value=50,
-            max_value=5000,
-            value=cfg.default_max_history_points,
-            step=50,
-        )
-        top_n = st.slider("Top models to show", min_value=5, max_value=100, value=20)
-        auto_refresh = st.toggle("Auto refresh", value=True)
-        refresh_now = st.button("Refresh now", type="primary")
+        manual_refresh = st.sidebar.button("Refresh now")
 
-    results_dir = (
-        Path(results_override).expanduser()
-        if results_override
-        else default_results_dir(task)
+    with sidebar_section("Display"):
+        max_history_points = int(
+            st.sidebar.number_input(
+                "Max history points",
+                min_value=1,
+                max_value=500,
+                value=cfg.default_history_points,
+                step=1,
+            )
+        )
+        top_n = int(
+            st.sidebar.number_input(
+                "Top N models",
+                min_value=1,
+                max_value=100,
+                value=cfg.default_top_n,
+                step=1,
+            )
+        )
+    return SidebarSelection(
+        task_name=task_name,
+        results_dir=Path(results_dir_text),
+        auto_refresh=auto_refresh,
+        refresh_seconds=float(refresh_seconds),
+        max_history_points=max_history_points,
+        top_n=top_n,
+        manual_refresh=manual_refresh,
     )
 
-    render_header(str(results_dir))
 
-    data = load_registry_snapshot(results_dir)
-    if data is None:
-        st.warning(f"Waiting for registry: {results_dir / 'shared_registry.duckdb'}")
-        st.stop()
+def _load_state(selection: SidebarSelection) -> dict[str, object]:
+    registry_path = selection.results_dir / "shared_registry.duckdb"
+    registry_available = registry_path.exists()
 
-    if refresh_now or auto_refresh:
-        append_snapshot(data, max_points=max_history_points)
+    snapshot = None
+    summary = None
+    judge_rows: list[dict[str, object]] = []
+    feedback_artifacts: list[dict[str, object]] = []
+    judge_trace_artifacts: list[dict[str, object]] = []
+    stats: dict[str, int] = {"complete": 0, "running": 0, "errors": 0, "recovery_failed": 0}
+    diagnostics_rows = []
 
-    tab_overview, tab_clients, tab_models, tab_results, tab_judge = st.tabs(
-        ["Overview", "Clients", "Models", "Results", "Judge"]
+    if registry_available:
+        snapshot = load_registry_snapshot(selection.results_dir)
+        summary = load_diagnostics_summary(selection.results_dir)
+        feedback_artifacts = load_feedback_artifacts(selection.results_dir)
+        judge_trace_artifacts = load_judge_trace_artifacts(selection.results_dir)
+        if snapshot is not None:
+            stats = summary_stats(snapshot)
+            judge_rows = normalize_judge_iterations(snapshot)
+        diagnostics_rows = load_diagnostics_model_rows(selection.results_dir, iteration=0)
+
+    return {
+        "registry_available": registry_available,
+        "registry_path": registry_path,
+        "snapshot": snapshot,
+        "summary": summary,
+        "feedback_artifacts": feedback_artifacts,
+        "judge_trace_artifacts": judge_trace_artifacts,
+        "stats": stats,
+        "judge_rows": judge_rows,
+        "diagnostics_rows": diagnostics_rows,
+    }
+
+
+def main() -> None:
+    """Render the dashboard shell."""
+
+    _ensure_streamlit()
+
+    st.set_page_config(page_title="GeCCo-MH Dashboard", layout="wide")
+    apply_dashboard_theme()
+    st.title("GeCCo-MH Dashboard")
+    st.caption(f"Project root: {project_root()}")
+
+    selection = _read_sidebar()
+    state = _load_state(selection)
+
+    append_snapshot(
+        {
+            "task_name": selection.task_name,
+            "results_dir": str(selection.results_dir),
+            "registry_available": state["registry_available"],
+            "stats": state["stats"],
+        },
+        max_points=selection.max_history_points,
     )
 
-    with tab_overview:
-        render_overview(data)
-        render_trajectory(data)
-        render_history(st.session_state.dashboard_history)
+    history = get_history()
+    if not state["registry_available"]:
+        render_waiting_state(str(selection.results_dir), str(state["registry_path"]))
 
-    with tab_clients:
-        render_clients(data)
+    tabs = st.tabs(list(DashboardConfig.tab_names))
+    tab_renderers = (
+        lambda: render_overview_tab(state["snapshot"], state["summary"], history),
+        lambda: render_models_tab(state["summary"], snapshot=state["snapshot"], top_n=selection.top_n),
+        lambda: render_clients_tab(state["snapshot"]),
+        lambda: render_results_tab(
+            state["summary"],
+            results_dir=selection.results_dir,
+            feedback_artifacts=state["feedback_artifacts"],
+            snapshot=state["snapshot"],
+            trace_artifacts=state["judge_trace_artifacts"],
+        ),
+        lambda: render_judge_tab(
+            state["judge_rows"],
+            results_dir=selection.results_dir,
+            trace_artifacts=state["judge_trace_artifacts"],
+        ),
+    )
+    for tab, render in zip(tabs, tab_renderers, strict=True):
+        with tab:
+            render()
 
-    with tab_models:
-        render_models(data, top_n=top_n)
-        render_r2(data)
+    if selection.manual_refresh:
+        st.rerun()
+        return
 
-    with tab_results:
-        render_results_browser(data, results_dir)
-
-    with tab_judge:
-        render_judge_tab(data, results_dir)
-
-    if auto_refresh:
-        time.sleep(refresh_seconds)
+    if selection.auto_refresh and state["registry_available"]:
+        time.sleep(selection.refresh_seconds)
         st.rerun()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

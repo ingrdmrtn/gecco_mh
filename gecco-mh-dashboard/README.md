@@ -1,31 +1,13 @@
 # GeCCo-MH Dashboard
 
-Interactive Streamlit dashboard for monitoring distributed GeCCo runs.
+Streamlit dashboard for inspecting current DuckDB-backed GeCCo outputs.
 
-## Install
-
-```bash
-# uv (recommended — from the repo root)
-uv sync --extra dashboard
-
-# pip/conda (compatibility)
-pip install -r gecco-mh-dashboard/requirements.txt
-```
-
-## Run (remote host)
+## Run
 
 ```bash
-# uv
-uv run streamlit run gecco-mh-dashboard/app.py --server.address 127.0.0.1 --server.port 8501
-
-# pip/conda
 streamlit run gecco-mh-dashboard/app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-## SSH tunnel (from local machine)
+## Install
 
-```bash
-ssh -N -L 8501:127.0.0.1:8501 <user>@<remote-host>
-```
-
-Then open: <http://127.0.0.1:8501>
+Install the dashboard extras so `streamlit` and `pandas` are available.

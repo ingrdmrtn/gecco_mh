@@ -1,816 +1,797 @@
+"""Minimal Streamlit views for the dashboard bootstrap."""
+
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import streamlit as st
 
-from pathlib import Path
+from dashboard import components
+from dashboard.data_adapter import build_client_df, build_model_comparison_frame, build_overview_summary, model_dashboard_key
 
-from dashboard.data_adapter import (
-    build_baseline_row,
-    build_client_df,
-    build_iteration_df,
-    build_landscape_df,
-    build_r2_df,
-    get_iteration_results_by_idx,
-    get_model_code,
-    list_iterations,
-    list_judge_traces,
-    load_diagnostics_model_rows_state,
-    load_judge_trace,
-    load_json_file,
-    load_text_file,
-    normalize_judge_iterations,
-    summary_stats,
-)
+try:  # pragma: no cover - streamlit is optional in the test environment
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    st = None
 
 
-def _fmt_float(x: Any) -> str:
-    if x is None:
-        return "-"
-    try:
-        return f"{float(x):.2f}"
-    except (TypeError, ValueError):
-        return "-"
+def _overview_caption(summary: dict[str, Any], history: list[dict[str, Any]]) -> str:
+    caption_bits = ["Command center for the current DuckDB registry snapshot."]
+    if history:
+        latest = history[-1]
+        captured_at = latest.get("captured_at")
+        if captured_at:
+            caption_bits.append(f"Last captured {captured_at}.")
+    if summary.get("run_state_label"):
+        caption_bits.append(f"Run state: {summary['run_state_label']}.")
+    return " ".join(caption_bits)
 
 
-def render_header(results_dir: str) -> None:
-    st.title("🧠 GeCCo Distributed Dashboard")
-    st.caption(f"Run: {results_dir} · Updated: {datetime.now().strftime('%H:%M:%S')}")
-
-
-def render_overview(data: dict[str, Any]) -> None:
-    stats = summary_stats(data)
-    baseline = data.get("baseline") or {}
-    best = data.get("global_best") or {}
-
-    failed = stats.get("failed", 0)
-    succeeded = stats["models"] - failed
-    recovery_failed = stats.get("recovery_failed", 0)
-    errors = stats.get("errors", 0)
-    cols = st.columns(8)  # Changed from 7 to 8
-    cols[0].metric("Clients", f"{stats['n_clients']}", f"{stats['running']} running")
-    cols[1].metric("Completed", f"{stats['complete']}")
-    cols[2].metric("Iterations", f"{stats['iterations']}")
-    cols[3].metric("Models", f"{succeeded}")
-    cols[4].metric("Recovery Failed", f"{recovery_failed}")
-    cols[5].metric("Errors", f"{errors}")
-    cols[6].metric("Param sets", f"{stats['param_combos']}")
-    cols[7].metric("Best BIC", _fmt_float(best.get("metric_value")))
-
-    with st.container(border=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Global best")
-            if best:
-                st.write(f"- Client: **{best.get('client_id', '-')}**")
-                st.write(f"- Iteration: **{best.get('iteration', '-')}**")
-                st.write(
-                    f"- Parameters: {', '.join(best.get('param_names', [])) or '-'}"
-                )
-            else:
-                st.info("No fitted model yet.")
-        with c2:
-            st.subheader("Baseline")
-            if baseline and baseline.get("metric_value") is not None:
-                st.write(
-                    f"- Baseline BIC: **{_fmt_float(baseline.get('metric_value'))}**"
-                )
-                if best and best.get("metric_value") is not None:
-                    delta = baseline["metric_value"] - best["metric_value"]
-                    st.write(f"- Improvement vs baseline: **{delta:+.2f}**")
-                st.write(
-                    f"- Parameters: {', '.join(baseline.get('param_names', [])) or '-'}"
-                )
-            else:
-                st.info("Baseline not available yet.")
-
-
-def render_clients(data: dict[str, Any]) -> None:
-    st.subheader("Client status")
-    df = build_client_df(data)
-    if df.empty:
-        st.info("No client updates yet.")
-        return
-
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-def render_trajectory(data: dict[str, Any]) -> None:
-    st.subheader("BIC trajectory")
-    tdf = build_iteration_df(data)
-    if tdf.empty:
-        st.info("No iteration data yet.")
-        return
-
-    pivot = tdf.pivot_table(
-        index="Iteration", columns="Client", values="Best BIC", aggfunc="min"
-    )
-    st.line_chart(pivot, use_container_width=True)
-    with st.expander("Trajectory table"):
-        st.dataframe(tdf, use_container_width=True, hide_index=True)
-
-
-def render_models(data: dict[str, Any], top_n: int) -> None:
-    st.subheader("Model landscape")
-
-    # Show baseline as a fixed reference row
-    baseline_df = build_baseline_row(data)
-    if baseline_df is not None:
-        st.caption("Baseline")
-        st.dataframe(baseline_df, use_container_width=True, hide_index=True)
-
-    ldf = build_landscape_df(data)
-    if ldf.empty:
-        st.info("No models evaluated yet.")
-        return
-
-    st.caption(f"Top {top_n} models (by BIC) — click a row to view code")
-
-    # Show top_n successful models first, then up to 10 failed models
-    success_df = ldf[ldf["Status"] == "success"].head(top_n)
-    failed_df = ldf[ldf["Status"] != "success"].head(10)
-
-    show = pd.concat([success_df, failed_df])
-
-    # Configure column styling
-    styled_df = show.copy()
-    styled_df["Status"] = styled_df["Status"].map(
-        {
-            "success": "🟢 Success",
-            "recovery_failed": "🟠 Recovery Failed",
-            "error": "🔴 Error",
-        }
-    )
-
-    # Select display columns
-    display_cols = [
-        "Model",
-        "Status",
-        "BIC",
-        "Max R²",
-        "Best Param",
-        "Mean R²",
-        "Params",
-        "Client",
-        "Iteration",
-    ]
-    display_df = styled_df[display_cols]
-
-    event = st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-    )
-
-    if event.selection.rows:
-        row = show.iloc[event.selection.rows[0]]
-        code = get_model_code(data, row["Model"], row["Client"], row["Iteration"])
-        if code:
-            st.subheader(f"Code: {row['Model']}")
-            st.code(code, language="python")
-        else:
-            st.caption("Code not available for this model.")
-
-        # Show error details for failed models
-        if row["Status"] != "success":
-            if row["Status"] == "recovery_failed" and row.get("Recovery R"):
-                st.warning(f"Parameter recovery failed (r={row['Recovery R']:.2f})")
-            elif row["Status"] == "error" and row.get("Error"):
-                st.error(f"Error: {row['Error']}")
-
-
-def render_r2(data: dict[str, Any]) -> None:
-    st.subheader("Individual differences (R²)")
-    rdf = build_r2_df(data)
-    if rdf.empty:
-        st.caption("No R² metadata available yet.")
-        return
-
-    st.dataframe(rdf, use_container_width=True, hide_index=True)
-
-
-def render_history(history: list[dict[str, Any]]) -> None:
-    st.subheader("Session history")
-    if not history:
-        st.caption("No snapshots in this browser session.")
-        return
-
-    hdf = pd.DataFrame(history)
-    hdf["ts"] = pd.to_datetime(hdf["ts"])
-    hdf = hdf.sort_values("ts")
-    st.line_chart(hdf.set_index("ts")[["best_bic"]], use_container_width=True)
-
-
-# ============================================================
-# Results browser
-# ============================================================
-
-
-def _file_pattern(iteration: int, client_id: Any, suffix: str) -> str:
-    """Build the filename pattern for a given iteration/client."""
-    tag = f"_client{client_id}" if client_id is not None else ""
-    return f"iter{iteration}{tag}_run0{suffix}"
-
-
-def render_results_browser(data: dict[str, Any], results_dir: Path) -> None:
-    """Rich results browser for inspecting iteration artifacts."""
-    iterations = list_iterations(data)
-    if not iterations:
-        st.info("No iteration data available yet.")
-        return
-
-    # --- Filters ---
-    clients = sorted({str(it["client_id"]) for it in iterations})
-    col1, col2 = st.columns(2)
-    with col1:
-        selected_client = st.selectbox("Client", clients, index=0, key="results_client")
-    # Filter iterations for selected client
-    client_iters = [it for it in iterations if str(it["client_id"]) == selected_client]
-
-    # Build display labels that disambiguate re-runs of the same iteration
-    iter_labels: list[str] = []
-    for it in client_iters:
-        label = str(it["iteration"])
-        if it["run"] > 0:
-            label += f" (run {it['run'] + 1})"
-        iter_labels.append(label)
-
-    with col2:
-        selected_label = st.selectbox(
-            "Iteration",
-            iter_labels,
-            index=len(iter_labels) - 1 if iter_labels else 0,
-            key="results_iter",
-        )
-
-    if not selected_label:
-        return
-
-    # Map selected label back to the iteration info
-    label_idx = (
-        iter_labels.index(selected_label) if selected_label in iter_labels else 0
-    )
-    iter_info = client_iters[label_idx]
-    history_idx = iter_info["history_idx"]
-    selected_iter = iter_info["iteration"]
-
-    # Resolve client_id back to its original type
-    client_id_typed: Any = selected_client
-    for it in iterations:
-        if str(it["client_id"]) == selected_client:
-            client_id_typed = it["client_id"]
-            break
-
-    results = get_iteration_results_by_idx(data, history_idx)
-    with st.container(border=True):
-        st.markdown(
-            f"**Iteration {selected_iter}** · Client {selected_client} · "
-            f"**{iter_info['n_models'] if iter_info else 0}** models evaluated"
-        )
-        if iter_info and iter_info.get("best_bic") is not None:
-            best_result = min(
-                (r for r in results if r.get("metric_value") is not None),
-                key=lambda r: r["metric_value"],
-                default=None,
-            )
-            if best_result:
-                st.markdown(
-                    f"Best this iteration: **{best_result.get('function_name', '?')}** "
-                    f"(BIC: **{best_result['metric_value']:.2f}**)"
-                )
-
-    # --- Models ---
-    st.subheader("Models")
-
-    # --- Diagnostics-backed model rows (preferred when available) ---
-    diag_state = load_diagnostics_model_rows_state(results_dir, selected_iter)
-    diag_rows = diag_state.rows
-    if diag_state.available and diag_rows:
-        st.caption("Diagnostics store (stable source_db + model_id)")
-        diag_display_rows: list[dict[str, Any]] = []
-        for row in diag_rows:
-            detail = row.get("detail") or {}
-            display_row = {
-                "Model": row.get("name", "?"),
-                "Status": row.get("status", detail.get("status", "unknown")),
-                "BIC": row.get("metric_value", detail.get("metric_value")),
-                "Max R²": row.get("max_r2", detail.get("max_r2")),
-                "Best Param": row.get("best_param", detail.get("best_param")),
-                "Mean R²": row.get("mean_r2", detail.get("mean_r2")),
-                "Params": ", ".join(detail.get("param_names", row.get("param_names", [])) or []),
-                "Split": row.get("split", detail.get("split")),
-                "Model ID": row.get("model_id"),
-                "Source DB": row.get("source_db"),
-            }
-            diag_display_rows.append(display_row)
-
-        styled_df = pd.DataFrame(diag_display_rows)
-        styled_df["Status"] = styled_df["Status"].map(
+def _overview_metric_rows(summary: dict[str, Any]) -> None:
+    components.metric_grid(
+        [
             {
-                "success": "🟢 Success",
-                "recovery_failed": "🟠 Recovery Failed",
-                "error": "🔴 Error",
-            }
-        ).fillna(styled_df["Status"])
-
-        display_cols = [
-            "Model",
-            "Status",
-            "BIC",
-            "Max R²",
-            "Best Param",
-            "Mean R²",
-            "Params",
-            "Split",
-            "Model ID",
-            "Source DB",
+                "label": "Run state",
+                "value": summary.get("run_state_label") or "Idle",
+                "help": "Current run status derived from registry client state.",
+            },
+            {
+                "label": "Best model",
+                "value": summary.get("best_model_name") or "Not available",
+                "delta": (
+                    f"BIC {summary['best_bic']:.2f}" if summary.get("best_bic") is not None else None
+                ),
+                "help": "Best model found so far from the registry trajectory.",
+            },
+            {
+                "label": "Baseline BIC",
+                "value": components.format_value(summary.get("baseline_bic")),
+                "delta": (
+                    f"Δ {summary['bic_delta']:+.2f}"
+                    if summary.get("bic_delta") is not None
+                    else None
+                ),
+                "help": "Baseline comparison from the shared registry.",
+            },
+            {
+                "label": "Health",
+                "value": summary.get("health_label") or "Waiting",
+                "help": "High-level run health derived from client status mix.",
+            },
         ]
-        display_df = styled_df[display_cols]
-        event = st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-        )
+    )
 
-        if event.selection.rows:
-            row = diag_rows[event.selection.rows[0]]
-            detail = row.get("detail") or {}
-            name = row.get("name", "model")
-            st.subheader(f"Code: {name}")
+    components.metric_grid(
+        [
+            {"label": "Clients", "value": components.format_value(summary.get("client_count"))},
+            {"label": "Iterations", "value": components.format_value(summary.get("iteration_count"))},
+            {"label": "Successful models", "value": components.format_value(summary.get("trajectory_points"))},
+            {"label": "Failures", "value": components.format_value(summary.get("error_clients"))},
+            {"label": "Param sets", "value": components.format_value(summary.get("param_set_count"))},
+            {"label": "Best BIC", "value": components.format_value(summary.get("best_bic"))},
+        ]
+    )
+
+
+def _render_overview_best_vs_baseline(summary: dict[str, Any]) -> None:
+    if st is None:
+        return
+
+    components.section_header("Baseline comparison")
+    left, right = st.columns(2) if hasattr(st, "columns") else (None, None)
+
+    if left is not None:
+        with left:
+            if summary.get("best_bic") is None:
+                components.empty_state("No global best model yet.")
+            else:
+                st.caption("Best model")
+                st.write(f"Best model: {summary.get('best_model_name') or 'Not available'}")
+                st.metric("Best BIC", components.format_value(summary.get("best_bic")))
+                st.caption(
+                    f"Client {components.format_value(summary.get('best_client_id'))} • Iteration {components.format_value(summary.get('best_iteration'))}"
+                )
+                if summary.get("best_param_names"):
+                    st.caption(f"Parameters: {', '.join(str(value) for value in summary['best_param_names'])}")
+
+    if right is not None:
+        with right:
+            if summary.get("baseline_bic") is None:
+                components.empty_state("Baseline comparison not available.")
+            else:
+                st.metric(
+                    "Baseline BIC",
+                    components.format_value(summary.get("baseline_bic")),
+                    delta=(
+                        f"Δ {summary['bic_delta']:+.2f} ({summary['bic_delta_pct']:+.1f}%)"
+                        if summary.get("bic_delta") is not None and summary.get("bic_delta_pct") is not None
+                        else None
+                    ),
+                )
+                st.caption("Lower BIC is better.")
+
+
+def _render_overview_health(summary: dict[str, Any], history: list[dict[str, Any]]) -> None:
+    if st is None:
+        return
+
+    components.section_header("Run health")
+    left, right = st.columns(2) if hasattr(st, "columns") else (None, None)
+
+    if left is not None:
+        with left:
+            st.metric(
+                "Client mix",
+                f"{components.format_value(summary.get('client_count'))} total",
+                delta=(
+                    f"{components.format_value(summary.get('running_clients'))} running / {components.format_value(summary.get('complete_clients'))} complete"
+                    if summary.get("client_count") is not None
+                    else None
+                ),
+            )
             st.caption(
-                f"Model ID {row.get('model_id')} · {row.get('source_db')} · {row.get('split')}"
+                f"Failures: {components.format_value(summary.get('error_clients'))} • Recovery failed: {components.format_value(summary.get('recovery_failed_clients'))}"
             )
 
-            code = detail.get("code")
-            if code:
-                st.code(code, language="python")
+    if right is not None:
+        with right:
+            latest_capture = history[-1].get("captured_at") if history else None
+            if latest_capture:
+                st.metric("Latest capture", str(latest_capture))
             else:
-                st.caption("Code not available for this model.")
+                components.empty_state("No captured history yet.")
+            if summary.get("latest_client_activity"):
+                st.caption(f"Latest client activity: {summary['latest_client_activity']}")
 
-            status = row.get("status") or detail.get("status")
-            if status != "success":
-                if status == "recovery_failed" and row.get("recovery_mean_r") is not None:
-                    st.warning(
-                        f"Parameter recovery failed (r={row.get('recovery_mean_r'):.2f})"
-                    )
-                elif status == "error" and row.get("metric_name"):
-                    st.error(f"Error: {row.get('metric_name')}")
-    elif diag_state.available:
-        st.info("Diagnostics are available for this run, but none match the current iteration/filter.")
-    else:
-        diag_df = None
 
-    # Load structured metadata if available (optional audit fallback)
-    structured_meta = load_json_file(
-        results_dir, "models", _file_pattern(selected_iter, client_id_typed, ".json")
-    )
-    meta_by_idx: dict[int, dict] = {}
-    if isinstance(structured_meta, list):
-        for idx, m in enumerate(structured_meta):
-            if isinstance(m, dict):
-                meta_by_idx[idx] = m
+def _render_overview_trend(summary: dict[str, Any]) -> None:
+    if st is None:
+        return
 
-    if not diag_state.available and not results:
-        st.caption("No model results for this iteration.")
-    elif not diag_state.available:
-        for i, r in enumerate(results):
-            name = r.get("function_name", f"model_{i + 1}")
-            bic = r.get("metric_value")
-            bic_str = f"{bic:.2f}" if bic is not None else "N/A"
-            metric_name = r.get("metric_name", "BIC")
+    components.section_header("BIC trajectory")
+    iteration_frame = summary.get("iteration_frame")
+    if iteration_frame is None or iteration_frame.empty:
+        components.empty_state("No BIC trajectory available yet.")
+        return
 
-            # Status indicator
-            if metric_name == "RECOVERY_FAILED":
-                icon = "🔴"
-                if (
-                    r.get("simulation_error")
-                    and r.get("recovery_n_successful", -1) == 0
-                ):
-                    status_note = " — simulation error"
-                else:
-                    recovery_r = r.get("recovery_r")
-                    r_note = f" (r={recovery_r:.2f})" if recovery_r is not None else ""
-                    status_note = f" — recovery failed{r_note}"
-            elif metric_name == "VALIDATION_ERROR":
-                icon = "🔴"
-                status_note = f" — validation error: {r.get('error_type', 'unknown')}"
-            elif metric_name == "FIT_ERROR":
-                icon = "🔴"
-                status_note = " — fitting error"
-            elif bic is not None and bic < float("inf"):
-                icon = "🟢"
-                status_note = ""
+    trend_frame = iteration_frame[[column for column in ["iteration", "best_bic", "best_model_name", "client_id", "timestamp"] if column in iteration_frame.columns]].copy()
+    trend_frame = trend_frame[trend_frame["best_bic"].notna()].copy() if "best_bic" in trend_frame.columns else trend_frame
+    if trend_frame.empty:
+        components.empty_state("No BIC trajectory available yet.")
+        return
+
+    trend_frame = trend_frame.sort_values(by="iteration", kind="stable")
+    if hasattr(st, "line_chart"):
+        chart_frame = trend_frame.set_index("iteration")[["best_bic"]]
+        st.line_chart(chart_frame)
+    components.write_dataframe(trend_frame)
+
+
+def _render_overview_history(history: list[dict[str, Any]]) -> None:
+    if st is None:
+        return
+
+    components.section_header("Session history")
+    if not history:
+        components.empty_state("No session history captured yet.")
+        return
+
+    history_frame = pd.DataFrame(history)
+    columns = [column for column in ["captured_at", "task_name", "registry_available", "stats", "results_dir"] if column in history_frame.columns]
+    components.write_dataframe(history_frame[columns] if columns else history_frame)
+
+
+def _render_overview_debug(summary: dict[str, Any], *, show_debug: bool = False) -> None:
+    if st is None:
+        return
+
+    with st.expander("Overview debug details", expanded=show_debug):
+        st.caption("Derived tables only; raw registry JSON stays hidden by default.")
+        client_frame = summary.get("client_frame")
+        iteration_frame = summary.get("iteration_frame")
+        if client_frame is not None:
+            st.subheader("Client summary")
+            components.write_dataframe(client_frame)
+        if iteration_frame is not None:
+            st.subheader("Iteration summary")
+            components.write_dataframe(iteration_frame)
+
+
+def render_overview(snapshot: dict[str, Any] | None, *, history: list[dict[str, Any]] | None = None, show_debug: bool = False) -> None:
+    if st is None:
+        return
+
+    history = history or []
+    summary = build_overview_summary(snapshot or {}) if snapshot is not None else build_overview_summary({})
+
+    components.section_header("GeCCo run overview", caption=_overview_caption(summary, history))
+    if summary.get("client_count", 0) == 0 and summary.get("iteration_count", 0) == 0 and not summary.get("has_global_best") and not summary.get("has_baseline"):
+        components.empty_state("No running registry snapshot loaded yet.")
+    _overview_metric_rows(summary)
+    _render_overview_best_vs_baseline(summary)
+    _render_overview_health(summary, history)
+    components.section_header("Trajectory / session history")
+    _render_overview_trend(summary)
+    _render_overview_history(history)
+    _render_overview_debug(summary, show_debug=show_debug)
+
+
+def render_overview_tab(
+    snapshot: dict[str, Any] | None,
+    summary: pd.DataFrame | None,
+    history: list[dict[str, Any]],
+    *,
+    show_debug: bool = False,
+) -> None:
+    del summary
+    render_overview(snapshot, history=history, show_debug=show_debug)
+def _artifact_title(prefix: str, artifact: dict[str, Any]) -> str:
+    path = artifact.get("path") or artifact.get("absolute_path") or "artifact"
+    kind = str(artifact.get("kind") or "artifact").replace("_", " ").title()
+    return f"{prefix}: {kind} • {path}"
+
+
+def _render_artifact_handoff(title: str, message: str) -> None:
+    if st is None:
+        return
+    with st.expander(title, expanded=False):
+        st.caption(message)
+
+
+def _render_detail_payload(title: str, detail: dict[str, Any] | None) -> None:
+    if st is None or not detail:
+        return
+    with st.expander(title, expanded=False):
+        if detail.get("code"):
+            st.subheader("Model code")
+            st.code(detail["code"], language="python")
+        if detail.get("validation_errors"):
+            st.subheader("Validation errors")
+            components.write_dataframe(pd.DataFrame(detail["validation_errors"]))
+        if detail.get("parameter_recovery"):
+            st.subheader("Parameter recovery")
+            components.write_dataframe(pd.DataFrame([detail["parameter_recovery"]]))
+        if detail.get("individual_differences"):
+            st.subheader("R² details")
+            components.write_dataframe(pd.DataFrame([detail["individual_differences"]]))
+        if detail.get("ppc"):
+            st.subheader("Feedback / raw LLM output")
+            components.write_dataframe(pd.DataFrame(detail["ppc"]))
+        if detail.get("block_residuals"):
+            st.subheader("Block residuals")
+            components.write_dataframe(pd.DataFrame(detail["block_residuals"]))
+        components.debug_details("Raw model detail payload", detail)
+
+
+def _render_plain_artifact(title: str, artifact: dict[str, Any]) -> None:
+    if st is None:
+        return
+    with st.expander(title, expanded=False):
+        if artifact.get("path"):
+            st.caption(str(artifact["path"]))
+        if artifact.get("content") is not None:
+            if artifact.get("kind") == "model_code":
+                st.code(str(artifact["content"]), language="python")
             else:
-                icon = "🟡"
-                status_note = " — failed to fit"
-
-            with st.expander(
-                f"{icon} **{name}** — {metric_name}: {bic_str}{status_note}"
-            ):
-                meta = meta_by_idx.get(i, {})
-
-                # Show diagnostics model_id link
-                if diag_df is not None and not diag_df.empty:
-                    name_rows = diag_df[diag_df["name"] == name]
-                    if not name_rows.empty:
-                        mids = name_rows["model_id"].unique().tolist()
-                        st.caption(f"Diagnostics model_id(s): {mids}")
-
-                # Error details for failed models
-                error_msg = r.get("error")
-                if error_msg:
-                    st.error(f"**Error:** {error_msg}")
-                sim_error = r.get("simulation_error")
-                if sim_error:
-                    st.error(f"**Simulation error:** {sim_error}")
-                recovery_per_param = r.get("recovery_per_param")
-                if metric_name == "RECOVERY_FAILED" and recovery_per_param:
-                    parts = [f"{k}: r={v:.2f}" for k, v in recovery_per_param.items()]
-                    st.warning(f"**Recovery per param:** {', '.join(parts)}")
-
-                # Rationale
-                rationale = meta.get("rationale") or ""
-                if rationale:
-                    st.markdown(f"*{rationale}*")
-
-                # Parameters
-                params = r.get("param_names", [])
-                if params:
-                    st.markdown(f"**Parameters:** `{', '.join(params)}`")
-
-                # R² info
-                max_r2 = r.get("max_r2")
-                best_param_r2 = r.get("best_param")
-                mean_r2 = r.get("mean_r2")
-                per_param_r2 = r.get("per_param_r2")
-                if max_r2 is not None:
-                    bp_note = f" ({best_param_r2})" if best_param_r2 else ""
-                    st.markdown(
-                        f"**Best param R²:** {max_r2:.3f}{bp_note} · **Mean R²:** {mean_r2:.3f}"
-                        if mean_r2 is not None
-                        else f"**Best param R²:** {max_r2:.3f}{bp_note}"
-                    )
-                elif mean_r2 is not None:
-                    st.markdown(f"**Mean R²:** {mean_r2:.3f}")
-                if per_param_r2:
-                    r2_parts = [f"{k}: {v:.3f}" for k, v in per_param_r2.items()]
-                    st.markdown(f"**Per-param R²:** {', '.join(r2_parts)}")
-
-                # Analysis / thinking
-                analysis = meta.get("analysis") or ""
-                if analysis:
-                    with st.expander("LLM analysis / thinking", expanded=False):
-                        st.markdown(analysis)
-
-                # Code
-                code = r.get("code") or ""
-                if code:
-                    st.code(code, language="python")
-
-    # --- Feedback (optional audit) ---
-    st.subheader("Feedback")
-    feedback_text = load_text_file(
-        results_dir, "feedback", _file_pattern(selected_iter, client_id_typed, ".txt")
-    )
-    if feedback_text:
-        with st.expander("Feedback sent to LLM", expanded=False):
-            st.text(feedback_text)
-    else:
-        st.caption("No feedback file found for this iteration.")
-
-    # --- Raw LLM output (optional audit) ---
-    raw_output = load_text_file(
-        results_dir, "models", _file_pattern(selected_iter, client_id_typed, ".txt")
-    )
-    if raw_output:
-        with st.expander("Raw LLM response", expanded=False):
-            st.code(raw_output, language="text")
-
-    # --- Raw registry JSON ---
-    with st.expander("Raw shared registry JSON"):
-        st.json(data)
+                st.write(str(artifact["content"]))
+        if artifact.get("payload") is not None:
+            st.json(artifact["payload"])
+        if artifact.get("raw_text") is not None and artifact.get("error"):
+            st.subheader("Raw text")
+            st.code(str(artifact["raw_text"]), language="text")
+        if artifact.get("error"):
+            st.warning(str(artifact["error"]))
+        components.debug_details("Raw artifact payload", artifact)
 
 
-_CONFIDENCE_ICONS = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+def _render_judge_artifact(title: str, artifact: dict[str, Any]) -> None:
+    if st is None:
+        return
+    with st.expander(title, expanded=False):
+        if artifact.get("path"):
+            st.caption(str(artifact["path"]))
+        for label, key in (
+            ("Synthesized feedback", "synthesized_feedback"),
+            ("Verdict", "verdict"),
+            ("Tool call trace", "trace"),
+            ("Full trace", "full_trace"),
+        ):
+            value = artifact.get(key)
+            if value is None:
+                continue
+            st.subheader(label)
+            if isinstance(value, (dict, list, tuple)):
+                st.json(value)
+            else:
+                st.code(str(value), language="text")
+        if artifact.get("payload") is not None:
+            st.subheader("Raw payload")
+            st.json(artifact["payload"])
+        if artifact.get("error"):
+            st.warning(str(artifact["error"]))
+        components.debug_details("Raw judge trace artifact", artifact)
 
 
-def render_judge_tab(data: dict[str, Any], results_dir: Path) -> None:
-    """Render the Judge tab with registry state first, trace JSON as secondary."""
-    st.subheader("Registry judge state")
+def _render_row_drilldown(title: str, row: dict[str, Any]) -> None:
+    if st is None:
+        return
+    with st.expander(title, expanded=False):
+        for key in ("metric_name", "metric_value", "mean_r2", "max_r2", "status", "split"):
+            if key in row:
+                components.key_value(key.replace("_", " ").title(), row.get(key))
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else None
+        if detail:
+            _render_detail_payload("Model code / error / raw details", detail)
+        components.debug_details("Raw result row payload", row)
+def _missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, float):
+        return pd.isna(value)
+    return False
 
-    judge_rows = normalize_judge_iterations(data)
-    if judge_rows:
-        jdf = pd.DataFrame(judge_rows)
-        st.dataframe(jdf, use_container_width=True, hide_index=True)
-    else:
-        st.caption("No judge iterations in registry snapshot.")
 
-    traces = list_judge_traces(results_dir)
-    if not traces:
-        if judge_rows:
-            st.caption(
-                "No judge trace JSON files — registry state shown above is the "
-                "canonical source. Trace files appear once the orchestrated "
-                "judge pipeline has produced a feedback artifact for this run."
-            )
+def _rankable_selection_frame(frame: pd.DataFrame, *, top_n: int) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    ranked = frame[frame["display_rank"].notna()].copy() if "display_rank" in frame.columns else frame.copy()
+    if "display_rank" in ranked.columns:
+        ranked = ranked[ranked["display_rank"] <= top_n]
+    non_rankable = frame[frame["display_rank"].isna()].copy() if "display_rank" in frame.columns else frame.iloc[0:0].copy()
+    if ranked.empty and non_rankable.empty:
+        return frame.iloc[0:0].copy()
+    return pd.concat([ranked, non_rankable], ignore_index=True)
+
+
+def _format_model_option(row: dict[str, Any], *, rank: Any = None) -> str:
+    name = row.get("name") or row.get("function_name") or "Model"
+    metric_name = row.get("metric_name") or "metric"
+    metric_value = components.format_value(row.get("metric_value"), default="—")
+    status = components.status_metadata(row.get("status"))["label"]
+    prefix = f"#{int(rank)} " if isinstance(rank, int) else ""
+    return f"{prefix}{name} • {metric_name} {metric_value} • {status}"
+
+
+def _render_model_detail_panel(row: dict[str, Any], *, snapshot: dict[str, Any] | None = None) -> None:
+    if st is None:
         return
 
-    st.subheader("Trace file drill-down (optional audit)")
-    iterations = list_iterations(data)
-    if not iterations:
-        st.info("No iteration data available.")
-        return
-
-    # Judge runs once per iteration for all clients — deduplicate by (iteration, run).
-    seen_iter_keys: set[tuple] = set()
-    unique_iters: list[dict] = []
-    for it in iterations:
-        key = (it["iteration"], it["run"])
-        if key not in seen_iter_keys:
-            seen_iter_keys.add(key)
-            unique_iters.append(it)
-
-    available_trace_keys = {(t["iteration"], t["run_idx"], t["tag"]) for t in traces}
-
-    iter_labels: list[str] = []
-    iter_trace_map: list[tuple | None] = []
-    for it in unique_iters:
-        label = str(it["iteration"])
-        if it["run"] > 0:
-            label += f" (run {it['run'] + 1})"
-        key = (it["iteration"], it["run"], "")
-        has_trace = key in available_trace_keys
-        if not has_trace:
-            tag_matches = [
-                k
-                for k in available_trace_keys
-                if k[0] == it["iteration"] and k[1] == it["run"]
-            ]
-            if tag_matches:
-                key = tag_matches[0]
-                has_trace = True
-        if has_trace:
-            label += " ✅"
-        else:
-            label += " ⬜"
-        iter_labels.append(label)
-        iter_trace_map.append(key if has_trace else None)
-
-    sel_idx = len(iter_labels) - 1 if iter_labels else 0
-    selected_label = st.selectbox(
-        "Iteration", iter_labels, index=sel_idx, key="judge_iter"
-    )
-
-    if not selected_label or not iter_labels:
-        return
-
-    label_idx = (
-        iter_labels.index(selected_label) if selected_label in iter_labels else 0
-    )
-    trace_key = iter_trace_map[label_idx]
-
-    if trace_key is None:
-        st.info(
-            "No judge trace for this iteration — the orchestrated judge may not "
-            "have run yet for this iteration."
-        )
-        return
-
-    iteration, run_idx, tag = trace_key
-    trace = load_judge_trace(results_dir, iteration, run_idx, tag)
-    if trace is None:
-        st.warning("Trace file could not be loaded.")
-        return
-
-    render_judge_trace_viewer(trace)
-
-
-def render_judge_timeline(full_trace: list[dict]) -> None:
-    """Render the full investigation timeline as a vertical event stream."""
-    for event in full_trace:
-        event_type = event.get("type")
-
-        if event_type == "planning":
-            with st.container(border=True):
-                st.markdown("**📋 Planning**")
-                content = event.get("content", "")
-                st.markdown(content)
-
-        elif event_type == "tool_call":
-            with st.container(border=True):
-                tool_name = event.get("tool", "unknown")
-                args = event.get("args", {})
-                # Format args preview
-                args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                if len(args_preview) > 60:
-                    args_preview = args_preview[:57] + "..."
-                st.markdown(f"**🔧 {tool_name}**({args_preview})")
-
-                result_summary = event.get("result_summary", "")
-                if result_summary:
-                    st.caption(result_summary[:300])
-
-                # Expander for full args and result
-                with st.expander("Full details"):
-                    st.subheader("Arguments")
-                    st.json(args)
-                    st.subheader("Result")
-                    st.text(result_summary)
-
-        elif event_type == "reflection":
-            with st.container(border=True):
-                st.markdown("*💭 **Reflection***")
-                content = event.get("content", "")
-                st.markdown(content)
-
-
-def render_judge_trace_viewer(trace: dict[str, Any]) -> None:
-    """Render a single judge trace with all sections."""
-    is_short_circuit = trace.get("short_circuit", False)
-
-    if is_short_circuit:
-        source_iter = trace.get("source_iter", "?")
-        st.warning(
-            f"⚡ **Short-circuit verdict** — All candidate models from iteration "
-            f"{source_iter} failed parameter recovery. The verdict was reused "
-            f"from a prior iteration with failure notes appended."
-        )
-        recovery_failures = trace.get("recovery_failures", [])
-        if recovery_failures:
-            rows = []
-            for rf in recovery_failures:
-                name = rf.get("model", rf.get("function_name", "?"))
-                mean_r = rf.get("mean_r", "N/A")
-                mean_r_str = (
-                    f"{mean_r:.2f}" if isinstance(mean_r, (int, float)) else str(mean_r)
-                )
-                per_param = rf.get("recovery_per_param", {})
-                if per_param:
-                    worst = min(
-                        per_param,
-                        key=lambda k: (
-                            per_param[k]
-                            if isinstance(per_param[k], (int, float))
-                            else 0
-                        ),
-                    )
-                    worst_str = (
-                        f"{worst} r={per_param[worst]:.2f}"
-                        if isinstance(per_param[worst], (int, float))
-                        else ""
-                    )
-                    worst_params = [
-                        f"{k} r={v:.2f}"
-                        for k, v in sorted(
-                            per_param.items(),
-                            key=lambda kv: (
-                                kv[1] if isinstance(kv[1], (int, float)) else 0
-                            ),
-                        )
-                    ][:3]
-                    worst_str = ", ".join(worst_params)
-                else:
-                    worst_str = "-"
-                rows.append(
-                    {"Model": name, "Mean r": mean_r_str, "Worst parameters": worst_str}
-                )
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    tool_call_count = trace.get("tool_call_count", 0)
-    wall_time = trace.get("wall_time_seconds", 0.0)
-    timestamp = trace.get("timestamp", "")
-    if timestamp:
+    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    baseline = (snapshot or {}).get("baseline") or {}
+    baseline_bic = baseline.get("metric_value")
+    metric_value = row.get("metric_value")
+    baseline_delta = None
+    if baseline_bic is not None and metric_value is not None:
         try:
-            from datetime import datetime as _dt
+            baseline_delta = float(baseline_bic) - float(metric_value)
+        except (TypeError, ValueError):
+            baseline_delta = None
 
-            ts_display = _dt.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
-        except (ValueError, TypeError):
-            ts_display = timestamp[:19] if len(timestamp) >= 19 else timestamp
+    caption_bits = [f"Selected {row.get('dashboard_model_key') or model_dashboard_key(row)}."]
+    if baseline:
+        caption_bits.append(f"Baseline: {baseline.get('name') or 'baseline'} ({components.format_value(baseline_bic, default='—')}).")
+    if baseline_delta is not None:
+        caption_bits.append(f"Δ vs baseline: {components.format_value(baseline_delta, default='—', precision=3)}.")
+    components.section_header("Selected model detail", caption=" ".join(caption_bits))
+
+    components.key_value("Model", row.get("name") or row.get("function_name") or "—")
+    components.key_value("Status", components.status_metadata(row.get("status"))["label"])
+    components.key_value("Metric", f"{components.format_value(metric_value, default='—')} ({row.get('metric_name') or 'metric'})")
+    if row.get("split") is not None:
+        components.key_value("Split", row.get("split"))
+    if row.get("display_rank") is not None:
+        components.key_value("Rank", row.get("display_rank"))
+
+    params = row.get("param_names") or detail.get("param_names") or []
+    if params:
+        components.key_value("Parameters", ", ".join(str(param) for param in params))
     else:
-        ts_display = "-"
+        components.key_value("Parameters", "—")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Tool calls", tool_call_count)
-    c2.metric("Wall time", f"{wall_time:.1f}s")
-    c3.metric("Timestamp", ts_display)
+    recovery = detail.get("parameter_recovery") or row.get("parameter_recovery")
+    error_value = (
+        detail.get("error")
+        or row.get("error")
+        or row.get("last_error")
+        or row.get("error_message")
+    )
 
-    full_trace = trace.get("full_trace", [])
-    tool_calls = trace.get("tool_call_trace", [])
+    with st.expander("Error / recovery status", expanded=False):
+        if error_value is not None and not _missing_value(error_value):
+            st.warning(f"{error_value}")
+        else:
+            st.info("No explicit error recorded.")
 
-    if full_trace:
-        with st.expander("**Investigation Timeline**", expanded=True):
-            render_judge_timeline(full_trace)
-    elif tool_calls:
-        with st.expander(f"**Tool Calls** ({len(tool_calls)} calls)", expanded=False):
-            rows = []
-            for i, tc in enumerate(tool_calls):
-                args = tc.get("args", {})
-                args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                if len(args_str) > 80:
-                    args_str = args_str[:77] + "..."
-                result_preview = tc.get("result_summary", "")[:200]
-                rows.append(
-                    {
-                        "#": i + 1,
-                        "Tool": tc.get("tool", ""),
-                        "Args": args_str,
-                        "Result Preview": result_preview,
-                    }
-                )
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+        if isinstance(recovery, dict):
+            if recovery.get("passed") is False:
+                st.warning("Parameter recovery failed.")
+            if recovery.get("simulation_error"):
+                st.warning(f"Recovery simulation error: {recovery.get('simulation_error')}")
+        elif recovery:
+            st.write(recovery)
 
-            for i, tc in enumerate(tool_calls):
-                with st.expander(
-                    f"Call {i + 1}: {tc.get('tool', '?')}", expanded=False
-                ):
-                    st.json(tc.get("args", {}))
-                    st.text(tc.get("result_summary", ""))
-    elif is_short_circuit:
-        st.caption("No tool calls (short-circuit verdict).")
-    else:
-        st.caption("No tool calls recorded.")
+    provenance_bits = [
+        f"{row.get('source_db') or 'registry'}",
+        f"model_id={components.format_value(row.get('model_id'))}" if row.get("model_id") is not None else None,
+        f"client_id={components.format_value(row.get('client_id'))}" if row.get("client_id") is not None else None,
+        f"iteration={components.format_value(row.get('iteration'))}" if row.get("iteration") is not None else None,
+        f"result_index={components.format_value(row.get('result_index'))}" if row.get("result_index") is not None else None,
+        f"split={row.get('split')}" if row.get("split") is not None else None,
+    ]
+    provenance = " • ".join(bit for bit in provenance_bits if bit)
+    components.key_value("Provenance", provenance)
 
-    per_angle = trace.get("per_angle", [])
-    if per_angle:
-        st.subheader("Per-Angle Analysis")
-        for row_idx in range(0, len(per_angle), 2):
-            cols = st.columns(2)
-            for col_idx in range(2):
-                angle_idx = row_idx + col_idx
-                if angle_idx >= len(per_angle):
-                    break
-                angle_data = per_angle[angle_idx]
-                if not isinstance(angle_data, dict):
-                    continue
-                with cols[col_idx]:
-                    with st.container(border=True):
-                        angle_name = angle_data.get("angle", "Unknown")
-                        confidence = angle_data.get("confidence", "")
-                        icon = _CONFIDENCE_ICONS.get(confidence, "⚪")
-                        st.markdown(f"**{angle_name}**")
-                        st.markdown(
-                            f"{icon} **{confidence.upper()}**"
-                            if confidence
-                            else "⚪ Analysis pending"
-                        )
-                        supporting = angle_data.get("supporting_tool_calls", [])
-                        if supporting:
-                            pills = " ".join(f"`{t}`" for t in supporting)
-                            st.markdown(
-                                f"<small>📎 {pills}</small>", unsafe_allow_html=True
-                            )
-                        findings = angle_data.get("findings", "")
-                        if findings:
-                            lines = findings.split("\n")
-                            preview = "\n".join(lines[:3])
-                            if len(lines) > 3:
-                                with st.expander("Full findings"):
-                                    st.markdown(findings)
-                            else:
-                                st.markdown(preview)
-    elif is_short_circuit:
-        pass
-    else:
-        st.info("No per-angle analysis available.")
+    _render_artifact_handoff(
+        "Model artifacts",
+        "Raw generated code, recovery payloads, validation errors, R² details, and other debug material are centralized in the Artifacts tab.",
+    )
 
-    recommendations = trace.get("key_recommendations", [])
-    if recommendations:
-        st.subheader("Key Recommendations")
-        for i, rec in enumerate(recommendations[:5], 1):
-            st.markdown(f"{i}. {rec}")
+    _render_detail_payload("Selected model details", detail or row)
 
-    # Display personas and stuck_search as metadata badges
-    personas = trace.get("personas", [])
-    stuck_search = trace.get("stuck_search", False)
+    components.debug_details("Model summary payload", {"dashboard_model_key": row.get("dashboard_model_key"), "source_db": row.get("source_db"), "model_id": row.get("model_id"), "split": row.get("split")})
 
-    if personas or stuck_search:
-        badge_cols = st.columns([1, 1, 4])
-        with badge_cols[0]:
-            if personas:
-                st.markdown(f"**Personas:** {', '.join(personas)}")
-        with badge_cols[1]:
-            if stuck_search:
-                st.markdown("🔴 **Stuck Search**")
 
-    feedback = trace.get("synthesized_feedback", "")
-    if feedback:
-        with st.expander("**Synthesized Feedback**"):
-            st.caption(
-                "Feedback is written for the model code generator — not for human interpretation."
-            )
-            # Handle dict-format (orchestrator) vs string-format (legacy)
-            if isinstance(feedback, dict):
-                for persona_name, persona_feedback in feedback.items():
-                    with st.expander(
-                        f"Persona: {persona_name}", expanded=(persona_name == "exploit")
-                    ):
-                        st.markdown(persona_feedback)
+def render_waiting_state(results_dir: str, registry_path: str) -> None:
+    if st is None:
+        return
+    st.warning(f"Waiting for {registry_path} in {results_dir}.")
+
+
+def render_clients_tab(snapshot: dict[str, Any] | None) -> None:
+    if st is None:
+        return
+    components.section_header("Clients", caption="Live client status and freshness.")
+    if snapshot is None:
+        components.empty_state("No client state available.")
+        return
+    frame = build_client_df(snapshot)
+    if frame.empty:
+        components.empty_state("No client rows available.")
+        return
+
+    status_series = frame["status"].map(components.normalize_status) if "status" in frame.columns else pd.Series(dtype=str)
+    running_count = int(status_series.isin({"running", "retrying"}).sum())
+    complete_count = int(status_series.isin({"complete", "complete_no_success", "success"}).sum())
+    issue_count = int(status_series.isin({"error", "failed", "validation_error", "fit_error", "recovery_failed"}).sum())
+
+    components.metric_grid(
+        [
+            {"label": "Clients", "value": components.format_value(len(frame))},
+            {"label": "Running", "value": components.format_value(running_count)},
+            {"label": "Complete", "value": components.format_value(complete_count)},
+            {"label": "Issues", "value": components.format_value(issue_count)},
+        ]
+    )
+
+    display_frame = frame.copy()
+    display_frame["status"] = display_frame["status label"]
+    display_frame["activity"] = display_frame["activity"].map(lambda value: components.format_value(value))
+    display_frame["last iteration"] = display_frame["last iteration"].map(lambda value: components.format_value(value))
+    display_frame["best BIC"] = display_frame["best BIC"].map(lambda value: components.format_value(value, precision=2))
+    display_frame["updated"] = display_frame["updated age"]
+
+    display_columns = [column for column in ["client", "status", "activity", "last iteration", "best BIC", "updated"] if column in display_frame.columns]
+    components.write_dataframe(display_frame[display_columns])
+
+
+def render_models_tab(summary: pd.DataFrame | None, *, snapshot: dict[str, Any] | None = None, top_n: int = 10) -> None:
+    if st is None:
+        return
+    frame = build_model_comparison_frame(summary, snapshot=snapshot)
+    if frame is None or frame.empty:
+        caption = None
+        if snapshot and snapshot.get("baseline"):
+            baseline = snapshot["baseline"]
+            caption = f"Baseline: {baseline.get('name') or 'baseline'} • BIC {components.format_value(baseline.get('metric_value'))}"
+        components.section_header("Models", caption=caption)
+        components.empty_state("No diagnostics or registry model rows available.")
+        return
+
+    baseline = (snapshot or {}).get("baseline") or {}
+    caption_bits = []
+    if baseline:
+        caption_bits.append(f"Baseline: {baseline.get('name') or 'baseline'} • BIC {components.format_value(baseline.get('metric_value'))}")
+    if frame["display_rank"].notna().any():
+        best_row = frame[frame["display_rank"].notna()].iloc[0]
+        if baseline and baseline.get("metric_value") is not None and best_row.get("metric_value") is not None:
+            try:
+                delta = float(baseline.get("metric_value")) - float(best_row.get("metric_value"))
+            except (TypeError, ValueError):
+                delta = None
             else:
-                st.markdown(feedback)
+                caption_bits.append(f"Best Δ vs baseline {components.format_value(delta, default='—', precision=3)}")
+    components.section_header("Models", caption=" • ".join(caption_bits) if caption_bits else None)
+
+    display_frame = _rankable_selection_frame(frame, top_n=top_n).reset_index(drop=True)
+    display_columns = [
+        column
+        for column in ["display_rank", "dashboard_model_key", "name", "split", "metric_name", "metric_value", "mean_r2", "max_r2", "status"]
+        if column in display_frame.columns
+    ]
+    components.write_dataframe(display_frame[display_columns])
+
+    top_frame = display_frame
+    if top_frame.empty:
+        components.empty_state("No model rows to inspect.")
+        return
+
+    key_to_row = {str(row.get("dashboard_model_key") or model_dashboard_key(row.to_dict())): row.to_dict() for _, row in top_frame.iterrows()}
+    option_keys = list(key_to_row)
+    selectbox = getattr(st, "selectbox", None)
+    if callable(selectbox):
+        selected_key = selectbox(
+            "Selected model",
+            option_keys,
+            index=0,
+            format_func=lambda key: _format_model_option(key_to_row[str(key)], rank=key_to_row[str(key)].get("display_rank")),
+        )
+    else:
+        selected_key = option_keys[0]
+    selected_row = key_to_row[str(selected_key)]
+    _render_model_detail_panel(selected_row, snapshot=snapshot)
+
+
+def render_results_tab(
+    summary: pd.DataFrame | None,
+    *,
+    results_dir: Path | str | None = None,
+    feedback_artifacts: list[dict[str, Any]] | None = None,
+    snapshot: dict[str, Any] | None = None,
+    trace_artifacts: list[dict[str, Any]] | None = None,
+) -> None:
+    if st is None:
+        return
+    components.section_header("Artifacts", caption="Centralized raw registry, feedback, trace, and debug artifacts.")
+
+    if snapshot is not None:
+        with st.expander("Registry JSON", expanded=False):
+            st.caption("Raw registry snapshot payload.")
+            st.json(snapshot)
+
+    if summary is None:
+        components.empty_state("No diagnostics rows available.")
+    else:
+        columns = [column for column in ["dashboard_model_key", "name", "split", "metric_value", "status"] if column in summary.columns]
+        components.write_dataframe(summary[columns].head(25) if columns else summary.head(25))
+
+        st.subheader("Artifacts browser")
+        for _, row in summary.head(25).iterrows():
+            _render_row_drilldown(str(row.get("dashboard_model_key") or row.get("name") or "Result"), row.to_dict())
+
+    if feedback_artifacts:
+        components.section_header("Raw LLM output / feedback")
+        for artifact in feedback_artifacts:
+            title = _artifact_title("Artifact", artifact)
+            _render_plain_artifact(title, artifact)
+
+    if trace_artifacts:
+        components.section_header("Full judge traces")
+        for artifact in trace_artifacts:
+            title = _artifact_title("Judge trace", artifact)
+            _render_judge_artifact(title, artifact)
+
+
+def _judge_feedback_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if not value:
+            return None
+        if "default" in value and value["default"]:
+            return str(value["default"])
+        parts = [f"{key}: {components.format_value(item)}" for key, item in value.items() if not _missing_value(item)]
+        return "; ".join(parts) if parts else None
+    if isinstance(value, (list, tuple)):
+        items = [components.format_value(item) for item in value if not _missing_value(item)]
+        return "; ".join(items) if items else None
+    text = components.format_value(value)
+    return text if text != "—" else None
+
+
+def _judge_verdict_payload(row: dict[str, Any]) -> dict[str, Any]:
+    verdict = row.get("verdict")
+    return verdict if isinstance(verdict, dict) else {}
+
+
+def _judge_verdict_label(row: dict[str, Any]) -> str:
+    verdict = _judge_verdict_payload(row)
+    if verdict:
+        if verdict.get("accepted") is True:
+            return "Accepted"
+        if verdict.get("accepted") is False:
+            return "Rejected"
+        label = verdict.get("label") or verdict.get("decision") or verdict.get("status")
+        if label is not None:
+            return components.format_value(label, default="Verdict available")
+        return "Verdict available"
+    if bool(row.get("failed")):
+        return "Failed"
+    return "Awaiting verdict"
+
+
+def _judge_status_label(row: dict[str, Any]) -> str:
+    if bool(row.get("failed")):
+        return "Failed"
+    if _judge_verdict_payload(row):
+        return "Resolved"
+    return "Awaiting verdict"
+
+
+def _judge_recommendations(row: dict[str, Any]) -> list[str]:
+    verdict = _judge_verdict_payload(row)
+    recommendations: list[str] = []
+    raw_recommendations = verdict.get("key_recommendations") if verdict else None
+    if isinstance(raw_recommendations, (list, tuple)):
+        for recommendation in raw_recommendations:
+            if not _missing_value(recommendation):
+                recommendations.append(components.format_value(recommendation))
+    elif not _missing_value(raw_recommendations):
+        recommendations.append(components.format_value(raw_recommendations))
+    return recommendations
+
+
+def _judge_confidence_summary(row: dict[str, Any]) -> str | None:
+    verdict = _judge_verdict_payload(row)
+    per_angle = verdict.get("per_angle") if verdict else None
+    if not isinstance(per_angle, (list, tuple)):
+        return None
+
+    entries: list[str] = []
+    for angle in per_angle:
+        if not isinstance(angle, dict):
+            continue
+        name = angle.get("angle") or angle.get("name") or "angle"
+        confidence = angle.get("confidence")
+        findings = angle.get("findings") or angle.get("summary")
+        bits = [str(name)]
+        if not _missing_value(confidence):
+            bits.append(f"confidence={components.format_value(confidence)}")
+        if not _missing_value(findings):
+            bits.append(components.format_value(findings))
+        entries.append(" • ".join(bits))
+
+    if not entries:
+        return None
+    return "; ".join(entries)
+
+
+def _judge_trace_artifact_for_iteration(iteration: Any, trace_artifacts: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    if not trace_artifacts:
+        return None
+    iteration_text = str(iteration)
+    for artifact in trace_artifacts:
+        artifact_iteration = artifact.get("iteration")
+        if artifact_iteration is not None and str(artifact_iteration) == iteration_text:
+            return artifact
+        path = str(artifact.get("path") or "")
+        payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+        if str(payload.get("iteration")) == str(iteration):
+            return artifact
+        basename = Path(path).name
+        if re.search(rf"^iter{re.escape(iteration_text)}(?=(_|\.|$))", basename):
+            return artifact
+    return None
+
+
+def _judge_trace_state(row: dict[str, Any], trace_artifact: dict[str, Any] | None) -> str:
+    if trace_artifact is None:
+        return "Trace JSON missing"
+
+    payload = trace_artifact.get("payload") if isinstance(trace_artifact.get("payload"), dict) else {}
+    trace = trace_artifact.get("trace")
+    full_trace = trace_artifact.get("full_trace")
+    trace_count = len(trace) if isinstance(trace, list) else 0
+    full_trace_count = len(full_trace) if isinstance(full_trace, list) else 0
+
+    if payload.get("short_circuit"):
+        return f"Short-circuit trace • {trace_count} tool calls"
+    if bool(row.get("failed")) and not trace_count and not full_trace_count:
+        return "Failed before trace capture"
+
+    parts = [f"{trace_count} tool calls"]
+    if full_trace_count:
+        parts.append(f"{full_trace_count} timeline steps")
+    return " • ".join(parts)
+
+
+def _judge_summary_frame(judge_rows: list[dict[str, Any]], trace_artifacts: list[dict[str, Any]] | None) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for row in judge_rows:
+        trace_artifact = _judge_trace_artifact_for_iteration(row.get("iteration"), trace_artifacts)
+        feedback_text = _judge_feedback_text(row.get("synthesized_feedback") or row.get("feedback"))
+        recommendations = _judge_recommendations(row)
+        confidence_summary = _judge_confidence_summary(row)
+        rows.append(
+            {
+                "iteration": row.get("iteration"),
+                "status": _judge_status_label(row),
+                "verdict": _judge_verdict_label(row),
+                "recommendations": "; ".join(recommendations) if recommendations else "—",
+                "confidence summary": confidence_summary or "—",
+                "trace state": _judge_trace_state(row, trace_artifact),
+                "feedback": feedback_text or "—",
+                "error": row.get("error") or "—",
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "iteration",
+            "status",
+            "verdict",
+            "recommendations",
+            "confidence summary",
+            "trace state",
+            "feedback",
+            "error",
+        ],
+    )
+
+
+def render_judge_tab(
+    judge_rows: list[dict[str, Any]],
+    *,
+    results_dir: Path | str | None = None,
+    trace_artifacts: list[dict[str, Any]] | None = None,
+) -> None:
+    if st is None:
+        return
+    components.section_header(
+        "Judge",
+        caption="Registry judge state, verdicts, recommendations, and confidence summaries appear before trace details.",
+    )
+    if not judge_rows:
+        components.empty_state("No judge rows available.")
+    else:
+        components.section_header("Registry verdict summary")
+        components.write_dataframe(_judge_summary_frame(judge_rows, trace_artifacts))
+
+        components.section_header("Judge iteration details")
+        st.subheader("Verdict / feedback drilldown")
+        for row in judge_rows:
+            trace_artifact = _judge_trace_artifact_for_iteration(row.get("iteration"), trace_artifacts)
+            title = f"Judge iteration {row.get('iteration', '?')} — {_judge_verdict_label(row)}"
+            with st.expander(title, expanded=False):
+                st.subheader("Registry state")
+                st.write(f"Status: {_judge_status_label(row)}")
+                st.write(f"Verdict: {_judge_verdict_label(row)}")
+                if row.get("failed"):
+                    st.warning("Judge marked this iteration as failed.")
+                feedback = _judge_feedback_text(row.get("synthesized_feedback") or row.get("feedback"))
+                if feedback:
+                    st.subheader("Feedback")
+                    st.write(feedback)
+                verdict = _judge_verdict_payload(row)
+                if verdict:
+                    st.subheader("Verdict")
+                    st.write(verdict)
+                recommendations = _judge_recommendations(row)
+                if recommendations:
+                    st.subheader("Recommendations")
+                    for recommendation in recommendations:
+                        st.write(f"- {recommendation}")
+                confidence_summary = _judge_confidence_summary(row)
+                if confidence_summary:
+                    st.subheader("Confidence summary")
+                    st.write(confidence_summary)
+                trace_state = _judge_trace_state(row, trace_artifact)
+                st.subheader("Trace state")
+                st.write(trace_state)
+                if trace_artifact is None:
+                    components.empty_state("Trace JSON is optional; the registry verdict remains visible without it.")
+                else:
+                    st.caption("Full timeline/tool-call/raw trace details are centralized in Artifacts.")
+                if row.get("error"):
+                    st.subheader("Error")
+                    st.write(row["error"])
+
+        _render_artifact_handoff(
+            "Judge artifacts",
+            "Full judge traces, raw payloads, and generated debug output are centralized in the Artifacts tab.",
+        )

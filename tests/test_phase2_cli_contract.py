@@ -186,6 +186,53 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
     assert len(seen_commands) == 3
 
 
+def test_run_distributed_does_not_launch_orchestrator_for_judge_mode_off(tmp_path):
+    """judge.mode=off should keep distributed runs judge-free."""
+    from gecco.cli.launch_distributed import run_distributed_launcher
+    from gecco.cli.launcher_utils import LaunchExecutor as RealLaunchExecutor
+
+    project_root = tmp_path
+    config_dir = project_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "demo.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1, n_clients=2),
+        judge=SimpleNamespace(mode="off"),
+        centralized_model_generation=SimpleNamespace(enabled=False),
+        clients={"alpha": SimpleNamespace(), "beta": SimpleNamespace()},
+        slurm={},
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        if "run_gecco_distributed.sh" in command and "--array=" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2001\n", stderr="")
+        if "run_test_evaluation.sh" in command:
+            return SimpleNamespace(returncode=0, stdout="Submitted batch job 2003\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    real_executor = RealLaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+
+    with patch("gecco.cli.launch_distributed.PROJECT_ROOT", project_root):
+        with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
+            with patch("gecco.cli.launch_distributed.get_provider_spec") as provider_spec_mock:
+                provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
+                with patch("gecco.cli.launch_distributed.init_sentry"):
+                    with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
+                        run_distributed_launcher(config="demo.yaml")
+
+    assert len(seen_commands) == 2
+    assert "run_gecco_distributed.sh" in seen_commands[0]
+    assert "run_test_evaluation.sh" in seen_commands[1]
+    assert all("run_judge_orchestrator.sh" not in command for command in seen_commands)
+
+
 def test_run_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
     """With --conda-env, sbatch commands should include the conda env name."""
     from gecco.cli.launch_distributed import run_distributed_launcher
@@ -363,6 +410,57 @@ def test_run_cmg_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path
         'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" "gecco_mh"'
     )
     assert all("uv run" not in command for command in seen_commands)
+
+
+def test_distributed_client_publishes_abort_on_unhandled_exception(tmp_path):
+    """Client failures should persist shared abort state before re-raising."""
+    from gecco.cli import run_gecco_distributed as distributed
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="mock", base_model="mock-model"),
+        loop=SimpleNamespace(max_independent_runs=1, max_iterations=1),
+        data=SimpleNamespace(
+            path="unused.csv",
+            input_columns=["choice"],
+            id_column="participant",
+            splits="train",
+            data2text_function="dummy",
+            narrative_template="template",
+        ),
+        evaluation=SimpleNamespace(
+            fit_type="group",
+            train_ratio=0.6,
+            val_ratio=0.2,
+            split_seed=42,
+            metric="bic",
+        ),
+        metadata=SimpleNamespace(flag=False),
+    )
+    project_root = tmp_path / "project_root"
+    (project_root / "config").mkdir(parents=True, exist_ok=True)
+
+    with patch.object(distributed, "PROJECT_ROOT", project_root):
+        with patch.object(distributed, "load_config", return_value=cfg):
+            with patch.object(distributed, "configure_temp_dirs"):
+                with patch.object(distributed, "init_sentry"):
+                    with patch.object(
+                        distributed,
+                        "load_data",
+                        side_effect=RuntimeError("data load boom"),
+                    ):
+                        with pytest.raises(RuntimeError, match="data load boom"):
+                            distributed.run_distributed_client(config="demo.yaml")
+
+    registry = distributed.SharedRegistry.open_existing(
+        project_root / "results" / "demo-task" / "shared_registry.duckdb"
+    )
+    abort = registry.get_abort()
+    assert abort is not None
+    assert abort["client_id"] == 0
+    assert abort["status"] == "failed"
+    assert abort["reason"] == "RuntimeError: data load boom"
+    assert registry.read()["client_entries"]["0"]["status"] == "failed"
 
 
 def test_cli_entrypoint_functions_are_importable_and_callable():

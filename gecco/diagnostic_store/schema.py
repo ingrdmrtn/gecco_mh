@@ -9,7 +9,7 @@ Call :func:`create_schema` on a fresh DuckDB connection to initialise the
 database.
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 CREATE_STATEMENTS = [
     # ------------------------------------------------------------------ #
@@ -228,6 +228,17 @@ CREATE_STATEMENTS = [
         failed                  BOOLEAN DEFAULT FALSE,
         error                   TEXT,
         timestamp               VARCHAR
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_abort (
+        singleton      INTEGER PRIMARY KEY DEFAULT 1,
+        client_id      VARCHAR,
+        iteration      INTEGER,
+        reason         TEXT,
+        status         VARCHAR NOT NULL DEFAULT 'failed',
+        created_at     VARCHAR,
+        CHECK (singleton = 1)
     )
     """,
     """

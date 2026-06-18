@@ -166,10 +166,10 @@ class GeCCoModelSearch:
 
         # --- Unified judge pipeline ---
         self.tool_judge = None
-        self.judge_enabled = bool(judge_cfg is not None)
         judge_mode = get_judge_mode(cfg)
+        self.judge_enabled = bool(judge_cfg is not None and judge_mode != "off")
         judge_needs_store = judge_mode not in ("off", "random")
-        if judge_cfg:
+        if self.judge_enabled:
             if shared_registry is not None:
                 console.print(
                     "[dim]Orchestrated mode: per-client tool judge skipped.[/]"
@@ -820,6 +820,9 @@ class GeCCoModelSearch:
         for it in range(start_iter, end_iter):
             console.rule(f"[bold]Iteration {it}")
 
+            if self.shared_registry is not None:
+                self.shared_registry.raise_if_aborted()
+
             # --- Sync from shared registry (distributed mode) ---
             self._sync_from_registry()
 
@@ -929,7 +932,7 @@ class GeCCoModelSearch:
                         persona_name=self.client_id or "default",
                         set_activity=self._set_activity,
                     )
-                else:
+                elif not feedback:
                     feedback = ""
                     verdict = SimpleNamespace(
                         synthesized_feedback="",

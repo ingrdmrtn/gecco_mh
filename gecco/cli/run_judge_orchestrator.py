@@ -182,6 +182,8 @@ def run_orchestrator(
     for iteration in range(max_iterations):
         console.rule(f"[bold]Judge Orchestrator - Iteration {iteration}")
 
+        registry.raise_if_aborted()
+
         console.print(
             f"[cyan]Waiting for {resolved_n_clients} clients to complete iteration {iteration}...[/]"
         )

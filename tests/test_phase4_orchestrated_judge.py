@@ -24,6 +24,133 @@ from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.run_gecco import GeCCoModelSearch
 
 
+def test_judge_mode_off_does_not_wait_for_centralized_feedback(tmp_path):
+    """Distributed clients should not wait on judge feedback when mode is off."""
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=2),
+        judge=SimpleNamespace(mode="off", barrier=SimpleNamespace(client_wait_seconds=1)),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        validation=SimpleNamespace(max_syntax_retries=0),
+        centralized_model_generation=SimpleNamespace(enabled=False),
+    )
+    search.shared_registry = MagicMock()
+    search.shared_registry.wait_for_judge_feedback.side_effect = AssertionError(
+        "judge feedback should not be awaited"
+    )
+    search.client_id = "alpha"
+    search.judge_enabled = False
+    search.tool_judge = None
+    search.best_model = None
+    search.best_metric = 0.0
+    search.best_params = None
+    search.best_iter = 0
+    search.best_state = SimpleNamespace()
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 0
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 0
+    search.df_val = None
+    search.prompt_builder = None
+    search.generate = None
+    search.model = None
+    search.tokenizer = None
+    search.tried_param_sets = set()
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.df = SimpleNamespace()
+    search._sync_from_registry = MagicMock()
+    search._sync_best_attrs_from_state = MagicMock()
+    search._set_activity = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._cmg_config = MagicMock(return_value=None)
+    search._require_distributed_coordinator = MagicMock(
+        return_value=SimpleNamespace(start_iteration=MagicMock(return_value=1))
+    )
+    search._require_artifact_store = MagicMock()
+    search._require_candidate_generator = MagicMock(
+        return_value=SimpleNamespace(generate_non_cmg_iteration=MagicMock(return_value=SimpleNamespace()))
+    )
+    search._require_candidate_evaluator = MagicMock(
+        return_value=SimpleNamespace(
+            run_non_cmg_iteration=MagicMock(
+                return_value=SimpleNamespace(should_retry=False, had_runnable_model=False)
+            )
+        )
+    )
+
+    search.run_n_shots(run_idx=0, baseline_bic=0.0)
+
+    search.shared_registry.wait_for_judge_feedback.assert_not_called()
+
+
+def test_distributed_run_raises_immediately_when_shared_abort_is_present(tmp_path):
+    """Abort state should stop a distributed client before any judge wait or fitting."""
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=2),
+        judge=SimpleNamespace(mode="static", barrier=SimpleNamespace(client_wait_seconds=1)),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        validation=SimpleNamespace(max_syntax_retries=0),
+        centralized_model_generation=SimpleNamespace(enabled=False),
+    )
+    search.shared_registry = MagicMock()
+    search.shared_registry.raise_if_aborted.side_effect = RuntimeError("shared abort")
+    search.shared_registry.wait_for_judge_feedback.side_effect = AssertionError(
+        "judge feedback should not be awaited after abort"
+    )
+    search.client_id = "alpha"
+    search.judge_enabled = True
+    search.tool_judge = None
+    search.best_model = "def candidate_model():\n    return 0.0"
+    search.best_metric = 0.0
+    search.best_params = None
+    search.best_iter = 0
+    search.best_state = SimpleNamespace()
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 0
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 0
+    search.df_val = None
+    search.prompt_builder = None
+    search.generate = MagicMock(side_effect=AssertionError("generate should not run"))
+    search.model = None
+    search.tokenizer = None
+    search.tried_param_sets = set()
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.df = SimpleNamespace(participant=["p1"])
+    search._sync_from_registry = MagicMock()
+    search._sync_best_attrs_from_state = MagicMock()
+    search._set_activity = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._cmg_config = MagicMock(return_value=None)
+    search._require_distributed_coordinator = MagicMock(
+        return_value=SimpleNamespace(start_iteration=MagicMock(return_value=1))
+    )
+    search._require_artifact_store = MagicMock()
+    search._require_candidate_generator = MagicMock(
+        return_value=SimpleNamespace(generate_non_cmg_iteration=MagicMock())
+    )
+    search._require_candidate_evaluator = MagicMock(
+        return_value=SimpleNamespace(run_non_cmg_iteration=MagicMock())
+    )
+
+    with pytest.raises(RuntimeError, match="shared abort"):
+        search.run_n_shots(run_idx=0, baseline_bic=0.0)
+
+    search.shared_registry.raise_if_aborted.assert_called_once()
+    search.shared_registry.wait_for_judge_feedback.assert_not_called()
+    search._require_candidate_generator.assert_not_called()
+    search._require_candidate_evaluator.assert_not_called()
+
+
 class _SummaryOnlyStore:
     """Store stub that exposes duplicate attempted models and a short trajectory."""
 

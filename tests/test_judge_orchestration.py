@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 import sys
 import os
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -74,6 +75,43 @@ class TestBarrierPrimitives:
 
             assert count == 1
             assert 0.9 < elapsed < 1.5  # Should wait roughly 1 second
+
+    def test_wait_for_clients_complete_raises_on_abort_without_proceeding(self):
+        """An active abort should stop the client barrier immediately."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
+            registry.request_abort(
+                client_id=7,
+                iteration=3,
+                reason="RuntimeError: distributed client crashed",
+            )
+
+            with patch("gecco.coordination.time.sleep", side_effect=AssertionError("sleep should not run")):
+                with pytest.raises(RuntimeError, match="client 7"):
+                    registry.wait_for_clients_complete(
+                        iteration=3,
+                        n_expected=2,
+                        timeout_seconds=5.0,
+                        poll_seconds=0.1,
+                    )
+
+    def test_wait_for_judge_feedback_raises_on_abort_without_timeout_wait(self):
+        """Judge feedback polling should respect shared aborts before timing out."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry = SharedRegistry(str(Path(tmpdir) / "shared_registry.duckdb"))
+            registry.request_abort(
+                client_id="alpha",
+                iteration=4,
+                reason="ValueError: invalid model state",
+            )
+
+            with patch("gecco.coordination.time.sleep", side_effect=AssertionError("sleep should not run")):
+                with pytest.raises(RuntimeError, match="client alpha"):
+                    registry.wait_for_judge_feedback(
+                        iteration=4,
+                        timeout_seconds=5.0,
+                        poll_seconds=0.1,
+                    )
 
     def test_set_and_get_judge_feedback(self):
         """Test storing and retrieving shared judge feedback."""

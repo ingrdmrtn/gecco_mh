@@ -126,6 +126,55 @@ def test_normal_registry_writes_do_not_recreate_schema_after_initialization(
     assert registry.read()["iteration_history"][0]["iteration"] == 0
 
 
+def test_abort_state_round_trips_across_registry_handles(registry: SharedRegistry):
+    """Abort metadata should be visible from a separate registry handle."""
+    registry.request_abort(
+        client_id="client-a",
+        iteration=7,
+        reason="RuntimeError: client crashed",
+    )
+
+    other_handle = SharedRegistry.open_existing(registry.registry_path)
+    abort = other_handle.get_abort()
+
+    assert abort is not None
+    assert abort["client_id"] == "client-a"
+    assert abort["iteration"] == 7
+    assert abort["reason"] == "RuntimeError: client crashed"
+    assert abort["status"] == "failed"
+    assert other_handle.read()["abort"] == abort
+    with pytest.raises(RuntimeError, match="client-a"):
+        other_handle.raise_if_aborted()
+
+
+def test_request_abort_does_not_overwrite_existing_abort(registry: SharedRegistry):
+    """The first abort record should remain authoritative once written."""
+    registry.request_abort(
+        client_id="client-a",
+        iteration=7,
+        reason="RuntimeError: client crashed",
+    )
+
+    other_handle = SharedRegistry.open_existing(registry.registry_path)
+    other_handle.request_abort(
+        client_id="client-b",
+        iteration=8,
+        reason="ValueError: later failure",
+    )
+
+    abort = registry.get_abort()
+    assert abort is not None
+    assert abort["client_id"] == "client-a"
+    assert abort["iteration"] == 7
+    assert abort["reason"] == "RuntimeError: client crashed"
+
+
+def test_raise_if_aborted_is_noop_without_abort(registry: SharedRegistry):
+    """Absent abort state should keep registry waits available."""
+    assert registry.get_abort() is None
+    assert registry.raise_if_aborted() is None
+
+
 def test_runtime_iteration_history_counts_use_per_iteration_fields(
     registry: SharedRegistry,
 ):

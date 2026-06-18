@@ -113,64 +113,6 @@ def run_distributed_client(
     metadata = getattr(getattr(cfg, "metadata", None), "flag", False)
     max_independent_runs = cfg.loop.max_independent_runs
 
-    df = load_data(data_cfg.path, data_cfg.input_columns)
-    splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-    df_prompt = splits["prompt"]
-
-    train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
-    val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
-    non_prompt_ids = sorted(
-        set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique())
-    )
-    np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
-    np.random.shuffle(non_prompt_ids)
-    n = len(non_prompt_ids)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    train_ids = non_prompt_ids[:n_train]
-    val_ids = non_prompt_ids[n_train : n_train + n_val]
-    test_ids = non_prompt_ids[n_train + n_val :]
-    df_train = df[df[data_cfg.id_column].isin(train_ids)]
-    df_val = df[df[data_cfg.id_column].isin(val_ids)]
-    df_test = df[df[data_cfg.id_column].isin(test_ids)]
-
-    split_table = Table(title="Data Split", show_header=True, header_style="bold")
-    split_table.add_column("Split")
-    split_table.add_column("Participants", justify="right")
-    split_table.add_row("Prompt", str(len(df_prompt[data_cfg.id_column].unique())))
-    split_table.add_row("Train", str(len(train_ids)))
-    split_table.add_row("Val", str(len(val_ids)))
-    split_table.add_row("Test", str(len(test_ids)))
-    console.print(split_table)
-
-    if getattr(cfg.loop, "early_stopping", "False") == "True":
-        df_baselines = load_data(data_cfg.path)
-        splits_baselines = split_by_participant(
-            df_baselines, data_cfg.id_column, data_cfg.splits
-        )
-        df_train_splits = splits_baselines["train"]
-        baseline_bic = np.mean(df_train_splits.baseline_bic)
-    else:
-        baseline_bic = None
-
-    data2text = get_data2text_function(data_cfg.data2text_function)
-    data_text = data2text(
-        df_prompt,
-        id_col=data_cfg.id_column,
-        template=data_cfg.narrative_template,
-        fit_type=getattr(cfg.evaluation, "fit_type", "group"),
-        metadata=getattr(cfg.metadata, "narrative_template", None) if metadata else None,
-        max_trials=getattr(data_cfg, "max_prompt_trials", None),
-        value_mappings=getattr(data_cfg, "value_mappings", None),
-    )
-
-    prompt_builder = PromptBuilderWrapper(cfg, data_text, df_prompt)
-    model, tokenizer = load_llm(
-        cfg.llm.provider,
-        cfg.llm.base_model,
-        base_url=getattr(cfg.llm, "base_url", None),
-    )
-
     results_dir = (
         PROJECT_ROOT / "results" / cfg.task.name
         if getattr(cfg.evaluation, "fit_type", "group") != "individual"
@@ -178,37 +120,112 @@ def run_distributed_client(
     )
     registry = SharedRegistry(results_dir / "shared_registry.duckdb")
 
-    from gecco.baseline import fit_baseline_if_needed
+    try:
+        df = load_data(data_cfg.path, data_cfg.input_columns)
+        splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
+        df_prompt = splits["prompt"]
 
-    id_eval_data = None
-    if hasattr(cfg, "individual_differences_eval"):
-        from gecco.offline_evaluation.individual_differences import load_id_data
+        train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
+        val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
+        non_prompt_ids = sorted(
+            set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique())
+        )
+        np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
+        np.random.shuffle(non_prompt_ids)
+        n = len(non_prompt_ids)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        train_ids = non_prompt_ids[:n_train]
+        val_ids = non_prompt_ids[n_train : n_train + n_val]
+        test_ids = non_prompt_ids[n_train + n_val :]
+        df_train = df[df[data_cfg.id_column].isin(train_ids)]
+        df_val = df[df[data_cfg.id_column].isin(val_ids)]
+        df_test = df[df[data_cfg.id_column].isin(test_ids)]
 
-        id_eval_data = load_id_data(cfg)
+        split_table = Table(title="Data Split", show_header=True, header_style="bold")
+        split_table.add_column("Split")
+        split_table.add_column("Participants", justify="right")
+        split_table.add_row("Prompt", str(len(df_prompt[data_cfg.id_column].unique())))
+        split_table.add_row("Train", str(len(train_ids)))
+        split_table.add_row("Val", str(len(val_ids)))
+        split_table.add_row("Test", str(len(test_ids)))
+        console.print(split_table)
 
-    baseline_result = fit_baseline_if_needed(
-        cfg=cfg,
-        df_train=df_train,
-        registry=registry,
-        id_eval_data=id_eval_data,
-    )
-    if baseline_result:
-        console.print(
-            f"[dim]Baseline {baseline_result['metric_name']}: "
-            f"{baseline_result['metric_value']:.2f}[/]"
+        if getattr(cfg.loop, "early_stopping", "False") == "True":
+            df_baselines = load_data(data_cfg.path)
+            splits_baselines = split_by_participant(
+                df_baselines, data_cfg.id_column, data_cfg.splits
+            )
+            df_train_splits = splits_baselines["train"]
+            baseline_bic = np.mean(df_train_splits.baseline_bic)
+        else:
+            baseline_bic = None
+
+        data2text = get_data2text_function(data_cfg.data2text_function)
+        data_text = data2text(
+            df_prompt,
+            id_col=data_cfg.id_column,
+            template=data_cfg.narrative_template,
+            fit_type=getattr(cfg.evaluation, "fit_type", "group"),
+            metadata=getattr(cfg.metadata, "narrative_template", None) if metadata else None,
+            max_trials=getattr(data_cfg, "max_prompt_trials", None),
+            value_mappings=getattr(data_cfg, "value_mappings", None),
         )
 
-    search = GeCCoModelSearch(
-        model,
-        tokenizer,
-        cfg,
-        df_train,
-        prompt_builder,
-        client_id=resolved_client_id,
-        shared_registry=registry,
-        df_val=df_val,
-    )
+        prompt_builder = PromptBuilderWrapper(cfg, data_text, df_prompt)
+        model, tokenizer = load_llm(
+            cfg.llm.provider,
+            cfg.llm.base_model,
+            base_url=getattr(cfg.llm, "base_url", None),
+        )
+    except Exception as exc:
+        abort_reason = f"{exc.__class__.__name__}: {exc}"
+        console.print(
+            f"[red]Distributed client failed; publishing shared abort: {abort_reason}[/]"
+        )
+        try:
+            registry.request_abort(
+                client_id=resolved_client_id,
+                reason=abort_reason,
+                iteration=None,
+            )
+            registry.set_client_status(resolved_client_id, status="failed")
+        except Exception as abort_exc:
+            console.print(f"[red]Failed to publish shared abort: {abort_exc}[/]")
+        raise
+    search: GeCCoModelSearch | None = None
     try:
+        from gecco.baseline import fit_baseline_if_needed
+
+        id_eval_data = None
+        if hasattr(cfg, "individual_differences_eval"):
+            from gecco.offline_evaluation.individual_differences import load_id_data
+
+            id_eval_data = load_id_data(cfg)
+
+        baseline_result = fit_baseline_if_needed(
+            cfg=cfg,
+            df_train=df_train,
+            registry=registry,
+            id_eval_data=id_eval_data,
+        )
+        if baseline_result:
+            console.print(
+                f"[dim]Baseline {baseline_result['metric_name']}: "
+                f"{baseline_result['metric_value']:.2f}[/]"
+            )
+
+        search = GeCCoModelSearch(
+            model,
+            tokenizer,
+            cfg,
+            df_train,
+            prompt_builder,
+            client_id=resolved_client_id,
+            shared_registry=registry,
+            df_val=df_val,
+        )
+
         global_best_bic = np.inf
 
         for run_index in range(max_independent_runs):
@@ -298,8 +315,24 @@ def run_distributed_client(
         console.rule(f"[bold blue]Client {resolved_client_id} — GeCCo Search Complete")
         console.print(f"  Best mean BIC: [bold cyan]{global_best_bic:.2f}[/]")
         return None
+    except Exception as exc:
+        abort_reason = f"{exc.__class__.__name__}: {exc}"
+        console.print(
+            f"[red]Distributed client failed; publishing shared abort: {abort_reason}[/]"
+        )
+        try:
+            registry.request_abort(
+                client_id=resolved_client_id,
+                reason=abort_reason,
+                iteration=search.best_iter if search is not None and search.best_iter >= 0 else None,
+            )
+            registry.set_client_status(resolved_client_id, status="failed")
+        except Exception as abort_exc:
+            console.print(f"[red]Failed to publish shared abort: {abort_exc}[/]")
+        raise
     finally:
-        search.close()
+        if search is not None:
+            search.close()
 
 
 def main(args: argparse.Namespace) -> int | None:

@@ -68,6 +68,7 @@ class SharedRegistry:
         return {
             "global_best": None,
             "baseline": None,
+            "abort": None,
             "tried_param_sets": [],
             "client_entries": {},
             "iteration_history": [],
@@ -288,6 +289,19 @@ class SharedRegistry:
                     entry["error"] = row[4]
                 data["judge_iterations"][str(row[0])] = entry
 
+            abort_row = conn.execute(
+                "SELECT client_id, iteration, reason, status, created_at "
+                "FROM runtime_abort WHERE singleton = 1"
+            ).fetchone()
+            if abort_row is not None:
+                data["abort"] = {
+                    "client_id": self._restore_client_id(abort_row[0]),
+                    "iteration": abort_row[1],
+                    "reason": abort_row[2],
+                    "status": abort_row[3],
+                    "created_at": abort_row[4],
+                }
+
             return data
 
         return self._with_connection(write=False, operation="read", callback=_read)
@@ -432,6 +446,34 @@ class SharedRegistry:
 
         self._with_connection(write=True, operation="update", callback=_update)
 
+    def set_client_status(self, client_id, status, activity=None):
+        """Update a client's status without writing a new iteration row."""
+
+        client_key = self._client_key(client_id)
+
+        def _set(conn):
+            existing = conn.execute(
+                "SELECT last_iteration, best_metric, had_runnable_model, activity "
+                "FROM runtime_client_entries WHERE client_id = ?",
+                [client_key],
+            ).fetchone()
+            timestamp = datetime.now().isoformat()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO runtime_client_entries "
+                    "(client_id, last_iteration, best_metric, status, updated_at, had_runnable_model, activity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [client_key, None, None, status, timestamp, None, activity],
+                )
+            else:
+                conn.execute(
+                    "UPDATE runtime_client_entries SET status = ?, updated_at = ?, activity = COALESCE(?, activity) "
+                    "WHERE client_id = ?",
+                    [status, timestamp, activity, client_key],
+                )
+
+        self._with_connection(write=True, operation="set-client-status", callback=_set)
+
     def get_max_iteration(self):
         """Return the highest iteration number across all clients, or -1."""
         row = self._fetchone(
@@ -537,6 +579,7 @@ class SharedRegistry:
         """Poll until at least *n_expected* clients have written iteration results."""
         start_time = time.time()
         while True:
+            self.raise_if_aborted()
             count = self.count_clients_at_iteration(iteration)
             if count >= n_expected:
                 console.print(
@@ -545,6 +588,7 @@ class SharedRegistry:
                 )
                 return count
 
+            self.raise_if_aborted()
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 console.print(
@@ -585,6 +629,7 @@ class SharedRegistry:
         """Poll until *n_expected* clients have completed an iteration."""
         start_time = time.time()
         while True:
+            self.raise_if_aborted()
             count = self.count_clients_complete(iteration)
             if count >= n_expected:
                 console.print(
@@ -593,6 +638,7 @@ class SharedRegistry:
                 )
                 return count
 
+            self.raise_if_aborted()
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 console.print(
@@ -651,6 +697,65 @@ class SharedRegistry:
 
         self._with_connection(write=True, operation="set-judge-failure", callback=_set)
 
+    def request_abort(
+        self,
+        *,
+        client_id: Any,
+        reason: str,
+        iteration: int | None = None,
+        status: str = "failed",
+    ) -> None:
+        """Persist a shared abort request for distributed clients."""
+
+        def _set(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO runtime_abort "
+                "(singleton, client_id, iteration, reason, status, created_at) "
+                "VALUES (1, ?, ?, ?, ?, ?)",
+                [
+                    self._client_key(client_id),
+                    iteration,
+                    reason,
+                    status,
+                    datetime.now().isoformat(),
+                ],
+            )
+
+        self._with_connection(write=True, operation="request-abort", callback=_set)
+
+    def get_abort(self) -> Optional[dict]:
+        """Return the active abort record, if present."""
+
+        row = self._fetchone(
+            "SELECT client_id, iteration, reason, status, created_at "
+            "FROM runtime_abort WHERE singleton = 1",
+        )
+        if row is None:
+            return None
+        return {
+            "client_id": self._restore_client_id(row["client_id"]),
+            "iteration": row["iteration"],
+            "reason": row["reason"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+
+    def raise_if_aborted(self) -> None:
+        """Raise if any client has requested a shared abort."""
+
+        abort = self.get_abort()
+        if abort is None:
+            return None
+
+        iteration = abort.get("iteration")
+        iteration_fragment = f" at iteration {iteration}" if iteration is not None else ""
+        message = (
+            f"Distributed run aborted by client {abort.get('client_id')}{iteration_fragment}: "
+            f"{abort.get('reason', 'unknown reason')}"
+        )
+        console.print(f"[red]{message}[/]")
+        raise RuntimeError(message)
+
     def get_judge_feedback(self, iteration: int) -> Optional[dict]:
         """Retrieve the stored judge verdict for an iteration."""
         row = self._fetchone(
@@ -700,6 +805,7 @@ class SharedRegistry:
         """Poll until judge feedback is available for an iteration, or timeout."""
         start_time = time.time()
         while True:
+            self.raise_if_aborted()
             feedback = self.get_judge_feedback(iteration)
             if feedback is not None:
                 elapsed = time.time() - start_time
@@ -715,6 +821,7 @@ class SharedRegistry:
                     )
                 return feedback
 
+            self.raise_if_aborted()
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 console.print(
@@ -791,6 +898,7 @@ class SharedRegistry:
         """Poll until candidate models are available or timeout."""
         start_time = time.time()
         while True:
+            self.raise_if_aborted()
             result = self.get_candidate_models(iteration)
             if result is not None:
                 elapsed = time.time() - start_time
@@ -800,6 +908,7 @@ class SharedRegistry:
                 )
                 return result
 
+            self.raise_if_aborted()
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 console.print(

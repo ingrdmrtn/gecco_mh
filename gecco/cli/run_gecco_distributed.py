@@ -14,6 +14,7 @@ from rich.table import Table
 
 from config.schema import load_config
 from gecco.coordination import SharedRegistry, apply_client_profile
+from gecco.cli.config_paths import resolve_config_path
 from gecco.load_llms.model_loader import load_llm
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
@@ -74,7 +75,7 @@ def run_distributed_client(
         )
     )
 
-    cfg = load_config(PROJECT_ROOT / "config" / config)
+    cfg = load_config(resolve_config_path(config, project_root=PROJECT_ROOT))
 
     init_sentry(
         cfg=cfg,

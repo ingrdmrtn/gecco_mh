@@ -139,6 +139,27 @@ class TestExistingCaptureHelpers:
 
 
 class TestCliFallbackCapture:
+    def test_cli_initializes_sentry_before_dispatch(self):
+        from gecco.cli import main
+
+        with patch("gecco.cli.init_sentry") as mock_init:
+            with patch("gecco.cli.build_parser") as mock_build:
+                mock_parser = MagicMock()
+                mock_args = MagicMock()
+                mock_args.handler.return_value = 0
+                mock_parser.parse_args.return_value = mock_args
+
+                def build_parser_side_effect():
+                    assert mock_init.called
+                    return mock_parser
+
+                mock_build.side_effect = build_parser_side_effect
+
+                result = main(["dummy"])
+
+        assert result == 0
+        mock_init.assert_called_once_with(component="cli", operation="startup")
+
     def test_cli_reports_uncaught_exception(self):
         with patch.object(sentry_sdk, "capture_exception") as mock_capture:
             error = RuntimeError("handler failure")
@@ -175,6 +196,21 @@ class TestCliFallbackCapture:
                         main(["dummy"])
                     assert exc_info.value.code == 0
             mock_capture.assert_not_called()
+
+    def test_cli_reports_nonzero_system_exit(self):
+        with patch.object(sentry_sdk, "capture_exception") as mock_capture:
+            from gecco.cli import main
+            with patch("gecco.cli.init_sentry"):
+                with patch("gecco.cli.build_parser") as mock_build:
+                    mock_parser = MagicMock()
+                    mock_args = MagicMock()
+                    mock_args.handler.side_effect = SystemExit(1)
+                    mock_parser.parse_args.return_value = mock_args
+                    mock_build.return_value = mock_parser
+                    with pytest.raises(SystemExit) as exc_info:
+                        main(["dummy"])
+                    assert exc_info.value.code == 1
+            mock_capture.assert_called_once()
 
     def test_cli_does_not_report_system_exit_none(self):
         with patch.object(sentry_sdk, "capture_exception") as mock_capture:

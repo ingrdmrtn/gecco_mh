@@ -55,12 +55,7 @@ fi
 echo "[CMG evaluator] Python: $PYTHON_EXECUTABLE"
 
 # Detect provider from config to skip vLLM setup for API-based providers
-if ! PROVIDER=$($PYTHON_CMD -c "
-import yaml, sys
-with open('config/$CONFIG' if '/' not in '$CONFIG' else '$CONFIG') as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('llm', {}).get('provider', 'vllm'))
-" ); then
+if ! PROVIDER=$($PYTHON_CMD -m gecco.cli.slurm_preflight --config "$CONFIG"); then
     echo "[CMG evaluator] ERROR: Failed to detect provider from config via $ENV_MANAGER"
     exit 1
 fi

@@ -16,13 +16,14 @@ from gecco.construct_feedback.orchestrated import (
     run_orchestrated_judge_pipeline,
 )
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
+from gecco.cli.config_paths import resolve_config_path
 from gecco.coordination import SharedRegistry
 from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.load_llms.model_loader import load_llm
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
-from gecco.sentry_init import init_sentry
+from gecco.sentry_init import capture_operational_error, init_sentry
 from gecco.tempdirs import configure_temp_dirs
 from gecco.utils import TimestampedConsole
 
@@ -80,6 +81,7 @@ def run_orchestrator(
     n_clients: int | None = None,
 ) -> int | None:
     """Run the centralised judge orchestrator."""
+    had_failure = False
     configure_temp_dirs(PROJECT_ROOT, prefix="Orchestrator")
 
     if vllm_url:
@@ -96,7 +98,7 @@ def run_orchestrator(
         )
     )
 
-    cfg = load_config(PROJECT_ROOT / "config" / config)
+    cfg = load_config(resolve_config_path(config, project_root=PROJECT_ROOT))
 
     init_sentry(cfg=cfg, task_name=cfg.task.name, config_name=config)
 
@@ -248,11 +250,19 @@ def run_orchestrator(
                 f"[red]Failed to load diagnostic DuckDB sources: {exc}[/]\n"
                 f"[red]Writing failure entry to registry; clients will halt.[/]"
             )
+            capture_operational_error(
+                exc,
+                component="judge_orchestrator",
+                operation="load_duckdb_store",
+                iteration=iteration,
+                results_dir=str(resolved_results_dir),
+            )
             registry.set_judge_failure(
                 iteration=iteration,
                 error=f"Diagnostic DuckDB load failed: {exc}",
             )
-            continue
+            had_failure = True
+            break
 
         console.print("[cyan]Running centralized judge...[/]")
         max_judge_retries = 2
@@ -314,10 +324,22 @@ def run_orchestrator(
                         f"  [red]Judge failed after {max_judge_retries + 1} attempts: {exc}[/]\n"
                         f"  [red]Writing failure entry to registry; clients will halt.[/]"
                     )
+                    capture_operational_error(
+                        exc,
+                        component="judge_orchestrator",
+                        operation="final_judge_retry",
+                        iteration=iteration,
+                        results_dir=str(resolved_results_dir),
+                    )
                     registry.set_judge_failure(iteration=iteration, error=str(exc))
+                    had_failure = True
+                    break
+
+        if had_failure:
+            break
 
     console.rule("[green]Orchestrator Complete")
-    return None
+    return 1 if had_failure else None
 
 
 def main(args: argparse.Namespace) -> int | None:

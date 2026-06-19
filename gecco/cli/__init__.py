@@ -15,6 +15,7 @@ from . import run_gecco_distributed
 from . import run_judge_orchestrator
 from . import run_local_client
 from . import run_test_evaluation
+from gecco.sentry_init import capture_operational_error, init_sentry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +48,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def main(argv: Sequence[str] | None = None) -> int | None:
     """Run the GeCCo CLI."""
     load_dotenv(PROJECT_ROOT / ".env", override=False)
+    init_sentry(component="cli", operation="startup")
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    return args.handler(args)
+    try:
+        return args.handler(args)
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            capture_operational_error(exc, component="cli", operation="handler_dispatch")
+        raise
+    except Exception as exc:
+        capture_operational_error(exc, component="cli", operation="handler_dispatch")
+        raise

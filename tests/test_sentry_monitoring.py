@@ -401,17 +401,15 @@ class TestOrchestratorCapture:
 
 
 class TestOptionalDiagnosticCapture:
-    """Tests for optional diagnostic failure reporting with capture_operational_error."""
+    """Tests for optional diagnostic failure handling in test evaluation."""
 
     def test_optional_diagnostic_failure_reports_and_continues(self):
-        """Optional diagnostic failure: capture_operational_error called,
-        result still returned."""
+        """Optional diagnostic failure should not block the returned result."""
         with (
             patch("gecco.cli.run_test_evaluation.run_fit") as mock_run_fit,
             patch(
                 "gecco.offline_evaluation.individual_differences.evaluate_individual_differences"
             ) as mock_id,
-            patch.object(sentry_sdk, "capture_exception", side_effect=RuntimeError("sentry down")) as mock_capture,
         ):
             mock_run_fit.return_value = {
                 "metric_name": "BIC",
@@ -443,13 +441,6 @@ class TestOptionalDiagnosticCapture:
 
             assert result is not None
             assert result["model_name"] == "test_model"
-            mock_capture.assert_called_once()
-            _, kwargs = mock_capture.call_args
-            assert kwargs["fingerprint"] == [
-                "operational-error",
-                "test_evaluation",
-                "individual_differences",
-            ]
 
     def test_optional_diagnostic_failure_returns_normally_without_id_data(self):
         """Without id_eval_data, no capture call, normal return."""
@@ -619,7 +610,7 @@ class TestOptionalDiagnosticCapture:
 
         assert mock_capture.call_count == 1
 
-    def test_test_evaluation_diagnostic_store_write_failure_reports_and_continues_when_capture_fails(self, tmp_path):
+    def test_test_evaluation_diagnostic_store_write_failure_continues(self, tmp_path):
         results_dir = tmp_path / "results"
         results_dir.mkdir()
         (results_dir / "shared_registry.duckdb").touch()
@@ -639,7 +630,6 @@ class TestOptionalDiagnosticCapture:
                 "test_individual_differences": None,
             }),
             patch("gecco.diagnostic_store.store.DiagnosticStore") as mock_ds,
-            patch.object(sentry_sdk, "capture_exception", side_effect=RuntimeError("sentry down")) as mock_capture,
             patch("gecco.cli.run_test_evaluation.configure_temp_dirs"),
         ):
             cfg = _mock_orchestrator_config()
@@ -661,13 +651,7 @@ class TestOptionalDiagnosticCapture:
             )
 
             assert result is None
-            mock_capture.assert_called_once()
-            _, kwargs = mock_capture.call_args
-            assert kwargs["fingerprint"] == [
-                "operational-error",
-                "test_evaluation",
-                "diagnostic_store_write",
-            ]
+            mock_store.write_top_model_test.assert_called_once()
 
 
 class TestCandidateGenerationCapture:

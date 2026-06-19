@@ -122,6 +122,17 @@ def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
     return entry
 
 
+def _format_optional_float(value) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if not np.isfinite(value):
+            return "n/a"
+    except TypeError:
+        return "n/a"
+    return f"{float(value):.2f}"
+
+
 def run_test_evaluation(
     *, config: str, results_dir: str, write_store: bool = False
 ) -> int | None:
@@ -181,8 +192,9 @@ def run_test_evaluation(
         entry = fit_one_on_test(cand, df_test, cfg, id_eval_data=id_eval_data)
         if entry is not None:
             results.append(entry)
+            val_nll_text = _format_optional_float(entry.get("val_nll"))
             print(
-                f"[test] {entry['model_name']}: val_nll={entry['val_nll']:.2f}, "
+                f"[test] {entry['model_name']}: val_nll={val_nll_text}, "
                 f"test_BIC={entry['test_mean_BIC']:.2f}, test_NLL={entry['test_mean_NLL']:.2f}"
             )
 

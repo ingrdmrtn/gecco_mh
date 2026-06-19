@@ -16,6 +16,7 @@ def fit_baseline_if_needed(
     *,
     cfg: Any,
     df_train,
+    df_val=None,
     registry: SharedRegistry,
     id_eval_data=None,
 ) -> dict[str, Any] | None:
@@ -96,7 +97,24 @@ def fit_baseline_if_needed(
                 "code": baseline_code,
                 "eval_metrics": [float(v) for v in fit_res.get("eval_metrics", [])],
                 "participant_n_trials": fit_res.get("participant_n_trials", []),
+                "val_mean_nll": None,
             }
+
+            if df_val is not None and not df_val.empty:
+                try:
+                    val_fit_res = run_fit(
+                        df_val, baseline_code, cfg=cfg, expected_func_name=func_name
+                    )
+                    result["val_metric_value"] = float(val_fit_res["metric_value"])
+                    result["val_mean_nll"] = float(val_fit_res["mean_nll"])
+                    result["val_eval_metrics"] = [
+                        float(v) for v in val_fit_res.get("eval_metrics", [])
+                    ]
+                    result["val_per_participant_nll"] = [
+                        float(v) for v in val_fit_res.get("per_participant_nll", [])
+                    ]
+                except Exception as exc:
+                    _log(f"[GeCCo] Baseline validation eval failed: {exc}")
 
             param_values = fit_res.get("parameter_values", [])
             if param_values:

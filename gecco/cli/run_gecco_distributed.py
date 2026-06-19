@@ -207,6 +207,7 @@ def run_distributed_client(
         baseline_result = fit_baseline_if_needed(
             cfg=cfg,
             df_train=df_train,
+            df_val=df_val,
             registry=registry,
             id_eval_data=id_eval_data,
         )

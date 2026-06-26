@@ -65,21 +65,20 @@ class EvaluationConfig(GeCCoBaseModel):
     fit_type: str = "group"
     fitting_method: str = "scipy_minimize"
     best_model_path: str | None = None
-    train_ratio: float = 0.6
-    val_ratio: float = 0.2
-    test_ratio: float = 0.2
+    train_ratio: float = 0.7
+    test_ratio: float = 0.3
     split_seed: int = 42
     n_test_models: int = 10
     n_starts: int = 10
 
     @model_validator(mode="after")
     def check_ratios_sum_to_one(self) -> "EvaluationConfig":
-        """Ensure train/validation/test ratios form a full partition."""
-        total = self.train_ratio + self.val_ratio + self.test_ratio
+        """Ensure train/test ratios form a full partition."""
+        total = self.train_ratio + self.test_ratio
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
-                f"train_ratio ({self.train_ratio}) + val_ratio ({self.val_ratio}) "
-                f"+ test_ratio ({self.test_ratio}) must sum to 1.0, got {total}"
+                f"train_ratio ({self.train_ratio}) + test_ratio ({self.test_ratio}) "
+                f"must sum to 1.0, got {total}"
             )
         return self
 

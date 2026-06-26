@@ -32,6 +32,27 @@ console = TimestampedConsole()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _split_prompt_train_test(df, data_cfg, evaluation_cfg):
+    """Split participants into prompt, train, and test partitions."""
+    splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
+    df_prompt = splits["prompt"]
+
+    non_prompt_ids = sorted(
+        set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique())
+    )
+    shuffled_ids = list(non_prompt_ids)
+    np.random.default_rng(getattr(evaluation_cfg, "split_seed", 42)).shuffle(shuffled_ids)
+
+    train_ratio = getattr(evaluation_cfg, "train_ratio", 0.7)
+    n_train = int(len(shuffled_ids) * train_ratio)
+    train_ids = shuffled_ids[:n_train]
+    test_ids = shuffled_ids[n_train:]
+
+    df_train = df[df[data_cfg.id_column].isin(train_ids)]
+    df_test = df[df[data_cfg.id_column].isin(test_ids)]
+    return df_prompt, df_train, df_test, train_ids, test_ids
+
+
 def register_parser(subparsers) -> argparse.ArgumentParser:
     """Register the internal distributed worker subcommand."""
     parser = subparsers.add_parser(
@@ -123,32 +144,15 @@ def run_distributed_client(
 
     try:
         df = load_data(data_cfg.path, data_cfg.input_columns)
-        splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-        df_prompt = splits["prompt"]
-
-        train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
-        val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
-        non_prompt_ids = sorted(
-            set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique())
+        df_prompt, df_train, df_test, train_ids, test_ids = _split_prompt_train_test(
+            df, data_cfg, cfg.evaluation
         )
-        np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
-        np.random.shuffle(non_prompt_ids)
-        n = len(non_prompt_ids)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
-        train_ids = non_prompt_ids[:n_train]
-        val_ids = non_prompt_ids[n_train : n_train + n_val]
-        test_ids = non_prompt_ids[n_train + n_val :]
-        df_train = df[df[data_cfg.id_column].isin(train_ids)]
-        df_val = df[df[data_cfg.id_column].isin(val_ids)]
-        df_test = df[df[data_cfg.id_column].isin(test_ids)]
 
         split_table = Table(title="Data Split", show_header=True, header_style="bold")
         split_table.add_column("Split")
         split_table.add_column("Participants", justify="right")
         split_table.add_row("Prompt", str(len(df_prompt[data_cfg.id_column].unique())))
         split_table.add_row("Train", str(len(train_ids)))
-        split_table.add_row("Val", str(len(val_ids)))
         split_table.add_row("Test", str(len(test_ids)))
         console.print(split_table)
 
@@ -207,7 +211,6 @@ def run_distributed_client(
         baseline_result = fit_baseline_if_needed(
             cfg=cfg,
             df_train=df_train,
-            df_val=df_val,
             registry=registry,
             id_eval_data=id_eval_data,
         )
@@ -225,7 +228,6 @@ def run_distributed_client(
             prompt_builder,
             client_id=resolved_client_id,
             shared_registry=registry,
-            df_val=df_val,
         )
 
         global_best_bic = np.inf

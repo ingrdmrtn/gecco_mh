@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from config.schema import GeCCoConfig, JudgeConfig, load_config
+from config.schema import EvaluationConfig, GeCCoConfig, JudgeConfig, load_config
 from gecco.construct_feedback.tool_judge import (
     JudgeVerdict,
     ToolUsingJudge,
@@ -91,6 +91,28 @@ class DummyStore:
 # ======================================================================
 # Contract A: Config Schema Is Explicit And Fails Fast
 # ======================================================================
+
+
+def test_evaluation_config_defaults_to_two_way_split():
+    """EvaluationConfig should default to a 70/30 train/test split."""
+    cfg = EvaluationConfig()
+
+    assert cfg.train_ratio == pytest.approx(0.7)
+    assert cfg.test_ratio == pytest.approx(0.3)
+
+
+def test_evaluation_config_accepts_valid_two_way_ratios():
+    """Explicit train/test ratios that sum to one should validate."""
+    cfg = EvaluationConfig(train_ratio=0.6, test_ratio=0.4)
+
+    assert cfg.train_ratio == pytest.approx(0.6)
+    assert cfg.test_ratio == pytest.approx(0.4)
+
+
+def test_evaluation_config_rejects_invalid_two_way_ratios():
+    """Train/test ratios that do not sum to one should fail validation."""
+    with pytest.raises(ValidationError, match="must sum to 1.0"):
+        EvaluationConfig(train_ratio=0.6, test_ratio=0.5)
 
 
 def test_schema_accepts_valid_mode_off(tmp_path):

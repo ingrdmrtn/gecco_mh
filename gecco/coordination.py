@@ -198,23 +198,25 @@ class SharedRegistry:
                 }
 
             baseline = conn.execute(
-                "SELECT function_name, metric_name, metric_value, param_names, eval_metrics, "
-                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll "
+                "SELECT function_name, executable_function_name, metric_name, metric_value, "
+                "param_names, eval_metrics, mean_r2, max_r2, best_param, per_param_r2, "
+                "code, val_mean_nll "
                 "FROM runtime_baseline WHERE singleton = 1"
             ).fetchone()
             if baseline is not None:
                 data["baseline"] = {
                     "function_name": baseline[0],
-                    "metric_name": baseline[1],
-                    "metric_value": baseline[2],
-                    "param_names": self._from_json_value(baseline[3]) or [],
-                    "eval_metrics": self._from_json_value(baseline[4]) or [],
-                    "mean_r2": baseline[5],
-                    "max_r2": baseline[6],
-                    "best_param": baseline[7],
-                    "per_param_r2": self._from_json_value(baseline[8]) or {},
-                    "code": baseline[9],
-                    "val_mean_nll": baseline[10],
+                    "executable_function_name": baseline[1],
+                    "metric_name": baseline[2],
+                    "metric_value": baseline[3],
+                    "param_names": self._from_json_value(baseline[4]) or [],
+                    "eval_metrics": self._from_json_value(baseline[5]) or [],
+                    "mean_r2": baseline[6],
+                    "max_r2": baseline[7],
+                    "best_param": baseline[8],
+                    "per_param_r2": self._from_json_value(baseline[9]) or {},
+                    "code": baseline[10],
+                    "val_mean_nll": baseline[11],
                 }
 
             for row in conn.execute(
@@ -541,11 +543,13 @@ class SharedRegistry:
             id_res = baseline_result.get("individual_differences") or {}
             conn.execute(
                 "INSERT OR REPLACE INTO runtime_baseline "
-                "(singleton, function_name, metric_name, metric_value, param_names, eval_metrics, "
-                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(singleton, function_name, executable_function_name, metric_name, metric_value, "
+                "param_names, eval_metrics, mean_r2, max_r2, best_param, per_param_r2, code, "
+                "val_mean_nll) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     baseline_result.get("function_name", "baseline_model"),
+                    baseline_result.get("executable_function_name"),
                     baseline_result.get("metric_name", "BIC"),
                     baseline_result.get("metric_value"),
                     self._to_json_text(baseline_result.get("param_names", [])),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,12 @@ import numpy as np
 
 from config.schema import load_config
 from gecco.coordination import SharedRegistry
+from gecco.cli.run_gecco_distributed import _split_prompt_train_test
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
 )
-from gecco.prepare_data.io import load_data, split_by_participant
+from gecco.offline_evaluation.utils import build_model_spec
+from gecco.prepare_data.io import load_data
 from gecco.tempdirs import configure_temp_dirs
 
 
@@ -37,64 +40,112 @@ def load_splits(cfg):
     """Replicate the exact split logic from the distributed client."""
     data_cfg = cfg.data
     df = load_data(data_cfg.path, data_cfg.input_columns)
-    splits = split_by_participant(df, data_cfg.id_column, data_cfg.splits)
-    df_prompt = splits["prompt"]
-
-    train_ratio = getattr(cfg.evaluation, "train_ratio", 0.6)
-    val_ratio = getattr(cfg.evaluation, "val_ratio", 0.2)
-    non_prompt_ids = sorted(
-        set(df[data_cfg.id_column].unique()) - set(df_prompt[data_cfg.id_column].unique())
-    )
-    np.random.seed(getattr(cfg.evaluation, "split_seed", 42))
-    np.random.shuffle(non_prompt_ids)
-    n = len(non_prompt_ids)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    test_ids = non_prompt_ids[n_train + n_val :]
-    return df[df[data_cfg.id_column].isin(test_ids)]
+    _, _, df_test, _, _ = _split_prompt_train_test(df, data_cfg, cfg.evaluation)
+    return df_test
 
 
-def collect_candidates(registry):
-    """Collect unique candidates with finite validation NLL."""
+def _selection_metric_field(cfg) -> str:
+    """Return the development metric field to rank candidates by."""
+    metric = str(getattr(cfg.evaluation, "metric", "BIC")).lower()
+    return "mean_nll" if "nll" in metric else "metric_value"
+
+
+def _selection_metric_value(candidate: dict, cfg) -> float | None:
+    """Return a finite ranking score from the chosen development metric."""
+    field = _selection_metric_field(cfg)
+    value = candidate.get(field)
+    if value is None:
+        return None
+    try:
+        if not np.isfinite(value):
+            return None
+    except TypeError:
+        return None
+    return float(value)
+
+
+def collect_candidates(registry, cfg):
+    """Collect unique candidates with finite development scores."""
     data = registry.read()
     candidates = {}
+    selection_field = _selection_metric_field(cfg)
     for entry in data.get("iteration_history", []):
         client_id = entry.get("client_id")
         iteration = entry.get("iteration")
         for result in entry.get("results", []):
-            val_nll = result.get("val_mean_nll")
-            if val_nll is None or not np.isfinite(val_nll):
+            score = _selection_metric_value(result, cfg)
+            if score is None:
                 continue
             name = result.get("function_name", "")
-            if name and (
-                name not in candidates or val_nll < candidates[name]["val_mean_nll"]
-            ):
-                candidates[name] = {
-                    "client_id": client_id,
-                    "iteration": iteration,
-                    "function_name": name,
-                    "code": result.get("code", ""),
-                    "val_mean_nll": val_nll,
-                    "param_names": result.get("param_names", []),
-                }
-    return sorted(candidates.values(), key=lambda candidate: candidate["val_mean_nll"])
+            code = result.get("code", "")
+            candidate_key = (
+                client_id,
+                iteration,
+                name,
+                hashlib.sha256(code.encode("utf-8")).hexdigest() if code else "",
+            )
+            candidate = {
+                "client_id": client_id,
+                "iteration": iteration,
+                "function_name": name,
+                "executable_function_name": result.get("executable_function_name")
+                or result.get("func_name"),
+                "code": code,
+                "selection_metric_name": selection_field,
+                "selection_metric_value": score,
+                "param_names": result.get("param_names", []),
+            }
+            if candidate_key not in candidates or score < candidates[candidate_key][
+                "selection_metric_value"
+            ]:
+                candidates[candidate_key] = candidate
+    return sorted(
+        candidates.values(),
+        key=lambda candidate: (
+            candidate["selection_metric_value"],
+            str(candidate.get("client_id", "")),
+            -1 if candidate.get("iteration") is None else int(candidate.get("iteration")),
+            candidate.get("function_name", ""),
+        ),
+    )
+
+
+def _resolve_executable_function_name(candidate, cfg):
+    """Resolve the callable name to execute for a candidate record."""
+    explicit_name = candidate.get("executable_function_name") or candidate.get("func_name")
+    if explicit_name:
+        return explicit_name
+
+    code = candidate.get("code", "")
+    if not code:
+        return candidate.get("function_name", "")
+
+    display_name = candidate.get("function_name") or "cognitive_model"
+    try:
+        spec = build_model_spec(code, expected_func_name=display_name, cfg=cfg)
+    except Exception:
+        return display_name
+    return getattr(spec.func, "__name__", display_name)
 
 
 def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
     """Fit a single candidate model on the test split."""
     func_name = candidate["function_name"]
+    expected_func_name = _resolve_executable_function_name(candidate, cfg)
     code = candidate["code"]
     if not code:
         return None
     try:
-        fit_res = run_fit(df_test, code, cfg=cfg, expected_func_name=func_name)
+        fit_res = run_fit(df_test, code, cfg=cfg, expected_func_name=expected_func_name)
     except Exception as exc:
         print(f"[test] skipping {func_name}: {exc}")
         return None
 
     entry = {
         "model_name": func_name,
-        "val_nll": candidate["val_mean_nll"],
+        "selection_metric_name": candidate.get("selection_metric_name"),
+        "selection_metric_value": candidate.get("selection_metric_value"),
+        "val_nll": candidate.get("val_mean_nll"),
         "test_mean_BIC": float(fit_res["metric_value"]),
         "test_mean_NLL": float(fit_res["mean_nll"]),
         "test_individual_BIC": fit_res["eval_metrics"],
@@ -166,8 +217,8 @@ def run_test_evaluation(
     df_test = load_splits(cfg)
     print(f"[test] Loaded test split: {len(df_test)} rows")
 
-    candidates = collect_candidates(registry)
-    print(f"[test] Found {len(candidates)} unique candidates with valid val NLL")
+    candidates = collect_candidates(registry, cfg)
+    print(f"[test] Found {len(candidates)} unique candidates with valid development scores")
 
     n_top = getattr(cfg.evaluation, "n_test_models", 10)
     top = candidates[:n_top]
@@ -175,14 +226,18 @@ def run_test_evaluation(
 
     baseline = registry.read().get("baseline")
     if baseline and baseline.get("code"):
+        baseline_score = _selection_metric_value(baseline, cfg)
         top = [
             {
                 "client_id": "baseline",
                 "iteration": -1,
                 "function_name": baseline.get("function_name", "baseline_model"),
                 "code": baseline["code"],
+                "selection_metric_name": _selection_metric_field(cfg),
+                "selection_metric_value": baseline_score,
                 "val_mean_nll": baseline.get("val_mean_nll", float("nan")),
                 "param_names": baseline.get("param_names", []),
+                "executable_function_name": baseline.get("executable_function_name"),
             }
         ] + top
         print("[test] Added baseline to evaluation list")
@@ -192,9 +247,10 @@ def run_test_evaluation(
         entry = fit_one_on_test(cand, df_test, cfg, id_eval_data=id_eval_data)
         if entry is not None:
             results.append(entry)
+            selection_text = _format_optional_float(entry.get("selection_metric_value"))
             val_nll_text = _format_optional_float(entry.get("val_nll"))
             print(
-                f"[test] {entry['model_name']}: val_nll={val_nll_text}, "
+                f"[test] {entry['model_name']}: score={selection_text}, val_nll={val_nll_text}, "
                 f"test_BIC={entry['test_mean_BIC']:.2f}, test_NLL={entry['test_mean_NLL']:.2f}"
             )
 

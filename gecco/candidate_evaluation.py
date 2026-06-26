@@ -122,10 +122,6 @@ class CandidateEvaluator:
             run_idx=run_idx,
             tag=tag,
             metric_value=mean_metric,
-            val_metric_value=result.get("val_metric_value"),
-            val_mean_nll=result.get("val_mean_nll"),
-            val_eval_metrics=result.get("val_eval_metrics"),
-            val_per_participant_nll=result.get("val_per_participant_nll"),
             participant=participant,
         )
         return True
@@ -386,7 +382,6 @@ class CandidateEvaluator:
         ppc_n_sims: int = 100,
         block_residuals_enabled: bool = False,
         block_residuals_n_blocks: int = 10,
-        df_val: Any | None = None,
         set_activity: Callable[[str], None] | None = None,
         model: Any | None = None,
         tokenizer: Any | None = None,
@@ -418,7 +413,6 @@ class CandidateEvaluator:
             ppc_n_sims: Number of PPC simulations.
             block_residuals_enabled: Whether block residuals are enabled.
             block_residuals_n_blocks: Number of residual blocks.
-            df_val: Optional validation data frame.
             set_activity: Optional activity callback.
             model: LLM model handle.
             tokenizer: LLM tokenizer handle.
@@ -492,7 +486,6 @@ class CandidateEvaluator:
                 ppc_n_sims=ppc_n_sims,
                 block_residuals_enabled=block_residuals_enabled,
                 block_residuals_n_blocks=block_residuals_n_blocks,
-                df_val=df_val,
                 set_activity=set_activity,
                 participant=participant,
                 tried_param_sets=tried_param_sets,
@@ -537,6 +530,7 @@ class CandidateEvaluator:
             result.setdefault("candidate_index", idx)
             result.setdefault("expected_func_name", func_name)
             result.setdefault("display_name", display_name)
+            result.setdefault("executable_function_name", func_name)
 
         if result is not None:
             self._update_best_state(
@@ -583,7 +577,6 @@ class CandidateEvaluator:
         ppc_n_sims: int = 100,
         block_residuals_enabled: bool = False,
         block_residuals_n_blocks: int = 10,
-        df_val: Any | None = None,
         set_activity: Callable[[str], None] | None = None,
         max_syntax_retries: int = 0,
         syntax_retry_count: int = 0,
@@ -612,7 +605,6 @@ class CandidateEvaluator:
             ppc_n_sims: Number of PPC simulations.
             block_residuals_enabled: Whether block residuals are enabled.
             block_residuals_n_blocks: Number of residual blocks.
-            df_val: Optional validation data frame.
             set_activity: Optional activity callback.
             max_syntax_retries: Maximum retry attempts.
             syntax_retry_count: Current retry count.
@@ -645,7 +637,6 @@ class CandidateEvaluator:
                 ppc_n_sims=ppc_n_sims,
                 block_residuals_enabled=block_residuals_enabled,
                 block_residuals_n_blocks=block_residuals_n_blocks,
-                df_val=df_val,
                 set_activity=set_activity,
                 participant=participant,
                 tried_param_sets=tried_param_sets,
@@ -765,7 +756,6 @@ class CandidateEvaluator:
         ppc_n_sims: int = 100,
         block_residuals_enabled: bool = False,
         block_residuals_n_blocks: int = 10,
-        df_val: Any | None = None,
         set_activity: Callable[[str], None] | None = None,
         participant: str | None = None,
         tried_param_sets: list[list[Any]] | None = None,
@@ -790,7 +780,6 @@ class CandidateEvaluator:
             ppc_n_sims: Number of PPC simulations.
             block_residuals_enabled: Whether block residuals should run.
             block_residuals_n_blocks: Number of residual blocks.
-            df_val: Optional validation frame.
             set_activity: Optional status callback.
             participant: Optional participant identifier.
             tried_param_sets: Mutable list tracking successful parameter sets.
@@ -980,41 +969,6 @@ class CandidateEvaluator:
                         f"  [yellow]Individual differences eval failed for {display_name}:[/] {exc}"
                     )
 
-            val_fit_res = None
-            val_id_results = None
-            if df_val is not None:
-                try:
-                    val_fit_res = run_fit_model(
-                        df_val,
-                        func_code,
-                        cfg=cfg,
-                        expected_func_name=func_name,
-                        structured_params=structured_params,
-                    )
-                    console.print(
-                        f"    [dim]val {metric_name} = [cyan]{val_fit_res['metric_value']:.2f}[/]"
-                    )
-                    if id_eval_data is not None:
-                        try:
-                            from gecco.offline_evaluation.individual_differences import (
-                                evaluate_individual_differences,
-                            )
-
-                            val_id_results = evaluate_individual_differences(
-                                val_fit_res,
-                                df_val,
-                                cfg,
-                                id_data=id_eval_data,
-                            )
-                        except Exception as exc:
-                            console.print(
-                                f"  [yellow]Individual differences eval failed for {display_name} on val:[/] {exc}"
-                            )
-                except Exception as exc:
-                    console.print(
-                        f"  [yellow]Val fitting failed for {display_name}:[/] {exc}"
-                    )
-
             ppc_result = None
             block_residuals_result = None
             needs_diagnostic_spec = bool(
@@ -1101,6 +1055,7 @@ class CandidateEvaluator:
 
             result_dict = {
                 "function_name": display_name,
+                "executable_function_name": func_name,
                 "metric_name": metric_name,
                 "metric_value": mean_metric,
                 "param_names": params,
@@ -1114,12 +1069,6 @@ class CandidateEvaluator:
                 "mean_nll": fit_res.get("mean_nll"),
                 "per_participant_nll": fit_res.get("per_participant_nll"),
             }
-            if val_fit_res is not None:
-                result_dict["val_metric_value"] = val_fit_res["metric_value"]
-                result_dict["val_mean_nll"] = val_fit_res["mean_nll"]
-                result_dict["val_eval_metrics"] = val_fit_res["eval_metrics"]
-                result_dict["val_per_participant_nll"] = val_fit_res["per_participant_nll"]
-                result_dict["val_individual_differences"] = val_id_results
             if ppc_result is not None:
                 result_dict["ppc"] = ppc_result
             if block_residuals_result is not None:

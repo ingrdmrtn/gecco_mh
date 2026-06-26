@@ -86,7 +86,6 @@ def test_run_n_shots_non_cmg_uses_extracted_services_and_retries_once(tmp_path: 
     search = GeCCoModelSearch.__new__(GeCCoModelSearch)
     search.cfg = cfg
     search.df = SimpleNamespace()
-    search.df_val = None
     search.model = object()
     search.tokenizer = object()
     search.prompt_builder = SimpleNamespace(

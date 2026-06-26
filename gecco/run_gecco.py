@@ -87,13 +87,11 @@ class GeCCoModelSearch:
         prompt_builder,
         client_id=None,
         shared_registry=None,
-        df_val=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.df = df
-        self.df_val = df_val
         self.prompt_builder = prompt_builder
         self.client_id = client_id
         self.shared_registry = shared_registry
@@ -780,7 +778,6 @@ class GeCCoModelSearch:
             ppc_n_sims=self.ppc_n_sims,
             block_residuals_enabled=self.block_residuals_enabled,
             block_residuals_n_blocks=self.block_residuals_n_blocks,
-            df_val=self.df_val,
             set_activity=self._set_activity,
             model=self.model,
             tokenizer=self.tokenizer,
@@ -1018,7 +1015,6 @@ class GeCCoModelSearch:
                     ppc_n_sims=self.ppc_n_sims,
                     block_residuals_enabled=self.block_residuals_enabled,
                     block_residuals_n_blocks=self.block_residuals_n_blocks,
-                    df_val=self.df_val,
                     set_activity=self._set_activity,
                     max_syntax_retries=max_syntax_retries,
                     syntax_retry_count=syntax_retry_count,

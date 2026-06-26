@@ -54,7 +54,6 @@ def test_judge_mode_off_does_not_wait_for_centralized_feedback(tmp_path):
     search.ppc_n_sims = 0
     search.block_residuals_enabled = False
     search.block_residuals_n_blocks = 0
-    search.df_val = None
     search.prompt_builder = None
     search.generate = None
     search.model = None
@@ -118,7 +117,6 @@ def test_distributed_run_raises_immediately_when_shared_abort_is_present(tmp_pat
     search.ppc_n_sims = 0
     search.block_residuals_enabled = False
     search.block_residuals_n_blocks = 0
-    search.df_val = None
     search.prompt_builder = None
     search.generate = MagicMock(side_effect=AssertionError("generate should not run"))
     search.model = None

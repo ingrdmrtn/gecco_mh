@@ -241,31 +241,22 @@ def test_fit_baseline_if_needed_writes_only_to_registry_and_never_touches_baseli
     assert not any(tmp_path.rglob("baseline.duckdb.lock"))
 
 
-def test_fit_baseline_if_needed_fits_validation_and_persists_val_nll(
+def test_fit_baseline_if_needed_only_fits_training_data(
     registry: SharedRegistry,
 ):
-    """Baseline validation should reuse the shared fit path and persist val NLL."""
+    """Baseline fitting should only use the training split."""
     cfg = SimpleNamespace(
         baseline=SimpleNamespace(model="def baseline_model(data):\n    return data"),
         llm=SimpleNamespace(template_model=None),
     )
     df_train = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
-    df_val = pd.DataFrame({"x": [10, 20], "y": [30, 40]})
 
     train_fit_result = {
         "metric_name": "BIC",
         "metric_value": 12.5,
-        "mean_nll": 1.25,
         "param_names": ["alpha"],
         "eval_metrics": [1.0],
         "participant_n_trials": [5],
-    }
-    val_fit_result = {
-        "metric_name": "BIC",
-        "metric_value": 22.5,
-        "mean_nll": 2.25,
-        "eval_metrics": [2.0],
-        "per_participant_nll": [2.25],
     }
     calls: list[pd.DataFrame] = []
 
@@ -275,8 +266,6 @@ def test_fit_baseline_if_needed_fits_validation_and_persists_val_nll(
         calls.append(df)
         if df is df_train:
             return train_fit_result
-        if df is df_val:
-            return val_fit_result
         raise AssertionError("unexpected data frame passed to run_fit")
 
     with patch(
@@ -286,36 +275,30 @@ def test_fit_baseline_if_needed_fits_validation_and_persists_val_nll(
         result = fit_baseline_if_needed(
             cfg=cfg,
             df_train=df_train,
-            df_val=df_val,
             registry=registry,
             id_eval_data=None,
         )
 
     assert result is not None
-    assert calls == [df_train, df_val]
+    assert calls == [df_train]
     assert result["metric_value"] == pytest.approx(12.5)
-    assert result["val_metric_value"] == pytest.approx(22.5)
-    assert result["val_mean_nll"] == pytest.approx(2.25)
-    assert result["val_eval_metrics"] == [2.0]
-    assert result["val_per_participant_nll"] == [2.25]
-    assert registry.read()["baseline"]["val_mean_nll"] == pytest.approx(2.25)
+    assert result["val_mean_nll"] is None
+    assert registry.read()["baseline"]["val_mean_nll"] is None
 
 
-def test_fit_baseline_if_needed_validation_fit_failure_keeps_val_nll_none(
+def test_fit_baseline_if_needed_training_only_result_keeps_val_nll_none(
     registry: SharedRegistry,
 ):
-    """Validation fit errors should not block baseline creation or persistence."""
+    """Baseline fitting should still succeed without a validation split."""
     cfg = SimpleNamespace(
         baseline=SimpleNamespace(model="def baseline_model(data):\n    return data"),
         llm=SimpleNamespace(template_model=None),
     )
     df_train = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
-    df_val = pd.DataFrame({"x": [10, 20], "y": [30, 40]})
 
     train_fit_result = {
         "metric_name": "BIC",
         "metric_value": 12.5,
-        "mean_nll": 1.25,
         "param_names": ["alpha"],
         "eval_metrics": [1.0],
         "participant_n_trials": [5],
@@ -328,8 +311,6 @@ def test_fit_baseline_if_needed_validation_fit_failure_keeps_val_nll_none(
         calls.append(df)
         if df is df_train:
             return train_fit_result
-        if df is df_val:
-            raise RuntimeError("validation fit failed")
         raise AssertionError("unexpected data frame passed to run_fit")
 
     with patch(
@@ -339,13 +320,12 @@ def test_fit_baseline_if_needed_validation_fit_failure_keeps_val_nll_none(
         result = fit_baseline_if_needed(
             cfg=cfg,
             df_train=df_train,
-            df_val=df_val,
             registry=registry,
             id_eval_data=None,
         )
 
     assert result is not None
-    assert calls == [df_train, df_val]
+    assert calls == [df_train]
     assert result["val_mean_nll"] is None
     assert registry.read()["baseline"]["val_mean_nll"] is None
 
@@ -386,10 +366,132 @@ def test_fit_baseline_if_needed_without_validation_keeps_val_nll_none(
     assert registry.read()["baseline"]["val_mean_nll"] is None
 
 
-def test_run_distributed_client_passes_validation_split_to_baseline(
+def test_fit_baseline_if_needed_persists_executable_function_name(
+    registry: SharedRegistry,
+):
+    """Baseline fits should persist the executable function name separately."""
+    cfg = SimpleNamespace(
+        baseline=SimpleNamespace(model="def hybrid_model(data):\n    return data"),
+        llm=SimpleNamespace(template_model=None),
+    )
+    df_train = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+
+    fit_result = {
+        "metric_name": "BIC",
+        "metric_value": 12.5,
+        "param_names": ["alpha"],
+        "eval_metrics": [1.0],
+        "participant_n_trials": [5],
+    }
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        return_value=fit_result,
+    ):
+        result = fit_baseline_if_needed(
+            cfg=cfg,
+            df_train=df_train,
+            registry=registry,
+            id_eval_data=None,
+        )
+
+    assert result is not None
+    assert result["function_name"] == "baseline_model"
+    assert result["executable_function_name"] == "hybrid_model"
+    assert registry.read()["baseline"]["executable_function_name"] == "hybrid_model"
+
+
+def test_cached_baseline_read_includes_executable_function_name(
+    registry: SharedRegistry,
+):
+    """Cached baseline reads should preserve the executable function name."""
+    registry.set_baseline(
+        {
+            "function_name": "baseline_model",
+            "executable_function_name": "hybrid_model",
+            "metric_name": "BIC",
+            "metric_value": 12.5,
+            "param_names": ["alpha"],
+            "eval_metrics": [1.0],
+            "code": "def hybrid_model(data):\n    return data",
+        }
+    )
+
+    snapshot = registry.read()
+    assert snapshot["baseline"]["function_name"] == "baseline_model"
+    assert snapshot["baseline"]["executable_function_name"] == "hybrid_model"
+
+    cfg = SimpleNamespace(
+        baseline=SimpleNamespace(model="def hybrid_model(data):\n    return data"),
+        llm=SimpleNamespace(template_model=None),
+    )
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        side_effect=AssertionError("baseline should be loaded from cache"),
+    ):
+        cached = fit_baseline_if_needed(
+            cfg=cfg,
+            df_train=pd.DataFrame({"x": [1, 2], "y": [3, 4]}),
+            registry=registry,
+            id_eval_data=None,
+        )
+
+    assert cached is not None
+    assert cached["function_name"] == "baseline_model"
+    assert cached["executable_function_name"] == "hybrid_model"
+
+
+def test_fit_baseline_if_needed_uses_dict_baseline_model(
+    registry: SharedRegistry,
+):
+    """Dict-style baseline config should prefer baseline.model over template_model."""
+    cfg = SimpleNamespace(
+        baseline={"model": "def seven_param_model(a, b, c, d, e, f, g):\n    return a"},
+        llm=SimpleNamespace(template_model="def template_model(x, y):\n    return x"),
+    )
+    df_train = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+
+    train_fit_result = {
+        "metric_name": "BIC",
+        "metric_value": 12.5,
+        "param_names": ["alpha"],
+        "eval_metrics": [1.0],
+        "participant_n_trials": [5],
+    }
+    calls: list[pd.DataFrame] = []
+
+    def _run_fit(df, code, *, cfg, expected_func_name):
+        assert code.startswith("def seven_param_model")
+        assert expected_func_name == "seven_param_model"
+        assert "template_model" not in code
+        calls.append(df)
+        if df is df_train:
+            return train_fit_result
+        raise AssertionError("unexpected data frame passed to run_fit")
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        side_effect=_run_fit,
+    ):
+        result = fit_baseline_if_needed(
+            cfg=cfg,
+            df_train=df_train,
+            registry=registry,
+            id_eval_data=None,
+        )
+
+    assert result is not None
+    assert calls == [df_train]
+    assert result["metric_value"] == pytest.approx(12.5)
+    assert result["val_mean_nll"] is None
+    assert registry.read()["baseline"]["val_mean_nll"] is None
+
+
+def test_run_distributed_client_splits_prompt_train_and_test_only(
     tmp_path: Path, monkeypatch
 ):
-    """The distributed entrypoint should pass the shared validation split through."""
+    """The distributed entrypoint should split non-prompt participants into train/test only."""
     from gecco.cli import run_gecco_distributed as dist
 
     project_root = tmp_path / "project_root"
@@ -397,8 +499,8 @@ def test_run_distributed_client_passes_validation_split_to_baseline(
 
     df = pd.DataFrame(
         {
-            "participant_id": [0, 1, 2, 3],
-            "value": [10, 11, 12, 13],
+            "participant_id": [0, 1, 2, 3, 4],
+            "value": [10, 11, 12, 13, 14],
         }
     )
     prompt_df = df.iloc[[0]].copy()
@@ -416,12 +518,7 @@ def test_run_distributed_client_passes_validation_split_to_baseline(
             max_prompt_trials=None,
             value_mappings=None,
         ),
-        evaluation=SimpleNamespace(
-            fit_type="group",
-            train_ratio=0.5,
-            val_ratio=0.25,
-            split_seed=42,
-        ),
+        evaluation=SimpleNamespace(fit_type="group", split_seed=42),
         metadata=SimpleNamespace(flag=False),
         baseline=SimpleNamespace(model="def baseline_model(data):\n    return data"),
     )
@@ -431,16 +528,17 @@ def test_run_distributed_client_passes_validation_split_to_baseline(
     search_seen: dict[str, pd.DataFrame] = {}
 
     class FakeSearch:
-        def __init__(self, *args, **kwargs):
-            search_seen["df_val"] = kwargs.get("df_val")
+        def __init__(self, model, tokenizer, cfg, df, prompt_builder, **kwargs):
+            search_seen["search_df"] = df
+            search_seen["search_kwargs"] = kwargs
             self.best_iter = -1
             self.results_dir = tmp_path / "results" / "demo"
 
         def close(self):
             return None
 
-    def _fit_baseline_if_needed(*, cfg, df_train, df_val=None, registry, id_eval_data=None):
-        search_seen["baseline_df_val"] = df_val
+    def _fit_baseline_if_needed(*, cfg, df_train, registry, id_eval_data=None):
+        search_seen["baseline_df_train"] = df_train
         return {"metric_name": "BIC", "metric_value": 1.0}
 
     monkeypatch.setattr(dist, "configure_temp_dirs", lambda *args, **kwargs: None)
@@ -460,7 +558,42 @@ def test_run_distributed_client_passes_validation_split_to_baseline(
     result = dist.run_distributed_client(config="dummy.yaml")
 
     assert result is None
-    assert search_seen["baseline_df_val"] is search_seen["df_val"]
+    assert search_seen["baseline_df_train"] is search_seen["search_df"]
+    assert len(search_seen["search_df"]) == 2
+    assert len(search_seen["baseline_df_train"]) == 2
+    assert 0 not in search_seen["search_df"]["participant_id"].tolist()
+    assert "df_val" not in search_seen["search_kwargs"]
+
+
+def test_split_prompt_train_test_excludes_prompt_participants_and_uses_two_way_default_ratios():
+    """The production split helper should partition only non-prompt participants."""
+    from gecco.cli import run_gecco_distributed as dist
+
+    df = pd.DataFrame(
+        {
+            "participant_id": [100, 101, 10, 11, 12, 13, 14],
+            "value": [1, 2, 3, 4, 5, 6, 7],
+        }
+    )
+    prompt_df = df.iloc[[0, 1]].copy()
+    data_cfg = SimpleNamespace(id_column="participant_id", splits=[])
+    evaluation_cfg = SimpleNamespace(split_seed=42, train_ratio=0.7, test_ratio=0.3)
+
+    with patch.object(dist, "split_by_participant", return_value={"prompt": prompt_df}) as split_mock:
+        result = dist._split_prompt_train_test(df, data_cfg, evaluation_cfg)
+
+    split_mock.assert_called_once_with(df, "participant_id", [])
+    assert len(result) == 5
+
+    df_prompt, df_train, df_test, train_ids, test_ids = result
+    assert df_prompt.equals(prompt_df)
+    assert train_ids == [14, 12, 13]
+    assert test_ids == [11, 10]
+    assert len(train_ids) == int(5 * 0.7)
+    assert set(df_train["participant_id"]) == set(train_ids)
+    assert set(df_test["participant_id"]) == set(test_ids)
+    assert set(prompt_df["participant_id"]).isdisjoint(df_train["participant_id"])
+    assert set(prompt_df["participant_id"]).isdisjoint(df_test["participant_id"])
 
 
 def test_run_test_evaluation_uses_placeholder_for_missing_baseline_val_nll(
@@ -515,6 +648,239 @@ def test_run_test_evaluation_uses_placeholder_for_missing_baseline_val_nll(
     fit_mock.assert_called_once()
     assert fit_mock.call_args.args[0]["client_id"] == "baseline"
     assert "val_nll=n/a" in captured
+
+
+def test_run_test_evaluation_load_splits_returns_test_partition(
+    tmp_path: Path, monkeypatch
+):
+    """The test-evaluation helper should return the held-out test partition."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    df = pd.DataFrame(
+        {
+            "participant_id": [0, 1, 2, 3, 4],
+            "value": [10, 11, 12, 13, 14],
+        }
+    )
+    prompt_df = df.iloc[[0]].copy()
+    train_df = df.iloc[[1, 2]].copy()
+    test_df = df.iloc[[3, 4]].copy()
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(split_seed=42),
+    )
+
+    with patch.object(test_eval, "load_data", return_value=df):
+        with patch.object(
+            test_eval,
+            "_split_prompt_train_test",
+            return_value=(prompt_df, train_df, test_df, [1, 2], [3, 4]),
+        ) as split_mock:
+            result = test_eval.load_splits(cfg)
+
+    split_mock.assert_called_once()
+    assert result.equals(test_df)
+
+
+def test_collect_candidates_ranks_by_development_metric_without_validation_fields():
+    """Candidate collection should rank by dev metrics and keep distinct identities."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    registry = MagicMock()
+    registry.read.return_value = {
+        "iteration_history": [
+            {
+                "client_id": 0,
+                "iteration": 0,
+                "results": [
+                    {
+                        "function_name": "shared_model",
+                        "metric_value": 9.0,
+                        "code": "def shared_model():\n    return 1",
+                        "param_names": ["alpha"],
+                    },
+                    {
+                        "function_name": "shared_model",
+                        "metric_value": 7.0,
+                        "code": "def shared_model():\n    return 1",
+                        "param_names": ["alpha"],
+                    },
+                ],
+            },
+            {
+                "client_id": 1,
+                "iteration": 0,
+                "results": [
+                    {
+                        "function_name": "shared_model",
+                        "metric_value": 8.0,
+                        "code": "def shared_model():\n    return 3",
+                        "param_names": ["alpha"],
+                    },
+                    {
+                        "function_name": "unique_model",
+                        "metric_value": 6.0,
+                        "code": "def unique_model():\n    return 4",
+                        "param_names": ["beta"],
+                    },
+                    {
+                        "function_name": "ignored_model",
+                        "metric_value": None,
+                        "code": "def ignored_model():\n    return 5",
+                        "param_names": ["gamma"],
+                    },
+                ],
+            },
+        ],
+        "baseline": {},
+    }
+    cfg = SimpleNamespace(evaluation=SimpleNamespace(metric="BIC"))
+
+    candidates = test_eval.collect_candidates(registry, cfg)
+
+    assert len(candidates) == 3
+    assert [candidate["selection_metric_value"] for candidate in candidates] == [6.0, 7.0, 8.0]
+    assert all("val_mean_nll" not in candidate for candidate in candidates)
+    assert [candidate["function_name"] for candidate in candidates] == [
+        "unique_model",
+        "shared_model",
+        "shared_model",
+    ]
+
+    nll_registry = MagicMock()
+    nll_registry.read.return_value = {
+        "iteration_history": [
+            {
+                "client_id": 2,
+                "iteration": 1,
+                "results": [
+                    {
+                        "function_name": "nll_model",
+                        "mean_nll": 2.5,
+                        "code": "def nll_model():\n    return 1",
+                        "param_names": [],
+                    }
+                ],
+            }
+        ],
+        "baseline": {},
+    }
+    nll_cfg = SimpleNamespace(evaluation=SimpleNamespace(metric="NLL"))
+
+    nll_candidates = test_eval.collect_candidates(nll_registry, nll_cfg)
+
+    assert len(nll_candidates) == 1
+    assert nll_candidates[0]["selection_metric_name"] == "mean_nll"
+    assert nll_candidates[0]["selection_metric_value"] == pytest.approx(2.5)
+
+
+def test_run_test_evaluation_default_evaluates_10_generated_plus_baseline(
+    tmp_path: Path, monkeypatch
+):
+    """Default test-evaluation count should cover 10 generated models plus baseline."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {
+        "iteration_history": [],
+        "baseline": {
+            "function_name": "baseline_model",
+            "executable_function_name": "hybrid_model",
+            "code": "def hybrid_model(data):\n    return data",
+            "val_mean_nll": 0.5,
+            "param_names": [],
+        },
+    }
+    candidate_names = [f"candidate_{idx}" for idx in range(11)]
+    fit_calls: list[str] = []
+
+    def _fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
+        fit_calls.append(candidate["client_id"])
+        return {"model_name": candidate["function_name"], "val_nll": 0.0, "test_mean_BIC": 1.0, "test_mean_NLL": 2.0, "test_individual_BIC": [], "test_individual_NLL": [], "test_individual_differences": None}
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "collect_candidates", return_value=[{"client_id": name, "function_name": name, "code": "def f():\n    return 1", "val_mean_nll": float(idx), "param_names": []} for idx, name in enumerate(candidate_names)]):
+                with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                    registry_cls.open_existing.return_value = fake_registry
+                    registry_cls.side_effect = AssertionError("constructor path must not be used")
+                    with patch.object(test_eval, "fit_one_on_test", side_effect=_fit_one_on_test):
+                        result = test_eval.run_test_evaluation(
+                            config="unused",
+                            results_dir=str(results_dir),
+                            write_store=False,
+                        )
+
+    assert result is None
+    assert fit_calls == ["baseline", *candidate_names[:10]]
+
+
+def test_run_test_evaluation_explicit_1_evaluates_1_generated_plus_baseline(
+    tmp_path: Path, monkeypatch
+):
+    """Explicit test-evaluation count should still leave baseline outside the limit."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=1),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {
+        "iteration_history": [],
+        "baseline": {
+            "function_name": "baseline_model",
+            "executable_function_name": "hybrid_model",
+            "code": "def hybrid_model(data):\n    return data",
+            "val_mean_nll": 0.5,
+            "param_names": [],
+        },
+    }
+    candidate_names = ["candidate_0", "candidate_1"]
+    fit_calls: list[str] = []
+
+    def _fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
+        fit_calls.append(candidate["client_id"])
+        return {"model_name": candidate["function_name"], "val_nll": 0.0, "test_mean_BIC": 1.0, "test_mean_NLL": 2.0, "test_individual_BIC": [], "test_individual_NLL": [], "test_individual_differences": None}
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "collect_candidates", return_value=[{"client_id": name, "function_name": name, "code": "def f():\n    return 1", "val_mean_nll": float(idx), "param_names": []} for idx, name in enumerate(candidate_names)]):
+                with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                    registry_cls.open_existing.return_value = fake_registry
+                    registry_cls.side_effect = AssertionError("constructor path must not be used")
+                    with patch.object(test_eval, "fit_one_on_test", side_effect=_fit_one_on_test):
+                        result = test_eval.run_test_evaluation(
+                            config="unused",
+                            results_dir=str(results_dir),
+                            write_store=False,
+                        )
+
+    assert result is None
+    assert fit_calls == ["baseline", "candidate_0"]
 
 
 def test_fit_baseline_if_needed_is_single_fit_under_process_contention(
@@ -617,6 +983,84 @@ def test_run_test_evaluation_opens_existing_registry_read_only(tmp_path: Path, m
 
     registry_cls.open_existing.assert_called_once_with(registry_path)
     assert result is None
+
+
+def test_run_test_evaluation_uses_executable_name_for_display_named_candidate(
+    tmp_path: Path, monkeypatch
+):
+    """Display names in the registry should not be used as executable names."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=1),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {
+        "iteration_history": [
+            {
+                "client_id": 0,
+                "iteration": 0,
+                "results": [
+                        {
+                            "function_name": "perseveration_net_mf",
+                            "code": "@njit\ndef cognitive_model1(model_parameters):\n    x = model_parameters[0]\n    return x",
+                            "metric_value": 1.5,
+                            "param_names": ["x"],
+                        }
+                ],
+            }
+        ],
+        "baseline": {},
+    }
+
+    fit_entry = {
+        "metric_name": "BIC",
+        "metric_value": 2.0,
+        "mean_nll": 3.0,
+        "eval_metrics": [2.0],
+        "per_participant_nll": [3.0],
+    }
+
+    def _run_fit(df, code, *, cfg, expected_func_name):
+        assert expected_func_name == "cognitive_model1"
+        assert code == "@njit\ndef cognitive_model1(model_parameters):\n    x = model_parameters[0]\n    return x"
+        return fit_entry
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                registry_cls.open_existing.return_value = fake_registry
+                registry_cls.side_effect = AssertionError("constructor path must not be used")
+                with patch.object(test_eval, "run_fit", side_effect=_run_fit):
+                    result = test_eval.run_test_evaluation(
+                        config="unused",
+                        results_dir=str(results_dir),
+                        write_store=False,
+                    )
+
+    assert result is None
+    assert (results_dir / "bics" / "top_models_test.json").exists()
+
+
+def test_build_model_spec_falls_back_to_injected_njit():
+    """Missing function names should still resolve to the injected numba helper."""
+    from gecco.offline_evaluation.utils import build_model_spec
+
+    code = "@njit\ndef cognitive_model(model_parameters):\n    x = model_parameters[0]\n    return x + 1\n"
+
+    spec = build_model_spec(code, expected_func_name="missing_model")
+
+    assert spec.name == "missing_model"
+    assert spec.func.__name__ == "njit"
 
 
 def test_run_test_evaluation_does_not_use_default_results_dir(tmp_path: Path, monkeypatch):

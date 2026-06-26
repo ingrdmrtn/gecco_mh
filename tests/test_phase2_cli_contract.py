@@ -430,8 +430,8 @@ def test_distributed_client_publishes_abort_on_unhandled_exception(tmp_path):
         ),
         evaluation=SimpleNamespace(
             fit_type="group",
-            train_ratio=0.6,
-            val_ratio=0.2,
+            train_ratio=0.7,
+            test_ratio=0.3,
             split_seed=42,
             metric="bic",
         ),

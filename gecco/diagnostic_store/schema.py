@@ -9,7 +9,7 @@ Call :func:`create_schema` on a fresh DuckDB connection to initialise the
 database.
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 CREATE_STATEMENTS = [
     # ------------------------------------------------------------------ #
@@ -178,6 +178,7 @@ CREATE_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS runtime_baseline (
         singleton      INTEGER PRIMARY KEY DEFAULT 1,
         function_name  VARCHAR,
+        executable_function_name VARCHAR,
         metric_name    VARCHAR,
         metric_value   DOUBLE,
         param_names    JSON,
@@ -336,6 +337,15 @@ def create_schema(connection) -> None:
     """Initialise all tables in *connection* (idempotent)."""
     for stmt in CREATE_STATEMENTS:
         connection.execute(stmt.strip())
+
+    baseline_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info('runtime_baseline')").fetchall()
+    }
+    if "executable_function_name" not in baseline_columns:
+        connection.execute(
+            "ALTER TABLE runtime_baseline ADD COLUMN executable_function_name VARCHAR"
+        )
 
     version_row = connection.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
     if version_row == 0:

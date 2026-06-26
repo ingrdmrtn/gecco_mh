@@ -448,7 +448,6 @@ def test_run_n_shots_generator_resume_uses_generator_helper():
     search.shared_registry = MagicMock()
     search.shared_registry.get_max_generator_iteration.return_value = 0
     search.df = MagicMock()
-    search.df_val = None
     search.best_model = None
     search.best_metric = float("inf")
     search.best_iter = -1
@@ -502,7 +501,6 @@ def test_run_n_shots_evaluator_resume_uses_per_client_helper():
     search.shared_registry = MagicMock()
     search.shared_registry.get_max_iteration_for_client.return_value = 0
     search.df = MagicMock()
-    search.df_val = None
     search.best_model = None
     search.best_metric = float("inf")
     search.best_iter = -1
@@ -557,7 +555,6 @@ def test_run_n_shots_respects_max_iterations_on_resume():
     # Client has completed iteration 0, so resume should start at iteration 1
     search.shared_registry.get_max_iteration_for_client.return_value = 0
     search.df = MagicMock()
-    search.df_val = None
     search.best_model = None
     search.best_metric = float("inf")
     search.best_iter = -1
@@ -615,7 +612,6 @@ def test_run_n_shots_preserves_terminal_no_success_status(tmp_path):
     search.shared_registry.mark_complete = MagicMock()
     search.distributed_coordinator = MagicMock(start_iteration=MagicMock(return_value=0))
     search.df = SimpleNamespace()
-    search.df_val = None
     search.best_model = None
     search.best_metric = float("inf")
     search.best_iter = -1

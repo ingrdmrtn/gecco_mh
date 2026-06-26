@@ -16,7 +16,6 @@ def fit_baseline_if_needed(
     *,
     cfg: Any,
     df_train,
-    df_val=None,
     registry: SharedRegistry,
     id_eval_data=None,
 ) -> dict[str, Any] | None:
@@ -33,7 +32,10 @@ def fit_baseline_if_needed(
         configured or fitting fails.
     """
     baseline_cfg = getattr(cfg, "baseline", None)
-    baseline_code = getattr(baseline_cfg, "model", None) if baseline_cfg else None
+    if isinstance(baseline_cfg, dict):
+        baseline_code = baseline_cfg.get("model")
+    else:
+        baseline_code = getattr(baseline_cfg, "model", None) if baseline_cfg else None
     if not baseline_code:
         baseline_code = getattr(cfg.llm, "template_model", None)
     if not baseline_code:
@@ -51,22 +53,24 @@ def fit_baseline_if_needed(
         def _baseline_from_row(row) -> dict[str, Any]:
             return {
                 "function_name": row[0],
-                "metric_name": row[1],
-                "metric_value": row[2],
-                "param_names": registry._from_json_value(row[3]) or [],
-                "eval_metrics": registry._from_json_value(row[4]) or [],
-                "mean_r2": row[5],
-                "max_r2": row[6],
-                "best_param": row[7],
-                "per_param_r2": registry._from_json_value(row[8]) or {},
-                "code": row[9],
-                "val_mean_nll": row[10],
+                "executable_function_name": row[1],
+                "metric_name": row[2],
+                "metric_value": row[3],
+                "param_names": registry._from_json_value(row[4]) or [],
+                "eval_metrics": registry._from_json_value(row[5]) or [],
+                "mean_r2": row[6],
+                "max_r2": row[7],
+                "best_param": row[8],
+                "per_param_r2": registry._from_json_value(row[9]) or {},
+                "code": row[10],
+                "val_mean_nll": row[11],
             }
 
         def _fit_or_load(conn) -> dict[str, Any] | None:
             row = conn.execute(
-                "SELECT function_name, metric_name, metric_value, param_names, eval_metrics, "
-                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll "
+                "SELECT function_name, executable_function_name, metric_name, metric_value, "
+                "param_names, eval_metrics, mean_r2, max_r2, best_param, per_param_r2, "
+                "code, val_mean_nll "
                 "FROM runtime_baseline WHERE singleton = 1"
             ).fetchone()
             if row is not None:
@@ -91,6 +95,7 @@ def fit_baseline_if_needed(
 
             result: dict[str, Any] = {
                 "function_name": "baseline_model",
+                "executable_function_name": func_name,
                 "metric_name": fit_res["metric_name"],
                 "metric_value": float(fit_res["metric_value"]),
                 "param_names": fit_res["param_names"],
@@ -99,22 +104,6 @@ def fit_baseline_if_needed(
                 "participant_n_trials": fit_res.get("participant_n_trials", []),
                 "val_mean_nll": None,
             }
-
-            if df_val is not None and not df_val.empty:
-                try:
-                    val_fit_res = run_fit(
-                        df_val, baseline_code, cfg=cfg, expected_func_name=func_name
-                    )
-                    result["val_metric_value"] = float(val_fit_res["metric_value"])
-                    result["val_mean_nll"] = float(val_fit_res["mean_nll"])
-                    result["val_eval_metrics"] = [
-                        float(v) for v in val_fit_res.get("eval_metrics", [])
-                    ]
-                    result["val_per_participant_nll"] = [
-                        float(v) for v in val_fit_res.get("per_participant_nll", [])
-                    ]
-                except Exception as exc:
-                    _log(f"[GeCCo] Baseline validation eval failed: {exc}")
 
             param_values = fit_res.get("parameter_values", [])
             if param_values:
@@ -145,11 +134,13 @@ def fit_baseline_if_needed(
             id_res = result.get("individual_differences") or {}
             conn.execute(
                 "INSERT OR REPLACE INTO runtime_baseline "
-                "(singleton, function_name, metric_name, metric_value, param_names, eval_metrics, "
-                "mean_r2, max_r2, best_param, per_param_r2, code, val_mean_nll) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(singleton, function_name, executable_function_name, metric_name, metric_value, "
+                "param_names, eval_metrics, mean_r2, max_r2, best_param, per_param_r2, code, "
+                "val_mean_nll) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     result.get("function_name", "baseline_model"),
+                    result.get("executable_function_name"),
                     result.get("metric_name", "BIC"),
                     result.get("metric_value"),
                     registry._to_json_text(result.get("param_names", [])),

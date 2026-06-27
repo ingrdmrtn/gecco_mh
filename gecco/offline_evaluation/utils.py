@@ -1,6 +1,5 @@
 import ast
 import re
-import types
 from typing import Any, Dict, List, Optional
 import numpy as np
 import numba
@@ -318,11 +317,36 @@ def _safe_exec_user_code(
     return ns
 
 
-def _find_first_function(ns: Dict[str, Any]) -> Optional[Any]:
-    """Return the first callable function defined in the executed namespace."""
-    for k, v in ns.items():
-        if isinstance(v, types.FunctionType) and not k.startswith("_"):
-            return v
+def _user_defined_callable_names(code: str) -> List[str]:
+    """Return top-level callable names introduced by user code."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    names: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            names.append(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.append(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.append(node.target.id)
+    return names
+
+
+def _find_first_function(
+    ns: Dict[str, Any], candidate_names: Optional[List[str]] = None
+) -> Optional[Any]:
+    """Return the first callable introduced by user code, excluding injected helpers."""
+    for name in candidate_names or []:
+        if name.startswith("_"):
+            continue
+        value = ns.get(name)
+        if callable(value):
+            return value
     return None
 
 
@@ -510,6 +534,7 @@ def build_model_spec(
     # Extract code block if wrapped in markdown
     code = _extract_code_block(code)
     is_class = is_class_based_code(code)
+    user_callable_names = _user_defined_callable_names(code)
 
     # Get base class code if needed
     if is_class and base_class_code is None:
@@ -526,7 +551,7 @@ def build_model_spec(
     # Get the function
     func = ns.get(expected_func_name)
     if func is None:
-        func = _find_first_function(ns)
+        func = _find_first_function(ns, user_callable_names)
     if func is None:
         # Log the first few lines to help diagnose extraction issues
         preview = code[:200].replace("\n", "\\n") if code else "(empty)"

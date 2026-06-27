@@ -1051,8 +1051,8 @@ def test_run_test_evaluation_uses_executable_name_for_display_named_candidate(
     assert (results_dir / "bics" / "top_models_test.json").exists()
 
 
-def test_build_model_spec_falls_back_to_injected_njit():
-    """Missing function names should still resolve to the injected numba helper."""
+def test_build_model_spec_falls_back_to_user_defined_function_not_injected_njit():
+    """Missing display names should resolve to user code, never injected helpers."""
     from gecco.offline_evaluation.utils import build_model_spec
 
     code = "@njit\ndef cognitive_model(model_parameters):\n    x = model_parameters[0]\n    return x + 1\n"
@@ -1060,7 +1060,7 @@ def test_build_model_spec_falls_back_to_injected_njit():
     spec = build_model_spec(code, expected_func_name="missing_model")
 
     assert spec.name == "missing_model"
-    assert spec.func.__name__ == "njit"
+    assert spec.func.__name__ == "cognitive_model"
 
 
 def test_run_test_evaluation_does_not_use_default_results_dir(tmp_path: Path, monkeypatch):

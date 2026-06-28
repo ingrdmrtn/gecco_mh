@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
 from pathlib import Path
 
 import numpy as np
+from rich.console import Console
+from rich.table import Table
 
 from config.schema import load_config
 from gecco.coordination import SharedRegistry
@@ -64,37 +67,108 @@ def _selection_metric_value(candidate: dict, cfg) -> float | None:
     return float(value)
 
 
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest() if code else ""
+
+
+def _candidate_generation_display_name(candidate: dict) -> str:
+    return (
+        candidate.get("display_name")
+        or candidate.get("name")
+        or candidate.get("function_name")
+        or candidate.get("func_name")
+        or ""
+    )
+
+
+def _resolve_display_name(result: dict, generation_candidates: list[dict] | None = None) -> str:
+    explicit_display_name = result.get("display_name") or result.get("name")
+    if explicit_display_name:
+        return explicit_display_name
+
+    generation_candidates = generation_candidates or []
+    candidate_index = result.get("candidate_index")
+    code_hash = _code_hash(result.get("code", ""))
+
+    if candidate_index is not None:
+        for candidate in generation_candidates:
+            if candidate.get("index") == candidate_index:
+                display_name = _candidate_generation_display_name(candidate)
+                if display_name:
+                    return display_name
+
+    if code_hash:
+        for candidate in generation_candidates:
+            if _code_hash(candidate.get("code", "")) == code_hash:
+                display_name = _candidate_generation_display_name(candidate)
+                if display_name:
+                    return display_name
+
+    return result.get("function_name", "")
+
+
 def collect_candidates(registry, cfg):
     """Collect unique candidates with finite development scores."""
     data = registry.read()
     candidates = {}
+    generation_candidates_by_iteration = data.get("candidate_generations", {})
     selection_field = _selection_metric_field(cfg)
     for entry in data.get("iteration_history", []):
         client_id = entry.get("client_id")
         iteration = entry.get("iteration")
+        generation_candidates = (
+            generation_candidates_by_iteration.get(str(iteration), {}).get("candidates", [])
+        )
         for result in entry.get("results", []):
             score = _selection_metric_value(result, cfg)
             if score is None:
                 continue
-            name = result.get("function_name", "")
+            display_name = _resolve_display_name(result, generation_candidates)
+            executable_function_name = (
+                result.get("executable_function_name")
+                or result.get("func_name")
+                or next(
+                    (
+                        candidate.get("func_name")
+                        or candidate.get("executable_function_name")
+                        or candidate.get("function_name")
+                        for candidate in generation_candidates
+                        if (
+                            result.get("candidate_index") is not None
+                            and candidate.get("index") == result.get("candidate_index")
+                        )
+                        or (
+                            _code_hash(candidate.get("code", ""))
+                            == _code_hash(result.get("code", ""))
+                            and result.get("code")
+                        )
+                    ),
+                    None,
+                )
+            )
             code = result.get("code", "")
+            candidate_index = result.get("candidate_index")
             candidate_key = (
                 client_id,
                 iteration,
-                name,
-                hashlib.sha256(code.encode("utf-8")).hexdigest() if code else "",
+                candidate_index if candidate_index is not None else display_name,
+                _code_hash(code),
             )
             candidate = {
                 "client_id": client_id,
                 "iteration": iteration,
-                "function_name": name,
-                "executable_function_name": result.get("executable_function_name")
-                or result.get("func_name"),
+                "candidate_index": candidate_index,
+                "function_name": display_name,
+                "display_name": display_name,
+                "executable_function_name": executable_function_name,
                 "code": code,
+                "code_hash": _code_hash(code),
                 "selection_metric_name": selection_field,
                 "selection_metric_value": score,
                 "param_names": result.get("param_names", []),
             }
+            if "val_mean_nll" in result:
+                candidate["val_mean_nll"] = result["val_mean_nll"]
             if candidate_key not in candidates or score < candidates[candidate_key][
                 "selection_metric_value"
             ]:
@@ -130,7 +204,7 @@ def _resolve_executable_function_name(candidate, cfg):
 
 def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
     """Fit a single candidate model on the test split."""
-    func_name = candidate["function_name"]
+    func_name = candidate.get("display_name") or candidate["function_name"]
     expected_func_name = _resolve_executable_function_name(candidate, cfg)
     code = candidate["code"]
     if not code:
@@ -143,6 +217,11 @@ def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
 
     entry = {
         "model_name": func_name,
+        "display_name": func_name,
+        "executable_function_name": expected_func_name,
+        "client_id": candidate.get("client_id"),
+        "iteration": candidate.get("iteration"),
+        "candidate_index": candidate.get("candidate_index"),
         "selection_metric_name": candidate.get("selection_metric_name"),
         "selection_metric_value": candidate.get("selection_metric_value"),
         "val_nll": candidate.get("val_mean_nll"),
@@ -182,6 +261,86 @@ def _format_optional_float(value) -> str:
     except TypeError:
         return "n/a"
     return f"{float(value):.2f}"
+
+
+_SUMMARY_CSV_FIELDNAMES = [
+    "model_name",
+    "executable_function_name",
+    "client_id",
+    "iteration",
+    "selection_metric_name",
+    "selection_metric_value",
+    "val_nll",
+    "test_mean_BIC",
+    "test_mean_NLL",
+    "individual_differences_mean_r2",
+    "individual_differences_max_r2",
+    "individual_differences_best_param",
+]
+
+
+def _summary_row(entry: dict) -> dict[str, str]:
+    individual_differences = entry.get("test_individual_differences") or {}
+    return {
+        "model_name": str(entry.get("model_name", "")),
+        "executable_function_name": str(entry.get("executable_function_name", "")),
+        "client_id": "" if entry.get("client_id") is None else str(entry.get("client_id")),
+        "iteration": "" if entry.get("iteration") is None else str(entry.get("iteration")),
+        "selection_metric_name": str(entry.get("selection_metric_name", "")),
+        "selection_metric_value": _format_optional_float(entry.get("selection_metric_value")),
+        "val_nll": _format_optional_float(entry.get("val_nll")),
+        "test_mean_BIC": _format_optional_float(entry.get("test_mean_BIC")),
+        "test_mean_NLL": _format_optional_float(entry.get("test_mean_NLL")),
+        "individual_differences_mean_r2": _format_optional_float(
+            individual_differences.get("mean_r2")
+        ),
+        "individual_differences_max_r2": _format_optional_float(
+            individual_differences.get("max_r2")
+        ),
+        "individual_differences_best_param": ""
+        if individual_differences.get("best_param") is None
+        else str(individual_differences.get("best_param")),
+    }
+
+
+def _render_summary_table(results: list[dict]) -> None:
+    table = Table(title="Test evaluation summary", show_lines=False)
+    table.add_column("Model name")
+    table.add_column("Executable name")
+    table.add_column("Client")
+    table.add_column("Iteration")
+    table.add_column("Selection metric")
+    table.add_column("Selection value")
+    table.add_column("Val NLL")
+    table.add_column("Test BIC")
+    table.add_column("Test NLL")
+    table.add_column("ID mean R2")
+    table.add_column("ID max R2")
+    table.add_column("ID best param")
+
+    for result in results:
+        individual_differences = result.get("test_individual_differences") or {}
+        table.add_row(
+            str(result.get("model_name", "")),
+            str(result.get("executable_function_name", "")),
+            "" if result.get("client_id") is None else str(result.get("client_id")),
+            "" if result.get("iteration") is None else str(result.get("iteration")),
+            str(result.get("selection_metric_name", "")),
+            _format_optional_float(result.get("selection_metric_value")),
+            _format_optional_float(result.get("val_nll")),
+            _format_optional_float(result.get("test_mean_BIC")),
+            _format_optional_float(result.get("test_mean_NLL")),
+            _format_optional_float(individual_differences.get("mean_r2")),
+            _format_optional_float(individual_differences.get("max_r2")),
+            "" if individual_differences.get("best_param") is None else str(individual_differences.get("best_param")),
+        )
+
+    console = Console()
+    console.print(
+        "[test] Summary columns: Model name | Executable name | Client | Iteration | "
+        "Selection metric | Selection value | Val NLL | Test BIC | Test NLL"
+    )
+    console.print(table)
 
 
 def run_test_evaluation(
@@ -227,17 +386,25 @@ def run_test_evaluation(
     baseline = registry.read().get("baseline")
     if baseline and baseline.get("code"):
         baseline_score = _selection_metric_value(baseline, cfg)
+        baseline_display_name = (
+            baseline.get("display_name")
+            or baseline.get("name")
+            or baseline.get("function_name", "baseline_model")
+        )
         top = [
             {
                 "client_id": "baseline",
                 "iteration": -1,
-                "function_name": baseline.get("function_name", "baseline_model"),
+                "function_name": baseline_display_name,
+                "display_name": baseline_display_name,
                 "code": baseline["code"],
+                "code_hash": _code_hash(baseline["code"]),
                 "selection_metric_name": _selection_metric_field(cfg),
                 "selection_metric_value": baseline_score,
                 "val_mean_nll": baseline.get("val_mean_nll", float("nan")),
                 "param_names": baseline.get("param_names", []),
                 "executable_function_name": baseline.get("executable_function_name"),
+                "candidate_index": baseline.get("candidate_index"),
             }
         ] + top
         print("[test] Added baseline to evaluation list")
@@ -259,6 +426,16 @@ def run_test_evaluation(
     with out_path.open("w", encoding="utf-8") as file_obj:
         json.dump(results, file_obj, indent=2)
     print(f"[test] Wrote {len(results)} entries to {out_path}")
+
+    csv_path = resolved_results_dir / "bics" / "top_models_test.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=_SUMMARY_CSV_FIELDNAMES)
+        writer.writeheader()
+        for entry in results:
+            writer.writerow(_summary_row(entry))
+    print(f"[test] Wrote {len(results)} summary rows to {csv_path}")
+
+    _render_summary_table(results)
 
     if write_store:
         try:

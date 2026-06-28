@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import multiprocessing as mp
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -985,6 +986,180 @@ def test_run_test_evaluation_opens_existing_registry_read_only(tmp_path: Path, m
     assert result is None
 
 
+def test_run_test_evaluation_writes_json_csv_and_rich_summary(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Completed test evaluation should write JSON, CSV, and a Rich summary table."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=1),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {
+        "iteration_history": [
+            {
+                "client_id": 7,
+                "iteration": 3,
+                "results": [
+                    {
+                        "function_name": "descriptive_model",
+                        "display_name": "descriptive model",
+                        "executable_function_name": "cognitive_model1",
+                        "code": "@njit\ndef cognitive_model1(model_parameters):\n    return model_parameters[0]",
+                        "val_mean_nll": 4.25,
+                        "metric_value": 1.25,
+                        "param_names": ["x"],
+                        "candidate_index": 0,
+                    }
+                ],
+            }
+        ],
+        "baseline": {},
+    }
+
+    fit_entry = {
+        "metric_name": "BIC",
+        "metric_value": 2.0,
+        "mean_nll": 3.0,
+        "eval_metrics": [2.0],
+        "per_participant_nll": [3.0],
+    }
+
+    def _run_fit(df, code, *, cfg, expected_func_name):
+        assert expected_func_name == "cognitive_model1"
+        assert code == "@njit\ndef cognitive_model1(model_parameters):\n    return model_parameters[0]"
+        return fit_entry
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                registry_cls.open_existing.return_value = fake_registry
+                registry_cls.side_effect = AssertionError("constructor path must not be used")
+                with patch.object(test_eval, "run_fit", side_effect=_run_fit):
+                    result = test_eval.run_test_evaluation(
+                        config="unused",
+                        results_dir=str(results_dir),
+                        write_store=False,
+                    )
+
+    captured = capsys.readouterr().out
+    json_path = results_dir / "bics" / "top_models_test.json"
+    csv_path = results_dir / "bics" / "top_models_test.csv"
+
+    assert result is None
+    assert json_path.exists()
+    assert csv_path.exists()
+    assert "Test evaluation summary" in captured
+    assert "Model name" in captured
+    assert "descriptive model" in captured
+
+    json_rows = json.loads(json_path.read_text(encoding="utf-8"))
+    csv_rows = pd.read_csv(csv_path)
+
+    assert json_rows[0]["model_name"] == "descriptive model"
+    assert json_rows[0]["val_nll"] == 4.25
+    assert csv_rows.loc[0, "model_name"] == "descriptive model"
+    assert csv_rows.loc[0, "executable_function_name"] == "cognitive_model1"
+    assert csv_rows.loc[0, "val_nll"] == pytest.approx(4.25)
+    assert "test_individual_BIC" not in csv_rows.columns
+    assert "test_individual_NLL" not in csv_rows.columns
+
+
+def test_run_test_evaluation_uses_descriptive_model_name_without_executable_regression(
+    tmp_path: Path, monkeypatch
+):
+    """Recoverable registry names should stay human-facing while execution stays callable-based."""
+    from gecco.cli import run_test_evaluation as test_eval
+
+    project_root = tmp_path / "project_root"
+    monkeypatch.setattr(test_eval, "PROJECT_ROOT", project_root)
+
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    registry_path = results_dir / "shared_registry.duckdb"
+    registry_path.touch()
+
+    code = "@njit\ndef cognitive_model1(model_parameters):\n    return model_parameters[0]"
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(path="unused", input_columns=[], id_column="participant_id", splits=[]),
+        evaluation=SimpleNamespace(n_test_models=1),
+    )
+    fake_registry = MagicMock()
+    fake_registry.read.return_value = {
+        "iteration_history": [
+            {
+                "client_id": 0,
+                "iteration": 4,
+                "results": [
+                    {
+                        "function_name": "cognitive_model1",
+                        "candidate_index": 2,
+                        "code": code,
+                        "metric_value": 1.5,
+                        "param_names": ["x"],
+                    }
+                ],
+            }
+        ],
+        "candidate_generations": {
+            "4": {
+                "candidates": [
+                    {
+                        "index": 2,
+                        "name": "perseveration net",
+                        "func_name": "cognitive_model1",
+                        "code": code,
+                    }
+                ]
+            }
+        },
+        "baseline": {},
+    }
+
+    fit_entry = {
+        "metric_name": "BIC",
+        "metric_value": 2.0,
+        "mean_nll": 3.0,
+        "eval_metrics": [2.0],
+        "per_participant_nll": [3.0],
+    }
+
+    def _run_fit(df, code, *, cfg, expected_func_name):
+        assert expected_func_name == "cognitive_model1"
+        assert code == "@njit\ndef cognitive_model1(model_parameters):\n    return model_parameters[0]"
+        return fit_entry
+
+    with patch.object(test_eval, "load_config", return_value=cfg):
+        with patch.object(test_eval, "load_splits", return_value=pd.DataFrame()):
+            with patch.object(test_eval, "SharedRegistry") as registry_cls:
+                registry_cls.open_existing.return_value = fake_registry
+                registry_cls.side_effect = AssertionError("constructor path must not be used")
+                with patch.object(test_eval, "run_fit", side_effect=_run_fit):
+                    result = test_eval.run_test_evaluation(
+                        config="unused",
+                        results_dir=str(results_dir),
+                        write_store=False,
+                    )
+
+    json_rows = json.loads((results_dir / "bics" / "top_models_test.json").read_text(encoding="utf-8"))
+    csv_rows = pd.read_csv(results_dir / "bics" / "top_models_test.csv")
+
+    assert result is None
+    assert json_rows[0]["model_name"] == "perseveration net"
+    assert csv_rows.loc[0, "model_name"] == "perseveration net"
+    assert csv_rows.loc[0, "executable_function_name"] == "cognitive_model1"
+
+
 def test_run_test_evaluation_uses_executable_name_for_display_named_candidate(
     tmp_path: Path, monkeypatch
 ):
@@ -1048,7 +1223,35 @@ def test_run_test_evaluation_uses_executable_name_for_display_named_candidate(
                     )
 
     assert result is None
-    assert (results_dir / "bics" / "top_models_test.json").exists()
+    assert json.loads((results_dir / "bics" / "top_models_test.json").read_text(encoding="utf-8"))[0]["model_name"] == "perseveration_net_mf"
+    assert pd.read_csv(results_dir / "bics" / "top_models_test.csv").loc[0, "model_name"] == "perseveration_net_mf"
+    assert pd.read_csv(results_dir / "bics" / "top_models_test.csv").loc[0, "executable_function_name"] == "cognitive_model1"
+
+
+def test_shared_registry_update_preserves_naming_metadata(registry: SharedRegistry):
+    """Registry snapshots should keep naming metadata for later test evaluation."""
+    registry.update(
+        client_id=1,
+        iteration=2,
+        results=[
+            {
+                "function_name": "perseveration_net_mf",
+                "display_name": "perseveration_net_mf",
+                "executable_function_name": "cognitive_model1",
+                "candidate_index": 3,
+                "metric_value": 1.0,
+                "param_names": ["x"],
+            }
+        ],
+        status="complete",
+    )
+
+    snapshot = registry.read()
+    result = snapshot["iteration_history"][0]["results"][0]
+
+    assert result["display_name"] == "perseveration_net_mf"
+    assert result["executable_function_name"] == "cognitive_model1"
+    assert result["candidate_index"] == 3
 
 
 def test_build_model_spec_falls_back_to_user_defined_function_not_injected_njit():

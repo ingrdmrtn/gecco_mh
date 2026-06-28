@@ -335,6 +335,13 @@ class SharedRegistry:
                 "param_names": result.get("param_names", []),
                 "code": result.get("code", ""),
             }
+            display_name = result.get("display_name") or result.get("name")
+            if display_name is not None:
+                entry["display_name"] = display_name
+            if result.get("executable_function_name") is not None:
+                entry["executable_function_name"] = result["executable_function_name"]
+            if result.get("candidate_index") is not None:
+                entry["candidate_index"] = result["candidate_index"]
             if result.get("error"):
                 entry["error"] = result["error"]
             if result.get("recovery_r") is not None:

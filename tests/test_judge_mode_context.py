@@ -158,6 +158,8 @@ def _make_cfg(provider: str, context: dict[str, bool], mode: str = "agent") -> S
             base_model="gpt-test",
             max_output_tokens=64,
             temperature=0.0,
+            provider_retry_attempts=2,
+            provider_retry_backoff_seconds=0.0,
         ),
         judge=SimpleNamespace(
             mode=mode,
@@ -308,6 +310,52 @@ def _run_agent_judge(provider: str, context: dict[str, bool], responses, monkeyp
     )
     analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
     return analysis, client
+
+
+def test_agent_judge_retries_json_decode_error_then_succeeds():
+    calls = {"count": 0}
+
+    class _RetryingOpenAIClient:
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            self.calls.append(kwargs)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            if calls["count"] == 2:
+                return _openai_response(content="planning")
+            return _openai_response(content="analysis complete")
+
+    cfg = _make_cfg(
+        "openai",
+        {
+            "attempted_models": True,
+            "performance": False,
+            "best_model_code": False,
+            "diagnostic": False,
+            "individual_differences": False,
+        },
+    )
+    client = _RetryingOpenAIClient()
+
+    judge = ToolUsingJudge(
+        cfg=cfg,
+        diagnostic_store=_AgentStore(),
+        model=client,
+        tokenizer=None,
+        results_dir=None,
+    )
+
+    analysis = judge.get_feedback_analysis(iteration=0, run_idx=0, tag="")
+
+    assert analysis["analysis_text"] == "analysis complete"
+    assert calls["count"] == 3
+    assert len(client.calls) == 3
 
 
 def _tool_schema_dump(provider: str, client) -> str:

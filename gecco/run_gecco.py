@@ -26,6 +26,7 @@ from gecco.candidate_generation import CandidateGenerator
 from gecco.distributed_coordinator import DistributedCoordinator
 from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.load_llms.provider_registry import get_provider_spec
+from gecco.llm_provider_retries import retry_llm_provider_call
 from gecco.run_context import RunContext
 from gecco.utils import log as _log, TimestampedConsole
 from config.schema import get_judge_capabilities, get_judge_mode
@@ -525,7 +526,16 @@ class GeCCoModelSearch:
             # debug_kwargs = {k: v for k, v in create_kwargs.items() if k != "messages"}
             # console.print(f"[dim]Request kwargs (excl. messages): {debug_kwargs!r}[/]")
             try:
-                resp = model.chat.completions.create(**create_kwargs)
+                resp = retry_llm_provider_call(
+                    lambda: model.chat.completions.create(**create_kwargs),
+                    provider=self.cfg.llm.provider,
+                    model=self.cfg.llm.base_model,
+                    operation="candidate generation",
+                    attempts=getattr(self.cfg.llm, "provider_retry_attempts", 3),
+                    backoff_seconds=getattr(
+                        self.cfg.llm, "provider_retry_backoff_seconds", 2.0
+                    ),
+                )
                 # Log the raw response for debugging, especially to inspect reasoning_details and any API error messages
                 # console.print(f"RAW response object:")
                 # console.print(f"[dim]Raw response: {resp!r}[/]")

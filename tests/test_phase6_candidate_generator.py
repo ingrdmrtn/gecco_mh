@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from gecco.artifacts import ArtifactStore
 from gecco.candidate_generation import CandidateGenerator, CandidatePayload
+from gecco.run_gecco import GeCCoModelSearch
 from gecco.run_context import RunContext
 
 
@@ -100,6 +101,93 @@ def test_candidate_payload_normalises_attribute_based_models():
     assert payload.name == "model_a"
     assert payload.validation_failed is True
     assert payload.to_dict()["validation_errors"] == ["bad syntax"]
+
+
+def test_candidate_generator_retries_openai_compatible_json_decode_failure():
+    calls = {"count": 0}
+
+    class _OpenAICompatibleClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="generated candidate text")
+                    )
+                ]
+            )
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        llm=SimpleNamespace(
+            provider="openrouter",
+            base_model="gpt-test",
+            max_tokens=64,
+            temperature=0.1,
+            provider_retry_attempts=2,
+            provider_retry_backoff_seconds=0.0,
+        )
+    )
+
+    result = GeCCoModelSearch.generate(
+        search,
+        _OpenAICompatibleClient(),
+        prompt="build one model",
+        system_prompt="Be concise",
+    )
+
+    assert result == "generated candidate text"
+    assert calls["count"] == 2
+
+
+def test_candidate_generator_keeps_openrouter_404_non_retryable(capsys):
+    calls = {"count": 0}
+
+    class _OpenRouter404Client:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            calls["count"] += 1
+            raise RuntimeError("404 No endpoints found for requested model")
+
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        llm=SimpleNamespace(
+            provider="openrouter",
+            base_model="gpt-test",
+            max_tokens=64,
+            temperature=0.1,
+            provider_retry_attempts=3,
+            provider_retry_backoff_seconds=0.0,
+            supports_json_schema=True,
+            system_prompt="Be helpful",
+        )
+    )
+
+    result = GeCCoModelSearch.generate(
+        search,
+        _OpenRouter404Client(),
+        prompt="build one model",
+        response_schema={"type": "object", "properties": {}},
+        system_prompt="Be concise",
+    )
+
+    captured = capsys.readouterr().out
+
+    assert result == ""
+    assert calls["count"] == 1
+    assert "OpenRouter 404 — no matching endpoint." in captured
+    assert "Remove supports_json_schema: true from the config" in captured
 
 
 def test_candidate_generator_persists_review_through_artifact_store(tmp_path: Path):

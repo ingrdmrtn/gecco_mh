@@ -185,6 +185,43 @@ def test_schema_accepts_valid_mode_llm(tmp_path):
     assert cfg.judge.mode == "llm"
 
 
+def test_schema_defaults_llm_provider_retry_settings(tmp_path):
+    config_path = _write_config(tmp_path, _minimal_config("""  mode: "off"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+"""))
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.llm.provider_retry_attempts == 3
+    assert cfg.llm.provider_retry_backoff_seconds == pytest.approx(2.0)
+
+
+def test_schema_accepts_explicit_llm_provider_retry_settings(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        _minimal_config("""  mode: "off"
+  context:
+    attempted_models: false
+    performance: false
+    best_model_code: false
+    diagnostic: false
+""")
+        .replace(
+            "  guardrails: []\n",
+            "  guardrails: []\n  provider_retry_attempts: 5\n  provider_retry_backoff_seconds: 0.25\n",
+        ),
+    )
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.llm.provider_retry_attempts == 5
+    assert cfg.llm.provider_retry_backoff_seconds == pytest.approx(0.25)
+
+
 def test_schema_accepts_valid_mode_agent(tmp_path):
     config_path = _write_config(tmp_path, _minimal_config("""  mode: "agent"
   context:

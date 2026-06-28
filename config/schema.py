@@ -49,6 +49,8 @@ class LLMConfig(GeCCoBaseModel):
     base_model: str
     temperature: float = 0.7
     max_tokens: int = 4096
+    provider_retry_attempts: int = 3
+    provider_retry_backoff_seconds: float = 2.0
     guardrails: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")

@@ -39,6 +39,7 @@ from rich.console import Console
 
 from config.schema import get_judge_mode, judge_context_enabled
 from gecco.diagnostic_store.tools import dispatch_tool, get_judge_tool_names, get_judge_tool_schemas
+from gecco.llm_provider_retries import retry_llm_provider_call
 from gecco.utils import TimestampedConsole
 
 _console = TimestampedConsole()
@@ -880,18 +881,24 @@ class _OpenAIToolLoop:
         self,
         client,
         model_name: str,
+        provider: str,
         max_tokens: int,
         temperature: float | None,
         tool_schemas: list[dict],
         allowed_tool_names: set[str],
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 2.0,
         verbose: bool = False,
     ):
         self.client = client
         self.model_name = model_name
+        self.provider = provider
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.tool_schemas = tool_schemas
         self.allowed_tool_names = allowed_tool_names
+        self.retry_attempts = retry_attempts
+        self.retry_backoff_seconds = retry_backoff_seconds
         self.verbose = verbose
 
     def run(
@@ -931,7 +938,14 @@ class _OpenAIToolLoop:
             if self.temperature is not None:
                 kwargs["temperature"] = self.temperature
 
-            response = self.client.chat.completions.create(**kwargs)
+            response = retry_llm_provider_call(
+                lambda: self.client.chat.completions.create(**kwargs),
+                provider=self.provider,
+                model=self.model_name,
+                operation="judge tool loop planning" if is_planning_turn else "judge tool loop",
+                attempts=self.retry_attempts,
+                backoff_seconds=self.retry_backoff_seconds,
+            )
             choice = response.choices[0]
             msg = choice.message
 
@@ -1086,7 +1100,14 @@ class _OpenAIToolLoop:
         }
         if self.temperature is not None:
             kwargs_final["temperature"] = self.temperature
-        final_resp = self.client.chat.completions.create(**kwargs_final)
+        final_resp = retry_llm_provider_call(
+            lambda: self.client.chat.completions.create(**kwargs_final),
+            provider=self.provider,
+            model=self.model_name,
+            operation="judge tool loop synthesis",
+            attempts=self.retry_attempts,
+            backoff_seconds=self.retry_backoff_seconds,
+        )
         return final_resp.choices[0].message.content or "", trace, full_trace
 
 
@@ -1954,6 +1975,12 @@ class ToolUsingJudge:
 
         self.model_name: str = getattr(cfg.llm, "base_model", "unknown")
         self.provider: str = getattr(cfg.llm, "provider", "").lower()
+        self.provider_retry_attempts: int = getattr(
+            cfg.llm, "provider_retry_attempts", 3
+        )
+        self.provider_retry_backoff_seconds: float = getattr(
+            cfg.llm, "provider_retry_backoff_seconds", 2.0
+        )
         self.max_tokens: int = getattr(
             cfg.llm,
             "max_output_tokens",
@@ -1981,10 +2008,13 @@ class ToolUsingJudge:
             return _OpenAIToolLoop(
                 self.model,
                 self.model_name,
+                self.provider,
                 self.max_tokens,
                 self.temperature,
                 self.tool_schemas,
                 self.allowed_tool_names,
+                retry_attempts=self.provider_retry_attempts,
+                retry_backoff_seconds=self.provider_retry_backoff_seconds,
                 verbose=self.verbose,
             )
         elif "gemini" in p:
@@ -2465,7 +2495,14 @@ class ToolUsingJudge:
             }
             if self.temperature is not None:
                 kwargs["temperature"] = self.temperature
-            resp = self.model.chat.completions.create(**kwargs)
+            resp = retry_llm_provider_call(
+                lambda: self.model.chat.completions.create(**kwargs),
+                provider=self.provider or "openai-compatible",
+                model=self.model_name,
+                operation="judge structured verdict synthesis",
+                attempts=self.provider_retry_attempts,
+                backoff_seconds=self.provider_retry_backoff_seconds,
+            )
             result = resp.choices[0].message.content or analysis_text
             if self.verbose:
                 _console.print(
@@ -2674,7 +2711,14 @@ class ToolUsingJudge:
             }
             if self.temperature is not None:
                 kwargs["temperature"] = self.temperature
-            resp = self.model.chat.completions.create(**kwargs)
+            resp = retry_llm_provider_call(
+                lambda: self.model.chat.completions.create(**kwargs),
+                provider=self.provider or "openai-compatible",
+                model=self.model_name,
+                operation="judge fallback generation",
+                attempts=self.provider_retry_attempts,
+                backoff_seconds=self.provider_retry_backoff_seconds,
+            )
             content = (
                 resp.choices[0].message.content
                 if resp.choices and resp.choices[0].message

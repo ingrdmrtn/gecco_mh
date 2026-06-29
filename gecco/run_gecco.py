@@ -94,6 +94,7 @@ class GeCCoModelSearch:
         client_id=None,
         shared_registry=None,
         config_path: str | Path | None = None,
+        results_dir: str | Path | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -111,6 +112,7 @@ class GeCCoModelSearch:
             cfg,
             client_id=client_id,
             config_path=config_path,
+            results_dir=results_dir,
         )
         self.project_root = self.run_context.project_root
         self.results_dir = self.run_context.results_dir

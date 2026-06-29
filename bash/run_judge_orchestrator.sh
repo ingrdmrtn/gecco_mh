@@ -19,6 +19,7 @@ CONFIG=${1:-"two_step_factors.yaml"}
 VLLM_URL_ARG=${2:-""}
 N_CLIENTS=${3:-""}
 CONDA_ENV=${4:-""}
+RESULTS_DIR=${5:-""}
 
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
@@ -47,6 +48,9 @@ else
 fi
 
 echo "[Orchestrator] Config: $CONFIG"
+if [ -n "$RESULTS_DIR" ]; then
+    echo "[Orchestrator] Results dir: $RESULTS_DIR"
+fi
 echo "[Orchestrator] Env manager: $ENV_MANAGER"
 if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
     echo "[Orchestrator] ERROR: Failed to run Python via $ENV_MANAGER"
@@ -62,6 +66,10 @@ fi
 echo "[Orchestrator] Provider: $PROVIDER"
 
 VLLM_ARG=""
+RESULTS_DIR_ARG=()
+if [ -n "$RESULTS_DIR" ]; then
+    RESULTS_DIR_ARG=(--results-dir "$RESULTS_DIR")
+fi
 if [ "$PROVIDER" = "vllm" ]; then
     # Resolve vLLM server URL: explicit arg > .vllm_env > environment
     if [ -n "$VLLM_URL_ARG" ]; then
@@ -109,4 +117,5 @@ echo "[Orchestrator] Starting centralized judge orchestrator..."
 $PYTHON_CMD -m gecco internal judge-orchestrate \
     --config "$CONFIG" \
     $VLLM_ARG \
-    $N_CLIENTS_ARG
+    $N_CLIENTS_ARG \
+    "${RESULTS_DIR_ARG[@]}"

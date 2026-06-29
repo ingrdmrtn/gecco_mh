@@ -35,6 +35,7 @@ def results_dir_for_config(
     *,
     project_root: Path = PROJECT_ROOT,
     fit_type: str = "group",
+    run_id: str | None = None,
 ) -> Path:
     """Return the canonical results directory for a config file."""
 
@@ -43,6 +44,8 @@ def results_dir_for_config(
         project_root=project_root,
         individual=fit_type == "individual",
     )
+    if run_id:
+        subpath = subpath / run_id
     return project_root / "results" / subpath
 
 
@@ -51,6 +54,7 @@ def logs_dir_for_config(
     *,
     project_root: Path = PROJECT_ROOT,
     fit_type: str = "group",
+    run_id: str | None = None,
 ) -> Path:
     """Return the canonical logs directory for a config file."""
 
@@ -59,6 +63,8 @@ def logs_dir_for_config(
         project_root=project_root,
         individual=fit_type == "individual",
     )
+    if run_id:
+        subpath = subpath / run_id
     return project_root / "logs" / subpath
 
 

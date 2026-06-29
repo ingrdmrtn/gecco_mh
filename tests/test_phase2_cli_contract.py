@@ -122,6 +122,7 @@ def test_run_distributed_handler_passes_typed_arguments_directly():
         partition=None,
         cpus_per_task=None,
         mem=None,
+        run_id=None,
         dry_run=False,
         local=True,
         launch_orchestrator=False,
@@ -169,20 +170,20 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
                 provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                        run_distributed_launcher(config="demo.yaml")
+                        run_distributed_launcher(config="demo.yaml", run_id="run-123")
 
     load_config_mock.assert_called_once_with(project_root / "config" / "demo.yaml")
     assert seen_commands[0].startswith("sbatch --array=0-1 --cpus-per-task=48")
     assert seen_commands[0].endswith(
-        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" ""'
+        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" "" "results/demo/run-123"'
     )
     assert seen_commands[1].startswith("sbatch --cpus-per-task=8")
     assert seen_commands[1].endswith(
-        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""'
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "" "results/demo/run-123"'
     )
     assert seen_commands[2].startswith("sbatch --dependency=afterok:2001 --cpus-per-task=8")
     assert seen_commands[2].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" ""'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo/run-123" ""'
     )
     assert len(seen_commands) == 3
 
@@ -226,7 +227,7 @@ def test_run_distributed_does_not_launch_orchestrator_for_judge_mode_off(tmp_pat
                 provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                        run_distributed_launcher(config="demo.yaml")
+                        run_distributed_launcher(config="demo.yaml", run_id="run-123")
 
     assert len(seen_commands) == 2
     assert "run_gecco_distributed.sh" in seen_commands[0]
@@ -267,7 +268,8 @@ def test_distributed_client_startup_failure_uses_nested_registry_path(tmp_path):
     ):
         with pytest.raises(RuntimeError, match="stop"):
             run_gecco_distributed.run_distributed_client(
-                config="two_step_factors/deepseekv4flash/judge_off.yaml"
+                config="two_step_factors/deepseekv4flash/judge_off.yaml",
+                results_dir="results/two_step_factors/deepseekv4flash/judge_off/run-123",
             )
 
     assert registry_state["path"] == (
@@ -275,8 +277,9 @@ def test_distributed_client_startup_failure_uses_nested_registry_path(tmp_path):
         / "results"
         / "two_step_factors"
         / "deepseekv4flash"
-        / "judge_off"
-        / "shared_registry.duckdb"
+            / "judge_off"
+            / "run-123"
+            / "shared_registry.duckdb"
     )
     assert registry_state["request_abort"]["reason"].startswith("RuntimeError: stop")
     assert registry_state["set_client_status"][1]["status"] == "failed"
@@ -323,16 +326,16 @@ def test_run_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
                 provider_spec_mock.return_value = SimpleNamespace(label="OpenRouter", key="openrouter")
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                        run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh")
+                        run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh", run_id="run-123")
 
     assert seen_commands[0].endswith(
-        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" "gecco_mh"'
+        'bash/run_gecco_distributed.sh "demo.yaml" "alpha,beta" "" "gecco_mh" "results/demo/run-123"'
     )
     assert seen_commands[1].endswith(
-        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh" "results/demo/run-123"'
     )
     assert seen_commands[2].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" "gecco_mh"'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo/run-123" "gecco_mh"'
     )
     assert all("uv run" not in command for command in seen_commands)
 
@@ -381,21 +384,21 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
         with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
             with patch("gecco.cli.launch_distributed.init_sentry"):
                 with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                    run_distributed_launcher(config="demo.yaml")
+                    run_distributed_launcher(config="demo.yaml", run_id="run-123")
 
     assert seen_commands[0].startswith("sbatch --job-name=gecco-cmg-generator")
     assert seen_commands[0].endswith(
-        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" ""'
+        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" "" "results/demo/run-123"'
     )
     assert seen_commands[1].startswith("sbatch --array=0-1 --job-name=gecco-cmg-evaluator")
-    assert seen_commands[1].endswith('bash/run_cmg_evaluator.sh "demo.yaml" "" ""')
+    assert seen_commands[1].endswith('bash/run_cmg_evaluator.sh "demo.yaml" "" "" "results/demo/run-123"')
     assert seen_commands[2].startswith("sbatch --job-name=gecco-cmg-orchestrator")
     assert seen_commands[2].endswith(
-        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" ""'
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "" "results/demo/run-123"'
     )
     assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
     assert seen_commands[3].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" ""'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo/run-123" ""'
     )
     assert len(seen_commands) == 4
 
@@ -444,19 +447,19 @@ def test_run_cmg_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path
         with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
             with patch("gecco.cli.launch_distributed.init_sentry"):
                 with patch("gecco.cli.launch_distributed.LaunchExecutor", return_value=real_executor):
-                    run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh")
+                    run_distributed_launcher(config="demo.yaml", conda_env="gecco_mh", run_id="run-123")
 
     assert seen_commands[0].endswith(
-        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" "gecco_mh"'
+        'bash/run_cmg_generator.sh "demo.yaml" "generator" "" "gecco_mh" "results/demo/run-123"'
     )
     assert seen_commands[1].endswith(
-        'bash/run_cmg_evaluator.sh "demo.yaml" "" "gecco_mh"'
+        'bash/run_cmg_evaluator.sh "demo.yaml" "" "gecco_mh" "results/demo/run-123"'
     )
     assert seen_commands[2].endswith(
-        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
+        'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh" "results/demo/run-123"'
     )
     assert seen_commands[3].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" "gecco_mh"'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo/run-123" "gecco_mh"'
     )
     assert all("uv run" not in command for command in seen_commands)
 

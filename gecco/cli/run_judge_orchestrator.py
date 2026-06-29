@@ -102,15 +102,16 @@ def run_orchestrator(
 
     init_sentry(cfg=cfg, task_name=cfg.task.name, config_name=config)
 
-    resolved_results_dir = (
-        Path(results_dir)
-        if results_dir
-        else results_dir_for_config(
+    if results_dir:
+        resolved_results_dir = Path(results_dir)
+        if not resolved_results_dir.is_absolute():
+            resolved_results_dir = PROJECT_ROOT / resolved_results_dir
+    else:
+        resolved_results_dir = results_dir_for_config(
             config,
             project_root=PROJECT_ROOT,
             fit_type=getattr(cfg.evaluation, "fit_type", "group"),
         )
-    )
 
     cmg_cfg = getattr(cfg, "centralized_model_generation", None)
     cmg_enabled = cmg_cfg is not None and getattr(cmg_cfg, "enabled", False)

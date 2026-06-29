@@ -18,6 +18,7 @@
 CONFIG=${1:-"two_step_factors_cmg.yaml"}
 VLLM_URL_ARG=${2:-""}
 CONDA_ENV=${3:-""}
+RESULTS_DIR=${4:-""}
 
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
@@ -47,6 +48,9 @@ fi
 
 echo "[CMG evaluator] Client $SLURM_ARRAY_TASK_ID starting"
 echo "[CMG evaluator] Config: $CONFIG"
+if [ -n "$RESULTS_DIR" ]; then
+    echo "[CMG evaluator] Results dir: $RESULTS_DIR"
+fi
 echo "[CMG evaluator] Env manager: $ENV_MANAGER"
 if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
     echo "[CMG evaluator] ERROR: Failed to run Python via $ENV_MANAGER"
@@ -62,6 +66,10 @@ fi
 echo "[CMG evaluator] Provider: $PROVIDER"
 
 VLLM_ARG=""
+RESULTS_DIR_ARG=()
+if [ -n "$RESULTS_DIR" ]; then
+    RESULTS_DIR_ARG=(--results-dir "$RESULTS_DIR")
+fi
 if [ "$PROVIDER" = "vllm" ]; then
     # Resolve vLLM server URL: explicit arg > .vllm_env > environment
     if [ -n "$VLLM_URL_ARG" ]; then
@@ -105,4 +113,5 @@ echo "[CMG evaluator] Starting CMG evaluator client..."
 $PYTHON_CMD -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
-    $VLLM_ARG
+    $VLLM_ARG \
+    "${RESULTS_DIR_ARG[@]}"

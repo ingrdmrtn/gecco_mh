@@ -62,6 +62,7 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     parser.add_argument("--client-id", type=int, default=None)
     parser.add_argument("--client-profile", type=str, default=None)
     parser.add_argument("--vllm-url", type=str, default=None)
+    parser.add_argument("--results-dir", type=str, default=None)
     parser.add_argument("--test", action="store_true")
     parser.set_defaults(handler=main)
     return parser
@@ -73,6 +74,7 @@ def run_distributed_client(
     client_id: int | None = None,
     client_profile: str | None = None,
     vllm_url: str | None = None,
+    results_dir: str | None = None,
     test: bool = False,
 ) -> int | None:
     """Run a distributed GeCCo worker client."""
@@ -90,6 +92,7 @@ def run_distributed_client(
         Panel(
             f"[bold]Client ID:[/] {resolved_client_id}\n"
             f"[bold]Profile:[/] {client_profile or 'default'}\n"
+            f"[bold]Results Dir:[/] {results_dir or '(from config path)'}\n"
             f"[bold]vLLM URL:[/] {os.environ.get('VLLM_BASE_URL', '(not set)')}",
             title="Distributed GeCCo Client",
             style="blue",
@@ -135,12 +138,17 @@ def run_distributed_client(
     metadata = getattr(getattr(cfg, "metadata", None), "flag", False)
     max_independent_runs = cfg.loop.max_independent_runs
 
-    results_dir = results_dir_for_config(
-        config,
-        project_root=PROJECT_ROOT,
-        fit_type=getattr(cfg.evaluation, "fit_type", "group"),
-    )
-    registry = SharedRegistry(results_dir / "shared_registry.duckdb")
+    if results_dir:
+        resolved_results_dir = Path(results_dir)
+        if not resolved_results_dir.is_absolute():
+            resolved_results_dir = PROJECT_ROOT / resolved_results_dir
+    else:
+        resolved_results_dir = results_dir_for_config(
+            config,
+            project_root=PROJECT_ROOT,
+            fit_type=getattr(cfg.evaluation, "fit_type", "group"),
+        )
+    registry = SharedRegistry(resolved_results_dir / "shared_registry.duckdb")
 
     try:
         df = load_data(data_cfg.path, data_cfg.input_columns)
@@ -229,6 +237,7 @@ def run_distributed_client(
             client_id=resolved_client_id,
             shared_registry=registry,
             config_path=config,
+            results_dir=resolved_results_dir,
         )
 
         global_best_bic = np.inf
@@ -347,5 +356,6 @@ def main(args: argparse.Namespace) -> int | None:
         client_id=args.client_id,
         client_profile=args.client_profile,
         vllm_url=args.vllm_url,
+        results_dir=args.results_dir,
         test=args.test,
     )

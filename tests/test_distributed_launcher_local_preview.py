@@ -35,7 +35,8 @@ def test_local_preview_prints_runnable_regular_commands(tmp_path, capsys):
         with patch("gecco.cli.launch_distributed.load_config", return_value=cfg):
             with patch("gecco.cli.launch_distributed.init_sentry"):
                 with patch("gecco.cli.launch_distributed.LaunchExecutor") as executor_mock:
-                    run_distributed_launcher(config="demo.yaml", local=True)
+                    with patch("gecco.cli.launch_distributed._new_run_id", return_value="auto-run"):
+                        run_distributed_launcher(config="demo.yaml", local=True)
 
     output = capsys.readouterr().out
 
@@ -43,6 +44,8 @@ def test_local_preview_prints_runnable_regular_commands(tmp_path, capsys):
     assert "python -m gecco internal distributed-client" in output
     assert "--client-profile \"alpha\"" in output
     assert "--client-profile \"beta\"" in output
+    assert "Run ID: auto-run" in output
+    assert '--results-dir "results/demo/auto-run"' in output
     assert "python -m gecco internal judge-orchestrate" in output
     executor_mock.assert_not_called()
 
@@ -106,6 +109,7 @@ def test_dry_run_regular_launch_uses_nested_paths(tmp_path, capsys):
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     run_distributed_launcher(
                         config="two_step_factors/deepseekv4flash/judge_off.yaml",
+                        run_id="run-123",
                         dry_run=True,
                         launch_orchestrator=True,
                     )
@@ -113,10 +117,10 @@ def test_dry_run_regular_launch_uses_nested_paths(tmp_path, capsys):
     output = capsys.readouterr().out
     normalized_output = " ".join(output.split())
 
-    assert "logs/two_step_factors/deepseekv4flash/judge_off/gecco-client-%A_%a.out" in normalized_output
-    assert "logs/two_step_factors/deepseekv4flash/judge_off/gecco-orchestrator-%j.err" in normalized_output
-    assert "Results dir: results/two_step_factors/deepseekv4flash/judge_off" in normalized_output
-    assert "python -m gecco monitor --task judge_off --results-dir results/two_step_factors/deepseekv4flash/judge_off --watch 10" in normalized_output
+    assert "logs/two_step_factors/deepseekv4flash/judge_off/run-123/gecco-client-%A_%a.out" in normalized_output
+    assert "logs/two_step_factors/deepseekv4flash/judge_off/run-123/gecco-orchestrator-%j.err" in normalized_output
+    assert "Results dir: results/two_step_factors/deepseekv4flash/judge_off/run-123" in normalized_output
+    assert "python -m gecco monitor --task judge_off --results-dir results/two_step_factors/deepseekv4flash/judge_off/run-123 --watch 10" in normalized_output
 
 
 def test_dry_run_regular_launch_accepts_config_prefixed_paths(tmp_path, capsys):
@@ -142,6 +146,7 @@ def test_dry_run_regular_launch_accepts_config_prefixed_paths(tmp_path, capsys):
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     run_distributed_launcher(
                         config="config/two_step_factors/deepseekv4flash/judge_off.yaml",
+                        run_id="run-123",
                         dry_run=True,
                     )
 
@@ -151,8 +156,8 @@ def test_dry_run_regular_launch_accepts_config_prefixed_paths(tmp_path, capsys):
     load_config_mock.assert_called_once_with(
         tmp_path / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"
     )
-    assert "logs/two_step_factors/deepseekv4flash/judge_off/gecco-client-%A_%a.out" in normalized_output
-    assert "Results dir: results/two_step_factors/deepseekv4flash/judge_off" in normalized_output
+    assert "logs/two_step_factors/deepseekv4flash/judge_off/run-123/gecco-client-%A_%a.out" in normalized_output
+    assert "Results dir: results/two_step_factors/deepseekv4flash/judge_off/run-123" in normalized_output
 
 
 def test_dry_run_cmg_launch_uses_nested_paths(tmp_path, capsys):
@@ -180,13 +185,14 @@ def test_dry_run_cmg_launch_uses_nested_paths(tmp_path, capsys):
                 with patch("gecco.cli.launch_distributed.init_sentry"):
                     run_distributed_launcher(
                         config="two_step_factors/deepseekv4flash/judge_off.yaml",
+                        run_id="run-123",
                         dry_run=True,
                     )
 
     output = capsys.readouterr().out
     normalized_output = " ".join(output.split())
 
-    assert "logs/two_step_factors/deepseekv4flash/judge_off/gecco-cmg-generator-%j.out" in normalized_output
-    assert "logs/two_step_factors/deepseekv4flash/judge_off/gecco-cmg-evaluator-%A_%a.err" in normalized_output
-    assert 'bash/run_test_evaluation.sh "two_step_factors/deepseekv4flash/judge_off.yaml" "results/two_step_factors/deepseekv4flash/judge_off"' in normalized_output
-    assert "python -m gecco monitor --task judge_off --results-dir results/two_step_factors/deepseekv4flash/judge_off --watch 10" in normalized_output
+    assert "logs/two_step_factors/deepseekv4flash/judge_off/run-123/gecco-cmg-generator-%j.out" in normalized_output
+    assert "logs/two_step_factors/deepseekv4flash/judge_off/run-123/gecco-cmg-evaluator-%A_%a.err" in normalized_output
+    assert 'bash/run_test_evaluation.sh "two_step_factors/deepseekv4flash/judge_off.yaml" "results/two_step_factors/deepseekv4flash/judge_off/run-123"' in normalized_output
+    assert "python -m gecco monitor --task judge_off --results-dir results/two_step_factors/deepseekv4flash/judge_off/run-123 --watch 10" in normalized_output

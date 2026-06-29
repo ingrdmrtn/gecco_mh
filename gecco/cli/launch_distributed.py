@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -71,6 +72,10 @@ def _get_cmg_state(cfg):
     return cmg_cfg is not None and getattr(cmg_cfg, "enabled", False), cmg_cfg
 
 
+def _new_run_id() -> str:
+    return str(uuid.uuid4())
+
+
 def _build_regular_launch_plan(
     *,
     config: str,
@@ -104,6 +109,7 @@ def _build_regular_launch_plan(
                     f'"{profiles_csv}"',
                     vllm_arg,
                     conda_arg,
+                    f'"{results_dir_rel}"',
                 ]
             ),
         )
@@ -116,16 +122,17 @@ def _build_regular_launch_plan(
                 label="orchestrator",
                 command=_join_command(
                     [
-                    "sbatch",
-                    "--cpus-per-task=8",
-                    partition_flag,
-                    "--mem=16G",
-                    *_sbatch_log_flags(logs_dir_rel, "gecco-orchestrator-%j"),
-                    "bash/run_judge_orchestrator.sh",
+                        "sbatch",
+                        "--cpus-per-task=8",
+                        partition_flag,
+                        "--mem=16G",
+                        *_sbatch_log_flags(logs_dir_rel, "gecco-orchestrator-%j"),
+                        "bash/run_judge_orchestrator.sh",
                         f'"{config}"',
                         vllm_arg,
                         n_clients_arg,
                         conda_arg,
+                        f'"{results_dir_rel}"',
                     ]
                 ),
             )
@@ -188,6 +195,7 @@ def _build_cmg_launch_plan(
                     f'"{generator_client}"',
                     resolved_vllm_arg,
                     conda_arg,
+                    f'"{results_dir_rel}"',
                 ]
             ),
         ),
@@ -206,6 +214,7 @@ def _build_cmg_launch_plan(
                     f'"{config}"',
                     resolved_vllm_arg,
                     conda_arg,
+                    f'"{results_dir_rel}"',
                 ]
             ),
         ),
@@ -224,6 +233,7 @@ def _build_cmg_launch_plan(
                     resolved_vllm_arg,
                     f'"{n_models}"',
                     conda_arg,
+                    f'"{results_dir_rel}"',
                 ]
             ),
         ),
@@ -261,10 +271,12 @@ def _print_regular_local_preview(
     profiles: list[str],
     extra_clients: int,
     vllm_url: str | None,
+    results_dir_rel: str,
     resolved_launch_orchestrator: bool,
     n_clients: int | None,
 ) -> None:
     vllm_arg = _optional_vllm_flag(vllm_url)
+    results_dir_arg = f'--results-dir "{results_dir_rel}"'
     all_profiles = profiles + [""] * extra_clients
     print("[Local preview] Distributed client commands")
     for client_id, profile in enumerate(all_profiles):
@@ -275,6 +287,7 @@ def _print_regular_local_preview(
                     f'--config "{config}"',
                     f'--client-profile "{profile}"',
                     vllm_arg,
+                    results_dir_arg,
                 ]
             )
         else:
@@ -284,6 +297,7 @@ def _print_regular_local_preview(
                     f'--config "{config}"',
                     f"--client-id {client_id}",
                     vllm_arg,
+                    results_dir_arg,
                 ]
             )
         _print_local_command(f"Client {client_id}", command)
@@ -296,6 +310,7 @@ def _print_regular_local_preview(
                 f'--config "{config}"',
                 vllm_arg,
                 n_clients_arg,
+                results_dir_arg,
             ]
         )
         _print_local_command("Orchestrator", command)
@@ -311,6 +326,7 @@ def _print_cmg_local_preview(
     final_eval_enabled: bool,
 ) -> None:
     vllm_arg = _optional_vllm_flag(resolved_vllm_url or None)
+    results_dir_arg = f'--results-dir "{results_dir_rel}"'
     print("[Local preview] CMG distributed commands")
     _print_local_command(
         "Generator",
@@ -320,6 +336,7 @@ def _print_cmg_local_preview(
                 f'--config "{config}"',
                 f'--client-profile "{generator_client}"',
                 vllm_arg,
+                results_dir_arg,
             ]
         ),
     )
@@ -332,6 +349,7 @@ def _print_cmg_local_preview(
                     f'--config "{config}"',
                     f"--client-id {index}",
                     vllm_arg,
+                    results_dir_arg,
                 ]
             ),
         )
@@ -343,6 +361,7 @@ def _print_cmg_local_preview(
                 f'--config "{config}"',
                 vllm_arg,
                 f'--n-clients {n_models}',
+                results_dir_arg,
             ]
         ),
     )
@@ -371,6 +390,7 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     parser.add_argument("--partition", type=str, default=None)
     parser.add_argument("--cpus-per-task", type=int, default=None)
     parser.add_argument("--mem", type=str, default=None)
+    parser.add_argument("--run-id", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--launch-orchestrator", action="store_true")
@@ -403,6 +423,7 @@ def run_distributed_launcher(
     partition: str | None = None,
     cpus_per_task: int | None = None,
     mem: str | None = None,
+    run_id: str | None = None,
     dry_run: bool = False,
     local: bool = False,
     launch_orchestrator: bool = False,
@@ -442,8 +463,19 @@ def run_distributed_launcher(
     resolved_launch_orchestrator = launch_orchestrator or judge_enabled
     env_manager = _resolve_env_manager(conda_env)
     fit_type = getattr(cfg.evaluation, "fit_type", "group")
-    results_dir = results_dir_for_config(config, project_root=PROJECT_ROOT, fit_type=fit_type)
-    logs_dir = logs_dir_for_config(config, project_root=PROJECT_ROOT, fit_type=fit_type)
+    resolved_run_id = run_id or _new_run_id()
+    results_dir = results_dir_for_config(
+        config,
+        project_root=PROJECT_ROOT,
+        fit_type=fit_type,
+        run_id=resolved_run_id,
+    )
+    logs_dir = logs_dir_for_config(
+        config,
+        project_root=PROJECT_ROOT,
+        fit_type=fit_type,
+        run_id=resolved_run_id,
+    )
     results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
     logs_dir_rel = str(logs_dir.relative_to(PROJECT_ROOT))
 
@@ -477,6 +509,7 @@ def run_distributed_launcher(
                 ("Final eval", "enabled" if final_eval_enabled else "disabled"),
                 ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
                 ("Env manager", env_manager),
+                ("Run ID", resolved_run_id),
                 ("Sentry", sentry_label),
                 ("Logs dir", logs_dir_rel),
                 ("Results dir", results_dir_rel),
@@ -549,6 +582,7 @@ def run_distributed_launcher(
         *([("Partition", resolved_partition)] if resolved_partition else []),
         *([("vLLM URL", vllm_url or "(from env / .vllm_env)")] if provider_spec.key == "vllm" else []),
         ("Env manager", env_manager),
+        ("Run ID", resolved_run_id),
         *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
         *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
         ("Sentry", sentry_label),
@@ -564,6 +598,7 @@ def run_distributed_launcher(
             profiles=resolved_profiles,
             extra_clients=extra_clients,
             vllm_url=vllm_url,
+            results_dir_rel=results_dir_rel,
             resolved_launch_orchestrator=resolved_launch_orchestrator,
             n_clients=n_clients,
         )
@@ -613,6 +648,7 @@ def main(args: argparse.Namespace) -> int | None:
         partition=args.partition,
         cpus_per_task=args.cpus_per_task,
         mem=args.mem,
+        run_id=args.run_id,
         dry_run=args.dry_run,
         local=args.local,
         launch_orchestrator=args.launch_orchestrator,

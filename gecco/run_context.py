@@ -44,6 +44,7 @@ class RunContext:
         project_root: str | Path | None = None,
         config_path: str | Path | None = None,
         client_id: Any = None,
+        results_dir: str | Path | None = None,
     ) -> "RunContext":
         """Resolve and create the runtime path layout from a config object.
 
@@ -70,7 +71,11 @@ class RunContext:
 
         resolved_root = Path(project_root) if project_root is not None else Path(__file__).resolve().parents[1]
         task_name = str(cfg.task.name)
-        if config_path is not None:
+        if results_dir is not None:
+            results_dir = Path(results_dir)
+            if not results_dir.is_absolute():
+                results_dir = resolved_root / results_dir
+        elif config_path is not None:
             from gecco.cli.config_paths import results_dir_for_config
 
             results_dir = results_dir_for_config(

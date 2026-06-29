@@ -20,6 +20,7 @@ CONFIG=${1:-"two_step_factors/distributed.yaml"}
 PROFILES_CSV=${2:-""}
 VLLM_URL_ARG=${3:-""}
 CONDA_ENV=${4:-""}
+RESULTS_DIR=${5:-""}
 
 # Resolve profile for this array task from the comma-separated list
 if [ -n "$PROFILES_CSV" ]; then
@@ -64,6 +65,9 @@ fi
 
 echo "[GeCCo] Client $SLURM_ARRAY_TASK_ID starting (profile: ${PROFILE:-default})"
 echo "[GeCCo] Config: $CONFIG"
+if [ -n "$RESULTS_DIR" ]; then
+    echo "[GeCCo] Results dir: $RESULTS_DIR"
+fi
 echo "[GeCCo] Env manager: $ENV_MANAGER"
 if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
     echo "[GeCCo] ERROR: Failed to run Python via $ENV_MANAGER"
@@ -79,6 +83,10 @@ fi
 echo "[GeCCo] Provider: $PROVIDER"
 
 VLLM_ARG=""
+RESULTS_DIR_ARG=()
+if [ -n "$RESULTS_DIR" ]; then
+    RESULTS_DIR_ARG=(--results-dir "$RESULTS_DIR")
+fi
 if [ "$PROVIDER" = "vllm" ]; then
     # Resolve vLLM server URL: explicit arg > .vllm_env > environment
     if [ -n "$VLLM_URL_ARG" ]; then
@@ -122,4 +130,5 @@ $PYTHON_CMD -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-id "$SLURM_ARRAY_TASK_ID" \
     $PROFILE_ARG \
-    $VLLM_ARG
+    $VLLM_ARG \
+    "${RESULTS_DIR_ARG[@]}"

@@ -54,6 +54,16 @@ def test_resolve_config_path_prefers_config_root_for_relative_subdirs(tmp_path):
         project_root=project_root,
         fit_type="individual",
     ) == project_root / "results" / "two_step_factors" / "deepseekv4flash" / "judge_off_individual"
+    assert results_dir_for_config(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+        run_id="run-123",
+    ) == project_root / "results" / "two_step_factors" / "deepseekv4flash" / "judge_off" / "run-123"
+    assert logs_dir_for_config(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+        run_id="run-123",
+    ) == project_root / "logs" / "two_step_factors" / "deepseekv4flash" / "judge_off" / "run-123"
 
 
 def test_slurm_preflight_prints_provider_only_on_success(tmp_path, capsys, monkeypatch):

@@ -18,6 +18,7 @@ CONFIG=${1:-"two_step_factors_cmg.yaml"}
 PROFILE=${2:-"generator"}
 VLLM_URL_ARG=${3:-""}
 CONDA_ENV=${4:-""}
+RESULTS_DIR=${5:-""}
 
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
@@ -47,6 +48,9 @@ fi
 
 echo "[Generator] CMG generator starting (profile: $PROFILE)"
 echo "[Generator] Config: $CONFIG"
+if [ -n "$RESULTS_DIR" ]; then
+    echo "[Generator] Results dir: $RESULTS_DIR"
+fi
 echo "[Generator] Env manager: $ENV_MANAGER"
 if ! PYTHON_EXECUTABLE=$($PYTHON_CMD -c "import sys; print(sys.executable)"); then
     echo "[Generator] ERROR: Failed to run Python via $ENV_MANAGER"
@@ -62,6 +66,10 @@ fi
 echo "[Generator] Provider: $PROVIDER"
 
 VLLM_ARG=""
+RESULTS_DIR_ARG=()
+if [ -n "$RESULTS_DIR" ]; then
+    RESULTS_DIR_ARG=(--results-dir "$RESULTS_DIR")
+fi
 if [ "$PROVIDER" = "vllm" ]; then
     # Resolve vLLM server URL: explicit arg > .vllm_env > environment
     if [ -n "$VLLM_URL_ARG" ]; then
@@ -105,4 +113,5 @@ echo "[Generator] Starting CMG generator client..."
 $PYTHON_CMD -m gecco internal distributed-client \
     --config "$CONFIG" \
     --client-profile "$PROFILE" \
-    $VLLM_ARG
+    $VLLM_ARG \
+    "${RESULTS_DIR_ARG[@]}"

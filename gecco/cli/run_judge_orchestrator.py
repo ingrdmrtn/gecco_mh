@@ -16,7 +16,7 @@ from gecco.construct_feedback.orchestrated import (
     run_orchestrated_judge_pipeline,
 )
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
-from gecco.cli.config_paths import resolve_config_path
+from gecco.cli.config_paths import resolve_config_path, results_dir_for_config
 from gecco.coordination import SharedRegistry
 from gecco.diagnostic_store.store import DiagnosticStore
 from gecco.load_llms.model_loader import load_llm
@@ -91,7 +91,7 @@ def run_orchestrator(
         Panel(
             f"[bold]Config:[/] {config}\n"
             f"[bold]vLLM URL:[/] {os.environ.get('VLLM_BASE_URL', '(not set)')}\n"
-            f"[bold]Results Dir:[/] {results_dir or '(from task name)'}\n"
+            f"[bold]Results Dir:[/] {results_dir or '(from config path)'}\n"
             f"[bold]N Clients:[/] {n_clients or '(from config)'}",
             title="Centralized Judge Orchestrator",
             style="cyan",
@@ -102,7 +102,15 @@ def run_orchestrator(
 
     init_sentry(cfg=cfg, task_name=cfg.task.name, config_name=config)
 
-    resolved_results_dir = Path(results_dir) if results_dir else Path("results") / cfg.task.name
+    resolved_results_dir = (
+        Path(results_dir)
+        if results_dir
+        else results_dir_for_config(
+            config,
+            project_root=PROJECT_ROOT,
+            fit_type=getattr(cfg.evaluation, "fit_type", "group"),
+        )
+    )
 
     cmg_cfg = getattr(cfg, "centralized_model_generation", None)
     cmg_enabled = cmg_cfg is not None and getattr(cmg_cfg, "enabled", False)

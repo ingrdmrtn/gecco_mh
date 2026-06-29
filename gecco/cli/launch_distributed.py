@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from config.schema import get_judge_mode, load_config
+from gecco.cli.config_paths import logs_dir_for_config, resolve_config_path, results_dir_for_config
 from gecco.cli.launcher_utils import LaunchCommand, LaunchExecutor, LaunchPlan, SubmissionResult
 from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.sentry_init import init_sentry
@@ -61,6 +62,10 @@ def _print_local_command(label: str, command: str) -> None:
     print(f"[{label}] {command}")
 
 
+def _sbatch_log_flags(logs_dir_rel: str, stem: str) -> list[str]:
+    return [f"--output={logs_dir_rel}/{stem}.out", f"--error={logs_dir_rel}/{stem}.err"]
+
+
 def _get_cmg_state(cfg):
     cmg_cfg = getattr(cfg, "centralized_model_generation", None)
     return cmg_cfg is not None and getattr(cmg_cfg, "enabled", False), cmg_cfg
@@ -72,6 +77,7 @@ def _build_regular_launch_plan(
     profiles_csv: str,
     array_spec: str,
     results_dir_rel: str,
+    logs_dir_rel: str,
     resolved_cpus_per_task: int,
     partition_flag: str,
     mem_flag: str,
@@ -92,6 +98,7 @@ def _build_regular_launch_plan(
                     f"--cpus-per-task={resolved_cpus_per_task}",
                     partition_flag,
                     mem_flag,
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-client-%A_%a"),
                     "bash/run_gecco_distributed.sh",
                     f'"{config}"',
                     f'"{profiles_csv}"',
@@ -109,11 +116,12 @@ def _build_regular_launch_plan(
                 label="orchestrator",
                 command=_join_command(
                     [
-                        "sbatch",
-                        "--cpus-per-task=8",
-                        partition_flag,
-                        "--mem=16G",
-                        "bash/run_judge_orchestrator.sh",
+                    "sbatch",
+                    "--cpus-per-task=8",
+                    partition_flag,
+                    "--mem=16G",
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-orchestrator-%j"),
+                    "bash/run_judge_orchestrator.sh",
                         f'"{config}"',
                         vllm_arg,
                         n_clients_arg,
@@ -133,6 +141,7 @@ def _build_regular_launch_plan(
                     "--cpus-per-task=8",
                     partition_flag,
                     "--mem=16G",
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-test-eval-%j"),
                     "bash/run_test_evaluation.sh",
                     f'"{config}"',
                     f'"{results_dir_rel}"',
@@ -152,7 +161,8 @@ def _build_cmg_launch_plan(
     config: str,
     generator_client: str,
     n_models: int,
-    results_dir_rel: Path,
+    results_dir_rel: str,
+    logs_dir_rel: str,
     resolved_cpus_per_task: int,
     partition_flag: str,
     mem_flag: str,
@@ -172,8 +182,7 @@ def _build_cmg_launch_plan(
                     f"--cpus-per-task={resolved_cpus_per_task}",
                     partition_flag,
                     mem_flag,
-                    "--output=logs/gecco-cmg-generator-%j.out",
-                    "--error=logs/gecco-cmg-generator-%j.err",
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-cmg-generator-%j"),
                     str(PROJECT_ROOT / "bash/run_cmg_generator.sh"),
                     f'"{config}"',
                     f'"{generator_client}"',
@@ -192,8 +201,7 @@ def _build_cmg_launch_plan(
                     f"--cpus-per-task={resolved_cpus_per_task}",
                     partition_flag,
                     mem_flag,
-                    "--output=logs/gecco-cmg-evaluator-%A_%a.out",
-                    "--error=logs/gecco-cmg-evaluator-%A_%a.err",
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-cmg-evaluator-%A_%a"),
                     str(PROJECT_ROOT / "bash/run_cmg_evaluator.sh"),
                     f'"{config}"',
                     resolved_vllm_arg,
@@ -210,8 +218,7 @@ def _build_cmg_launch_plan(
                     "--cpus-per-task=8",
                     partition_flag,
                     "--mem=16G",
-                    "--output=logs/gecco-cmg-orchestrator-%j.out",
-                    "--error=logs/gecco-cmg-orchestrator-%j.err",
+                    *_sbatch_log_flags(logs_dir_rel, "gecco-cmg-orchestrator-%j"),
                     str(PROJECT_ROOT / "bash/run_judge_orchestrator.sh"),
                     f'"{config}"',
                     resolved_vllm_arg,
@@ -233,6 +240,7 @@ def _build_cmg_launch_plan(
                         "--cpus-per-task=8",
                         partition_flag,
                         "--mem=16G",
+                        *_sbatch_log_flags(logs_dir_rel, "gecco-test-eval-%j"),
                         str(PROJECT_ROOT / "bash/run_test_evaluation.sh"),
                         f'"{config}"',
                         f'"{results_dir_rel}"',
@@ -298,7 +306,7 @@ def _print_cmg_local_preview(
     config: str,
     generator_client: str,
     n_models: int,
-    results_dir_rel: Path,
+    results_dir_rel: str,
     resolved_vllm_url: str,
     final_eval_enabled: bool,
 ) -> None:
@@ -400,7 +408,7 @@ def run_distributed_launcher(
     launch_orchestrator: bool = False,
 ) -> int | None:
     """Launch a distributed GeCCo search from a config file."""
-    config_path = PROJECT_ROOT / "config" / config
+    config_path = resolve_config_path(config, project_root=PROJECT_ROOT)
 
     if not config_path.exists():
         print(f"ERROR: Config not found: {config_path}")
@@ -433,6 +441,11 @@ def run_distributed_launcher(
     judge_enabled = getattr(cfg, "judge", None) is not None and get_judge_mode(cfg) != "off"
     resolved_launch_orchestrator = launch_orchestrator or judge_enabled
     env_manager = _resolve_env_manager(conda_env)
+    fit_type = getattr(cfg.evaluation, "fit_type", "group")
+    results_dir = results_dir_for_config(config, project_root=PROJECT_ROOT, fit_type=fit_type)
+    logs_dir = logs_dir_for_config(config, project_root=PROJECT_ROOT, fit_type=fit_type)
+    results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
+    logs_dir_rel = str(logs_dir.relative_to(PROJECT_ROOT))
 
     if cmg_enabled:
         generator_client = str(getattr(cmg_cfg, "generator_client", ""))
@@ -452,11 +465,6 @@ def run_distributed_launcher(
 
         final_eval_enabled = getattr(cmg_cfg, "run_final_evaluation", True)
         resolved_vllm_url = vllm_url or ""
-        task_name = getattr(cfg.task, "name", "unknown")
-        results_dir = PROJECT_ROOT / "results" / task_name
-        if getattr(cfg.evaluation, "fit_type", "group") == "individual":
-            results_dir = PROJECT_ROOT / "results" / f"{task_name}_individual"
-        results_dir_rel = results_dir.relative_to(PROJECT_ROOT)
 
         _print_config_table(
             [
@@ -470,8 +478,8 @@ def run_distributed_launcher(
                 ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
                 ("Env manager", env_manager),
                 ("Sentry", sentry_label),
-                ("Logs dir", "logs/ (SLURM stdout/stderr)"),
-                ("Results dir", str(results_dir_rel)),
+                ("Logs dir", logs_dir_rel),
+                ("Results dir", results_dir_rel),
             ]
         )
         print()
@@ -488,11 +496,14 @@ def run_distributed_launcher(
             return None
 
         executor = LaunchExecutor(printer=_command_printer)
+        if not dry_run:
+            logs_dir.mkdir(parents=True, exist_ok=True)
         plan = _build_cmg_launch_plan(
             config=config,
             generator_client=generator_client,
             n_models=n_models,
             results_dir_rel=results_dir_rel,
+            logs_dir_rel=logs_dir_rel,
             resolved_cpus_per_task=resolved_cpus_per_task,
             partition_flag=partition_flag,
             mem_flag=mem_flag,
@@ -507,7 +518,9 @@ def run_distributed_launcher(
                 f"[bold]Final evaluation[/bold] will run after all CMG jobs complete: job [yellow]{results_by_label['final_eval'].job_id}[/yellow]"
             )
         console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
-        console.print(f"  [cyan]python -m gecco monitor --task {task_name} --watch 10[/cyan]")
+        console.print(
+            f"  [cyan]python -m gecco monitor --task {cfg.task.name} --results-dir {results_dir_rel} --watch 10[/cyan]"
+        )
         return None
 
     resolved_profiles = profiles.split(",") if profiles else list((cfg.clients or {}).keys())
@@ -523,12 +536,6 @@ def run_distributed_launcher(
     profiles_csv = ",".join(all_profiles)
     array_spec = f"0-{n_total - 1}"
     n_clients = getattr(cfg.loop, "n_clients", None)
-    task_name = cfg.task.name
-    results_dir = PROJECT_ROOT / "results" / task_name
-    if getattr(cfg.evaluation, "fit_type", "group") == "individual":
-        results_dir = PROJECT_ROOT / "results" / f"{task_name}_individual"
-    results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
-
     rows = [
         ("Config", config),
         ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
@@ -545,8 +552,8 @@ def run_distributed_launcher(
         *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
         *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
         ("Sentry", sentry_label),
-        ("Logs dir", "logs/ (SLURM stdout/stderr)"),
-        ("Results dir", f"results/{task_name}/"),
+        ("Logs dir", logs_dir_rel),
+        ("Results dir", results_dir_rel),
     ]
     _print_config_table(rows)
     print()
@@ -563,11 +570,14 @@ def run_distributed_launcher(
         return None
 
     executor = LaunchExecutor(printer=_command_printer)
+    if not dry_run:
+        logs_dir.mkdir(parents=True, exist_ok=True)
     plan = _build_regular_launch_plan(
         config=config,
         profiles_csv=profiles_csv,
         array_spec=array_spec,
         results_dir_rel=results_dir_rel,
+        logs_dir_rel=logs_dir_rel,
         resolved_cpus_per_task=resolved_cpus_per_task,
         partition_flag=partition_flag,
         mem_flag=mem_flag,
@@ -580,8 +590,9 @@ def run_distributed_launcher(
     results_by_label = {result.label: result for result in main_results}
 
     console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
-    task_name = cfg.task.name
-    console.print(f"  [cyan]python -m gecco monitor --task {task_name} --watch 10[/cyan]")
+    console.print(
+        f"  [cyan]python -m gecco monitor --task {cfg.task.name} --results-dir {results_dir_rel} --watch 10[/cyan]"
+    )
     test_eval_result = results_by_label.get("test_evaluation")
     if test_eval_result and test_eval_result.job_id:
         test_eval_job_id = test_eval_result.job_id

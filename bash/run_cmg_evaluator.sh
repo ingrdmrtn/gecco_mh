@@ -9,20 +9,20 @@
 
 # CMG evaluator client for distributed GeCCo runs.
 #
-# Usage (via launcher):
+# Usage (via launcher; nested log directories are provided by sbatch overrides):
 #   python -m gecco run distributed --config <yaml>  # with centralized_model_generation.enabled: true
 #
-# Manual usage:
+# Manual usage (flat logs/ fallback only):
 #   sbatch --array=0-1 bash/run_cmg_evaluator.sh two_step_factors_cmg.yaml "http://gpu-node:8000/v1" "my_env"
 
 CONFIG=${1:-"two_step_factors_cmg.yaml"}
 VLLM_URL_ARG=${2:-""}
 CONDA_ENV=${3:-""}
 
-mkdir -p logs
-
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
+
+mkdir -p logs
 
 # Keep joblib/loky temp files off generic /tmp and within this run directory.
 export GECCO_TMPDIR="${GECCO_TMPDIR:-${PWD}/tmp}"

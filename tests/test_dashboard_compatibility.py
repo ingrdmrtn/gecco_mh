@@ -120,6 +120,19 @@ def test_available_tasks_detects_registry_and_diagnostics_duckdb(tmp_path: Path)
     assert "task_d" not in tasks
 
 
+def test_available_tasks_discovers_nested_result_dirs(tmp_path: Path):
+    """available_tasks must return nested task names without flattening them."""
+    results_root = tmp_path / "results"
+    nested = results_root / "two_step_factors" / "deepseekv4flash" / "judge_off"
+    nested.mkdir(parents=True)
+    (nested / "shared_registry.duckdb").touch()
+
+    with patch.object(dashboard_config, "project_root", return_value=tmp_path):
+        tasks = dashboard_config.available_tasks()
+
+    assert tasks == ["two_step_factors/deepseekv4flash/judge_off"]
+
+
 # --------------------------------------------------------------------------- #
 # Contract: Diagnostics are read from diagnostics*.duckdb
 # --------------------------------------------------------------------------- #

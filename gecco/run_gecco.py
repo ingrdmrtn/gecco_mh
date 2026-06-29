@@ -93,6 +93,7 @@ class GeCCoModelSearch:
         prompt_builder,
         client_id=None,
         shared_registry=None,
+        config_path: str | Path | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -106,7 +107,11 @@ class GeCCoModelSearch:
         self.feedback = _IterationFeedbackState()
 
         # --- Run context / resolved paths ---
-        self.run_context = RunContext.from_cfg(cfg, client_id=client_id)
+        self.run_context = RunContext.from_cfg(
+            cfg,
+            client_id=client_id,
+            config_path=config_path,
+        )
         self.project_root = self.run_context.project_root
         self.results_dir = self.run_context.results_dir
 

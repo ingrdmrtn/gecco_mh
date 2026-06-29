@@ -7,7 +7,12 @@ import pytest
 
 
 def test_resolve_config_path_prefers_config_root_for_relative_subdirs(tmp_path):
-    from gecco.cli.config_paths import resolve_config_path
+    from gecco.cli.config_paths import (
+        config_output_subpath,
+        logs_dir_for_config,
+        resolve_config_path,
+        results_dir_for_config,
+    )
 
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -16,13 +21,39 @@ def test_resolve_config_path_prefers_config_root_for_relative_subdirs(tmp_path):
         "two_step_factors/deepseekv4flash/judge_off.yaml",
         project_root=project_root,
     )
+    prefixed_path = resolve_config_path(
+        "config/two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+    )
     absolute_path = resolve_config_path(
         str(project_root / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"),
         project_root=project_root,
     )
 
     assert relative_path == project_root / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"
+    assert prefixed_path == project_root / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"
     assert absolute_path == project_root / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"
+    assert config_output_subpath(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+    ) == Path("two_step_factors/deepseekv4flash/judge_off")
+    assert config_output_subpath(
+        str(project_root / "config" / "two_step_factors" / "deepseekv4flash" / "judge_off.yaml"),
+        project_root=project_root,
+    ) == Path("two_step_factors/deepseekv4flash/judge_off")
+    assert results_dir_for_config(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+    ) == project_root / "results" / "two_step_factors" / "deepseekv4flash" / "judge_off"
+    assert logs_dir_for_config(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+    ) == project_root / "logs" / "two_step_factors" / "deepseekv4flash" / "judge_off"
+    assert results_dir_for_config(
+        "two_step_factors/deepseekv4flash/judge_off.yaml",
+        project_root=project_root,
+        fit_type="individual",
+    ) == project_root / "results" / "two_step_factors" / "deepseekv4flash" / "judge_off_individual"
 
 
 def test_slurm_preflight_prints_provider_only_on_success(tmp_path, capsys, monkeypatch):

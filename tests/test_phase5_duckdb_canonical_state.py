@@ -170,6 +170,128 @@ def test_request_abort_does_not_overwrite_existing_abort(registry: SharedRegistr
     assert abort["reason"] == "RuntimeError: client crashed"
 
 
+def test_orchestrator_default_registry_path_uses_nested_config_path(tmp_path: Path):
+    """The orchestrator should default its registry under the mirrored config path."""
+    from gecco.cli import run_judge_orchestrator
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="judge_off"),
+        evaluation=SimpleNamespace(fit_type="group"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1, n_clients=1),
+        data=SimpleNamespace(path="data.csv", input_columns=[], id_column="pid", splits={}),
+        judge=SimpleNamespace(barrier=SimpleNamespace(orchestrator_wait_seconds=1, retry_wait_seconds=1)),
+    )
+
+    registry_state = {}
+
+    class _FakeRegistry:
+        def __init__(self, registry_path):
+            registry_state["path"] = Path(registry_path)
+
+    with (
+        patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg),
+        patch("gecco.cli.run_judge_orchestrator.SharedRegistry", _FakeRegistry),
+        patch("gecco.cli.run_judge_orchestrator.load_llm", side_effect=RuntimeError("stop")),
+        patch("gecco.cli.run_judge_orchestrator.init_sentry"),
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            run_judge_orchestrator.run_orchestrator(
+                config="two_step_factors/deepseekv4flash/judge_off.yaml"
+            )
+
+    assert registry_state["path"] == (
+        run_judge_orchestrator.PROJECT_ROOT
+        / "results"
+        / "two_step_factors"
+        / "deepseekv4flash"
+        / "judge_off"
+        / "shared_registry.duckdb"
+    )
+
+
+def test_orchestrator_explicit_results_dir_overrides_default(tmp_path: Path):
+    """An explicit --results-dir must win over the mirrored config path."""
+    from gecco.cli import run_judge_orchestrator
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="judge_off"),
+        evaluation=SimpleNamespace(fit_type="group"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_iterations=1, n_clients=1),
+        data=SimpleNamespace(path="data.csv", input_columns=[], id_column="pid", splits={}),
+        judge=SimpleNamespace(barrier=SimpleNamespace(orchestrator_wait_seconds=1, retry_wait_seconds=1)),
+    )
+
+    registry_state = {}
+
+    class _FakeRegistry:
+        def __init__(self, registry_path):
+            registry_state["path"] = Path(registry_path)
+
+    explicit_results_dir = tmp_path / "custom-results"
+
+    with (
+        patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg),
+        patch("gecco.cli.run_judge_orchestrator.SharedRegistry", _FakeRegistry),
+        patch("gecco.cli.run_judge_orchestrator.load_llm", side_effect=RuntimeError("stop")),
+        patch("gecco.cli.run_judge_orchestrator.init_sentry"),
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            run_judge_orchestrator.run_orchestrator(
+                config="two_step_factors/deepseekv4flash/judge_off.yaml",
+                results_dir=str(explicit_results_dir),
+            )
+
+    assert registry_state["path"] == explicit_results_dir / "shared_registry.duckdb"
+
+
+def test_reset_uses_nested_results_dir_for_config_prefixed_path(tmp_path: Path):
+    """Reset should scan the config-mirrored results directory."""
+    from gecco.cli import reset_distributed
+
+    project_root = tmp_path / "project"
+    config_dir = project_root / "config" / "two_step_factors" / "deepseekv4flash"
+    config_dir.mkdir(parents=True)
+    (config_dir / "judge_off.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    results_dir = (
+        project_root
+        / "results"
+        / "two_step_factors"
+        / "deepseekv4flash"
+        / "judge_off"
+    )
+    results_dir.mkdir(parents=True)
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="judge_off"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    seen: dict[str, Path] = {}
+
+    def _scan_state(results_dir_arg: Path, include_baseline: bool):
+        seen["results_dir"] = results_dir_arg
+        seen["include_baseline"] = include_baseline
+        return []
+
+    with (
+        patch.object(reset_distributed, "PROJECT_ROOT", project_root),
+        patch.object(reset_distributed, "load_config", return_value=cfg),
+        patch.object(reset_distributed, "scan_state", side_effect=_scan_state),
+        patch.object(reset_distributed, "console", MagicMock()),
+    ):
+        result = reset_distributed.run_reset(
+            config="config/two_step_factors/deepseekv4flash/judge_off.yaml",
+            dry_run=True,
+            yes=True,
+        )
+
+    assert result is None
+    assert seen["results_dir"] == results_dir
+    assert seen["include_baseline"] is False
+
+
 def test_raise_if_aborted_is_noop_without_abort(registry: SharedRegistry):
     """Absent abort state should keep registry waits available."""
     assert registry.get_abort() is None

@@ -10,10 +10,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from config.schema import load_config
+from gecco.cli.config_paths import resolve_config_path, results_dir_for_config
 from gecco.utils import TimestampedConsole
 
 
 console = TimestampedConsole()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Subdirectories that accumulate during a distributed run
 ARTIFACT_DIRS = ["models", "feedback", "bics", "parameters", "simulation"]
@@ -35,10 +37,16 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     return parser
 
 
-def get_results_dir(cfg) -> Path:
+def get_results_dir(cfg, config_path: str | Path | None = None) -> Path:
     """Derive the results directory from config."""
-    task_name = cfg.task.name
     fit_type = getattr(cfg.evaluation, "fit_type", "group")
+    if config_path is not None:
+        return results_dir_for_config(
+            config_path,
+            project_root=PROJECT_ROOT,
+            fit_type=fit_type,
+        )
+    task_name = cfg.task.name
     suffix = "_individual" if fit_type == "individual" else ""
     return Path("results") / f"{task_name}{suffix}"
 
@@ -139,8 +147,9 @@ def run_reset(
     yes: bool = False,
 ) -> int | None:
     """Reset distributed GeCCo search state for a task."""
-    cfg = load_config(config)
-    results_dir = get_results_dir(cfg)
+    config_path = resolve_config_path(config, project_root=PROJECT_ROOT)
+    cfg = load_config(config_path)
+    results_dir = get_results_dir(cfg, config_path=config_path)
 
     console.print(
         Panel(

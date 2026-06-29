@@ -14,7 +14,7 @@ from rich.table import Table
 
 from config.schema import load_config
 from gecco.coordination import SharedRegistry, apply_client_profile
-from gecco.cli.config_paths import resolve_config_path
+from gecco.cli.config_paths import resolve_config_path, results_dir_for_config
 from gecco.load_llms.model_loader import load_llm
 from gecco.offline_evaluation.fit_generated_models import (
     run_fit_hierarchical as run_fit,
@@ -135,10 +135,10 @@ def run_distributed_client(
     metadata = getattr(getattr(cfg, "metadata", None), "flag", False)
     max_independent_runs = cfg.loop.max_independent_runs
 
-    results_dir = (
-        PROJECT_ROOT / "results" / cfg.task.name
-        if getattr(cfg.evaluation, "fit_type", "group") != "individual"
-        else PROJECT_ROOT / "results" / f"{cfg.task.name}_individual"
+    results_dir = results_dir_for_config(
+        config,
+        project_root=PROJECT_ROOT,
+        fit_type=getattr(cfg.evaluation, "fit_type", "group"),
     )
     registry = SharedRegistry(results_dir / "shared_registry.duckdb")
 
@@ -228,6 +228,7 @@ def run_distributed_client(
             prompt_builder,
             client_id=resolved_client_id,
             shared_registry=registry,
+            config_path=config,
         )
 
         global_best_bic = np.inf

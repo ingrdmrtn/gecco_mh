@@ -45,5 +45,13 @@ def available_tasks() -> list[str]:
     if not results_root.exists():
         return []
 
-    tasks = [path.name for path in results_root.iterdir() if _is_dashboard_result_dir(path)]
+    tasks: set[str] = set()
+    for pattern in ("shared_registry.duckdb", "diagnostics*.duckdb"):
+        for path in results_root.rglob(pattern):
+            parent = path.parent
+            if parent == results_root:
+                continue
+            if _is_dashboard_result_dir(parent):
+                tasks.add(parent.relative_to(results_root).as_posix())
+
     return sorted(tasks)

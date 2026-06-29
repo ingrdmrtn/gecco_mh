@@ -9,17 +9,18 @@
 
 # Post-processing script: runs test evaluation after all distributed clients complete.
 #
-# Usage (normally called by `gecco run distributed`):
+# Usage (normally called by `gecco run distributed`; launcher overrides nested
+# log paths via sbatch flags):
 #   sbatch --dependency=afterok:$CLIENT_JOB_ID bash/run_test_evaluation.sh two_step_factors_distributed.yaml results/two_step_factors
 
 CONFIG=${1:-"two_step_factors_distributed.yaml"}
 RESULTS_DIR=${2:-"results/two_step_factors"}
 CONDA_ENV=${3:-""}
 
-mkdir -p logs
-
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
+
+mkdir -p logs
 
 # Keep joblib/loky temp files off generic /tmp and within this run directory.
 export GECCO_TMPDIR="${GECCO_TMPDIR:-${PWD}/tmp}"

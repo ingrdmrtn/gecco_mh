@@ -152,3 +152,21 @@ def test_run_n_shots_non_cmg_uses_extracted_services_and_retries_once(tmp_path: 
 
     diagnostic_store.close()
     run_context.close()
+
+
+def test_run_context_uses_config_mirrored_results_dir_when_config_path_supplied(tmp_path: Path):
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="judge_off"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+
+    run_context = RunContext.from_cfg(
+        cfg,
+        project_root=tmp_path,
+        config_path="two_step_factors/deepseekv4flash/judge_off.yaml",
+    )
+
+    try:
+        assert run_context.results_dir == tmp_path / "results" / "two_step_factors" / "deepseekv4flash" / "judge_off"
+    finally:
+        run_context.close()

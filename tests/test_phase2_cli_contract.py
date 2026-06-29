@@ -1,5 +1,6 @@
 """CLI contract tests for Phase 2 cleanup work."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -181,7 +182,7 @@ def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_pa
     )
     assert seen_commands[2].startswith("sbatch --dependency=afterok:2001 --cpus-per-task=8")
     assert seen_commands[2].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" ""'
     )
     assert len(seen_commands) == 3
 
@@ -231,6 +232,54 @@ def test_run_distributed_does_not_launch_orchestrator_for_judge_mode_off(tmp_pat
     assert "run_gecco_distributed.sh" in seen_commands[0]
     assert "run_test_evaluation.sh" in seen_commands[1]
     assert all("run_judge_orchestrator.sh" not in command for command in seen_commands)
+
+
+def test_distributed_client_startup_failure_uses_nested_registry_path(tmp_path):
+    """Distributed client aborts should write the shared registry under the config path."""
+    from gecco.cli import run_gecco_distributed
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="judge_off"),
+        evaluation=SimpleNamespace(fit_type="group"),
+        data=SimpleNamespace(path="data.csv", input_columns=[]),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(max_independent_runs=1, max_iterations=1),
+        clients={},
+    )
+
+    registry_state = {}
+
+    class _FakeRegistry:
+        def __init__(self, registry_path):
+            registry_state["path"] = Path(registry_path)
+
+        def request_abort(self, **kwargs):
+            registry_state["request_abort"] = kwargs
+
+        def set_client_status(self, *args, **kwargs):
+            registry_state["set_client_status"] = (args, kwargs)
+
+    with (
+        patch("gecco.cli.run_gecco_distributed.load_config", return_value=cfg),
+        patch("gecco.cli.run_gecco_distributed.SharedRegistry", _FakeRegistry),
+        patch("gecco.cli.run_gecco_distributed.load_data", side_effect=RuntimeError("stop")),
+        patch("gecco.cli.run_gecco_distributed.init_sentry"),
+    ):
+        with pytest.raises(RuntimeError, match="stop"):
+            run_gecco_distributed.run_distributed_client(
+                config="two_step_factors/deepseekv4flash/judge_off.yaml"
+            )
+
+    assert registry_state["path"] == (
+        run_gecco_distributed.PROJECT_ROOT
+        / "results"
+        / "two_step_factors"
+        / "deepseekv4flash"
+        / "judge_off"
+        / "shared_registry.duckdb"
+    )
+    assert registry_state["request_abort"]["reason"].startswith("RuntimeError: stop")
+    assert registry_state["set_client_status"][1]["status"] == "failed"
 
 
 def test_run_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
@@ -283,7 +332,7 @@ def test_run_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path):
         'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
     )
     assert seen_commands[2].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" "gecco_mh"'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" "gecco_mh"'
     )
     assert all("uv run" not in command for command in seen_commands)
 
@@ -346,7 +395,7 @@ def test_run_cmg_distributed_builds_expected_commands(tmp_path):
     )
     assert seen_commands[3].startswith("sbatch --dependency=afterok:5001:5002:5003 --cpus-per-task=8")
     assert seen_commands[3].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" ""'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" ""'
     )
     assert len(seen_commands) == 4
 
@@ -407,7 +456,7 @@ def test_run_cmg_distributed_with_conda_env_passes_expected_sbatch_args(tmp_path
         'bash/run_judge_orchestrator.sh "demo.yaml" "" "2" "gecco_mh"'
     )
     assert seen_commands[3].endswith(
-        'bash/run_test_evaluation.sh "demo.yaml" "results/demo-task" "gecco_mh"'
+        'bash/run_test_evaluation.sh "demo.yaml" "results/demo" "gecco_mh"'
     )
     assert all("uv run" not in command for command in seen_commands)
 
@@ -453,7 +502,7 @@ def test_distributed_client_publishes_abort_on_unhandled_exception(tmp_path):
                             distributed.run_distributed_client(config="demo.yaml")
 
     registry = distributed.SharedRegistry.open_existing(
-        project_root / "results" / "demo-task" / "shared_registry.duckdb"
+        project_root / "results" / "demo" / "shared_registry.duckdb"
     )
     abort = registry.get_abort()
     assert abort is not None

@@ -8,10 +8,11 @@
 #SBATCH --error=logs/gecco-client-%A_%a.err
 # NOTE: --array is set dynamically by `gecco run distributed` (or override with sbatch --array=...)
 
-# Usage (preferred — reads profiles from config automatically):
+# Usage (preferred — reads profiles from config automatically; launcher overrides
+# the SBATCH log paths with config-mirrored nested directories):
 #   python -m gecco run distributed --config archive/two_step_factors_distributed.yaml
 #
-# Manual usage:
+# Manual usage (flat logs/ fallback only):
 #   sbatch --array=0-4 --dependency=afterok:$VLLM_JOB \
 #       bash/run_gecco_distributed.sh archive/two_step_factors_distributed.yaml "exploit,explore,diverse,minimal,hybrid" "http://gpu-node:8000/v1"
 
@@ -35,10 +36,10 @@ else
     PROFILE_ARG=""
 fi
 
-mkdir -p logs
-
 # Change to the directory where sbatch was submitted (repo root)
 cd "${SLURM_SUBMIT_DIR:-.}"
+
+mkdir -p logs
 
 # Keep joblib/loky temp files off generic /tmp and within this run directory.
 export GECCO_TMPDIR="${GECCO_TMPDIR:-${PWD}/tmp}"

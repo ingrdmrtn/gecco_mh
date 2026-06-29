@@ -513,7 +513,10 @@ def test_constructor_skips_diagnostic_store_open_for_cmg_generator(
                 shared_registry=object(),
             )
 
-        from_cfg_mock.assert_called_once_with(cfg, client_id="alpha")
+        # Orchestrator-style construction resolves paths up front for the shared run context.
+        from_cfg_mock.assert_called_once_with(
+            cfg, client_id="alpha", config_path=None, results_dir=None
+        )
         if should_open_store:
             store_cls.assert_called_once_with(run_context.default_diagnostics_path())
             assert search.diagnostic_store is store_instance
@@ -1512,3 +1515,211 @@ def test_orchestrator_uses_shared_orchestrated_runner(tmp_path, monkeypatch):
     assert mock_registry.set_judge_feedback.call_args.kwargs["synthesized_feedback"] == {
         "explore": "Focus on a different mechanism family."
     }
+
+
+def test_run_orchestrator_does_not_mark_judge_failure_after_transient_duckdb_lock(
+    tmp_path,
+):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "diagnostics_client0.duckdb").touch()
+    (results_dir / "diagnostics_client1.duckdb").touch()
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="phase4_trace"),
+        loop=SimpleNamespace(max_iterations=1),
+        llm=SimpleNamespace(provider="openai", base_model="gpt-test"),
+        judge=SimpleNamespace(
+            barrier=SimpleNamespace(
+                orchestrator_wait_seconds=1,
+                retry_wait_seconds=1,
+            ),
+            mode="static",
+            context=SimpleNamespace(
+                attempted_models=False,
+                performance=True,
+                best_model_code=True,
+                diagnostic=False,
+            ),
+            output=SimpleNamespace(persona_synthesis=False),
+        ),
+        data=SimpleNamespace(
+            path="dummy.csv",
+            input_columns=["choice_1"],
+            id_column="participant",
+            splits={"prompt": "[1:2]"},
+            data2text_function="narrative",
+            narrative_template="trial {choice_1}",
+        ),
+        clients={
+            "explore": SimpleNamespace(
+                llm=SimpleNamespace(feedback_guidance="Prioritise mechanism diversity.")
+            )
+        },
+        centralized_model_generation=SimpleNamespace(enabled=False),
+    )
+
+    mock_registry = MagicMock()
+    mock_registry.wait_for_clients_complete.return_value = 2
+    mock_registry.count_clients_with_models.return_value = 2
+    mock_registry.read.return_value = {
+        "global_best": {
+            "model_code": "def distributed_best_model(x):\n    return x",
+            "metric_value": 98.0,
+        }
+    }
+    artifact = FeedbackArtifact(
+        iteration=0,
+        run_idx=0,
+        tag="_orchestrator",
+        timestamp="2026-06-04T12:00:00+00:00",
+        tool_call_count=1,
+        wall_time_seconds=1.0,
+        best_bic=98.0,
+        tool_call_trace=[{"tool": "get_bic_trajectory", "result": "ok"}],
+        full_trace=[{"step": "analysis", "detail": "ok"}],
+        per_angle=[{"angle": "trajectory", "summary": "stalled"}],
+        key_recommendations=["Focus on a different mechanism family."],
+        synthesized_feedback={"explore": "Focus on a different mechanism family."},
+        personas=["explore"],
+        stuck_search=False,
+        short_circuit=False,
+        no_substantive_feedback=False,
+        random_feedback_only=False,
+        best_model_code_included=False,
+    )
+    store = MagicMock()
+    store.import_from_source_db.side_effect = [
+        RuntimeError("Could not set lock on diagnostics store"),
+        None,
+        None,
+    ]
+
+    with patch(
+        "gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources",
+        wraps=run_judge_orchestrator_module._build_judge_store_from_duckdb_sources,
+    ) as build_store_mock:
+        with patch(
+            "gecco.cli.run_judge_orchestrator.DiagnosticStore",
+            return_value=store,
+        ) as diagnostic_store_cls:
+            with patch("gecco.cli.run_judge_orchestrator.time.sleep") as sleep_mock:
+                with patch("gecco.cli.run_judge_orchestrator.load_config", return_value=cfg):
+                    with patch(
+                        "gecco.cli.run_judge_orchestrator.SharedRegistry",
+                        return_value=mock_registry,
+                    ):
+                        with patch(
+                            "gecco.cli.run_judge_orchestrator.load_llm",
+                            return_value=(None, None),
+                        ):
+                            with patch(
+                                "gecco.cli.run_judge_orchestrator.load_data",
+                                return_value=MagicMock(),
+                            ):
+                                with patch(
+                                    "gecco.cli.run_judge_orchestrator.split_by_participant",
+                                    return_value={"prompt": MagicMock()},
+                                ):
+                                    with patch(
+                                        "gecco.cli.run_judge_orchestrator.get_data2text_function",
+                                        return_value=lambda *args, **kwargs: "data text",
+                                    ):
+                                        with patch(
+                                            "gecco.cli.run_judge_orchestrator.ToolUsingJudge",
+                                            return_value=MagicMock(),
+                                        ):
+                                            with patch(
+                                                "gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline",
+                                                return_value=artifact,
+                                            ) as runner:
+                                                with patch(
+                                                    "gecco.cli.run_judge_orchestrator.init_sentry"
+                                                ):
+                                                    run_orchestrator(
+                                                        config="test.yaml",
+                                                        results_dir=str(results_dir),
+                                                        n_clients=2,
+                                                    )
+
+    build_store_mock.assert_called_once_with(results_dir)
+    diagnostic_store_cls.assert_called_once_with(results_dir / "diagnostics_unified.duckdb")
+    assert store.import_from_source_db.call_count == 3
+    sleep_mock.assert_called_once()
+    runner.assert_called_once()
+    mock_registry.set_judge_failure.assert_not_called()
+    mock_registry.set_judge_feedback.assert_called_once()
+
+
+def test_build_judge_store_retries_transient_duckdb_lock(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "diagnostics_client0.duckdb").touch()
+    (results_dir / "diagnostics_client1.duckdb").touch()
+
+    store = MagicMock()
+    store.import_from_source_db.side_effect = [
+        RuntimeError("Could not set lock on diagnostics store"),
+        None,
+        None,
+    ]
+
+    with patch(
+        "gecco.cli.run_judge_orchestrator.DiagnosticStore",
+        return_value=store,
+    ) as diagnostic_store_cls:
+        with patch("gecco.cli.run_judge_orchestrator.time.sleep") as sleep_mock:
+            built_store = run_judge_orchestrator_module._build_judge_store_from_duckdb_sources(
+                results_dir
+            )
+
+    assert built_store is store
+    diagnostic_store_cls.assert_called_once_with(results_dir / "diagnostics_unified.duckdb")
+    assert store.import_from_source_db.call_count == 3
+    assert sleep_mock.call_count == 1
+
+
+def test_build_judge_store_does_not_retry_non_lock_import_error(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "diagnostics_client0.duckdb").touch()
+
+    store = MagicMock()
+    store.import_from_source_db.side_effect = RuntimeError("schema mismatch")
+
+    with patch(
+        "gecco.cli.run_judge_orchestrator.DiagnosticStore",
+        return_value=store,
+    ) as diagnostic_store_cls:
+        with patch("gecco.cli.run_judge_orchestrator.time.sleep") as sleep_mock:
+            with pytest.raises(RuntimeError, match="schema mismatch"):
+                run_judge_orchestrator_module._build_judge_store_from_duckdb_sources(
+                    results_dir
+                )
+
+    diagnostic_store_cls.assert_called_once_with(results_dir / "diagnostics_unified.duckdb")
+    store.import_from_source_db.assert_called_once_with(results_dir / "diagnostics_client0.duckdb")
+    sleep_mock.assert_not_called()
+
+
+def test_build_judge_store_gives_up_after_lock_retry_limit(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "diagnostics_client0.duckdb").touch()
+
+    store = MagicMock()
+    store.import_from_source_db.side_effect = RuntimeError("Conflicting lock on source db")
+
+    with patch(
+        "gecco.cli.run_judge_orchestrator.DiagnosticStore",
+        return_value=store,
+    ) as diagnostic_store_cls:
+        with patch("gecco.cli.run_judge_orchestrator.time.sleep") as sleep_mock:
+            with pytest.raises(RuntimeError, match="Conflicting lock on source db"):
+                run_judge_orchestrator_module._build_judge_store_from_duckdb_sources(
+                    results_dir
+                )
+
+    diagnostic_store_cls.assert_called_once_with(results_dir / "diagnostics_unified.duckdb")
+    assert store.import_from_source_db.call_count == 5
+    assert sleep_mock.call_count == 4

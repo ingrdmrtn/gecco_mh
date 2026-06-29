@@ -30,6 +30,30 @@ from gecco.utils import TimestampedConsole
 
 console = TimestampedConsole()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DUCKDB_IMPORT_RETRY_ATTEMPTS = 5
+_DUCKDB_IMPORT_RETRY_BASE_SECONDS = 0.5
+_DUCKDB_IMPORT_RETRY_MAX_SECONDS = 4.0
+_DUCKDB_LOCK_ERROR_MARKERS = ("Could not set lock", "Conflicting lock")
+
+
+def _is_duckdb_lock_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker.lower() in message for marker in _DUCKDB_LOCK_ERROR_MARKERS)
+
+
+def _import_source_db_with_retries(store: DiagnosticStore, source_path: Path) -> None:
+    for attempt in range(_DUCKDB_IMPORT_RETRY_ATTEMPTS):
+        try:
+            store.import_from_source_db(source_path)
+            return
+        except Exception as exc:
+            if not _is_duckdb_lock_error(exc) or attempt == _DUCKDB_IMPORT_RETRY_ATTEMPTS - 1:
+                raise
+            backoff_seconds = min(
+                _DUCKDB_IMPORT_RETRY_BASE_SECONDS * (2**attempt),
+                _DUCKDB_IMPORT_RETRY_MAX_SECONDS,
+            )
+            time.sleep(backoff_seconds)
 
 
 def _build_judge_store_from_duckdb_sources(results_dir: Path) -> DiagnosticStore:
@@ -49,7 +73,7 @@ def _build_judge_store_from_duckdb_sources(results_dir: Path) -> DiagnosticStore
             lock_path.unlink()
         store = DiagnosticStore(unified_path)
         for source_path in source_paths:
-            store.import_from_source_db(source_path)
+            _import_source_db_with_retries(store, source_path)
         return store
 
     if unified_path.exists():

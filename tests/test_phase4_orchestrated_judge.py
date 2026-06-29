@@ -2,8 +2,9 @@
 
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -18,6 +19,7 @@ from gecco.construct_feedback.orchestrated import (
     persist_feedback_artifact,
     run_orchestrated_judge_pipeline,
 )
+from gecco.candidate_evaluation import CandidateEvaluator
 from gecco.construct_feedback.tool_judge import ToolUsingJudge
 from gecco.feedback_coordinator import FeedbackCoordinator
 from gecco.diagnostic_store.store import DiagnosticStore
@@ -149,6 +151,160 @@ def test_distributed_run_raises_immediately_when_shared_abort_is_present(tmp_pat
     search._require_candidate_evaluator.assert_not_called()
 
 
+def test_run_n_shots_reopens_diagnostic_store_only_after_judge_wait(tmp_path):
+    """Judge waits should happen before the next diagnostic-store reopen."""
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=2),
+        judge=SimpleNamespace(
+            mode="static",
+            barrier=SimpleNamespace(client_wait_seconds=1),
+            diagnostic_store=SimpleNamespace(enabled=True),
+        ),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        validation=SimpleNamespace(max_syntax_retries=0),
+        centralized_model_generation=SimpleNamespace(enabled=False),
+    )
+    search.shared_registry = MagicMock()
+    search.shared_registry.raise_if_aborted = MagicMock()
+    search.client_id = "alpha"
+    search.judge_enabled = True
+    search.tool_judge = None
+    search.best_model = "def candidate_model():\n    return 0.0"
+    search.best_metric = 0.0
+    search.best_params = []
+    search.best_iter = 0
+    search.best_state = SimpleNamespace()
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 0
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 0
+    search.prompt_builder = None
+    search.generate = MagicMock(return_value="candidate code")
+    search.model = None
+    search.tokenizer = None
+    search.tried_param_sets = set()
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.df = SimpleNamespace(participant=["p1"])
+    search.results_dir = tmp_path
+    search.artifact_store = SimpleNamespace(diagnostic_store=MagicMock(name="diagnostic_store"))
+    search.diagnostic_store = search.artifact_store.diagnostic_store
+    search._sync_from_registry = MagicMock()
+    search._sync_best_attrs_from_state = MagicMock()
+    search._set_activity = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._cmg_config = MagicMock(return_value=None)
+    search._require_artifact_store = MagicMock(return_value=search.artifact_store)
+    search._require_distributed_coordinator = MagicMock(
+        return_value=SimpleNamespace(start_iteration=MagicMock(return_value=0))
+    )
+    search._require_candidate_generator = MagicMock(
+        return_value=SimpleNamespace(
+            generate_non_cmg_iteration=MagicMock(return_value=SimpleNamespace())
+        )
+    )
+    events = []
+
+    def wait_for_judge_feedback(*, iteration, timeout_seconds, poll_seconds):
+        events.append("wait")
+        assert search._ensure_diagnostic_store_for_iteration.call_count == 1
+        assert search.diagnostic_store is None
+        return {"synthesized_feedback": "", "key_recommendations": []}
+
+    search.shared_registry.wait_for_judge_feedback.side_effect = wait_for_judge_feedback
+
+    def run_non_cmg_iteration(*, iteration, release_diagnostics_for_judge=None, **kwargs):
+        events.append(f"write_{iteration}")
+        if iteration == 0:
+            assert release_diagnostics_for_judge is not None
+            release_diagnostics_for_judge()
+        else:
+            assert search._ensure_diagnostic_store_for_iteration.call_count == 2
+        return SimpleNamespace(should_retry=False, had_runnable_model=False, retry_feedback=None)
+
+    search._require_candidate_evaluator = MagicMock(
+        return_value=SimpleNamespace(run_non_cmg_iteration=MagicMock(side_effect=run_non_cmg_iteration))
+    )
+    search._ensure_diagnostic_store_for_iteration = MagicMock(
+        side_effect=lambda: events.append("ensure")
+    )
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    search.run_n_shots(run_idx=0, baseline_bic=0.0)
+
+    assert events == ["ensure", "write_0", "wait", "ensure", "write_1"]
+    search.shared_registry.wait_for_judge_feedback.assert_called_once()
+    search._ensure_diagnostic_store_for_iteration.assert_has_calls([call(), call()])
+
+
+def test_run_n_shots_skips_diagnostic_store_reopen_for_cmg_generator(tmp_path):
+    """CMG generator runs should not reopen diagnostics unless a write is imminent."""
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        loop=SimpleNamespace(max_iterations=1),
+        judge=SimpleNamespace(
+            mode="static",
+            barrier=SimpleNamespace(client_wait_seconds=1),
+            diagnostic_store=SimpleNamespace(enabled=True),
+        ),
+        evaluation=SimpleNamespace(fit_type="group", metric="bic"),
+        llm=SimpleNamespace(models_per_iteration=1),
+        validation=SimpleNamespace(max_syntax_retries=0),
+        centralized_model_generation=SimpleNamespace(enabled=True),
+    )
+    search.shared_registry = MagicMock()
+    search.shared_registry.raise_if_aborted = MagicMock()
+    search.client_id = "alpha"
+    search.judge_enabled = True
+    search.tool_judge = None
+    search.best_model = None
+    search.best_metric = 0.0
+    search.best_params = []
+    search.best_iter = 0
+    search.best_state = SimpleNamespace()
+    search.recovery_checker = None
+    search.id_eval_data = None
+    search.ppc_enabled = False
+    search._ppc_simulator = None
+    search.ppc_n_sims = 0
+    search.block_residuals_enabled = False
+    search.block_residuals_n_blocks = 0
+    search.prompt_builder = None
+    search.generate = MagicMock(return_value="candidate code")
+    search.model = None
+    search.tokenizer = None
+    search.tried_param_sets = set()
+    search.feedback = SimpleNamespace(history=[], record_iteration=MagicMock())
+    search.df = SimpleNamespace(participant=["p1"])
+    search.results_dir = tmp_path
+    search.artifact_store = SimpleNamespace(diagnostic_store=None)
+    search.diagnostic_store = None
+    search._sync_from_registry = MagicMock()
+    search._sync_best_attrs_from_state = MagicMock()
+    search._set_activity = MagicMock()
+    search._file_tag = MagicMock(return_value="")
+    search._cmg_config = MagicMock(return_value=SimpleNamespace(enabled=True))
+    search._validate_cmg_runtime = MagicMock()
+    search._cmg_is_generator = MagicMock(return_value=True)
+    search._run_cmg_generator_iteration = MagicMock()
+    search._run_cmg_evaluator_iteration = MagicMock()
+    search._ensure_diagnostic_store_for_iteration = MagicMock()
+    search._require_distributed_coordinator = MagicMock(
+        return_value=SimpleNamespace(start_iteration=MagicMock(return_value=0))
+    )
+    search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
+
+    search.run_n_shots(run_idx=0, baseline_bic=0.0)
+
+    search._run_cmg_generator_iteration.assert_called_once()
+    search._run_cmg_evaluator_iteration.assert_not_called()
+    search._ensure_diagnostic_store_for_iteration.assert_not_called()
+
+
 class _SummaryOnlyStore:
     """Store stub that exposes duplicate attempted models and a short trajectory."""
 
@@ -228,6 +384,146 @@ def _make_single_worker_search(tmp_path: Path, judge_mock: MagicMock) -> GeCCoMo
     )
     search.run_n_shots = GeCCoModelSearch.run_n_shots.__get__(search, GeCCoModelSearch)
     return search
+
+
+@pytest.mark.parametrize(
+    "had_runnable_model, expected_status",
+    [(True, "complete"), (False, "complete_no_success")],
+)
+def test_finalize_iteration_results_releases_diagnostics_before_registry_update(
+    had_runnable_model, expected_status
+):
+    """Judge completion should publish only after diagnostics are released."""
+    evaluator = CandidateEvaluator.__new__(CandidateEvaluator)
+    events = []
+    evaluator.artifact_store = SimpleNamespace(
+        write_iteration_results=MagicMock(
+            side_effect=lambda **kwargs: events.append("write_iteration_results") or had_runnable_model
+        )
+    )
+
+    def publish_registry_status(**kwargs):
+        events.append("registry_update")
+        assert kwargs["status"] == expected_status
+
+    evaluator._publish_registry_status = MagicMock(side_effect=publish_registry_status)
+
+    release_diagnostics_for_judge = MagicMock(
+        side_effect=lambda: events.append("release_diagnostics")
+    )
+
+    result = evaluator.finalize_iteration_results(
+        iteration=1,
+        run_idx=0,
+        tag="",
+        iteration_results=[{"function_name": "candidate_model", "metric_name": "BIC", "metric_value": 10.0}],
+        client_id="client-a",
+        results_source=SimpleNamespace(participant=["p1"]),
+        shared_registry=SimpleNamespace(),
+        release_diagnostics_for_judge=release_diagnostics_for_judge,
+    )
+
+    assert result is had_runnable_model
+    assert events == ["write_iteration_results", "release_diagnostics", "registry_update"]
+    release_diagnostics_for_judge.assert_called_once()
+    evaluator.artifact_store.write_iteration_results.assert_called_once()
+    evaluator._publish_registry_status.assert_called_once()
+
+
+def test_diagnostic_store_reopens_after_release_and_updates_artifact_store(tmp_path):
+    """Released diagnostic writers should be recreated for the next iteration."""
+    search = GeCCoModelSearch.__new__(GeCCoModelSearch)
+    search.cfg = SimpleNamespace(
+        judge=SimpleNamespace(diagnostic_store=SimpleNamespace(enabled=True))
+    )
+    search.run_context = SimpleNamespace(
+        default_diagnostics_path=MagicMock(return_value=tmp_path / "diagnostics.duckdb")
+    )
+    search.shared_registry = object()
+    search.judge_enabled = True
+    search.artifact_store = SimpleNamespace(diagnostic_store=None)
+
+    first_store = MagicMock(name="first_store")
+    second_store = MagicMock(name="second_store")
+
+    with patch("gecco.run_gecco._DiagnosticStore", side_effect=[first_store, second_store]) as store_cls:
+        search._ensure_diagnostic_store_for_iteration()
+        assert search.diagnostic_store is first_store
+        assert search.artifact_store.diagnostic_store is first_store
+
+        search._release_diagnostic_store_for_judge()
+        first_store.close.assert_called_once()
+        assert search.diagnostic_store is None
+        assert search.artifact_store.diagnostic_store is None
+
+        search._ensure_diagnostic_store_for_iteration()
+        assert search.diagnostic_store is second_store
+        assert search.artifact_store.diagnostic_store is second_store
+
+    assert store_cls.call_args_list == [
+        call(tmp_path / "diagnostics.duckdb"),
+        call(tmp_path / "diagnostics.duckdb"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "generator_client, should_open_store",
+    [("alpha", False), ("beta", True)],
+)
+def test_constructor_skips_diagnostic_store_open_for_cmg_generator(
+    tmp_path, generator_client, should_open_store
+):
+    """Constructor-time store opening should respect CMG generator ownership."""
+    tempdir = TemporaryDirectory(dir=tmp_path)
+    try:
+        run_context = run_gecco_module.RunContext(
+            project_root=tmp_path,
+            results_dir=tmp_path,
+            temp_root=tmp_path,
+            tempdir=tempdir,
+            client_id="alpha",
+        )
+        cfg = SimpleNamespace(
+            task=SimpleNamespace(name="phase4_task"),
+            evaluation=SimpleNamespace(fit_type="group"),
+            judge=SimpleNamespace(
+                mode="static",
+                diagnostic_store=SimpleNamespace(enabled=True),
+            ),
+            centralized_model_generation=SimpleNamespace(
+                enabled=True,
+                generator_client=generator_client,
+            ),
+        )
+
+        store_instance = MagicMock(name="diagnostic_store")
+
+        with patch(
+            "gecco.run_gecco.RunContext.from_cfg", return_value=run_context
+        ) as from_cfg_mock, patch(
+            "gecco.run_gecco._DiagnosticStore", return_value=store_instance
+        ) as store_cls:
+            search = GeCCoModelSearch(
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                cfg=cfg,
+                df=SimpleNamespace(),
+                prompt_builder=None,
+                client_id="alpha",
+                shared_registry=object(),
+            )
+
+        from_cfg_mock.assert_called_once_with(cfg, client_id="alpha")
+        if should_open_store:
+            store_cls.assert_called_once_with(run_context.default_diagnostics_path())
+            assert search.diagnostic_store is store_instance
+            assert search.artifact_store.diagnostic_store is store_instance
+        else:
+            store_cls.assert_not_called()
+            assert search.diagnostic_store is None
+            assert search.artifact_store.diagnostic_store is None
+    finally:
+        tempdir.cleanup()
 
 
 def test_build_feedback_artifact_returns_canonical_json_shape():

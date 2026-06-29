@@ -33,6 +33,11 @@ from config.schema import get_judge_capabilities, get_judge_mode
 from gecco.construct_feedback.orchestrated import run_orchestrated_judge_pipeline
 from pathlib import Path
 
+try:
+    from gecco.diagnostic_store import DiagnosticStore as _DiagnosticStore
+except ImportError:  # pragma: no cover - optional dependency guard
+    _DiagnosticStore = None
+
 console = TimestampedConsole()
 
 
@@ -149,19 +154,23 @@ class GeCCoModelSearch:
         # --- Diagnostic store (optional) ---
         self.diagnostic_store = None
         judge_cfg = getattr(cfg, "judge", None)
-        if judge_cfg and getattr(
-            getattr(judge_cfg, "diagnostic_store", None), "enabled", False
+        cmg_cfg = self._cmg_config()
+        cmg_is_generator = (
+            cmg_cfg is not None and self._cmg_is_generator(cmg_cfg)
+        )
+        if (
+            judge_cfg
+            and getattr(getattr(judge_cfg, "diagnostic_store", None), "enabled", False)
+            and not cmg_is_generator
         ):
-            try:
-                from gecco.diagnostic_store import DiagnosticStore
-
-                db_path = self.run_context.default_diagnostics_path()
-                self.diagnostic_store = DiagnosticStore(db_path)
-                console.print(f"[dim]Diagnostic store: {db_path}[/]")
-            except ImportError:
+            if _DiagnosticStore is None:
                 console.print(
                     "[yellow]duckdb not installed — diagnostic store disabled.[/]"
                 )
+            else:
+                db_path = self.run_context.default_diagnostics_path()
+                self.diagnostic_store = _DiagnosticStore(db_path)
+                console.print(f"[dim]Diagnostic store: {db_path}[/]")
 
         # --- Unified judge pipeline ---
         self.tool_judge = None
@@ -229,8 +238,50 @@ class GeCCoModelSearch:
         if getattr(self, "diagnostic_store", None) is not None:
             self.diagnostic_store.close()
             self.diagnostic_store = None
+        if getattr(self, "artifact_store", None) is not None:
+            self.artifact_store.diagnostic_store = None
         if getattr(self, "run_context", None) is not None:
             self.run_context.close()
+
+    def _release_diagnostic_store_for_judge(self) -> None:
+        """Close the client-owned diagnostic writer before publishing completion."""
+
+        if not (
+            getattr(self, "shared_registry", None) is not None
+            and bool(getattr(self, "judge_enabled", False))
+        ):
+            return
+
+        diagnostic_store = getattr(self, "diagnostic_store", None)
+        if diagnostic_store is None:
+            if getattr(self, "artifact_store", None) is not None:
+                self.artifact_store.diagnostic_store = None
+            return
+
+        diagnostic_store.close()
+        self.diagnostic_store = None
+        if getattr(self, "artifact_store", None) is not None:
+            self.artifact_store.diagnostic_store = None
+
+    def _ensure_diagnostic_store_for_iteration(self) -> None:
+        """Reopen the diagnostic store before the next diagnostic write."""
+
+        judge_cfg = getattr(self, "cfg", None)
+        judge_cfg = getattr(judge_cfg, "judge", None) if judge_cfg is not None else None
+        diagnostic_store_cfg = getattr(judge_cfg, "diagnostic_store", None) if judge_cfg is not None else None
+        if not getattr(diagnostic_store_cfg, "enabled", False):
+            return
+
+        if getattr(self, "diagnostic_store", None) is not None:
+            return
+
+        if _DiagnosticStore is None:
+            return
+
+        db_path = self.run_context.default_diagnostics_path()
+        self.diagnostic_store = _DiagnosticStore(db_path)
+        if getattr(self, "artifact_store", None) is not None:
+            self.artifact_store.diagnostic_store = self.diagnostic_store
 
     # --- Explicit collaborator accessors (no fallback construction) ---
 
@@ -804,6 +855,9 @@ class GeCCoModelSearch:
             participant=participant,
             best_state=self.best_state,
             tried_param_sets=self.tried_param_sets,
+            release_diagnostics_for_judge=self._release_diagnostic_store_for_judge
+            if self.shared_registry is not None and bool(getattr(self, "judge_enabled", False))
+            else None,
         )
         self._sync_best_attrs_from_state()
 
@@ -824,6 +878,11 @@ class GeCCoModelSearch:
             )
 
         end_iter = self.cfg.loop.max_iterations
+        release_diagnostics_for_judge = (
+            self._release_diagnostic_store_for_judge
+            if self.shared_registry is not None and bool(getattr(self, "judge_enabled", False))
+            else None
+        )
         for it in range(start_iter, end_iter):
             console.rule(f"[bold]Iteration {it}")
 
@@ -966,6 +1025,7 @@ class GeCCoModelSearch:
                     self._run_cmg_generator_iteration(it, run_idx, feedback, cmg_cfg)
                     continue
                 else:
+                    self._ensure_diagnostic_store_for_iteration()
                     self._run_cmg_evaluator_iteration(it, run_idx, feedback, cmg_cfg, baseline_bic)
                     continue
 
@@ -1006,6 +1066,8 @@ class GeCCoModelSearch:
                     client_id=self.client_id,
                 )
 
+                self._ensure_diagnostic_store_for_iteration()
+
                 evaluation_result = evaluator.run_non_cmg_iteration(
                     iteration=it,
                     run_idx=run_idx,
@@ -1031,6 +1093,7 @@ class GeCCoModelSearch:
                     participant=participant,
                     feedback_record=self.feedback.record_iteration,
                     tried_param_sets=self.tried_param_sets,
+                    release_diagnostics_for_judge=release_diagnostics_for_judge,
                     )
 
                 self._sync_best_attrs_from_state()

@@ -392,6 +392,7 @@ class CandidateEvaluator:
         participant: str | None = None,
         best_state: BestModelState | None = None,
         tried_param_sets: list[list[Any]] | None = None,
+        release_diagnostics_for_judge: Callable[[], None] | None = None,
     ) -> CandidateEvaluationResult:
         """Evaluate the candidate assigned to this client.
 
@@ -553,6 +554,7 @@ class CandidateEvaluator:
             best_state=best_state,
             tried_param_sets=tried_param_sets,
             feedback_record=None,
+            release_diagnostics_for_judge=release_diagnostics_for_judge,
         )
         return CandidateEvaluationResult(iteration_results=iteration_results, model_file=model_file)
 
@@ -583,6 +585,7 @@ class CandidateEvaluator:
         participant: str | None = None,
         feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
         tried_param_sets: list[list[Any]] | None = None,
+        release_diagnostics_for_judge: Callable[[], None] | None = None,
     ) -> NonCMGEvaluationResult:
         """Evaluate a non-CMG batch and finalise it when no retry is needed.
 
@@ -694,6 +697,7 @@ class CandidateEvaluator:
             best_state=best_state,
             tried_param_sets=tried_param_sets,
             feedback_record=feedback_record,
+            release_diagnostics_for_judge=release_diagnostics_for_judge,
         )
 
         return NonCMGEvaluationResult(
@@ -1127,6 +1131,7 @@ class CandidateEvaluator:
         best_state: BestModelState | None = None,
         tried_param_sets: list[list[Any]] | None = None,
         feedback_record: Callable[[int, list[dict[str, Any]]], None] | None = None,
+        release_diagnostics_for_judge: Callable[[], None] | None = None,
     ) -> bool:
         """Persist and publish results for one completed iteration."""
 
@@ -1141,6 +1146,9 @@ class CandidateEvaluator:
 
         if feedback_record is not None:
             feedback_record(iteration, iteration_results)
+
+        if release_diagnostics_for_judge is not None:
+            release_diagnostics_for_judge()
 
         completion_status = "complete" if had_runnable_model else "complete_no_success"
         self._publish_registry_status(

@@ -305,18 +305,18 @@ def _summary_row(entry: dict) -> dict[str, str]:
 
 def _render_summary_table(results: list[dict]) -> None:
     table = Table(title="Test evaluation summary", show_lines=False)
-    table.add_column("Model name")
-    table.add_column("Executable name")
-    table.add_column("Client")
-    table.add_column("Iteration")
-    table.add_column("Selection metric")
-    table.add_column("Selection value")
-    table.add_column("Val NLL")
-    table.add_column("Test BIC")
-    table.add_column("Test NLL")
-    table.add_column("ID mean R2")
-    table.add_column("ID max R2")
-    table.add_column("ID best param")
+    table.add_column("Model", overflow="fold")
+    table.add_column("Exec", overflow="fold")
+    table.add_column("Client", justify="right", no_wrap=True)
+    table.add_column("Iter", justify="right", no_wrap=True)
+    table.add_column("Sel metric", overflow="fold")
+    table.add_column("Sel val", justify="right", no_wrap=True)
+    table.add_column("Val NLL", justify="right", no_wrap=True)
+    table.add_column("Test BIC", justify="right", no_wrap=True)
+    table.add_column("Test NLL", justify="right", no_wrap=True)
+    table.add_column("ID mean R2", justify="right", no_wrap=True)
+    table.add_column("ID max R2", justify="right", no_wrap=True)
+    table.add_column("ID best param", overflow="fold")
 
     for result in results:
         individual_differences = result.get("test_individual_differences") or {}
@@ -337,8 +337,8 @@ def _render_summary_table(results: list[dict]) -> None:
 
     console = Console()
     console.print(
-        "[test] Summary columns: Model name | Executable name | Client | Iteration | "
-        "Selection metric | Selection value | Val NLL | Test BIC | Test NLL"
+        "[test] Summary columns: Model | Exec | Client | Iter | Sel metric | Sel val | "
+        "Val NLL | Test BIC | Test NLL | ID mean R2 | ID max R2 | ID best param"
     )
     console.print(table)
 

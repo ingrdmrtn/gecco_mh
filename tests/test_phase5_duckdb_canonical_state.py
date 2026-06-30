@@ -1182,7 +1182,10 @@ def test_run_test_evaluation_writes_json_csv_and_rich_summary(
     assert json_path.exists()
     assert csv_path.exists()
     assert "Test evaluation summary" in captured
-    assert "Model name" in captured
+    assert "Model" in captured
+    assert "Exec" in captured
+    assert "Sel val" in captured
+    assert "Test BIC" in captured
     assert "descriptive model" in captured
 
     json_rows = json.loads(json_path.read_text(encoding="utf-8"))

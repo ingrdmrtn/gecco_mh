@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from rich.console import Console
 
 from config.schema import get_judge_mode, judge_context_enabled
@@ -688,6 +688,49 @@ class JudgeVerdict(BaseModel):
     tool_call_count: int
     wall_time_seconds: float
     best_bic: float | None = None  # persisted so next iteration can load it
+
+
+_ALLOWED_VERDICT_CONFIDENCES = {"low", "medium", "high"}
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item is not None]
+    return [str(value)]
+
+
+def _coerce_angle_analysis_item(item: Any) -> AngleAnalysis | None:
+    if isinstance(item, dict):
+        confidence = item.get("confidence", "medium")
+        if confidence not in _ALLOWED_VERDICT_CONFIDENCES:
+            confidence = "medium"
+        angle = item.get("angle", "")
+        findings = item.get("findings", "")
+        return AngleAnalysis(
+            angle="" if angle is None else str(angle),
+            findings="" if findings is None else str(findings),
+            supporting_tool_calls=_coerce_str_list(item.get("supporting_tool_calls", [])),
+            confidence=confidence,
+        )
+    if isinstance(item, str):
+        return AngleAnalysis(
+            angle="",
+            findings=item,
+            supporting_tool_calls=[],
+            confidence="medium",
+        )
+    if item is None or isinstance(item, (list, tuple, set)):
+        return None
+    return AngleAnalysis(
+        angle="",
+        findings=str(item),
+        supporting_tool_calls=[],
+        confidence="medium",
+    )
 
 
 # ======================================================================
@@ -1476,25 +1519,29 @@ def _parse_verdict_from_text(
     if json_text:
         try:
             data = json.loads(json_text)
-            per_angle = [
-                AngleAnalysis(
-                    angle=a.get("angle", ""),
-                    findings=a.get("findings", ""),
-                    supporting_tool_calls=a.get("supporting_tool_calls", []),
-                    confidence=a.get("confidence", "medium"),
-                )
-                for a in data.get("per_angle", [])
-            ]
+            if not isinstance(data, dict):
+                raise TypeError("verdict JSON must be an object")
+            per_angle: list[AngleAnalysis] = []
+            per_angle_raw = data.get("per_angle", [])
+            if not isinstance(per_angle_raw, list):
+                per_angle_raw = []
+            for item in per_angle_raw:
+                coerced = _coerce_angle_analysis_item(item)
+                if coerced is not None:
+                    per_angle.append(coerced)
+            synthesized_feedback = data.get("synthesized_feedback", text)
+            if synthesized_feedback is None:
+                synthesized_feedback = ""
             verdict = JudgeVerdict(
                 iteration=iteration,
                 per_angle=per_angle,
-                key_recommendations=data.get("key_recommendations", []),
-                synthesized_feedback=data.get("synthesized_feedback", text),
+                key_recommendations=_coerce_str_list(data.get("key_recommendations", [])),
+                synthesized_feedback=str(synthesized_feedback),
                 tool_call_count=tool_call_count,
                 wall_time_seconds=wall_time,
             )
             return verdict
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, ValidationError):
             pass
 
     # Fallback: treat the entire text as synthesized_feedback

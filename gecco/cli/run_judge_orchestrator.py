@@ -23,7 +23,7 @@ from gecco.load_llms.model_loader import load_llm
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
-from gecco.sentry_init import capture_operational_error, init_sentry
+from gecco.sentry_init import capture_operational_error, flush_sentry_events, init_sentry
 from gecco.tempdirs import configure_temp_dirs
 from gecco.utils import TimestampedConsole
 
@@ -124,7 +124,12 @@ def run_orchestrator(
 
     cfg = load_config(resolve_config_path(config, project_root=PROJECT_ROOT))
 
-    init_sentry(cfg=cfg, task_name=cfg.task.name, config_name=config)
+    sentry_connected = init_sentry(cfg=cfg, task_name=cfg.task.name, config_name=config)
+    console.print(
+        "[green]Sentry monitoring: connected[/]"
+        if sentry_connected
+        else "[yellow]Sentry monitoring: disabled (SENTRY_DSN not set)[/]"
+    )
 
     if results_dir:
         resolved_results_dir = Path(results_dir)
@@ -363,7 +368,11 @@ def run_orchestrator(
                         operation="final_judge_retry",
                         iteration=iteration,
                         results_dir=str(resolved_results_dir),
+                        attempt=attempt + 1,
+                        max_attempts=max_judge_retries + 1,
+                        exception_type=type(exc).__name__,
                     )
+                    flush_sentry_events()
                     registry.set_judge_failure(iteration=iteration, error=str(exc))
                     had_failure = True
                     break

@@ -18,6 +18,7 @@ from gecco.sentry_init import (
     capture_fit_error,
     capture_operational_error,
     capture_recovery_failed,
+    flush_sentry_events,
     init_sentry,
 )
 
@@ -33,6 +34,24 @@ class TestInitSentry:
                 result = init_sentry()
                 assert result is True
                 mock_init.assert_called_once()
+                assert mock_init.call_args.kwargs["environment"] == "production"
+
+    def test_config_environment_cannot_override_production(self):
+        cfg = SimpleNamespace(sentry=SimpleNamespace(environment="development"))
+        with patch.dict(os.environ, {"SENTRY_DSN": "https://key@o0.ingest.sentry.io/project"}):
+            with patch("gecco.sentry_init.sentry_sdk.init") as mock_init:
+                result = init_sentry(cfg=cfg)
+                assert result is True
+                assert mock_init.call_args.kwargs["environment"] == "production"
+
+    def test_flush_sentry_events_calls_sdk_flush(self):
+        with patch("gecco.sentry_init.sentry_sdk.flush") as mock_flush:
+            flush_sentry_events(timeout=3.5)
+            mock_flush.assert_called_once_with(timeout=3.5)
+
+    def test_flush_sentry_events_ignores_flush_failure(self):
+        with patch("gecco.sentry_init.sentry_sdk.flush", side_effect=RuntimeError("flush failed")):
+            flush_sentry_events(timeout=1.0)
 
     def test_init_without_config_does_not_raise(self):
         with patch.dict(os.environ, {"SENTRY_DSN": "https://key@o0.ingest.sentry.io/project"}):
@@ -312,6 +331,15 @@ class TestOrchestratorCapture:
         registry failure written, command returns non-zero."""
         expected_attempts = 3
         mm = MagicMock()
+        call_order = []
+
+        def _capture_side_effect(*args, **kwargs):
+            call_order.append("capture")
+            raise RuntimeError("sentry down")
+
+        def _flush_side_effect(*args, **kwargs):
+            call_order.append("flush")
+
         with (
             patch("gecco.cli.run_judge_orchestrator.load_config") as mock_load_config,
             patch("gecco.cli.run_judge_orchestrator.load_llm", return_value=(mm, mm)),
@@ -327,6 +355,7 @@ class TestOrchestratorCapture:
             patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline") as mock_pipeline,
             patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge"),
             patch.object(sentry_sdk, "capture_exception") as mock_capture,
+            patch("gecco.cli.run_judge_orchestrator.flush_sentry_events") as mock_flush,
         ):
             cfg = _mock_orchestrator_config()
             mock_load_config.return_value = cfg
@@ -339,7 +368,8 @@ class TestOrchestratorCapture:
             mock_build.return_value = MagicMock()
             mock_pipeline.side_effect = RuntimeError("judge failed every time")
             mock_ds.return_value = MagicMock()
-            mock_capture.side_effect = RuntimeError("sentry down")
+            mock_capture.side_effect = _capture_side_effect
+            mock_flush.side_effect = _flush_side_effect
 
             from gecco.cli.run_judge_orchestrator import run_orchestrator
 
@@ -362,6 +392,55 @@ class TestOrchestratorCapture:
                 "judge_orchestrator",
                 "final_judge_retry",
             ]
+            assert kwargs["extras"]["attempt"] == 3
+            assert kwargs["extras"]["max_attempts"] == 3
+            assert kwargs["extras"]["exception_type"] == "RuntimeError"
+            mock_flush.assert_called_once()
+            assert call_order == ["capture", "flush"]
+
+    def test_success_path_does_not_flush_or_capture(self):
+        mm = MagicMock()
+        artifact = SimpleNamespace(synthesized_feedback={"default": "ok"})
+        with (
+            patch("gecco.cli.run_judge_orchestrator.load_config") as mock_load_config,
+            patch("gecco.cli.run_judge_orchestrator.load_llm", return_value=(mm, mm)),
+            patch("gecco.cli.run_judge_orchestrator.load_data", return_value=mm),
+            patch("gecco.cli.run_judge_orchestrator.split_by_participant") as mock_split,
+            patch("gecco.cli.run_judge_orchestrator.get_data2text_function", return_value=MagicMock()),
+            patch("gecco.cli.run_judge_orchestrator.PromptBuilderWrapper"),
+            patch("gecco.cli.run_judge_orchestrator.SharedRegistry") as mock_registry_cls,
+            patch("gecco.cli.run_judge_orchestrator.configure_temp_dirs"),
+            patch("gecco.cli.run_judge_orchestrator.init_sentry"),
+            patch("gecco.cli.run_judge_orchestrator.DiagnosticStore") as mock_ds,
+            patch("gecco.cli.run_judge_orchestrator._build_judge_store_from_duckdb_sources") as mock_build,
+            patch("gecco.cli.run_judge_orchestrator.run_orchestrated_judge_pipeline", return_value=artifact) as mock_pipeline,
+            patch("gecco.cli.run_judge_orchestrator.ToolUsingJudge"),
+            patch.object(sentry_sdk, "capture_exception") as mock_capture,
+            patch("gecco.cli.run_judge_orchestrator.flush_sentry_events") as mock_flush,
+        ):
+            cfg = _mock_orchestrator_config()
+            cfg.loop.max_iterations = 1
+            mock_load_config.return_value = cfg
+            mock_split.return_value = {"prompt": mm}
+            mock_registry = MagicMock()
+            mock_registry.wait_for_clients_complete.return_value = 2
+            mock_registry.count_clients_with_models.return_value = 1
+            mock_registry.read.return_value = {"global_best": None}
+            mock_registry_cls.return_value = mock_registry
+            mock_build.return_value = MagicMock()
+            mock_ds.return_value = MagicMock()
+
+            from gecco.cli.run_judge_orchestrator import run_orchestrator
+
+            result = run_orchestrator(
+                config="dummy.yaml",
+                results_dir=str(Path("/tmp/opencode/test_orch_success")),
+            )
+
+            assert result is None
+            mock_capture.assert_not_called()
+            mock_flush.assert_not_called()
+            mock_pipeline.assert_called_once()
 
     def test_duckdb_load_failure_skips_judge_pipeline(self):
         """Judge pipeline is not invoked after a DuckDB load failure."""

@@ -15,6 +15,13 @@ def _safe_capture_exception(error: Exception, *, fingerprint, extras) -> None:
         return
 
 
+def flush_sentry_events(timeout: float = 2.0) -> None:
+    try:
+        sentry_sdk.flush(timeout=timeout)
+    except Exception:
+        return
+
+
 def _scrub_event(event, hint):
     """Strip sensitive data from Sentry events while preserving debugging context.
 
@@ -108,14 +115,14 @@ def init_sentry(
     client_id: Optional[str] = None,
     config_name: Optional[str] = None,
     **tags,
-) -> None:
+) -> bool:
     """Initialize Sentry SDK for error monitoring and distributed tracing.
 
     Parameters
     ----------
     cfg : optional
         Configuration object with optional .sentry attribute containing:
-        - environment: str = "development"
+        - environment is ignored; Sentry is always initialized with environment="production"
         - traces_sample_rate: float = 0.1
         - profiles_sample_rate: float = 0.0
         - release: Optional[str] = None
@@ -139,11 +146,6 @@ def init_sentry(
 
     sentry_cfg = getattr(cfg, "sentry", None) if cfg else None
 
-    environment = (
-        getattr(sentry_cfg, "environment", "development")
-        if sentry_cfg
-        else "development"
-    )
     traces_sample_rate = (
         getattr(sentry_cfg, "traces_sample_rate", 0.1) if sentry_cfg else 0.1
     )
@@ -168,7 +170,7 @@ def init_sentry(
 
     sentry_sdk.init(
         dsn=dsn,
-        environment=environment,
+        environment="production",
         traces_sample_rate=traces_sample_rate,
         profiles_sample_rate=profiles_sample_rate,
         release=release,

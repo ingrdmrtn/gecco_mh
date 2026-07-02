@@ -8,15 +8,22 @@ from datetime import datetime
 from collections.abc import Sequence
 from pathlib import Path
 
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
 from . import launch_distributed as launch_distributed_cli
 from .config_paths import config_output_subpath, resolve_config_path
 from .launch_distributed import (
     _build_distributed_launch_context,
     _command_printer,
-    _print_config_table,
     _print_submission_result,
 )
 from .launcher_utils import LaunchCommand, LaunchExecutor, SubmissionResult
+
+
+console = Console()
 
 
 def _display_config_string(config_path: Path) -> str:
@@ -63,6 +70,81 @@ def _config_run_id(config_path: Path, batch_id: str, replicate: int) -> str:
     subpath = config_output_subpath(config_path, project_root=launch_distributed_cli.PROJECT_ROOT)
     slug = str(subpath).replace("/", "__")
     return f"{batch_id}-{slug}-rep-{replicate:03d}"
+
+
+def _render_batch_summary(
+    *,
+    batch_id: str,
+    config_count: int,
+    replicates: int,
+    total_pipelines: int,
+    max_concurrent_configs: int,
+    dependency_policy: str,
+    dry_run: bool,
+) -> None:
+    table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    table.add_column("Label", style="bold", no_wrap=True)
+    table.add_column("Value", overflow="fold")
+    table.add_row("Batch ID", batch_id)
+    table.add_row("Configs", str(config_count))
+    table.add_row("Replicates", str(replicates))
+    table.add_row("Total pipelines", str(total_pipelines))
+    table.add_row("Max concurrent configs/lanes", str(max_concurrent_configs))
+    table.add_row("Dependency policy", dependency_policy)
+    table.add_row("Mode", "dry-run" if dry_run else "submit")
+    console.print(Panel(table, title="Distributed batch summary", border_style="blue"))
+
+
+def _render_batch_plan(
+    *,
+    heading: str,
+    planned_pipelines: list[tuple[int, int, str, int, str]],
+) -> None:
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("Pipeline", justify="right", no_wrap=True)
+    table.add_column("Lane", justify="right", no_wrap=True)
+    table.add_column("Config", overflow="fold")
+    table.add_column("Replicate", justify="right", no_wrap=True)
+    table.add_column("Run ID", overflow="fold")
+    for pipeline_index, lane, config_display, replicate, run_id in planned_pipelines:
+        table.add_row(
+            f"{pipeline_index}",
+            f"{lane}",
+            config_display,
+            f"{replicate}",
+            run_id,
+        )
+    console.print(Panel(table, title=heading, border_style="cyan"))
+
+
+def _render_pipeline_progress(
+    *,
+    pipeline_index: int,
+    total_pipelines: int,
+    lane: int,
+    max_concurrent_configs: int,
+    config_display: str,
+    replicate: int,
+    run_id: str,
+    lane_dependencies_applied: bool,
+) -> None:
+    console.print(
+        f"[bold]Pipeline {pipeline_index}/{total_pipelines}[/bold] "
+        f"lane {lane}/{max_concurrent_configs} • config [cyan]{config_display}[/cyan] • "
+        f"replicate {replicate} • run ID [yellow]{run_id}[/yellow] • "
+        f"lane dependencies: {'yes' if lane_dependencies_applied else 'no'}"
+    )
+
+
+def _render_batch_completion(*, batch_id: str, total_pipelines: int, dry_run: bool) -> None:
+    mode = "previewed" if dry_run else "submitted"
+    console.print(
+        Panel(
+            f"Batch [bold]{batch_id}[/bold] {mode} [bold]{total_pipelines}[/bold] pipelines.",
+            title="Distributed batch complete",
+            border_style="green",
+        )
+    )
 
 
 def _dependency_fallback(dependency_policy: str, dependency_labels: tuple[str, ...]) -> str | None:
@@ -170,6 +252,29 @@ def run_distributed_batch_launcher(
                 )
             )
 
+    planned_pipelines: list[tuple[int, int, str, int, str]] = []
+    for pipeline_index, (config_display, run_id) in enumerate(pipelines, start=1):
+        lane = (pipeline_index - 1) % max_concurrent_configs + 1
+        replicate = int(run_id.rsplit("-rep-", 1)[-1])
+        planned_pipelines.append((pipeline_index, lane, config_display, replicate, run_id))
+
+    _render_batch_summary(
+        batch_id=batch_id,
+        config_count=len(resolved_configs),
+        replicates=replicates,
+        total_pipelines=len(planned_pipelines),
+        max_concurrent_configs=max_concurrent_configs,
+        dependency_policy=dependency_policy,
+        dry_run=dry_run,
+    )
+    plan_title = (
+        "Configs to launch (explicit order)"
+        if configs is not None
+        else f"Configs found in {config_dir}"
+    )
+    _render_batch_plan(heading=plan_title, planned_pipelines=planned_pipelines)
+    console.print()
+
     executor = LaunchExecutor(printer=_command_printer)
     lane_results: list[dict[str, SubmissionResult]] = [
         {} for _ in range(max_concurrent_configs)
@@ -178,6 +283,7 @@ def run_distributed_batch_launcher(
 
     for pipeline_index, (config_display, run_id) in enumerate(pipelines):
         lane = pipeline_index % max_concurrent_configs
+        replicate = int(run_id.rsplit("-rep-", 1)[-1])
         context = _build_distributed_launch_context(
             config=config_display,
             vllm_url=vllm_url,
@@ -189,13 +295,21 @@ def run_distributed_batch_launcher(
             launch_orchestrator=launch_orchestrator,
         )
 
-        _print_config_table(list(context.config_table_rows))
-        print()
-
         pipeline_plan = _with_lane_dependencies(
             context.plan,
             lane_terminal_labels[lane],
             dependency_policy,
+        )
+
+        _render_pipeline_progress(
+            pipeline_index=pipeline_index + 1,
+            total_pipelines=len(pipelines),
+            lane=lane + 1,
+            max_concurrent_configs=max_concurrent_configs,
+            config_display=config_display,
+            replicate=replicate,
+            run_id=run_id,
+            lane_dependencies_applied=lane_terminal_labels[lane] is not None,
         )
 
         if not dry_run:
@@ -210,6 +324,7 @@ def run_distributed_batch_launcher(
         lane_results[lane] = {result.label: result for result in pipeline_results}
         lane_terminal_labels[lane] = context.terminal_labels
 
+    _render_batch_completion(batch_id=batch_id, total_pipelines=len(pipelines), dry_run=dry_run)
     return None
 
 

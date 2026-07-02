@@ -90,7 +90,7 @@ def test_batch_launcher_expands_explicit_config_list(tmp_path):
     assert "config/b.yaml" in root_commands[1]
 
 
-def test_batch_launcher_expands_config_dir_sorted_and_ignores_non_yaml(tmp_path):
+def test_batch_launcher_expands_config_dir_sorted_and_ignores_non_yaml(tmp_path, capsys):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "b.yaml").write_text("task: {}\n", encoding="utf-8")
@@ -106,14 +106,19 @@ def test_batch_launcher_expands_config_dir_sorted_and_ignores_non_yaml(tmp_path)
     ):
         run_distributed_batch_launcher(config_dir="config")
 
+    output = capsys.readouterr().out
+
     root_commands = _root_commands(seen_commands)
     assert len(root_commands) == 2
     assert "config/a.yaml" in root_commands[0]
     assert "config/b.yaml" in root_commands[1]
     assert all("ignore.txt" not in command for command in seen_commands)
+    assert "Distributed batch summary" in output
+    assert "Configs found in config" in output
+    assert "Distributed batch complete" in output
 
 
-def test_batch_launcher_creates_unique_replicate_run_ids(tmp_path):
+def test_batch_launcher_creates_unique_replicate_run_ids(tmp_path, capsys):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "demo.yaml").write_text("task: {}\n", encoding="utf-8")
@@ -133,6 +138,8 @@ def test_batch_launcher_creates_unique_replicate_run_ids(tmp_path):
             max_concurrent_configs=1,
         )
 
+    output = capsys.readouterr().out
+
     root_commands = _root_commands(seen_commands)
     assert len(root_commands) == 6
     assert sum("config/demo.yaml" in command for command in root_commands) == 3
@@ -149,6 +156,13 @@ def test_batch_launcher_creates_unique_replicate_run_ids(tmp_path):
         "batch-20260701-123456-alt-rep-002",
         "batch-20260701-123456-alt-rep-003",
     }
+    assert "Distributed batch summary" in output
+    assert "Configs to launch (explicit order)" in output
+    assert "Pipeline 1/6" in output
+    assert "lane dependencies: no" in output
+    assert "lane dependencies: yes" in output
+    assert "Distributed batch complete" in output
+    assert "job ID:" in output
 
 
 def test_batch_launcher_chains_orchestrated_runs_wait_on_all_terminal_jobs(tmp_path):
@@ -317,6 +331,32 @@ def test_batch_launcher_supports_afterok_policy(tmp_path):
     assert len(root_commands) == 2
     assert "--dependency=afterok:102" in root_commands[1]
     assert "--dependency=afterany" not in root_commands[1]
+
+
+def test_batch_launcher_reports_dry_run_summary(tmp_path, capsys):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "a.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = _make_cfg()
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ), patch("gecco.cli.launch_distributed_batch.datetime") as datetime_mock:
+        datetime_mock.now.return_value = datetime(2026, 7, 1, 12, 34, 56)
+        run_distributed_batch_launcher(configs=["config/a.yaml"], dry_run=True)
+
+    output = capsys.readouterr().out
+
+    assert "Distributed batch summary" in output
+    assert "dry-run" in output
+    assert "Pipeline 1/1" in output
+    assert "lane dependencies: no" in output
+    assert "Distributed batch complete" in output
+    assert "previewed" in output
+    assert "job ID:" not in output
 
 
 def test_batch_launcher_requires_configs_or_config_dir():

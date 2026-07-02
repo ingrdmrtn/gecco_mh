@@ -14,7 +14,15 @@ from rich.table import Table
 
 from config.schema import get_judge_mode, load_config
 from gecco.cli.config_paths import logs_dir_for_config, resolve_config_path, results_dir_for_config
-from gecco.cli.launcher_utils import LaunchCommand, LaunchExecutor, LaunchPlan, SubmissionResult
+from gecco.cli.launcher_utils import (
+    DEFAULT_SBATCH_RETRY_ATTEMPTS,
+    DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
+    DEFAULT_SUBMIT_DELAY_SECONDS,
+    LaunchCommand,
+    LaunchExecutor,
+    LaunchPlan,
+    SubmissionResult,
+)
 from gecco.load_llms.provider_registry import get_provider_spec
 from gecco.sentry_init import init_sentry
 
@@ -647,6 +655,33 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     parser.add_argument("--cpus-per-task", type=int, default=None)
     parser.add_argument("--mem", type=str, default=None)
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument(
+        "--submit-delay-seconds",
+        type=float,
+        default=DEFAULT_SUBMIT_DELAY_SECONDS,
+        help=(
+            "Seconds to wait between successful sbatch submissions "
+            f"(default: {DEFAULT_SUBMIT_DELAY_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--sbatch-retry-attempts",
+        type=int,
+        default=DEFAULT_SBATCH_RETRY_ATTEMPTS,
+        help=(
+            "Maximum sbatch submission attempts for transient controller/socket errors "
+            f"(default: {DEFAULT_SBATCH_RETRY_ATTEMPTS})."
+        ),
+    )
+    parser.add_argument(
+        "--sbatch-retry-backoff-seconds",
+        type=float,
+        default=DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
+        help=(
+            "Base backoff in seconds for transient sbatch retries; each retry doubles "
+            f"the delay starting from this value (default: {DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS})."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--launch-orchestrator", action="store_true")
@@ -680,6 +715,9 @@ def run_distributed_launcher(
     cpus_per_task: int | None = None,
     mem: str | None = None,
     run_id: str | None = None,
+    submit_delay_seconds: float = DEFAULT_SUBMIT_DELAY_SECONDS,
+    sbatch_retry_attempts: int = DEFAULT_SBATCH_RETRY_ATTEMPTS,
+    sbatch_retry_backoff_seconds: float = DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
     dry_run: bool = False,
     local: bool = False,
     launch_orchestrator: bool = False,
@@ -723,7 +761,12 @@ def run_distributed_launcher(
             )
         return None
 
-    executor = LaunchExecutor(printer=_command_printer)
+    executor = LaunchExecutor(
+        printer=_command_printer,
+        submit_delay_seconds=submit_delay_seconds,
+        sbatch_retry_attempts=sbatch_retry_attempts,
+        sbatch_retry_backoff_seconds=sbatch_retry_backoff_seconds,
+    )
     if not dry_run:
         context.logs_dir.mkdir(parents=True, exist_ok=True)
     submission_results = executor.execute(
@@ -765,6 +808,9 @@ def main(args: argparse.Namespace) -> int | None:
         cpus_per_task=args.cpus_per_task,
         mem=args.mem,
         run_id=args.run_id,
+        submit_delay_seconds=args.submit_delay_seconds,
+        sbatch_retry_attempts=args.sbatch_retry_attempts,
+        sbatch_retry_backoff_seconds=args.sbatch_retry_backoff_seconds,
         dry_run=args.dry_run,
         local=args.local,
         launch_orchestrator=args.launch_orchestrator,

@@ -123,10 +123,53 @@ def test_run_distributed_handler_passes_typed_arguments_directly():
         cpus_per_task=None,
         mem=None,
         run_id=None,
+        submit_delay_seconds=1.0,
+        sbatch_retry_attempts=3,
+        sbatch_retry_backoff_seconds=2.0,
         dry_run=False,
         local=True,
         launch_orchestrator=False,
     )
+
+
+def test_run_distributed_parser_exposes_submission_controls():
+    """The distributed parser should expose pacing and retry controls without changing defaults."""
+    from gecco.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "run",
+            "distributed",
+            "--config",
+            "demo.yaml",
+            "--submit-delay-seconds",
+            "2.5",
+            "--sbatch-retry-attempts",
+            "5",
+            "--sbatch-retry-backoff-seconds",
+            "4.5",
+        ]
+    )
+
+    assert args.submit_delay_seconds == 2.5
+    assert args.sbatch_retry_attempts == 5
+    assert args.sbatch_retry_backoff_seconds == 4.5
+
+
+def test_run_distributed_help_mentions_submission_controls(capsys):
+    """The distributed help text should document conservative submission defaults."""
+    from gecco.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "distributed", "--help"])
+
+    output = capsys.readouterr().out
+    assert "--submit-delay-seconds" in output
+    assert "default: 1.0" in output
+    assert "--sbatch-retry-attempts" in output
+    assert "default: 3" in output
+    assert "--sbatch-retry-backoff-seconds" in output
+    assert "default: 2.0" in output
 
 
 def test_run_distributed_infers_orchestrator_launch_from_validated_config(tmp_path):

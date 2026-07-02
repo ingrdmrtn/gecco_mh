@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -88,6 +88,49 @@ def test_batch_launcher_expands_explicit_config_list(tmp_path):
     assert len(root_commands) == 2
     assert "config/a.yaml" in root_commands[0]
     assert "config/b.yaml" in root_commands[1]
+
+
+def test_batch_launcher_passes_submission_controls_without_changing_plan(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "a.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = _make_cfg()
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ) as launch_executor_mock:
+        run_distributed_batch_launcher(
+            configs=["config/a.yaml"],
+            submit_delay_seconds=2.5,
+            sbatch_retry_attempts=5,
+            sbatch_retry_backoff_seconds=4.5,
+        )
+
+    launch_executor_mock.assert_called_once_with(
+        printer=ANY,
+        submit_delay_seconds=2.5,
+        sbatch_retry_attempts=5,
+        sbatch_retry_backoff_seconds=4.5,
+    )
+    root_commands = _root_commands(seen_commands)
+    assert len(root_commands) == 1
+    assert "config/a.yaml" in root_commands[0]
+
+
+def test_batch_launcher_help_mentions_submission_controls(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "distributed-batch", "--help"])
+
+    output = capsys.readouterr().out
+    assert "--submit-delay-seconds" in output
+    assert "default: 1.0" in output
+    assert "--sbatch-retry-attempts" in output
+    assert "default: 3" in output
+    assert "--sbatch-retry-backoff-seconds" in output
+    assert "default: 2.0" in output
 
 
 def test_batch_launcher_expands_config_dir_sorted_and_ignores_non_yaml(tmp_path, capsys):

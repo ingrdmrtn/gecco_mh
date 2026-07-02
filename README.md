@@ -520,6 +520,8 @@ uv run python -m gecco run distributed-batch --config-dir config/baselines \
     --conda-env gecco_mh
 ```
 
+Use `--submit-delay-seconds`, `--sbatch-retry-attempts`, and `--sbatch-retry-backoff-seconds` to pace successful SLURM submissions and retry transient controller/socket errors.
+
 By default (no `--conda-env`), generated SLURM jobs execute through `uv run`. Pass `--conda-env <name>` to switch to conda activation. The `requirements.txt` file is kept in sync for conda/pip compatibility.
 
 For local testing without SLURM, run clients directly through the CLI (ensure the correct environment is already active):

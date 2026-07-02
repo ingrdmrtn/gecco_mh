@@ -20,7 +20,14 @@ from .launch_distributed import (
     _command_printer,
     _print_submission_result,
 )
-from .launcher_utils import LaunchCommand, LaunchExecutor, SubmissionResult
+from .launcher_utils import (
+    DEFAULT_SBATCH_RETRY_ATTEMPTS,
+    DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
+    DEFAULT_SUBMIT_DELAY_SECONDS,
+    LaunchCommand,
+    LaunchExecutor,
+    SubmissionResult,
+)
 
 
 console = Console()
@@ -203,6 +210,33 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     parser.add_argument("--partition", type=str, default=None)
     parser.add_argument("--cpus-per-task", type=int, default=None)
     parser.add_argument("--mem", type=str, default=None)
+    parser.add_argument(
+        "--submit-delay-seconds",
+        type=float,
+        default=DEFAULT_SUBMIT_DELAY_SECONDS,
+        help=(
+            "Seconds to wait between successful sbatch submissions "
+            f"(default: {DEFAULT_SUBMIT_DELAY_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--sbatch-retry-attempts",
+        type=int,
+        default=DEFAULT_SBATCH_RETRY_ATTEMPTS,
+        help=(
+            "Maximum sbatch submission attempts for transient controller/socket errors "
+            f"(default: {DEFAULT_SBATCH_RETRY_ATTEMPTS})."
+        ),
+    )
+    parser.add_argument(
+        "--sbatch-retry-backoff-seconds",
+        type=float,
+        default=DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
+        help=(
+            "Base backoff in seconds for transient sbatch retries; each retry doubles "
+            f"the delay starting from this value (default: {DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS})."
+        ),
+    )
     parser.add_argument("--launch-orchestrator", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.set_defaults(handler=main)
@@ -222,6 +256,9 @@ def run_distributed_batch_launcher(
     partition: str | None = None,
     cpus_per_task: int | None = None,
     mem: str | None = None,
+    submit_delay_seconds: float = DEFAULT_SUBMIT_DELAY_SECONDS,
+    sbatch_retry_attempts: int = DEFAULT_SBATCH_RETRY_ATTEMPTS,
+    sbatch_retry_backoff_seconds: float = DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
     launch_orchestrator: bool = False,
     dry_run: bool = False,
 ) -> int | None:
@@ -275,7 +312,12 @@ def run_distributed_batch_launcher(
     _render_batch_plan(heading=plan_title, planned_pipelines=planned_pipelines)
     console.print()
 
-    executor = LaunchExecutor(printer=_command_printer)
+    executor = LaunchExecutor(
+        printer=_command_printer,
+        submit_delay_seconds=submit_delay_seconds,
+        sbatch_retry_attempts=sbatch_retry_attempts,
+        sbatch_retry_backoff_seconds=sbatch_retry_backoff_seconds,
+    )
     lane_results: list[dict[str, SubmissionResult]] = [
         {} for _ in range(max_concurrent_configs)
     ]
@@ -342,6 +384,9 @@ def main(args: argparse.Namespace) -> int | None:
         partition=args.partition,
         cpus_per_task=args.cpus_per_task,
         mem=args.mem,
+        submit_delay_seconds=args.submit_delay_seconds,
+        sbatch_retry_attempts=args.sbatch_retry_attempts,
+        sbatch_retry_backoff_seconds=args.sbatch_retry_backoff_seconds,
         launch_orchestrator=args.launch_orchestrator,
         dry_run=args.dry_run,
     )

@@ -502,6 +502,24 @@ uv run python -m gecco run distributed --config two_step_factors/distributed.yam
     --conda-env my_gecco_env
 ```
 
+#### Batch launch multiple configs
+
+`distributed-batch` launches whole config pipelines in lanes. It accepts either an explicit list or a config directory, and you can fan out replicates while capping concurrent pipelines:
+
+```bash
+# Explicit config list
+uv run python -m gecco run distributed-batch --configs config/a.yaml config/b.yaml \
+    --replicates 3 --max-concurrent-configs 2
+
+# Directory launch with a recursive glob and explicit dependency policy
+uv run python -m gecco run distributed-batch --config-dir config/baselines \
+    --config-glob "**/*.yaml" --dependency-policy afterok
+
+# Use a specific conda environment for batch submissions
+uv run python -m gecco run distributed-batch --config-dir config/baselines \
+    --conda-env gecco_mh
+```
+
 By default (no `--conda-env`), generated SLURM jobs execute through `uv run`. Pass `--conda-env <name>` to switch to conda activation. The `requirements.txt` file is kept in sync for conda/pip compatibility.
 
 For local testing without SLURM, run clients directly through the CLI (ensure the correct environment is already active):

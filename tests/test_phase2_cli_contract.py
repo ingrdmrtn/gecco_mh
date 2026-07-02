@@ -518,6 +518,7 @@ def test_distributed_client_publishes_abort_on_unhandled_exception(tmp_path):
 def test_cli_entrypoint_functions_are_importable_and_callable():
     """Extracted runtime entrypoints should be exposed as direct callables."""
     from gecco.cli.launch_distributed import run_distributed_launcher
+    from gecco.cli.launch_distributed_batch import run_distributed_batch_launcher
     from gecco.cli.monitor_distributed import run_monitor
     from gecco.cli.reset_distributed import run_reset
     from gecco.cli.run_gecco_distributed import run_distributed_client
@@ -526,6 +527,7 @@ def test_cli_entrypoint_functions_are_importable_and_callable():
     from gecco.cli.run_test_evaluation import run_test_evaluation
 
     assert callable(run_distributed_launcher)
+    assert callable(run_distributed_batch_launcher)
     assert callable(run_local_client)
     assert callable(run_monitor)
     assert callable(run_reset)

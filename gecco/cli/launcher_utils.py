@@ -15,8 +15,10 @@ class LaunchCommand:
     label: str
     command: str
     dependency_labels: tuple[str, ...] = ()
+    dependency_policy: str = "afterok"
     required_dependency_labels: tuple[str, ...] = ()
     dependency_fallback: str | None = None
+    lane_dependency: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -57,12 +59,23 @@ def build_afterok_dependency(
     prior_results: Mapping[str, SubmissionResult], dependency_labels: Sequence[str]
 ) -> str:
     """Build an ``afterok`` dependency string from previous submission results."""
+    return build_dependency("afterok", prior_results, dependency_labels)
+
+
+def build_dependency(
+    dependency_policy: str,
+    prior_results: Mapping[str, SubmissionResult],
+    dependency_labels: Sequence[str],
+) -> str:
+    """Build a SLURM dependency string from previous submission results."""
+    if dependency_policy not in {"afterok", "afterany"}:
+        raise ValueError(f"Unsupported dependency policy: {dependency_policy}")
     job_ids = [
         prior_results[label].job_id
         for label in dependency_labels
         if label in prior_results and prior_results[label].job_id
     ]
-    return f"--dependency=afterok:{':'.join(job_ids)}" if job_ids else ""
+    return f"--dependency={dependency_policy}:{':'.join(job_ids)}" if job_ids else ""
 
 
 class LaunchExecutor:
@@ -113,7 +126,8 @@ class LaunchExecutor:
     ) -> list[SubmissionResult]:
         """Run all commands in a plan sequentially."""
         results: list[SubmissionResult] = []
-        prior_results = dict(prior_results or {})
+        initial_prior_results = dict(prior_results or {})
+        prior_results = dict(initial_prior_results)
         for command in plan.commands:
             if command.required_dependency_labels:
                 missing_required = [
@@ -124,7 +138,13 @@ class LaunchExecutor:
                 if missing_required:
                     continue
 
-            dependency_flag = build_afterok_dependency(prior_results, command.dependency_labels)
+            dependency_source = initial_prior_results if command.lane_dependency else prior_results
+
+            dependency_flag = build_dependency(
+                command.dependency_policy,
+                dependency_source,
+                command.dependency_labels,
+            )
             if not dependency_flag and command.dependency_fallback:
                 dependency_flag = command.dependency_fallback
             effective_command = command.command.replace("{dependency}", dependency_flag)

@@ -6,6 +6,7 @@ from gecco.cli.launcher_utils import (
     LaunchCommand,
     LaunchExecutor,
     LaunchPlan,
+    SubmissionResult,
     build_afterok_dependency,
     _parse_job_id,
 )
@@ -84,3 +85,45 @@ def test_launch_executor_leaves_dependency_flag_blank_without_prior_job_ids():
 
     assert seen_commands == ["sbatch bash/run.sh"]
     assert results[0].job_id == "555"
+
+
+def test_launch_executor_prefers_current_pipeline_dependencies_over_prior_lane_snapshot():
+    """Lane-chained jobs should keep using the current pipeline's submitted job ids."""
+    seen_commands: list[str] = []
+
+    def fake_runner(command: str):
+        seen_commands.append(command)
+        job_id = str(100 + len(seen_commands))
+        return SimpleNamespace(returncode=0, stdout=f"Submitted batch job {job_id}\n", stderr="")
+
+    executor = LaunchExecutor(runner=fake_runner, printer=lambda *_: None)
+    prior_results = {
+        "client_array": SubmissionResult(label="client_array", command="", submitted=True, job_id="800"),
+        "test_evaluation": SubmissionResult(label="test_evaluation", command="", submitted=True, job_id="900"),
+        "orchestrator": SubmissionResult(label="orchestrator", command="", submitted=True, job_id="901"),
+    }
+    plan = LaunchPlan(
+        commands=(
+            LaunchCommand(
+                label="client_array",
+                command="sbatch {dependency} bash/run_clients.sh",
+                dependency_labels=("test_evaluation", "orchestrator"),
+                dependency_policy="afterany",
+            ),
+            LaunchCommand(
+                label="test_evaluation",
+                command="sbatch {dependency} bash/run_test_evaluation.sh",
+                dependency_labels=("client_array",),
+                dependency_policy="afterok",
+                required_dependency_labels=("client_array",),
+            ),
+        )
+    )
+
+    results = executor.execute(plan, prior_results=prior_results)
+
+    assert seen_commands == [
+        "sbatch --dependency=afterany:900:901 bash/run_clients.sh",
+        "sbatch --dependency=afterok:101 bash/run_test_evaluation.sh",
+    ]
+    assert [result.job_id for result in results] == ["101", "102"]

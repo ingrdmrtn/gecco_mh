@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from . import launch_distributed
+from . import launch_distributed_batch
 from . import monitor_distributed
 from . import reset_distributed
 from . import run_gecco_distributed
@@ -26,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Launch GeCCo workflows")
     run_subparsers = run_parser.add_subparsers(dest="run_command", required=True)
     launch_distributed.register_parser(run_subparsers)
+    launch_distributed_batch.register_parser(run_subparsers)
     run_local_client.register_parser(run_subparsers)
 
     monitor_distributed.register_parser(subparsers)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import uuid
+from dataclasses import dataclass
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -70,6 +71,261 @@ def _sbatch_log_flags(logs_dir_rel: str, stem: str) -> list[str]:
 def _get_cmg_state(cfg):
     cmg_cfg = getattr(cfg, "centralized_model_generation", None)
     return cmg_cfg is not None and getattr(cmg_cfg, "enabled", False), cmg_cfg
+
+
+@dataclass(slots=True, frozen=True)
+class DistributedLaunchContext:
+    """Resolved launch inputs and derived SLURM plan details."""
+
+    config: str
+    config_path: Path
+    cfg: object
+    provider_spec: object
+    sentry_label: str
+    env_manager: str
+    resolved_cpus_per_task: int
+    resolved_mem: str | None
+    resolved_partition: str | None
+    partition_flag: str
+    mem_flag: str
+    resolved_run_id: str
+    results_dir: Path
+    logs_dir: Path
+    results_dir_rel: str
+    logs_dir_rel: str
+    resolved_launch_orchestrator: bool
+    resolved_vllm_url: str | None
+    plan: LaunchPlan
+    terminal_labels: tuple[str, ...]
+    config_table_rows: tuple[tuple[str, str], ...]
+    profiles_csv: str | None
+    array_spec: str | None
+    n_clients: int | None
+    cmg_enabled: bool
+    final_eval_enabled: bool
+
+
+def _build_distributed_launch_context(
+    *,
+    config: str,
+    profiles: str | None = None,
+    extra_clients: int = 0,
+    vllm_url: str | None = None,
+    conda_env: str | None = None,
+    partition: str | None = None,
+    cpus_per_task: int | None = None,
+    mem: str | None = None,
+    run_id: str | None = None,
+    launch_orchestrator: bool = False,
+) -> DistributedLaunchContext:
+    config_path = resolve_config_path(config, project_root=PROJECT_ROOT)
+
+    if not config_path.exists():
+        print(f"ERROR: Config not found: {config_path}")
+        raise SystemExit(1)
+
+    cfg = load_config(config_path)
+
+    sentry_connected = init_sentry(
+        cfg=cfg,
+        task_name=cfg.task.name,
+        config_name=config,
+    )
+    sentry_label = "connected" if sentry_connected else "disabled (SENTRY_DSN not set)"
+
+    provider = cfg.llm.provider
+    try:
+        provider_spec = get_provider_spec(provider)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1) from exc
+
+    slurm_cfg = getattr(cfg, "slurm", {}) or {}
+    resolved_cpus_per_task = cpus_per_task or slurm_cfg.get("cpus_per_task", 48)
+    resolved_mem = mem or slurm_cfg.get("mem_per_task")
+    mem_flag = f"--mem={resolved_mem}" if resolved_mem else ""
+
+    resolved_partition = partition or slurm_cfg.get("partition")
+    partition_flag = f"--partition={resolved_partition}" if resolved_partition else ""
+
+    cmg_enabled, cmg_cfg = _get_cmg_state(cfg)
+    judge_enabled = getattr(cfg, "judge", None) is not None and get_judge_mode(cfg) != "off"
+    resolved_launch_orchestrator = launch_orchestrator or judge_enabled
+    env_manager = _resolve_env_manager(conda_env)
+    fit_type = getattr(cfg.evaluation, "fit_type", "group")
+    resolved_run_id = run_id or _new_run_id()
+    results_dir = results_dir_for_config(
+        config,
+        project_root=PROJECT_ROOT,
+        fit_type=fit_type,
+        run_id=resolved_run_id,
+    )
+    logs_dir = logs_dir_for_config(
+        config,
+        project_root=PROJECT_ROOT,
+        fit_type=fit_type,
+        run_id=resolved_run_id,
+    )
+    results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
+    logs_dir_rel = str(logs_dir.relative_to(PROJECT_ROOT))
+
+    if cmg_enabled:
+        generator_client = str(getattr(cmg_cfg, "generator_client", ""))
+        if not generator_client:
+            print("ERROR: centralized_model_generation.generator_client is required")
+            raise SystemExit(1)
+        if generator_client.isdigit() or generator_client.lstrip("-").isdigit():
+            print(
+                "ERROR: centralized_model_generation.generator_client must be a named profile, not a numeric evaluator ID"
+            )
+            raise SystemExit(1)
+
+        n_models = getattr(cmg_cfg, "n_models", None)
+        if not isinstance(n_models, int) or n_models <= 0:
+            print("ERROR: centralized_model_generation.n_models must be a positive integer")
+            raise SystemExit(1)
+
+        final_eval_enabled = getattr(cmg_cfg, "run_final_evaluation", True)
+        resolved_vllm_url = vllm_url or ""
+        plan = _build_cmg_launch_plan(
+            config=config,
+            generator_client=generator_client,
+            n_models=n_models,
+            results_dir_rel=results_dir_rel,
+            logs_dir_rel=logs_dir_rel,
+            resolved_cpus_per_task=resolved_cpus_per_task,
+            partition_flag=partition_flag,
+            mem_flag=mem_flag,
+            resolved_vllm_url=resolved_vllm_url,
+            conda_env=conda_env,
+            final_eval_enabled=final_eval_enabled,
+        )
+        rows = [
+            ("Config", config),
+            ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
+            ("CPUs/task", str(resolved_cpus_per_task)),
+            *([("Memory", resolved_mem)] if resolved_mem else []),
+            ("Generator client", generator_client),
+            ("Evaluators", str(n_models)),
+            ("Final eval", "enabled" if final_eval_enabled else "disabled"),
+            ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
+            ("Env manager", env_manager),
+            ("Run ID", resolved_run_id),
+            ("Sentry", sentry_label),
+            ("Logs dir", logs_dir_rel),
+            ("Results dir", results_dir_rel),
+        ]
+        terminal_labels = (
+            ("final_eval",)
+            if final_eval_enabled
+            else ("generator", "evaluator", "orchestrator")
+        )
+        return DistributedLaunchContext(
+            config=config,
+            config_path=config_path,
+            cfg=cfg,
+            provider_spec=provider_spec,
+            sentry_label=sentry_label,
+            env_manager=env_manager,
+            resolved_cpus_per_task=resolved_cpus_per_task,
+            resolved_mem=resolved_mem,
+            resolved_partition=resolved_partition,
+            partition_flag=partition_flag,
+            mem_flag=mem_flag,
+            resolved_run_id=resolved_run_id,
+            results_dir=results_dir,
+            logs_dir=logs_dir,
+            results_dir_rel=results_dir_rel,
+            logs_dir_rel=logs_dir_rel,
+            resolved_launch_orchestrator=resolved_launch_orchestrator,
+            resolved_vllm_url=resolved_vllm_url,
+            plan=plan,
+            terminal_labels=terminal_labels,
+            config_table_rows=tuple(rows),
+            profiles_csv=None,
+            array_spec=None,
+            n_clients=None,
+            cmg_enabled=True,
+            final_eval_enabled=final_eval_enabled,
+        )
+
+    resolved_profiles = profiles.split(",") if profiles else list((cfg.clients or {}).keys())
+    n_profiled = len(resolved_profiles)
+    n_total = n_profiled + extra_clients
+    if n_total == 0:
+        print(
+            "ERROR: No profiles found in config and --extra-clients is 0. Nothing to launch."
+        )
+        raise SystemExit(1)
+
+    all_profiles = resolved_profiles + [""] * extra_clients
+    profiles_csv = ",".join(all_profiles)
+    array_spec = f"0-{n_total - 1}"
+    n_clients = getattr(cfg.loop, "n_clients", None)
+    rows = [
+        ("Config", config),
+        ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
+        ("CPUs/task", str(resolved_cpus_per_task)),
+        *([("Memory", resolved_mem)] if resolved_mem else []),
+        ("Profiles", str(resolved_profiles if resolved_profiles else "(none)")),
+        ("Extra clients", str(extra_clients)),
+        ("Total clients", str(n_total)),
+        ("Array spec", f"--array={array_spec}"),
+        ("Profiles CSV", profiles_csv),
+        *([("Partition", resolved_partition)] if resolved_partition else []),
+        *([("vLLM URL", vllm_url or "(from env / .vllm_env)")] if provider_spec.key == "vllm" else []),
+        ("Env manager", env_manager),
+        ("Run ID", resolved_run_id),
+        *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
+        *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
+        ("Sentry", sentry_label),
+        ("Logs dir", logs_dir_rel),
+        ("Results dir", results_dir_rel),
+    ]
+    plan = _build_regular_launch_plan(
+        config=config,
+        profiles_csv=profiles_csv,
+        array_spec=array_spec,
+        results_dir_rel=results_dir_rel,
+        logs_dir_rel=logs_dir_rel,
+        resolved_cpus_per_task=resolved_cpus_per_task,
+        partition_flag=partition_flag,
+        mem_flag=mem_flag,
+        vllm_url=vllm_url,
+        conda_env=conda_env,
+        resolved_launch_orchestrator=resolved_launch_orchestrator,
+        n_clients=n_clients,
+    )
+    return DistributedLaunchContext(
+        config=config,
+        config_path=config_path,
+        cfg=cfg,
+        provider_spec=provider_spec,
+        sentry_label=sentry_label,
+        env_manager=env_manager,
+        resolved_cpus_per_task=resolved_cpus_per_task,
+        resolved_mem=resolved_mem,
+        resolved_partition=resolved_partition,
+        partition_flag=partition_flag,
+        mem_flag=mem_flag,
+        resolved_run_id=resolved_run_id,
+        results_dir=results_dir,
+        logs_dir=logs_dir,
+        results_dir_rel=results_dir_rel,
+        logs_dir_rel=logs_dir_rel,
+        resolved_launch_orchestrator=resolved_launch_orchestrator,
+        resolved_vllm_url=vllm_url,
+        plan=plan,
+        terminal_labels=("test_evaluation", "orchestrator")
+        if resolved_launch_orchestrator
+        else ("test_evaluation",),
+        config_table_rows=tuple(rows),
+        profiles_csv=profiles_csv,
+        array_spec=array_spec,
+        n_clients=n_clients,
+        cmg_enabled=False,
+        final_eval_enabled=False,
+    )
 
 
 def _new_run_id() -> str:
@@ -429,210 +685,70 @@ def run_distributed_launcher(
     launch_orchestrator: bool = False,
 ) -> int | None:
     """Launch a distributed GeCCo search from a config file."""
-    config_path = resolve_config_path(config, project_root=PROJECT_ROOT)
-
-    if not config_path.exists():
-        print(f"ERROR: Config not found: {config_path}")
-        raise SystemExit(1)
-
-    cfg = load_config(config_path)
-
-    sentry_connected = init_sentry(
-        cfg=cfg,
-        task_name=cfg.task.name,
-        config_name=config,
+    context = _build_distributed_launch_context(
+        config=config,
+        profiles=profiles,
+        extra_clients=extra_clients,
+        vllm_url=vllm_url,
+        conda_env=conda_env,
+        partition=partition,
+        cpus_per_task=cpus_per_task,
+        mem=mem,
+        run_id=run_id,
+        launch_orchestrator=launch_orchestrator,
     )
-    sentry_label = "connected" if sentry_connected else "disabled (SENTRY_DSN not set)"
 
-    provider = cfg.llm.provider
-    try:
-        provider_spec = get_provider_spec(provider)
-    except ValueError as exc:
-        print(f"ERROR: {exc}")
-        raise SystemExit(1) from exc
-    slurm_cfg = getattr(cfg, "slurm", {}) or {}
-    resolved_cpus_per_task = cpus_per_task or slurm_cfg.get("cpus_per_task", 48)
-    resolved_mem = mem or slurm_cfg.get("mem_per_task")
-    mem_flag = f"--mem={resolved_mem}" if resolved_mem else ""
-
-    resolved_partition = partition or slurm_cfg.get("partition")
-    partition_flag = f"--partition={resolved_partition}" if resolved_partition else ""
-
-    cmg_enabled, cmg_cfg = _get_cmg_state(cfg)
-    judge_enabled = getattr(cfg, "judge", None) is not None and get_judge_mode(cfg) != "off"
-    resolved_launch_orchestrator = launch_orchestrator or judge_enabled
-    env_manager = _resolve_env_manager(conda_env)
-    fit_type = getattr(cfg.evaluation, "fit_type", "group")
-    resolved_run_id = run_id or _new_run_id()
-    results_dir = results_dir_for_config(
-        config,
-        project_root=PROJECT_ROOT,
-        fit_type=fit_type,
-        run_id=resolved_run_id,
-    )
-    logs_dir = logs_dir_for_config(
-        config,
-        project_root=PROJECT_ROOT,
-        fit_type=fit_type,
-        run_id=resolved_run_id,
-    )
-    results_dir_rel = str(results_dir.relative_to(PROJECT_ROOT))
-    logs_dir_rel = str(logs_dir.relative_to(PROJECT_ROOT))
-
-    if cmg_enabled:
-        generator_client = str(getattr(cmg_cfg, "generator_client", ""))
-        if not generator_client:
-            print("ERROR: centralized_model_generation.generator_client is required")
-            raise SystemExit(1)
-        if generator_client.isdigit() or generator_client.lstrip("-").isdigit():
-            print(
-                "ERROR: centralized_model_generation.generator_client must be a named profile, not a numeric evaluator ID"
-            )
-            raise SystemExit(1)
-
-        n_models = getattr(cmg_cfg, "n_models", None)
-        if not isinstance(n_models, int) or n_models <= 0:
-            print("ERROR: centralized_model_generation.n_models must be a positive integer")
-            raise SystemExit(1)
-
-        final_eval_enabled = getattr(cmg_cfg, "run_final_evaluation", True)
-        resolved_vllm_url = vllm_url or ""
-
-        _print_config_table(
-            [
-                ("Config", config),
-                ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
-                ("CPUs/task", str(resolved_cpus_per_task)),
-                *([("Memory", resolved_mem)] if resolved_mem else []),
-                ("Generator client", generator_client),
-                ("Evaluators", str(n_models)),
-                ("Final eval", "enabled" if final_eval_enabled else "disabled"),
-                ("vLLM URL", resolved_vllm_url or "(from env / .vllm_env)"),
-                ("Env manager", env_manager),
-                ("Run ID", resolved_run_id),
-                ("Sentry", sentry_label),
-                ("Logs dir", logs_dir_rel),
-                ("Results dir", results_dir_rel),
-            ]
-        )
-        print()
-
-        if local:
-            _print_cmg_local_preview(
-                config=config,
-                generator_client=generator_client,
-                n_models=n_models,
-                results_dir_rel=results_dir_rel,
-                resolved_vllm_url=resolved_vllm_url,
-                final_eval_enabled=final_eval_enabled,
-            )
-            return None
-
-        executor = LaunchExecutor(printer=_command_printer)
-        if not dry_run:
-            logs_dir.mkdir(parents=True, exist_ok=True)
-        plan = _build_cmg_launch_plan(
-            config=config,
-            generator_client=generator_client,
-            n_models=n_models,
-            results_dir_rel=results_dir_rel,
-            logs_dir_rel=logs_dir_rel,
-            resolved_cpus_per_task=resolved_cpus_per_task,
-            partition_flag=partition_flag,
-            mem_flag=mem_flag,
-            resolved_vllm_url=resolved_vllm_url,
-            conda_env=conda_env,
-            final_eval_enabled=final_eval_enabled,
-        )
-        submission_results = executor.execute(plan, dry_run=dry_run, on_result=_print_submission_result)
-        results_by_label = {result.label: result for result in submission_results}
-        if final_eval_enabled and results_by_label.get("final_eval") and results_by_label["final_eval"].job_id:
-            console.print(
-                f"[bold]Final evaluation[/bold] will run after all CMG jobs complete: job [yellow]{results_by_label['final_eval'].job_id}[/yellow]"
-            )
-        console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
-        console.print(
-            f"  [cyan]python -m gecco monitor --task {cfg.task.name} --results-dir {results_dir_rel} --watch 10[/cyan]"
-        )
-        return None
-
-    resolved_profiles = profiles.split(",") if profiles else list((cfg.clients or {}).keys())
-    n_profiled = len(resolved_profiles)
-    n_total = n_profiled + extra_clients
-    if n_total == 0:
-        print(
-            "ERROR: No profiles found in config and --extra-clients is 0. Nothing to launch."
-        )
-        raise SystemExit(1)
-
-    all_profiles = resolved_profiles + [""] * extra_clients
-    profiles_csv = ",".join(all_profiles)
-    array_spec = f"0-{n_total - 1}"
-    n_clients = getattr(cfg.loop, "n_clients", None)
-    rows = [
-        ("Config", config),
-        ("Provider", f"{provider_spec.label} ({provider_spec.key})"),
-        ("CPUs/task", str(resolved_cpus_per_task)),
-        *([("Memory", resolved_mem)] if resolved_mem else []),
-        ("Profiles", str(resolved_profiles if resolved_profiles else "(none)")),
-        ("Extra clients", str(extra_clients)),
-        ("Total clients", str(n_total)),
-        ("Array spec", f"--array={array_spec}"),
-        ("Profiles CSV", profiles_csv),
-        *([("Partition", resolved_partition)] if resolved_partition else []),
-        *([("vLLM URL", vllm_url or "(from env / .vllm_env)")] if provider_spec.key == "vllm" else []),
-        ("Env manager", env_manager),
-        ("Run ID", resolved_run_id),
-        *([("Orchestrator", "ENABLED (centralized judge)")] if resolved_launch_orchestrator else []),
-        *([("n_clients", str(n_clients))] if resolved_launch_orchestrator and n_clients else []),
-        ("Sentry", sentry_label),
-        ("Logs dir", logs_dir_rel),
-        ("Results dir", results_dir_rel),
-    ]
-    _print_config_table(rows)
+    _print_config_table(list(context.config_table_rows))
     print()
 
     if local:
-        _print_regular_local_preview(
-            config=config,
-            profiles=resolved_profiles,
-            extra_clients=extra_clients,
-            vllm_url=vllm_url,
-            results_dir_rel=results_dir_rel,
-            resolved_launch_orchestrator=resolved_launch_orchestrator,
-            n_clients=n_clients,
-        )
+        if context.cmg_enabled:
+            _print_cmg_local_preview(
+                config=config,
+                generator_client=str(getattr(context.cfg.centralized_model_generation, "generator_client", "")),
+                n_models=int(getattr(context.cfg.centralized_model_generation, "n_models", 0)),
+                results_dir_rel=context.results_dir_rel,
+                resolved_vllm_url=context.resolved_vllm_url or "",
+                final_eval_enabled=context.final_eval_enabled,
+            )
+        else:
+            _print_regular_local_preview(
+                config=config,
+                profiles=(profiles.split(",") if profiles else list((context.cfg.clients or {}).keys())),
+                extra_clients=extra_clients,
+                vllm_url=vllm_url,
+                results_dir_rel=context.results_dir_rel,
+                resolved_launch_orchestrator=context.resolved_launch_orchestrator,
+                n_clients=context.n_clients,
+            )
         return None
 
     executor = LaunchExecutor(printer=_command_printer)
     if not dry_run:
-        logs_dir.mkdir(parents=True, exist_ok=True)
-    plan = _build_regular_launch_plan(
-        config=config,
-        profiles_csv=profiles_csv,
-        array_spec=array_spec,
-        results_dir_rel=results_dir_rel,
-        logs_dir_rel=logs_dir_rel,
-        resolved_cpus_per_task=resolved_cpus_per_task,
-        partition_flag=partition_flag,
-        mem_flag=mem_flag,
-        vllm_url=vllm_url,
-        conda_env=conda_env,
-        resolved_launch_orchestrator=resolved_launch_orchestrator,
-        n_clients=n_clients,
+        context.logs_dir.mkdir(parents=True, exist_ok=True)
+    submission_results = executor.execute(
+        context.plan,
+        dry_run=dry_run,
+        on_result=_print_submission_result,
     )
-    main_results = executor.execute(plan, dry_run=dry_run, on_result=_print_submission_result)
-    results_by_label = {result.label: result for result in main_results}
+    results_by_label = {result.label: result for result in submission_results}
 
     console.print("[bold green]Launched successfully.[/bold green] Monitor with:")
     console.print(
-        f"  [cyan]python -m gecco monitor --task {cfg.task.name} --results-dir {results_dir_rel} --watch 10[/cyan]"
+        f"  [cyan]python -m gecco monitor --task {context.cfg.task.name} --results-dir {context.results_dir_rel} --watch 10[/cyan]"
     )
+    if context.cmg_enabled:
+        final_eval_result = results_by_label.get("final_eval")
+        if context.final_eval_enabled and final_eval_result and final_eval_result.job_id:
+            console.print(
+                f"[bold]Final evaluation[/bold] will run after all CMG jobs complete: job [yellow]{final_eval_result.job_id}[/yellow]"
+            )
+        return None
+
     test_eval_result = results_by_label.get("test_evaluation")
     if test_eval_result and test_eval_result.job_id:
-        test_eval_job_id = test_eval_result.job_id
         console.print(
-            f"[bold]Test evaluation[/bold] will run after all clients complete: job [yellow]{test_eval_job_id}[/yellow]"
+            f"[bold]Test evaluation[/bold] will run after all clients complete: job [yellow]{test_eval_result.job_id}[/yellow]"
         )
     return None
 

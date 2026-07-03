@@ -126,11 +126,11 @@ def test_batch_launcher_help_mentions_submission_controls(capsys):
 
     output = capsys.readouterr().out
     assert "--submit-delay-seconds" in output
-    assert "default: 1.0" in output
+    assert "default: 5.0" in output
     assert "--sbatch-retry-attempts" in output
     assert "default: 3" in output
     assert "--sbatch-retry-backoff-seconds" in output
-    assert "default: 2.0" in output
+    assert "default: 5.0" in output
 
 
 def test_batch_launcher_expands_config_dir_sorted_and_ignores_non_yaml(tmp_path, capsys):

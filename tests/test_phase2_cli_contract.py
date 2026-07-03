@@ -558,6 +558,29 @@ def test_distributed_client_publishes_abort_on_unhandled_exception(tmp_path):
     assert registry.read()["client_entries"]["0"]["status"] == "failed"
 
 
+def test_internal_pipeline_allocation_routes_to_runtime():
+    """The hidden pipeline-allocation command should be reachable under internal."""
+    from gecco.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["internal", "pipeline-allocation", "--config", "demo.yaml", "--results-dir", "results/demo"]
+    )
+
+    assert args.config == "demo.yaml"
+    assert args.results_dir == "results/demo"
+
+
+def test_internal_pipeline_allocation_help_shows_no_output(capsys):
+    """--help on pipeline-allocation should print something (it's hidden but reachable)."""
+    from gecco.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["internal", "pipeline-allocation", "--help"])
+
+    output = capsys.readouterr().out
+    assert output  # help text exists even for hidden commands
+
+
 def test_cli_entrypoint_functions_are_importable_and_callable():
     """Extracted runtime entrypoints should be exposed as direct callables."""
     from gecco.cli.launch_distributed import run_distributed_launcher
@@ -567,6 +590,7 @@ def test_cli_entrypoint_functions_are_importable_and_callable():
     from gecco.cli.run_gecco_distributed import run_distributed_client
     from gecco.cli.run_judge_orchestrator import run_orchestrator
     from gecco.cli.run_local_client import run_local_client
+    from gecco.cli.run_pipeline_allocation import run_pipeline_allocation
     from gecco.cli.run_test_evaluation import run_test_evaluation
 
     assert callable(run_distributed_launcher)
@@ -577,6 +601,7 @@ def test_cli_entrypoint_functions_are_importable_and_callable():
     assert callable(run_distributed_client)
     assert callable(run_test_evaluation)
     assert callable(run_orchestrator)
+    assert callable(run_pipeline_allocation)
 
 
 @pytest.mark.parametrize(

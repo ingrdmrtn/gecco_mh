@@ -407,3 +407,170 @@ def test_batch_launcher_requires_configs_or_config_dir():
         build_parser().parse_args(["run", "distributed-batch"])
 
     assert excinfo.value.code == 2
+
+
+# ── Allocation-mode tests ──────────────────────────────────────────────
+
+
+def test_batch_launcher_pipeline_allocation_flag_accepted():
+    """--pipeline-allocation is accepted by the parser."""
+    args = build_parser().parse_args(
+        ["run", "distributed-batch", "--configs", "config/a.yaml", "--pipeline-allocation"]
+    )
+    assert args.pipeline_allocation is True
+
+
+def test_batch_launcher_pipeline_allocation_defaults_to_false():
+    """--pipeline-allocation defaults to False."""
+    args = build_parser().parse_args(
+        ["run", "distributed-batch", "--configs", "config/a.yaml"]
+    )
+    assert hasattr(args, "pipeline_allocation")
+    assert args.pipeline_allocation is False
+
+
+def test_batch_launcher_allocation_submits_one_sbatch_per_pipeline(tmp_path):
+    """Allocation mode submits one sbatch per config/replicate, no per-stage sbatch."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "a.yaml").write_text("task: {}\n", encoding="utf-8")
+    (config_dir / "b.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = _make_cfg()
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ):
+        run_distributed_batch_launcher(
+            configs=["config/a.yaml", "config/b.yaml"],
+            replicates=1,
+            pipeline_allocation=True,
+        )
+
+    # Exactly 2 sbatch commands (one per pipeline), all for run_pipeline_allocation.sh
+    assert len(seen_commands) == 2
+    assert all("run_pipeline_allocation.sh" in cmd for cmd in seen_commands)
+
+    # No per-stage script names
+    for marker in (
+        "run_gecco_distributed.sh",
+        "run_judge_orchestrator.sh",
+        "run_test_evaluation.sh",
+        "run_cmg_generator.sh",
+        "run_cmg_evaluator.sh",
+    ):
+        assert not any(marker in cmd for cmd in seen_commands), f"Unexpected {marker}"
+
+
+def test_batch_launcher_allocation_preserves_lane_dependencies(tmp_path):
+    """Allocation mode adds lane dependencies with --max-concurrent-configs."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    for name in ["a.yaml", "b.yaml", "c.yaml"]:
+        (config_dir / name).write_text("task: {}\n", encoding="utf-8")
+
+    cfg = _make_cfg()
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ):
+        run_distributed_batch_launcher(
+            config_dir="config",
+            replicates=1,
+            max_concurrent_configs=2,
+            pipeline_allocation=True,
+        )
+
+    # 3 pipelines, first 2 in parallel, 3rd depends on lane 1
+    assert len(seen_commands) == 3
+    assert "--dependency=" not in seen_commands[0]
+    assert "--dependency=" not in seen_commands[1]
+    assert "--dependency=" in seen_commands[2]
+    assert all("run_pipeline_allocation.sh" in cmd for cmd in seen_commands)
+
+
+def test_batch_launcher_allocation_rejects_cmg(tmp_path, capsys):
+    """Allocation mode must reject centralized model generation configs."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "cmg.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(n_clients=2),
+        judge=None,
+        centralized_model_generation=SimpleNamespace(
+            enabled=True,
+            generator_client="generator",
+            n_models=2,
+            run_final_evaluation=True,
+        ),
+        clients={"alpha": SimpleNamespace(), "beta": SimpleNamespace()},
+        slurm={},
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            run_distributed_batch_launcher(
+                configs=["config/cmg.yaml"],
+                pipeline_allocation=True,
+            )
+
+    assert excinfo.value.code == 1
+    # No sbatch commands should be submitted
+    assert len(seen_commands) == 0
+    # Error message should mention CMG rejection
+    output = capsys.readouterr().out
+    assert "Centralized model generation" in output and "not supported" in output
+
+
+def test_batch_launcher_allocation_uses_context_resolved_slurm_resources(tmp_path):
+    """Allocation sbatch commands must include config-resolved SLURM resources."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "a.yaml").write_text("task: {}\n", encoding="utf-8")
+
+    # Config has slurm resources that should propagate without explicit CLI flags
+    cfg = SimpleNamespace(
+        task=SimpleNamespace(name="demo-task"),
+        llm=SimpleNamespace(provider="openrouter", base_model="demo-model"),
+        loop=SimpleNamespace(n_clients=2),
+        judge=None,
+        centralized_model_generation=SimpleNamespace(enabled=False),
+        clients={"alpha": SimpleNamespace(), "beta": SimpleNamespace()},
+        slurm={"partition": "gpu", "cpus_per_task": 16, "mem_per_task": "32G"},
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+
+    seen_commands: list[str] = []
+    real_executor = RealLaunchExecutor(runner=_make_fake_runner(seen_commands), printer=lambda *_: None)
+
+    with _patched_batch_environment(tmp_path, cfg), patch(
+        "gecco.cli.launch_distributed_batch.LaunchExecutor", return_value=real_executor
+    ):
+        run_distributed_batch_launcher(
+            configs=["config/a.yaml"],
+            pipeline_allocation=True,
+            # Do NOT pass --partition, --cpus-per-task, or --mem explicitly
+        )
+
+    # Exactly 1 sbatch command for pipeline allocation
+    assert len(seen_commands) == 1
+    cmd = seen_commands[0]
+
+    # Config-resolved resources must appear in the sbatch command
+    assert "--partition=gpu" in cmd
+    assert "--cpus-per-task=16" in cmd
+    assert "--mem=32G" in cmd
+    assert "run_pipeline_allocation.sh" in cmd

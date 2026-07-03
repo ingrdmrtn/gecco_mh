@@ -15,6 +15,7 @@ from . import reset_distributed
 from . import run_gecco_distributed
 from . import run_judge_orchestrator
 from . import run_local_client
+from . import run_pipeline_allocation
 from . import run_test_evaluation
 from gecco.sentry_init import capture_operational_error, init_sentry
 
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="internal_command", required=True
     )
     run_gecco_distributed.register_parser(internal_subparsers)
+    run_pipeline_allocation.register_parser(internal_subparsers)
     run_test_evaluation.register_parser(internal_subparsers)
     run_judge_orchestrator.register_parser(internal_subparsers)
 

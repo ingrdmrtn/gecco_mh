@@ -14,11 +14,15 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import launch_distributed as launch_distributed_cli
-from .config_paths import config_output_subpath, resolve_config_path
+from .config_paths import config_output_subpath, logs_dir_for_config, resolve_config_path, results_dir_for_config
 from .launch_distributed import (
     _build_distributed_launch_context,
     _command_printer,
+    _join_command,
+    _optional_vllm_flag,
+    _positional_arg,
     _print_submission_result,
+    _sbatch_log_flags,
 )
 from .launcher_utils import (
     DEFAULT_SBATCH_RETRY_ATTEMPTS,
@@ -26,6 +30,7 @@ from .launcher_utils import (
     DEFAULT_SUBMIT_DELAY_SECONDS,
     LaunchCommand,
     LaunchExecutor,
+    LaunchPlan,
     SubmissionResult,
 )
 
@@ -161,6 +166,47 @@ def _dependency_fallback(dependency_policy: str, dependency_labels: tuple[str, .
     return f"--dependency={dependency_policy}:{placeholder_ids}"
 
 
+def _build_allocation_command(
+    *,
+    config_display: str,
+    profiles_csv: str,
+    vllm_url: str | None,
+    conda_env: str | None,
+    partition: str | None,
+    cpus_per_task: int | None,
+    mem: str | None,
+    results_dir_rel: str,
+    logs_dir_rel: str,
+) -> LaunchCommand:
+    """Build a single sbatch command for the pipeline allocation wrapper."""
+    vllm_arg = _positional_arg(vllm_url)
+    conda_arg = _positional_arg(conda_env)
+    resolved_partition = partition
+    partition_flag = f"--partition={resolved_partition}" if resolved_partition else ""
+    resolved_mem = mem
+    mem_flag = f"--mem={resolved_mem}" if resolved_mem else ""
+    resolved_cpus = cpus_per_task or 48
+
+    return LaunchCommand(
+        label="pipeline_allocation",
+        command=_join_command(
+            [
+                "sbatch",
+                f"--cpus-per-task={resolved_cpus}",
+                partition_flag,
+                mem_flag,
+                *_sbatch_log_flags(logs_dir_rel, "gecco-pipeline-allocation-%j"),
+                "bash/run_pipeline_allocation.sh",
+                f'"{config_display}"',
+                f'"{profiles_csv}"',
+                vllm_arg,
+                conda_arg,
+                f'"{results_dir_rel}"',
+            ]
+        ),
+    )
+
+
 def _with_lane_dependencies(
     plan, dependency_labels: tuple[str, ...] | None, dependency_policy: str
 ):
@@ -238,6 +284,17 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--launch-orchestrator", action="store_true")
+    parser.add_argument(
+        "--pipeline-allocation",
+        action="store_true",
+        help=(
+            "Submit one SLURM allocation job per config/replicate pipeline instead of "
+            "submitting per-stage sbatch commands. All clients run concurrently inside "
+            "the same job allocation. Use --conda-env for conda environment resolution "
+            "inside the allocation (falls back to uv if omitted). Not compatible with "
+            "centralized model generation (CMG) configs."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.set_defaults(handler=main)
     return parser
@@ -260,6 +317,7 @@ def run_distributed_batch_launcher(
     sbatch_retry_attempts: int = DEFAULT_SBATCH_RETRY_ATTEMPTS,
     sbatch_retry_backoff_seconds: float = DEFAULT_SBATCH_RETRY_BACKOFF_SECONDS,
     launch_orchestrator: bool = False,
+    pipeline_allocation: bool = False,
     dry_run: bool = False,
 ) -> int | None:
     """Launch batched distributed GeCCo pipelines."""
@@ -326,22 +384,67 @@ def run_distributed_batch_launcher(
     for pipeline_index, (config_display, run_id) in enumerate(pipelines):
         lane = pipeline_index % max_concurrent_configs
         replicate = int(run_id.rsplit("-rep-", 1)[-1])
-        context = _build_distributed_launch_context(
-            config=config_display,
-            vllm_url=vllm_url,
-            conda_env=conda_env,
-            partition=partition,
-            cpus_per_task=cpus_per_task,
-            mem=mem,
-            run_id=run_id,
-            launch_orchestrator=launch_orchestrator,
-        )
 
-        pipeline_plan = _with_lane_dependencies(
-            context.plan,
-            lane_terminal_labels[lane],
-            dependency_policy,
-        )
+        if pipeline_allocation:
+            # Build context to resolve profiles and paths
+            context = _build_distributed_launch_context(
+                config=config_display,
+                vllm_url=vllm_url,
+                conda_env=conda_env,
+                partition=partition,
+                cpus_per_task=cpus_per_task,
+                mem=mem,
+                run_id=run_id,
+                launch_orchestrator=launch_orchestrator,
+            )
+
+            # Reject CMG configs in allocation mode — CMG has its own multi-stage
+            # sbatch plan (generator + evaluators + orchestrator) that does not
+            # map to a single allocation job.
+            if context.cmg_enabled:
+                print(
+                    "ERROR: Centralized model generation (CMG) configs are not "
+                    "supported in --pipeline-allocation mode. Use the default "
+                    "distributed or distributed-batch launcher for CMG pipelines."
+                )
+                raise SystemExit(1)
+
+            allocation_cmd = _build_allocation_command(
+                config_display=config_display,
+                profiles_csv=context.profiles_csv or "",
+                vllm_url=vllm_url,
+                conda_env=conda_env,
+                partition=context.resolved_partition,
+                cpus_per_task=context.resolved_cpus_per_task,
+                mem=context.resolved_mem,
+                results_dir_rel=context.results_dir_rel,
+                logs_dir_rel=context.logs_dir_rel,
+            )
+            pipeline_plan = LaunchPlan(commands=(allocation_cmd,))
+            pipeline_plan = _with_lane_dependencies(
+                pipeline_plan,
+                lane_terminal_labels[lane],
+                dependency_policy,
+            )
+            terminal_labels_for_lane = ("pipeline_allocation",)
+        else:
+            context = _build_distributed_launch_context(
+                config=config_display,
+                vllm_url=vllm_url,
+                conda_env=conda_env,
+                partition=partition,
+                cpus_per_task=cpus_per_task,
+                mem=mem,
+                run_id=run_id,
+                launch_orchestrator=launch_orchestrator,
+            )
+
+            pipeline_plan = _with_lane_dependencies(
+                context.plan,
+                lane_terminal_labels[lane],
+                dependency_policy,
+            )
+            terminal_labels_for_lane = context.terminal_labels
 
         _render_pipeline_progress(
             pipeline_index=pipeline_index + 1,
@@ -364,7 +467,7 @@ def run_distributed_batch_launcher(
             prior_results=lane_results[lane],
         )
         lane_results[lane] = {result.label: result for result in pipeline_results}
-        lane_terminal_labels[lane] = context.terminal_labels
+        lane_terminal_labels[lane] = terminal_labels_for_lane
 
     _render_batch_completion(batch_id=batch_id, total_pipelines=len(pipelines), dry_run=dry_run)
     return None
@@ -388,5 +491,6 @@ def main(args: argparse.Namespace) -> int | None:
         sbatch_retry_attempts=args.sbatch_retry_attempts,
         sbatch_retry_backoff_seconds=args.sbatch_retry_backoff_seconds,
         launch_orchestrator=args.launch_orchestrator,
+        pipeline_allocation=args.pipeline_allocation,
         dry_run=args.dry_run,
     )

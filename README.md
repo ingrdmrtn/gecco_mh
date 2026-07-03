@@ -522,6 +522,22 @@ uv run python -m gecco run distributed-batch --config-dir config/baselines \
 
 Use `--submit-delay-seconds`, `--sbatch-retry-attempts`, and `--sbatch-retry-backoff-seconds` to pace successful SLURM submissions and retry transient controller/socket errors.
 
+##### Pipeline allocation mode (reduced `sbatch` volume)
+
+Add `--pipeline-allocation` to submit one SLURM job per config/replicate pipeline instead of one job per stage. The allocation job starts all clients concurrently inside the same job, waits for them, then runs the judge/orchestrator and test evaluation in order:
+
+```bash
+uv run python -m gecco run distributed-batch --config-dir config/baselines \
+    --pipeline-allocation --max-concurrent-configs 2
+```
+
+Benefits:
+- **Reduced `sbatch` volume**: one submission per pipeline, not per stage.
+- **Same-time client startup**: all clients start concurrently inside the allocation.
+- **Active pipeline limiting** via `--max-concurrent-configs` works the same way: lane dependencies cap the number of simultaneously running allocation jobs.
+
+The allocation wrapper (`bash/run_pipeline_allocation.sh`) activates the environment manager (conda or uv) and calls the hidden `python -m gecco internal pipeline-allocation` command. Per-stage scripts (`run_gecco_distributed.sh`, `run_judge_orchestrator.sh`, `run_test_evaluation.sh`) are **not** submitted individually — the orchestration happens inside the allocation job.
+
 By default (no `--conda-env`), generated SLURM jobs execute through `uv run`. Pass `--conda-env <name>` to switch to conda activation. The `requirements.txt` file is kept in sync for conda/pip compatibility.
 
 For local testing without SLURM, run clients directly through the CLI (ensure the correct environment is already active):

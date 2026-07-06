@@ -7,10 +7,12 @@ import sys
 from pathlib import Path
 
 from gecco.results_comparison import (
+    aggregate_configs,
     discover_run_dirs,
     export_figures,
     render_report_html,
     summarise_run,
+    write_config_summary_csv,
     write_results_csv,
 )
 
@@ -23,7 +25,8 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         description=(
             "Discover run directories containing diagnostic DuckDB files "
             "under one or more results directories, export a run-level "
-            "results.csv, a static report.html, and PNG/PDF figures."
+            "results.csv, a config-level config_summary.csv, a static "
+            "report.html, and PNG/PDF figures."
         ),
     )
     parser.add_argument(
@@ -70,17 +73,22 @@ def main(args: argparse.Namespace) -> int | None:
 
     # Summarise
     summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+    print(f"  Configs: {len(config_rows)}")
 
     # Export
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = write_results_csv(summaries, output_dir)
-    print(f"  CSV:   {csv_path}")
+    print(f"  CSV (run):   {csv_path}")
 
-    html_path = render_report_html(summaries, output_dir)
+    config_csv_path = write_config_summary_csv(config_rows, output_dir)
+    print(f"  CSV (config): {config_csv_path}")
+
+    html_path = render_report_html(summaries, output_dir, config_rows=config_rows)
     print(f"  HTML:  {html_path}")
 
-    fig_dir = export_figures(summaries, output_dir)
+    fig_dir = export_figures(summaries, output_dir, config_rows=config_rows)
     print(f"  Figs:  {fig_dir}/")
 
     return None

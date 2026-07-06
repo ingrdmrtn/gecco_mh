@@ -241,6 +241,145 @@ def summarise_run(entry: dict) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Config-level aggregation
+# --------------------------------------------------------------------------- #
+
+_NUMERIC_METRICS = [
+    "best_train_metric",
+    "best_val_metric",
+    "best_test_metric",
+    "best_test_nll",
+    "best_test_mean_r2",
+    "best_test_max_r2",
+]
+
+_CONFIG_COLUMN_ORDER = [
+    "config_label",
+    "n_runs",
+    "n_with_test_eval",
+    "n_with_individual_differences",
+    "n_models_total",
+    "n_failed_models_total",
+    "best_train_metric_mean",
+    "best_train_metric_std",
+    "best_train_metric_n",
+    "best_val_metric_mean",
+    "best_val_metric_std",
+    "best_val_metric_n",
+    "best_test_metric_mean",
+    "best_test_metric_std",
+    "best_test_metric_n",
+    "best_test_nll_mean",
+    "best_test_nll_std",
+    "best_test_nll_n",
+    "best_test_mean_r2_mean",
+    "best_test_mean_r2_std",
+    "best_test_mean_r2_n",
+    "best_test_max_r2_mean",
+    "best_test_max_r2_std",
+    "best_test_max_r2_n",
+]
+
+
+def aggregate_configs(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group run-level summaries by ``config_label`` and compute config-level aggregates.
+
+    For each config group, numeric metrics are summarised with mean, std
+    (sample standard deviation, ddof=1), and non-missing count.  Count
+    columns and boolean flags are summed or counted across runs.
+
+    Parameters
+    ----------
+    summaries:
+        List of run summary dicts (as returned by :func:`summarise_run`).
+
+    Returns
+    -------
+    list[dict]
+        One row per config label, sorted alphabetically by label.  Each row
+        contains all keys in ``_CONFIG_COLUMN_ORDER``.
+    """
+    import numpy as np
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for s in summaries:
+        label = s.get("config_label", "")
+        groups.setdefault(label, []).append(s)
+
+    config_rows: list[dict[str, Any]] = []
+    for label in sorted(groups):
+        runs = groups[label]
+        row: dict[str, Any] = {"config_label": label}
+
+        # Count columns
+        row["n_runs"] = len(runs)
+        row["n_with_test_eval"] = sum(
+            1 for r in runs if r.get("has_test_eval")
+        )
+        row["n_with_individual_differences"] = sum(
+            1 for r in runs if r.get("has_individual_differences")
+        )
+        row["n_models_total"] = sum(r.get("n_models", 0) for r in runs)
+        row["n_failed_models_total"] = sum(
+            r.get("n_failed_models", 0) for r in runs
+        )
+
+        # Numeric metric aggregates
+        for metric in _NUMERIC_METRICS:
+            vals = [
+                r.get(metric) for r in runs if r.get(metric) is not None
+            ]
+            if vals:
+                arr = np.array(vals, dtype=float)
+                row[f"{metric}_mean"] = float(np.mean(arr))
+                row[f"{metric}_std"] = (
+                    float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+                )
+                row[f"{metric}_n"] = len(arr)
+            else:
+                row[f"{metric}_mean"] = None
+                row[f"{metric}_std"] = None
+                row[f"{metric}_n"] = 0
+
+        config_rows.append(row)
+
+    return config_rows
+
+
+def write_config_summary_csv(
+    config_rows: list[dict[str, Any]], output_dir: str | Path
+) -> Path:
+    """Write a ``config_summary.csv`` with one row per config label.
+
+    Parameters
+    ----------
+    config_rows:
+        List of config summary dicts (as returned by :func:`aggregate_configs`).
+    output_dir:
+        Directory to write ``config_summary.csv`` into.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written CSV file.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / "config_summary.csv"
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=_CONFIG_COLUMN_ORDER, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for row in config_rows:
+            out_row = {k: row.get(k) for k in _CONFIG_COLUMN_ORDER}
+            writer.writerow(out_row)
+
+    return csv_path.resolve()
+
+
+# --------------------------------------------------------------------------- #
 # CSV export
 # --------------------------------------------------------------------------- #
 
@@ -299,15 +438,18 @@ _HTML_TEMPLATE = """\
   .fig-container {{ display: flex; flex-wrap: wrap; gap: 1em; margin: 1em 0; }}
   .fig-container img {{ max-width: 100%; border: 1px solid #eee; border-radius: 4px; }}
   .note {{ background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 0.75em 1em; margin: 1em 0; }}
+  .summary-cell {{ font-size: 0.85em; color: #555; }}
 </style>
 </head>
 <body>
 <h1>GeCCo Results Comparison</h1>
-<p>Generated from <strong>{n_runs}</strong> run director{plural}.</p>
+<p>Generated from <strong>{n_runs}</strong> run director{plural} across <strong>{n_configs}</strong> configuration{config_plural}.</p>
 
 {missing_data_notes}
 
-<h2>Run Overview</h2>
+{config_table_html}
+
+<h2>Run Details</h2>
 <table>
 <thead>
 <tr>
@@ -351,7 +493,10 @@ def _format_val(value: Any) -> str:
 
 
 def render_report_html(
-    summaries: list[dict[str, Any]], output_dir: str | Path
+    summaries: list[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    config_rows: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Render a self-contained static HTML report from the run summaries.
 
@@ -361,6 +506,10 @@ def render_report_html(
         List of run summary dicts.
     output_dir:
         Directory to write ``report.html`` into.
+    config_rows:
+        Optional list of config-level summary dicts (as returned by
+        :func:`aggregate_configs`).  When provided a "Config Summary"
+        table is rendered above the run-level table.
 
     Returns
     -------
@@ -370,10 +519,8 @@ def render_report_html(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Build table rows
-    rows_html = ""
+    # Build missing data notes
     missing_notes = []
-
     n_no_test = sum(1 for s in summaries if not s.get("has_test_eval"))
     n_no_id = sum(1 for s in summaries if not s.get("has_individual_differences"))
 
@@ -388,6 +535,53 @@ def render_report_html(
             "have no individual differences data.</div>"
         )
 
+    # Build config-level summary table
+    config_table_html = ""
+    if config_rows:
+        config_table_html = (
+            "<h2>Config Summary</h2>\n"
+            "<table>\n<thead>\n<tr>\n"
+            "  <th>Config</th>\n"
+            "  <th>Runs</th>\n"
+            "  <th>Train Metric</th>\n"
+            "  <th>Val Metric</th>\n"
+            "  <th>Test Metric</th>\n"
+            "  <th>Test NLL</th>\n"
+            "  <th>ID Mean R²</th>\n"
+            "  <th>ID Max R²</th>\n"
+            "  <th>Test Eval</th>\n"
+            "  <th>ID Data</th>\n"
+            "</tr>\n</thead>\n<tbody>\n"
+        )
+        for cr in config_rows:
+            def _mean_std_cell(prefix: str) -> str:
+                mean = cr.get(f"{prefix}_mean")
+                std = cr.get(f"{prefix}_std")
+                n = cr.get(f"{prefix}_n", 0)
+                if mean is None:
+                    return '<span class="missing">—</span>'
+                if std is not None and n is not None and n > 1:
+                    return f"{_format_val(mean)} ± {_format_val(std)} <span class=\"summary-cell\">(n={n})</span>"
+                return f"{_format_val(mean)} <span class=\"summary-cell\">(n={n})</span>"
+
+            config_table_html += (
+                "<tr>"
+                f"<td>{_format_val(cr.get('config_label'))}</td>"
+                f"<td>{cr.get('n_runs', 0)}</td>"
+                f"<td>{_mean_std_cell('best_train_metric')}</td>"
+                f"<td>{_mean_std_cell('best_val_metric')}</td>"
+                f"<td>{_mean_std_cell('best_test_metric')}</td>"
+                f"<td>{_mean_std_cell('best_test_nll')}</td>"
+                f"<td>{_mean_std_cell('best_test_mean_r2')}</td>"
+                f"<td>{_mean_std_cell('best_test_max_r2')}</td>"
+                f"<td>{cr.get('n_with_test_eval', 0)}/{cr.get('n_runs', 0)}</td>"
+                f"<td>{cr.get('n_with_individual_differences', 0)}/{cr.get('n_runs', 0)}</td>"
+                "</tr>\n"
+            )
+        config_table_html += "</tbody>\n</table>\n"
+
+    # Build run-level table rows
+    rows_html = ""
     for s in summaries:
         rows_html += (
             "<tr>"
@@ -405,12 +599,17 @@ def render_report_html(
         )
 
     n_runs = len(summaries)
+    n_configs = len(config_rows) if config_rows else 0
     plural = "y" if n_runs == 1 else "ies"
+    config_plural = "s" if n_configs != 1 else ""
 
     html = _HTML_TEMPLATE.format(
         n_runs=n_runs,
         plural=plural,
+        n_configs=n_configs,
+        config_plural=config_plural,
         missing_data_notes="\n".join(missing_notes),
+        config_table_html=config_table_html,
         rows_html=rows_html,
     )
 
@@ -424,16 +623,71 @@ def render_report_html(
 # --------------------------------------------------------------------------- #
 
 
+def _prepare_fit_vs_prediction_data(
+    summaries: list[dict[str, Any]],
+    config_rows: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], list[float | None], list[float | None]]:
+    """Prepare data for the fit-vs-prediction scatter plot.
+
+    When *config_rows* is provided the scatter uses config-level means
+    (one point per config).  Otherwise run-level values are used.
+    """
+    if config_rows:
+        labels = [
+            cr.get("config_label", f"cfg_{i}")
+            for i, cr in enumerate(config_rows)
+        ]
+        x_vals = [cr.get("best_train_metric_mean") for cr in config_rows]
+        y_vals = [cr.get("best_test_metric_mean") for cr in config_rows]
+    else:
+        labels = [
+            s.get("config_label", s.get("run_id", f"run_{i}"))
+            for i, s in enumerate(summaries)
+        ]
+        x_vals = [s.get("best_train_metric") for s in summaries]
+        y_vals = [s.get("best_test_metric") for s in summaries]
+    return labels, x_vals, y_vals
+
+
+def _config_level_series(
+    config_rows: list[dict[str, Any]], prefix: str
+) -> tuple[list[float], list[float]]:
+    """Extract config-level means and stds for a metric *prefix*.
+
+    Missing (``None``) values are returned as ``NaN`` so that they are
+    not rendered as zero-height bars in bar charts.
+    """
+    import numpy as np
+
+    means: list[float] = []
+    errors: list[float] = []
+    for cr in config_rows:
+        m = cr.get(f"{prefix}_mean")
+        s = cr.get(f"{prefix}_std")
+        means.append(float(m) if m is not None else np.nan)
+        errors.append(float(s) if s is not None else np.nan)
+    return means, errors
+
+
 def export_figures(
-    summaries: list[dict[str, Any]], output_dir: str | Path
+    summaries: list[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    config_rows: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Export comparison figures as PNG and PDF under ``output_dir/figures/``.
 
     Three figures are generated:
 
-    1. ``model_fit_by_config`` — bar chart of best train/val/test metrics per run.
-    2. ``individual_differences_by_config`` — bar chart of ID R² values per run.
-    3. ``fit_vs_prediction`` — scatter of train vs test metrics when both exist.
+    1. ``model_fit_by_config`` — bar chart of best train/val/test metrics per
+       config.  When *config_rows* is provided, bars show config-level means
+       with error bars (standard deviation).
+    2. ``individual_differences_by_config`` — bar chart of ID R² values per
+       config.  When *config_rows* is provided, bars show config-level means
+       with error bars.
+    3. ``fit_vs_prediction`` — scatter of train vs test metrics.  When
+       *config_rows* is provided the scatter uses config-level means (one
+       point per config); otherwise run-level values are used.
 
     Parameters
     ----------
@@ -441,6 +695,10 @@ def export_figures(
         List of run summary dicts.
     output_dir:
         Directory under which a ``figures/`` sub-directory is created.
+    config_rows:
+        Optional list of config-level summary dicts.  When provided the
+        config comparison bar charts and the fit-vs-prediction scatter all
+        use config-level aggregates.
 
     Returns
     -------
@@ -455,55 +713,168 @@ def export_figures(
     fig_dir = Path(output_dir) / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    labels = [s.get("config_label", s.get("run_id", f"run_{i}")) for i, s in enumerate(summaries)]
+    if config_rows:
+        _export_config_level_figures(fig_dir, config_rows)
+    else:
+        # Fallback: use run-level summaries as before
+        labels_run = [
+            s.get("config_label", s.get("run_id", f"run_{i}"))
+            for i, s in enumerate(summaries)
+        ]
+        train_vals = [s.get("best_train_metric") for s in summaries]
+        val_vals = [s.get("best_val_metric") for s in summaries]
+        test_vals = [s.get("best_test_metric") for s in summaries]
 
-    # -- 1. Model fit by config --
-    train_vals = [s.get("best_train_metric") for s in summaries]
-    val_vals = [s.get("best_val_metric") for s in summaries]
-    test_vals = [s.get("best_test_metric") for s in summaries]
+        _bar_chart(
+            fig_dir / "model_fit_by_config",
+            labels_run,
+            [
+                ("Train", train_vals),
+                ("Val", val_vals),
+                ("Test", test_vals),
+            ],
+            "Model Fit by Config",
+            "Metric Value",
+            "Best Fit Metric (lower is better)",
+        )
 
-    _bar_chart(
-        fig_dir / "model_fit_by_config",
-        labels,
-        [
-            ("Train", train_vals),
-            ("Val", val_vals),
-            ("Test", test_vals),
-        ],
-        "Model Fit by Config",
-        "Metric Value",
-        "Best Fit Metric (lower is better)",
+        id_mean = [s.get("best_test_mean_r2") for s in summaries]
+        id_max = [s.get("best_test_max_r2") for s in summaries]
+
+        _bar_chart(
+            fig_dir / "individual_differences_by_config",
+            labels_run,
+            [
+                ("Mean R²", id_mean),
+                ("Max R²", id_max),
+            ],
+            "Individual Differences by Config",
+            "R²",
+            "Test Individual Differences (higher is better)",
+        )
+
+    # -- 3. Fit vs Prediction --
+    labels_scatter, train_vals_scatter, test_vals_scatter = (
+        _prepare_fit_vs_prediction_data(summaries, config_rows=config_rows)
     )
 
-    # -- 2. Individual differences by config --
-    id_mean = [s.get("best_test_mean_r2") for s in summaries]
-    id_max = [s.get("best_test_max_r2") for s in summaries]
-
-    _bar_chart(
-        fig_dir / "individual_differences_by_config",
-        labels,
-        [
-            ("Mean R²", id_mean),
-            ("Max R²", id_max),
-        ],
-        "Individual Differences by Config",
-        "R²",
-        "Test Individual Differences (higher is better)",
+    title = (
+        "Train Metric vs Test Metric (config means)"
+        if config_rows
+        else "Train Metric vs Test Metric"
     )
-
-    # -- 3. Fit vs Prediction (train vs test scatter) --
     _scatter_plot(
         fig_dir / "fit_vs_prediction",
-        labels,
-        train_vals,
-        test_vals,
-        "Train Metric vs Test Metric",
+        labels_scatter,
+        train_vals_scatter,
+        test_vals_scatter,
+        title,
         "Best Train Metric",
         "Best Test Metric",
     )
 
     plt.close("all")
     return fig_dir.resolve()
+
+
+def _export_config_level_figures(
+    fig_dir: Path, config_rows: list[dict[str, Any]]
+) -> None:
+    """Draw config-level bar charts using config-row means with error bars."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    labels = [cr.get("config_label", f"cfg_{i}") for i, cr in enumerate(config_rows)]
+
+    # -- 1. Model fit by config (config-level means) --
+    train_means, train_errs = _config_level_series(config_rows, "best_train_metric")
+    val_means, val_errs = _config_level_series(config_rows, "best_val_metric")
+    test_means, test_errs = _config_level_series(config_rows, "best_test_metric")
+
+    _bar_chart_with_errors(
+        fig_dir / "model_fit_by_config",
+        labels,
+        [
+            ("Train", train_means, train_errs),
+            ("Val", val_means, val_errs),
+            ("Test", test_means, test_errs),
+        ],
+        "Model Fit by Config (mean ± SD)",
+        "Metric Value",
+        "Best Fit Metric (lower is better)",
+    )
+
+    # -- 2. Individual differences by config (config-level means) --
+    id_mean_vals, id_mean_errs = _config_level_series(config_rows, "best_test_mean_r2")
+    id_max_vals, id_max_errs = _config_level_series(config_rows, "best_test_max_r2")
+
+    _bar_chart_with_errors(
+        fig_dir / "individual_differences_by_config",
+        labels,
+        [
+            ("Mean R²", id_mean_vals, id_mean_errs),
+            ("Max R²", id_max_vals, id_max_errs),
+        ],
+        "Individual Differences by Config (mean ± SD)",
+        "R²",
+        "Test Individual Differences (higher is better)",
+    )
+
+
+def _bar_chart_with_errors(
+    base_path: Path,
+    labels: list[str],
+    series: list[tuple[str, list[float], list[float]]],
+    title: str,
+    ylabel: str,
+    caption: str,
+) -> None:
+    """Draw a grouped bar chart with error bars and save as PNG + PDF."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n_groups = len(labels)
+    n_series = len(series)
+
+    if n_groups == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, n_groups * 0.8), 4))
+    index = np.arange(n_groups)
+    bar_width = 0.8 / n_series
+
+    for i, (name, values, errors) in enumerate(series):
+        offset = (i - (n_series - 1) / 2) * bar_width
+        # Pass yerr when at least one error is valid; matplotlib skips
+        # NaN entries in error bars.
+        has_valid_err = any(
+            e is not None and not np.isnan(e) and e > 0 for e in errors
+        )
+        bars = ax.bar(
+            index + offset, values, bar_width, label=name, alpha=0.8,
+            yerr=errors if has_valid_err else None,
+            capsize=3,
+        )
+        _label_bars(bars, values)
+
+    ax.set_xlabel("Config")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticks(index)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.legend(fontsize=8)
+    ax.text(
+        0.5, -0.25, caption, transform=ax.transAxes,
+        ha="center", fontsize=8, color="gray", style="italic",
+    )
+    fig.tight_layout()
+    fig.savefig(str(base_path) + ".png", dpi=150)
+    fig.savefig(str(base_path) + ".pdf")
+    plt.close(fig)
 
 
 def _bar_chart(
@@ -605,9 +976,11 @@ def _scatter_plot(
 
 
 def _label_bars(bars, values: list[float | None]) -> None:
-    """Add text labels above bars when value is not None."""
+    """Add text labels above bars when value is not None and not NaN."""
+    import numpy as np
+
     for bar, val in zip(bars, values):
-        if val is not None:
+        if val is not None and not np.isnan(val):
             height = bar.get_height()
             ax = bar.axes
             ax.text(

@@ -292,3 +292,343 @@ def test_compare_handles_missing_test_or_id_data(tmp_path: Path):
     assert fig_dir.exists()
     for suffix in ("png", "pdf"):
         assert (fig_dir / f"model_fit_by_config.{suffix}").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Config-level aggregation
+# --------------------------------------------------------------------------- #
+
+
+def test_config_summary_aggregates_by_label(tmp_path: Path):
+    """Two runs with the same config_label produce one config summary row."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        summarise_run,
+    )
+
+    # Two runs with identical config_label structure
+    run1 = tmp_path / "runs" / "group_a" / "run_001"
+    run1.mkdir(parents=True)
+    _create_minimal_diagnostics(run1 / "diagnostics.duckdb", label="model")
+
+    run2 = tmp_path / "runs" / "group_a" / "run_002"
+    run2.mkdir(parents=True)
+    _create_minimal_diagnostics(run2 / "diagnostics.duckdb", label="model")
+
+    # One run with a different config_label
+    run3 = tmp_path / "runs" / "group_b" / "run_003"
+    run3.mkdir(parents=True)
+    _create_minimal_diagnostics(run3 / "diagnostics.duckdb", label="other")
+
+    discovered = discover_run_dirs([tmp_path / "runs"])
+    assert len(discovered) == 3
+
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    assert len(config_rows) == 2, f"Expected 2 config rows, got {len(config_rows)}"
+
+    labels = {r["config_label"] for r in config_rows}
+    assert labels == {"group_a", "group_b"}
+
+
+def test_config_summary_csv_contents(tmp_path: Path):
+    """config_summary.csv has expected columns and correct aggregation values."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        summarise_run,
+        write_config_summary_csv,
+    )
+
+    # Two runs with same config_label, both from _create_minimal_diagnostics
+    # Each has: best_train_metric=100, best_test_metric=130
+    run1 = tmp_path / "runs" / "cfg" / "run_001"
+    run1.mkdir(parents=True)
+    _create_minimal_diagnostics(run1 / "diagnostics.duckdb", label="a")
+
+    run2 = tmp_path / "runs" / "cfg" / "run_002"
+    run2.mkdir(parents=True)
+    _create_minimal_diagnostics(run2 / "diagnostics.duckdb", label="b")
+
+    discovered = discover_run_dirs([tmp_path / "runs"])
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    out_dir = tmp_path / "out"
+    csv_path = write_config_summary_csv(config_rows, out_dir)
+    assert csv_path.exists()
+    assert csv_path.name == "config_summary.csv"
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["config_label"] == "cfg"
+    assert row["n_runs"] == "2"
+    assert row["n_with_test_eval"] == "2"
+    assert row["n_with_individual_differences"] == "2"
+
+    # Both runs have best_train_metric=100, best_test_metric=130
+    assert float(row["best_train_metric_mean"]) == pytest.approx(100.0, abs=1e-4)
+    assert float(row["best_train_metric_n"]) == 2
+    # std of [100, 100] = 0
+    assert float(row["best_train_metric_std"]) == pytest.approx(0.0, abs=1e-4)
+
+    assert float(row["best_test_metric_mean"]) == pytest.approx(130.0, abs=1e-4)
+    assert int(row["best_test_metric_n"]) == 2
+    assert float(row["best_test_metric_std"]) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_config_summary_handles_missing_data(tmp_path: Path):
+    """Aggregation ignores None values; std is None/0 when only 1 run."""
+    from gecco.results_comparison import aggregate_configs
+
+    # Manually create summaries with mixed missing data
+    summaries = [
+        {
+            "config_label": "grp",
+            "best_train_metric": 100.0,
+            "best_val_metric": 105.0,
+            "best_test_metric": None,
+            "best_test_nll": None,
+            "best_test_mean_r2": None,
+            "best_test_max_r2": None,
+            "n_models": 5,
+            "n_failed_models": 1,
+            "has_test_eval": False,
+            "has_individual_differences": False,
+        },
+        {
+            "config_label": "grp",
+            "best_train_metric": 120.0,
+            "best_val_metric": None,
+            "best_test_metric": 130.0,
+            "best_test_nll": 4.0,
+            "best_test_mean_r2": 0.75,
+            "best_test_max_r2": 0.85,
+            "n_models": 8,
+            "n_failed_models": 0,
+            "has_test_eval": True,
+            "has_individual_differences": True,
+        },
+    ]
+
+    config_rows = aggregate_configs(summaries)
+    assert len(config_rows) == 1
+    row = config_rows[0]
+
+    assert row["n_runs"] == 2
+    assert row["n_with_test_eval"] == 1
+    assert row["n_with_individual_differences"] == 1
+    assert row["n_models_total"] == 13
+    assert row["n_failed_models_total"] == 1
+
+    # best_train_metric has 2 values
+    assert row["best_train_metric_mean"] == 110.0
+    assert row["best_train_metric_n"] == 2
+    # best_val_metric has 1 value → std is 0.0
+    assert row["best_val_metric_mean"] == 105.0
+    assert row["best_val_metric_std"] == 0.0
+    assert row["best_val_metric_n"] == 1
+    # best_test_metric has 1 value
+    assert row["best_test_metric_mean"] == 130.0
+    assert row["best_test_metric_n"] == 1
+    # best_test_nll has 1 value
+    assert row["best_test_nll_n"] == 1
+    # best_test_mean_r2 has 1 value
+    assert row["best_test_mean_r2_n"] == 1
+
+
+def test_compare_cli_writes_config_summary(tmp_path: Path):
+    """CLI handler writes config_summary.csv alongside results.csv."""
+    from gecco.cli.compare_results import main as compare_main
+    from types import SimpleNamespace
+
+    # Two runs sharing a config_label, one run in another config
+    for i, cfg in enumerate(["cfg_a", "cfg_a", "cfg_b"]):
+        run = tmp_path / "cli_runs" / cfg / f"run_{i:03d}"
+        run.mkdir(parents=True)
+        _create_minimal_diagnostics(run / "diagnostics.duckdb", label=f"m{i}")
+
+    out_dir = tmp_path / "cli_output"
+
+    args = SimpleNamespace(
+        results_dirs=[tmp_path / "cli_runs"],
+        output=str(out_dir),
+    )
+    compare_main(args)
+
+    assert (out_dir / "results.csv").exists()
+    assert (out_dir / "config_summary.csv").exists()
+
+    # Verify config_summary.csv content
+    with open(out_dir / "config_summary.csv", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 2, f"Expected 2 config rows, got {len(rows)}"
+    labels = {r["config_label"] for r in rows}
+    assert labels == {"cfg_a", "cfg_b"}
+
+    for row in rows:
+        if row["config_label"] == "cfg_a":
+            assert row["n_runs"] == "2"
+        elif row["config_label"] == "cfg_b":
+            assert row["n_runs"] == "1"
+
+
+def test_html_report_shows_config_and_run_tables(tmp_path: Path):
+    """HTML report contains both a config-level summary table and run details."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        render_report_html,
+        summarise_run,
+    )
+
+    # Two configs, one run each
+    run1 = tmp_path / "runs" / "cfg_x" / "run_001"
+    run1.mkdir(parents=True)
+    _create_minimal_diagnostics(run1 / "diagnostics.duckdb", label="x")
+
+    run2 = tmp_path / "runs" / "cfg_y" / "run_002"
+    run2.mkdir(parents=True)
+    _create_minimal_diagnostics(run2 / "diagnostics.duckdb", label="y")
+
+    discovered = discover_run_dirs([tmp_path / "runs"])
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    out_dir = tmp_path / "html_out"
+    html_path = render_report_html(summaries, out_dir, config_rows=config_rows)
+    assert html_path.exists()
+
+    html = html_path.read_text(encoding="utf-8")
+    # Should contain both tables
+    assert "Config Summary" in html
+    assert "Run Details" in html or "Run Overview" in html
+    # Should show config-level rows
+    assert "cfg_x" in html
+    assert "cfg_y" in html
+    # Should show run-level rows
+    assert "run_001" in html
+    assert "run_002" in html
+
+
+def test_export_figures_with_config_rows_uses_means(tmp_path: Path):
+    """Figures exported with config_rows show config-level means with error bars."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        export_figures,
+        summarise_run,
+    )
+
+    # Two runs in one config, one run in another
+    run1 = tmp_path / "runs" / "cfg_a" / "run_001"
+    run1.mkdir(parents=True)
+    _create_minimal_diagnostics(run1 / "diagnostics.duckdb", label="a1")
+
+    run2 = tmp_path / "runs" / "cfg_a" / "run_002"
+    run2.mkdir(parents=True)
+    _create_minimal_diagnostics(run2 / "diagnostics.duckdb", label="a2")
+
+    run3 = tmp_path / "runs" / "cfg_b" / "run_003"
+    run3.mkdir(parents=True)
+    _create_minimal_diagnostics(run3 / "diagnostics.duckdb", label="b")
+
+    discovered = discover_run_dirs([tmp_path / "runs"])
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    out_dir = tmp_path / "fig_out"
+    fig_dir = export_figures(summaries, out_dir, config_rows=config_rows)
+    assert fig_dir.exists()
+    for fname in ("model_fit_by_config", "individual_differences_by_config", "fit_vs_prediction"):
+        assert (fig_dir / f"{fname}.png").exists()
+        assert (fig_dir / f"{fname}.pdf").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Config-level figure data helpers
+# --------------------------------------------------------------------------- #
+
+
+def test_prepare_fit_vs_prediction_with_config_rows_uses_means():
+    """_prepare_fit_vs_prediction_data returns config-level means when
+    config_rows is provided, not run-level points."""
+    from gecco.results_comparison import _prepare_fit_vs_prediction_data
+
+    summaries = [
+        {"config_label": "cfg_a", "run_id": "run_001",
+         "best_train_metric": 100.0, "best_test_metric": 130.0},
+        {"config_label": "cfg_a", "run_id": "run_002",
+         "best_train_metric": 110.0, "best_test_metric": 140.0},
+        {"config_label": "cfg_b", "run_id": "run_003",
+         "best_train_metric": 200.0, "best_test_metric": 250.0},
+    ]
+    config_rows = [
+        {"config_label": "cfg_a",
+         "best_train_metric_mean": 105.0, "best_test_metric_mean": 135.0},
+        {"config_label": "cfg_b",
+         "best_train_metric_mean": 200.0, "best_test_metric_mean": 250.0},
+    ]
+
+    labels, x_vals, y_vals = _prepare_fit_vs_prediction_data(
+        summaries, config_rows=config_rows
+    )
+
+    # Uses config-level means, not run-level points
+    assert labels == ["cfg_a", "cfg_b"]
+    assert x_vals == [105.0, 200.0]   # config-level means
+    assert y_vals == [135.0, 250.0]   # config-level means
+
+
+def test_prepare_fit_vs_prediction_without_config_rows_uses_run_level():
+    """_prepare_fit_vs_prediction_data returns run-level values when
+    config_rows is None."""
+    from gecco.results_comparison import _prepare_fit_vs_prediction_data
+
+    summaries = [
+        {"config_label": "cfg_a", "run_id": "run_001",
+         "best_train_metric": 100.0, "best_test_metric": 130.0},
+        {"config_label": "cfg_b", "run_id": "run_002",
+         "best_train_metric": 200.0, "best_test_metric": 250.0},
+    ]
+
+    labels, x_vals, y_vals = _prepare_fit_vs_prediction_data(summaries)
+
+    assert labels == ["cfg_a", "cfg_b"]
+    assert x_vals == [100.0, 200.0]   # run-level values
+    assert y_vals == [130.0, 250.0]   # run-level values
+
+
+def test_config_level_series_uses_nan_for_missing_values():
+    """_config_level_series returns NaN, not zero, for missing metric values."""
+    import math
+    from gecco.results_comparison import _config_level_series
+
+    config_rows = [
+        {"config_label": "cfg_a",
+         "best_train_metric_mean": 100.0, "best_train_metric_std": 5.0,
+         "best_test_metric_mean": None, "best_test_metric_std": None},
+        {"config_label": "cfg_b",
+         "best_train_metric_mean": 200.0, "best_train_metric_std": 10.0,
+         "best_test_metric_mean": 300.0, "best_test_metric_std": 15.0},
+    ]
+
+    # For best_train_metric: both present
+    means, errors = _config_level_series(config_rows, "best_train_metric")
+    assert means == [100.0, 200.0]
+    assert errors == [5.0, 10.0]
+
+    # For best_test_metric: cfg_a is missing → NaN, not 0.0
+    means, errors = _config_level_series(config_rows, "best_test_metric")
+    assert math.isnan(means[0]), f"Expected NaN for missing, got {means[0]}"
+    assert means[1] == 300.0
+    assert math.isnan(errors[0]), f"Expected NaN for missing std, got {errors[0]}"
+    assert errors[1] == 15.0

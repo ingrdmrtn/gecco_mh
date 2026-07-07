@@ -663,7 +663,9 @@ class DiagnosticStore:
         ----------
         entry:
             Dict with keys: model_name, val_nll, test_mean_BIC, test_mean_NLL,
-            test_individual_BIC, test_individual_NLL, test_individual_differences.
+            test_individual_BIC, test_individual_NLL, test_individual_differences,
+            and optionally code, param_names, status, error_type, error_message,
+            error_details for invalid entries.
         """
         model_name = entry.get("model_name", "unknown")
         val_nll = entry.get("val_nll")
@@ -671,50 +673,110 @@ class DiagnosticStore:
         test_mean_nll = entry.get("test_mean_NLL")
         test_individual_bic = entry.get("test_individual_BIC", [])
         test_individual_nll = entry.get("test_individual_NLL", [])
+        test_individual_nll_trials = entry.get("test_individual_NLL_trials", [])
         test_id_results = entry.get("test_individual_differences")
+        code = entry.get("code")
+        param_names = entry.get("param_names", [])
+        status = entry.get("status", "ok")
+        error_type = entry.get("error_type")
+        error_message = entry.get("error_message")
+        error_details = entry.get("error_details")
 
-        self.execute(
-            "INSERT INTO models "
-            "(iteration_id, run_idx, iteration, name, code, metric_name, "
-            " metric_value, mean_nll, split, param_names, status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            [
-                None,
-                0,
-                -1,
-                model_name,
-                None,
-                "BIC",
-                test_mean_bic,
-                test_mean_nll,
-                "test",
-                orjson.dumps([]).decode(),
-                "ok",
-            ],
-        )
-        row = self.fetchone(
-            "SELECT model_id FROM models WHERE name=? AND split='test' ORDER BY model_id DESC LIMIT 1",
-            [model_name],
-        )
-        if row is None:
-            return
-        model_id = row["model_id"]
+        with self._lock:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                # Ensure a synthetic test iteration exists
+                iteration_row = self._conn.execute(
+                    "SELECT iteration_id FROM iterations "
+                    "WHERE run_idx=0 AND iteration=-1 AND tag='test_eval'"
+                ).fetchone()
+                if iteration_row:
+                    iteration_id = iteration_row[0]
+                else:
+                    self._conn.execute(
+                        "INSERT INTO iterations "
+                        "(run_idx, iteration, client_id, tag, timestamp, n_models_proposed) "
+                        "VALUES (0, -1, NULL, 'test_eval', NULL, 0)"
+                    )
+                    iteration_id = self._conn.execute(
+                        "SELECT iteration_id FROM iterations "
+                        "WHERE run_idx=0 AND iteration=-1 AND tag='test_eval'"
+                    ).fetchone()[0]
 
-        if test_id_results:
-            self.execute(
-                "INSERT OR REPLACE INTO individual_differences "
-                "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
-                "VALUES (?,?,?,?,?,?,?)",
-                [
-                    model_id,
-                    test_id_results.get("mean_r2"),
-                    test_id_results.get("max_r2"),
-                    test_id_results.get("best_param"),
-                    orjson.dumps(test_id_results.get("per_param_r2", {})).decode(),
-                    orjson.dumps(test_id_results.get("per_param_detail", {})).decode(),
-                    "test",
-                ],
-            )
+                # Derive status from entry
+                metric_name = "BIC" if status == "ok" else status
+
+                model_id = self._insert_model(
+                    iteration_id=iteration_id,
+                    run_idx=0,
+                    iteration=-1,
+                    name=model_name,
+                    code=code,
+                    metric_name=metric_name,
+                    metric_value=test_mean_bic if status == "ok" else None,
+                    param_names=param_names,
+                    status=status,
+                    mean_nll=test_mean_nll,
+                    split="test",
+                )
+
+                # Per-participant data
+                for idx in range(
+                    max(
+                        len(test_individual_bic),
+                        len(test_individual_nll),
+                        len(test_individual_nll_trials),
+                    )
+                ):
+                    bic_val = test_individual_bic[idx] if idx < len(test_individual_bic) else None
+                    nll_val = test_individual_nll[idx] if idx < len(test_individual_nll) else None
+                    n_trials_val = (
+                        test_individual_nll_trials[idx]
+                        if idx < len(test_individual_nll_trials)
+                        else None
+                    )
+                    self._conn.execute(
+                        "INSERT INTO model_participants "
+                        "(id, model_id, participant_idx, bic, nll, n_trials, params) "
+                        "VALUES (nextval('model_participants_id_seq'),?,?,?,?,?,?)",
+                        [model_id, idx, bic_val, nll_val, n_trials_val, "{}"],
+                    )
+
+                # Individual differences
+                if test_id_results:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO individual_differences "
+                        "(model_id, mean_r2, max_r2, best_param, per_param_r2, per_param_detail, split) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        [
+                            model_id,
+                            test_id_results.get("mean_r2"),
+                            test_id_results.get("max_r2"),
+                            test_id_results.get("best_param"),
+                            orjson.dumps(test_id_results.get("per_param_r2", {})).decode(),
+                            orjson.dumps(test_id_results.get("per_param_detail", {})).decode(),
+                            "test",
+                        ],
+                    )
+
+                # Validation errors for non-ok entries
+                if status != "ok" and error_type:
+                    self._conn.execute(
+                        "INSERT INTO validation_errors "
+                        "(model_id, error_type, error_message, error_details) "
+                        "VALUES (?,?,?,?)",
+                        [
+                            model_id,
+                            error_type,
+                            error_message,
+                            orjson.dumps(error_details or {}).decode(),
+                        ],
+                    )
+
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def close(self) -> None:
         """Close the underlying DuckDB connection."""

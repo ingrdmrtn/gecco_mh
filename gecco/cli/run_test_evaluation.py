@@ -209,11 +209,116 @@ def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
     code = candidate["code"]
     if not code:
         return None
+
+    # Static likelihood validation (pre-fit)
+    from gecco.offline_evaluation.likelihood_validation import (
+        validate_likelihood_static,
+    )
+
+    static_result = validate_likelihood_static(code, expected_func_name)
+    if not static_result.passed:
+        print(f"[test] {func_name}: static validation failed ({static_result.error_type})")
+        return {
+            "model_name": func_name,
+            "display_name": func_name,
+            "executable_function_name": expected_func_name,
+            "client_id": candidate.get("client_id"),
+            "iteration": candidate.get("iteration"),
+            "candidate_index": candidate.get("candidate_index"),
+            "selection_metric_name": candidate.get("selection_metric_name"),
+            "selection_metric_value": candidate.get("selection_metric_value"),
+            "val_nll": candidate.get("val_mean_nll"),
+            "test_mean_BIC": None,
+            "test_mean_NLL": None,
+            "test_individual_BIC": [],
+            "test_individual_NLL": [],
+            "test_individual_NLL_trials": [],
+            "test_individual_differences": None,
+            "code": code,
+            "param_names": candidate.get("param_names", []),
+            "status": static_result.error_type,
+            "error_type": "InvalidLikelihoodError",
+            "error_message": static_result.error_message,
+            "error_details": {
+                "reason": static_result.error_type,
+                **(static_result.error_details or {}),
+            },
+        }
+
     try:
         fit_res = run_fit(df_test, code, cfg=cfg, expected_func_name=expected_func_name)
     except Exception as exc:
         print(f"[test] skipping {func_name}: {exc}")
-        return None
+        return {
+            "model_name": func_name,
+            "display_name": func_name,
+            "executable_function_name": expected_func_name,
+            "client_id": candidate.get("client_id"),
+            "iteration": candidate.get("iteration"),
+            "candidate_index": candidate.get("candidate_index"),
+            "selection_metric_name": candidate.get("selection_metric_name"),
+            "selection_metric_value": candidate.get("selection_metric_value"),
+            "val_nll": candidate.get("val_mean_nll"),
+            "test_mean_BIC": None,
+            "test_mean_NLL": None,
+            "test_individual_BIC": [],
+            "test_individual_NLL": [],
+            "test_individual_NLL_trials": [],
+            "test_individual_differences": None,
+            "code": code,
+            "param_names": candidate.get("param_names", []),
+            "status": "fit_error",
+            "error_type": "fit_error",
+            "error_message": str(exc),
+            "error_details": {},
+        }
+
+    # Post-fit likelihood validation
+    from gecco.offline_evaluation.likelihood_validation import (
+        validate_likelihood_post_fit,
+    )
+
+    # Capture trial counts from fit result for per-choice validation
+    participant_n_trials = fit_res.get("participant_n_trials", [])
+    post_result = validate_likelihood_post_fit(
+        per_participant_nll=fit_res.get("per_participant_nll"),
+        mean_nll=fit_res.get("mean_nll"),
+        func_name=func_name,
+        n_participants=len(fit_res.get("per_participant_nll", [])),
+        participant_n_trials=participant_n_trials,
+    )
+    if not post_result.passed:
+        print(
+            f"[test] {func_name}: post-fit validation failed "
+            f"({post_result.error_type}): {post_result.error_message}"
+        )
+        return {
+            "model_name": func_name,
+            "display_name": func_name,
+            "executable_function_name": expected_func_name,
+            "client_id": candidate.get("client_id"),
+            "iteration": candidate.get("iteration"),
+            "candidate_index": candidate.get("candidate_index"),
+            "selection_metric_name": candidate.get("selection_metric_name"),
+            "selection_metric_value": candidate.get("selection_metric_value"),
+            "val_nll": candidate.get("val_mean_nll"),
+            # Clear success-looking public metrics for invalid entries
+            "test_mean_BIC": None,
+            "test_mean_NLL": None,
+            "test_individual_BIC": [],
+            "test_individual_NLL": [],
+            "test_individual_NLL_trials": participant_n_trials,
+            "test_individual_differences": None,
+            "code": code,
+            "param_names": candidate.get("param_names", []),
+            "status": post_result.error_type,
+            "error_type": "InvalidLikelihoodError",
+            "error_message": post_result.error_message,
+            "error_details": {
+                "reason": post_result.error_type,
+                **(post_result.error_details or {}),
+            },
+        }
 
     entry = {
         "model_name": func_name,
@@ -229,7 +334,11 @@ def fit_one_on_test(candidate, df_test, cfg, id_eval_data=None):
         "test_mean_NLL": float(fit_res["mean_nll"]),
         "test_individual_BIC": fit_res["eval_metrics"],
         "test_individual_NLL": fit_res["per_participant_nll"],
+        "test_individual_NLL_trials": fit_res.get("participant_n_trials", []),
         "test_individual_differences": None,
+        "code": code,
+        "param_names": candidate.get("param_names", []),
+        "status": "ok",
     }
     if id_eval_data is not None and hasattr(cfg, "individual_differences_eval"):
         try:
@@ -418,7 +527,8 @@ def run_test_evaluation(
             val_nll_text = _format_optional_float(entry.get("val_nll"))
             print(
                 f"[test] {entry['model_name']}: score={selection_text}, val_nll={val_nll_text}, "
-                f"test_BIC={entry['test_mean_BIC']:.2f}, test_NLL={entry['test_mean_NLL']:.2f}"
+                f"test_BIC={_format_optional_float(entry.get('test_mean_BIC'))}, "
+                f"test_NLL={_format_optional_float(entry.get('test_mean_NLL'))}"
             )
 
     out_path = resolved_results_dir / "bics" / "top_models_test.json"

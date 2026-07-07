@@ -344,6 +344,16 @@ class SharedRegistry:
                 entry["candidate_index"] = result["candidate_index"]
             if result.get("error"):
                 entry["error"] = result["error"]
+            if result.get("error_type"):
+                entry["error_type"] = result["error_type"]
+            if result.get("error_message"):
+                entry["error_message"] = result["error_message"]
+            if result.get("error_details"):
+                entry["error_details"] = result["error_details"]
+            if result.get("mean_nll") is not None:
+                entry["mean_nll"] = result["mean_nll"]
+            if result.get("per_participant_nll"):
+                entry["per_participant_nll"] = result["per_participant_nll"]
             if result.get("recovery_r") is not None:
                 entry["recovery_r"] = result["recovery_r"]
             if result.get("recovery_per_param"):

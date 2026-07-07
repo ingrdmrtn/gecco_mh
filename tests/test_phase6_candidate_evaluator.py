@@ -582,6 +582,21 @@ def test_candidate_evaluation_uses_hierarchical_fitter(tmp_path: Path):
     artifact_store = ArtifactStore(run_context, diagnostic_store)
     evaluator = CandidateEvaluator(artifact_store)
 
+    VALID_MODEL_CODE = (
+        "import math\n"
+        "def cognitive_model1(stimulus, action, reward, params):\n"
+        "    alpha, beta = params\n"
+        "    n_trials = len(stimulus)\n"
+        "    Q = 0.0\n"
+        "    log_lik = 0.0\n"
+        "    for t in range(n_trials):\n"
+        "        pe = reward[t] - Q\n"
+        "        prob = 1.0 / (1.0 + math.exp(-beta * pe))\n"
+        "        log_lik += math.log(prob + 1e-10)\n"
+        "        Q = Q + alpha * pe\n"
+        "    return -log_lik\n"
+    )
+
     fake_result = {
         "function_name": "model_a",
         "metric_name": "BIC",
@@ -592,7 +607,7 @@ def test_candidate_evaluation_uses_hierarchical_fitter(tmp_path: Path):
         "parameter_values": [[0.5]],
         "mean_nll": 2.0,
         "per_participant_nll": [2.0],
-        "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+        "code": VALID_MODEL_CODE,
     }
 
     with patch(
@@ -606,7 +621,7 @@ def test_candidate_evaluation_uses_hierarchical_fitter(tmp_path: Path):
             model_dict={
                 "func_name": "cognitive_model1",
                 "name": "model_a",
-                "code": "def cognitive_model1(x, model_parameters):\n    return 0.0",
+                "code": VALID_MODEL_CODE,
                 "parameters": [{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
             },
             model_idx=0,
@@ -800,6 +815,137 @@ def test_candidate_evaluation_skips_diagnostics_for_invalid_parameter_payload(
     assert "block_residuals" not in result
     compute_ppc.assert_not_called()
     compute_block_residuals.assert_not_called()
+
+    diagnostic_store.close()
+    run_context.close()
+
+
+# ========================================================================
+# Invalid likelihood rejection tests (Findings E.1, E.2)
+# ========================================================================
+
+
+def test_static_invalid_candidate_does_not_call_fit(tmp_path: Path):
+    """A statically invalid candidate (e.g. return 0.0) must not call
+    run_fit_hierarchical."""
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=[]),
+        task=SimpleNamespace(name="phase6_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
+    artifact_store = ArtifactStore(run_context, diagnostic_store)
+    evaluator = CandidateEvaluator(artifact_store)
+
+    RETURN_ZERO_CODE = "def cognitive_model1(stimulus, action, reward, params):\n    return 0.0\n"
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical"
+    ) as run_fit_hierarchical:
+        result, should_stop = evaluator.fit_candidate_model(
+            model_dict={
+                "func_name": "cognitive_model1",
+                "name": "model_a",
+                "code": RETURN_ZERO_CODE,
+                "parameters": [],
+            },
+            model_idx=0,
+            n_models=1,
+            it=0,
+            run_idx=1,
+            tag="",
+            model_file=artifact_store.candidate_model_path(iteration=0, run_idx=1, tag=""),
+            baseline_bic=None,
+            df=SimpleNamespace(),
+            cfg=cfg,
+        )
+
+    assert result["metric_name"] == "VALIDATION_ERROR"
+    assert result["error_type"] == "InvalidLikelihoodError"
+    assert result["error_details"].get("reason") == "constant_likelihood"
+    assert should_stop is False
+    run_fit_hierarchical.assert_not_called()
+
+    diagnostic_store.close()
+    run_context.close()
+
+
+def test_post_fit_zero_nll_converts_to_validation_error(tmp_path: Path):
+    """A post-fit zero-NLL mocked result must be converted to VALIDATION_ERROR
+    without running PPC/ID diagnostics."""
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=[]),
+        task=SimpleNamespace(name="phase6_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
+    artifact_store = ArtifactStore(run_context, diagnostic_store)
+    evaluator = CandidateEvaluator(artifact_store)
+
+    VALID_CODE = (
+        "import math\n"
+        "def cognitive_model1(stimulus, action, reward, params):\n"
+        "    alpha, beta = params\n"
+        "    n_trials = len(stimulus)\n"
+        "    Q = 0.0\n"
+        "    log_lik = 0.0\n"
+        "    for t in range(n_trials):\n"
+        "        pe = reward[t] - Q\n"
+        "        prob = 1.0 / (1.0 + math.exp(-beta * pe))\n"
+        "        log_lik += math.log(prob + 1e-10)\n"
+        "        Q = Q + alpha * pe\n"
+        "    return -log_lik\n"
+    )
+
+    # Zero NLL for all participants
+    zero_nll_result = {
+        "function_name": "model_a",
+        "metric_name": "BIC",
+        "metric_value": 5.0,
+        "param_names": ["alpha"],
+        "eval_metrics": [5.0],
+        "participant_n_trials": [3],
+        "parameter_values": [[0.5]],
+        "mean_nll": 0.0,
+        "per_participant_nll": [0.0],
+        "code": VALID_CODE,
+    }
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical",
+        return_value=zero_nll_result,
+    ) as run_fit_hierarchical, patch(
+        "gecco.offline_evaluation.ppc.compute_ppc",
+        side_effect=RuntimeError("ppc should not run"),
+    ) as compute_ppc:
+        result, should_stop = evaluator.fit_candidate_model(
+            model_dict={
+                "func_name": "cognitive_model1",
+                "name": "model_a",
+                "code": VALID_CODE,
+                "parameters": [{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
+            },
+            model_idx=0,
+            n_models=1,
+            it=0,
+            run_idx=1,
+            tag="",
+            model_file=artifact_store.candidate_model_path(iteration=0, run_idx=1, tag=""),
+            baseline_bic=None,
+            df=SimpleNamespace(),
+            cfg=cfg,
+            ppc_enabled=True,
+            ppc_simulator=object(),
+        )
+
+    assert result["metric_name"] == "VALIDATION_ERROR"
+    assert result["error_type"] == "InvalidLikelihoodError"
+    assert result["error_details"].get("reason") == "degenerate_nll"
+    assert should_stop is False
+    run_fit_hierarchical.assert_called_once()
+    compute_ppc.assert_not_called()
 
     diagnostic_store.close()
     run_context.close()

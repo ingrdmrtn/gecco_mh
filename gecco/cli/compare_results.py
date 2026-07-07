@@ -76,6 +76,14 @@ def main(args: argparse.Namespace) -> int | None:
     config_rows = aggregate_configs(summaries)
     print(f"  Configs: {len(config_rows)}")
 
+    # Print exclusion warnings
+    for s in summaries:
+        warnings = s.get("exclusion_warnings", [])
+        if warnings:
+            run_id = s.get("run_id", "?")
+            for w in warnings:
+                print(f"  [yellow]Warning ({run_id}): {w}[/]")
+
     # Export
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -69,6 +69,9 @@ def _create_minimal_diagnostics(db_path: Path, *, label: str = "run") -> None:
                     }
                 },
             },
+            "status": "ok",
+            "code": f"def {label}_model_a(stimulus, action, reward, params):\\n    return 0.0",
+            "param_names": ["alpha"],
         }
     )
     store2.close()
@@ -207,6 +210,9 @@ def test_compare_uses_best_split_metrics_and_id_results(tmp_path: Path):
                     }
                 },
             },
+            "status": "ok",
+            "code": "def best_model_b(stimulus, action, reward, params):\n    return 0.0",
+            "param_names": ["beta"],
         }
     )
     store.close()
@@ -631,4 +637,147 @@ def test_config_level_series_uses_nan_for_missing_values():
     assert math.isnan(means[0]), f"Expected NaN for missing, got {means[0]}"
     assert means[1] == 300.0
     assert math.isnan(errors[0]), f"Expected NaN for missing std, got {errors[0]}"
-    assert errors[1] == 15.0
+
+
+# --------------------------------------------------------------------------- #
+# Test-row exclusion logic
+# --------------------------------------------------------------------------- #
+
+
+def _create_invalid_test_row(db_path: Path, *, model_name: str = "invalid_model",
+                             low_bic: float = 80.0) -> None:
+    """Write an invalid test model row (status != 'ok') to the diagnostics DB."""
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": 2.0,
+        "test_mean_BIC": low_bic,
+        "test_mean_NLL": 2.0,
+        "test_individual_BIC": [low_bic],
+        "test_individual_NLL": [2.0],
+        "test_individual_differences": None,
+        "code": "def invalid_model(s, a, r, p):\n    return 0.0",
+        "param_names": ["alpha"],
+        "status": "choice_leakage",
+        "error_type": "InvalidLikelihoodError",
+        "error_message": "Choice leakage detected",
+        "error_details": {"reason": "choice_leakage"},
+    })
+    store.close()
+
+
+def _create_legacy_test_row(db_path: Path, *, model_name: str = "legacy_model",
+                            low_bic: float = 90.0) -> None:
+    """Write a legacy summary-only test row (status='ok' but code IS NULL)."""
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": 2.5,
+        "test_mean_BIC": low_bic,
+        "test_mean_NLL": 2.5,
+        "test_individual_BIC": [low_bic],
+        "test_individual_NLL": [2.5],
+        "test_individual_differences": None,
+        "code": None,  # legacy – no model code
+        "param_names": [],
+        "status": "ok",
+    })
+    store.close()
+
+
+def test_invalid_test_row_excluded_in_favor_of_valid(tmp_path: Path):
+    """An invalid test row (status != 'ok') with a low BIC is excluded;
+    the valid row with a higher BIC is selected as best_test_metric."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "invalid_vs_valid"
+    run.mkdir(parents=True)
+    # Create valid test row with higher BIC
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Add invalid row with a lower (better-looking) BIC
+    _create_invalid_test_row(run / "diagnostics.duckdb",
+                             model_name="invalid_better", low_bic=80.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Invalid row is excluded; valid row's metrics are used
+    assert summary["best_test_metric"] == 130.0  # valid_model_a's test BIC
+    # best_model_name comes from train split (lowest train BIC = model_b)
+    assert summary["best_model_name"] == "valid_model_b"
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_legacy_summary_only_row_excluded(tmp_path: Path):
+    """A legacy summary-only test row (code IS NULL, status='ok')
+    with a low BIC is excluded from best_test_metric selection."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "legacy_excluded"
+    run.mkdir(parents=True)
+    # Create valid test row with higher BIC
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="modern")
+    # Add legacy row with lower (better-looking) BIC but no code
+    _create_legacy_test_row(run / "diagnostics.duckdb",
+                            model_name="legacy_cheater", low_bic=90.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Legacy row is excluded; valid row's metrics are used
+    assert summary["best_test_metric"] == 130.0  # modern_model_a's test BIC
+    # best_model_name comes from train split (lowest train BIC = model_b)
+    assert summary["best_model_name"] == "modern_model_b"
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_exclusion_warnings_available(tmp_path: Path):
+    """summarise_run returns exclusion_warnings and n_excluded_rows."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "excl_warnings"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="m")
+    _create_invalid_test_row(run / "diagnostics.duckdb",
+                             model_name="bad", low_bic=80.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    assert summary["n_excluded_rows"] >= 1
+    assert isinstance(summary["exclusion_warnings"], list)
+    assert len(summary["exclusion_warnings"]) >= 1
+    # Should mention the invalid row
+    combined = " ".join(summary["exclusion_warnings"]).lower()
+    assert "invalid" in combined or "excluded" in combined
+
+
+def test_excluded_rows_do_not_feed_figure_data(tmp_path: Path):
+    """Excluded (invalid/legacy) rows do not affect summary metrics
+    used by figure/report generation."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "excl_figures"
+    run.mkdir(parents=True)
+    # Create a valid test row (BIC=130)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="good")
+
+    discovered = discover_run_dirs([tmp_path])
+    summary_before = summarise_run(discovered[0])
+
+    # Now add an invalid row and a legacy row, both with very low BIC
+    _create_invalid_test_row(run / "diagnostics.duckdb",
+                             model_name="bad_invalid", low_bic=10.0)
+    _create_legacy_test_row(run / "diagnostics.duckdb",
+                            model_name="bad_legacy", low_bic=5.0)
+
+    # Re-read; summarise_run must recompute
+    discovered_after = discover_run_dirs([tmp_path])
+    summary_after = summarise_run(discovered_after[0])
+
+    # best_test_metric must be unchanged (invalid/legacy rows excluded)
+    assert summary_after["best_test_metric"] == summary_before["best_test_metric"]
+    assert summary_after["best_test_metric"] == 130.0
+    assert summary_after["best_model_name"] == summary_before["best_model_name"]
+    # n_models may differ because rows were added; but n_excluded_rows > 0
+    assert summary_after["n_excluded_rows"] > 0

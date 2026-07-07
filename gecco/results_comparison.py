@@ -119,6 +119,27 @@ _COLUMN_ORDER = [
 ]
 
 
+def _count_excluded_test_rows(conn) -> tuple[int, list[str]]:
+    """Count test-split rows that are valid-ok but lack code (legacy summary-only rows),
+    returning (count, list_of_exclusion_reasons_for_this_run)."""
+    reasons = []
+    # Legacy summary-only rows: status='ok', split='test', code IS NULL
+    legacy_count = conn.execute(
+        "SELECT COUNT(*) FROM models "
+        "WHERE split='test' AND status='ok' AND code IS NULL"
+    ).fetchone()[0] or 0
+    if legacy_count:
+        reasons.append(f"{legacy_count} legacy test row(s) excluded (status='ok' but no model code)")
+    # Rows with non-ok status on test split
+    invalid_count = conn.execute(
+        "SELECT COUNT(*) FROM models "
+        "WHERE split='test' AND status != 'ok'"
+    ).fetchone()[0] or 0
+    if invalid_count:
+        reasons.append(f"{invalid_count} invalid test row(s) excluded (status != 'ok')")
+    return legacy_count + invalid_count, reasons
+
+
 def summarise_run(entry: dict) -> dict[str, Any]:
     """Query a single run's DuckDB and return a summary dict.
 
@@ -151,6 +172,8 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         "n_failed_models": 0,
         "has_test_eval": False,
         "has_individual_differences": False,
+        "n_excluded_rows": 0,
+        "exclusion_warnings": [],
     }
 
     try:
@@ -177,7 +200,12 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         result["n_models"] = count_row[0] or 0
         result["n_failed_models"] = count_row[1] or 0
 
-        # Best train model (lowest metric_value)
+        # Count excluded rows (legacy summary-only + invalid)
+        n_excluded, exclusion_reasons = _count_excluded_test_rows(conn)
+        result["n_excluded_rows"] = n_excluded
+        result["exclusion_warnings"] = exclusion_reasons
+
+        # Best train model (lowest metric_value) — valid-only
         train_row = conn.execute(
             "SELECT name, metric_value, mean_nll "
             "FROM models "
@@ -189,7 +217,7 @@ def summarise_run(entry: dict) -> dict[str, Any]:
             result["best_train_metric"] = float(train_row[1])
             result["best_model_name"] = train_row[0]
 
-        # Best val model (lowest metric_value)
+        # Best val model (lowest metric_value) — valid-only
         val_row = conn.execute(
             "SELECT metric_value "
             "FROM models "
@@ -200,11 +228,12 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         if val_row:
             result["best_val_metric"] = float(val_row[0])
 
-        # Best test model (lowest metric_value)
+        # Best test model (lowest metric_value) — valid-only, excluding legacy summary-only
         test_row = conn.execute(
             "SELECT name, metric_value, mean_nll "
             "FROM models "
             "WHERE split='test' AND status='ok' AND metric_value IS NOT NULL "
+            "AND code IS NOT NULL "
             "ORDER BY metric_value ASC "
             "LIMIT 1"
         ).fetchone()

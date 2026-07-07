@@ -815,6 +815,31 @@ class CandidateEvaluator:
                 "error_details": {"expected_func_name": func_name},
             }, False
 
+        # Static likelihood validation (pre-fit)
+        from gecco.offline_evaluation.likelihood_validation import (
+            validate_likelihood_static,
+        )
+
+        static_result = validate_likelihood_static(func_code, func_name)
+        if not static_result.passed:
+            console.print(
+                f"  [yellow]{display_name} static likelihood validation failed "
+                f"({static_result.error_type}): {static_result.error_message}[/]"
+            )
+            return {
+                "function_name": display_name,
+                "metric_name": "VALIDATION_ERROR",
+                "metric_value": float("inf"),
+                "param_names": [],
+                "code": func_code,
+                "error_type": "InvalidLikelihoodError",
+                "error_message": static_result.error_message,
+                "error_details": {
+                    "reason": static_result.error_type,
+                    **(static_result.error_details or {}),
+                },
+            }, False
+
         try:
             if recovery_checker is not None:
                 if set_activity is not None:
@@ -940,6 +965,37 @@ class CandidateEvaluator:
                 expected_func_name=func_name,
                 structured_params=structured_params,
             )
+
+            # Post-fit likelihood validation
+            from gecco.offline_evaluation.likelihood_validation import (
+                validate_likelihood_post_fit,
+            )
+
+            post_result = validate_likelihood_post_fit(
+                per_participant_nll=fit_res.get("per_participant_nll"),
+                mean_nll=fit_res.get("mean_nll"),
+                func_name=func_name,
+                n_participants=len(fit_res.get("per_participant_nll", [])),
+                participant_n_trials=fit_res.get("participant_n_trials"),
+            )
+            if not post_result.passed:
+                console.print(
+                    f"  [yellow]{display_name} post-fit likelihood validation failed "
+                    f"({post_result.error_type}): {post_result.error_message}[/]"
+                )
+                return {
+                    "function_name": display_name,
+                    "metric_name": "VALIDATION_ERROR",
+                    "metric_value": float("inf"),
+                    "param_names": fit_res.get("param_names", []),
+                    "code": func_code,
+                    "error_type": "InvalidLikelihoodError",
+                    "error_message": post_result.error_message,
+                    "error_details": {
+                        "reason": post_result.error_type,
+                        **(post_result.error_details or {}),
+                    },
+                }, False
 
             mean_metric = float(fit_res["metric_value"])
             metric_name = fit_res["metric_name"]

@@ -8,6 +8,7 @@ output from multiple GeCCo run directories.
 from __future__ import annotations
 
 import csv
+import html
 import os
 from pathlib import Path
 from typing import Any
@@ -539,6 +540,7 @@ _HTML_TEMPLATE = """\
   .fig-container img {{ max-width: 100%; border: 1px solid #eee; border-radius: 4px; }}
   .note {{ background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 0.75em 1em; margin: 1em 0; }}
   .summary-cell {{ font-size: 0.85em; color: #555; }}
+  .config-label {{ display: inline-block; line-height: 1.25; white-space: nowrap; }}
 </style>
 </head>
 <body>
@@ -590,6 +592,46 @@ def _format_val(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
+
+
+def _format_config_label_for_display(label: str | None) -> str:
+    """Return a human-readable config label for figures and HTML tables."""
+    if label is None or label == "":
+        return ""
+
+    raw_label = str(label)
+    leaf = Path(raw_label).name
+    if not leaf.startswith("judge_"):
+        return raw_label
+
+    tokens = leaf.split("_")
+    if len(tokens) < 2:
+        return raw_label
+
+    judge_type = tokens[1]
+    judge_display = {"llm": "LLM"}.get(judge_type, judge_type.capitalize())
+    if judge_type in {"off", "random"}:
+        return judge_display
+
+    detail = " ".join(tokens[2:]).strip()
+    if not detail:
+        return judge_display
+
+    detail = detail[0].upper() + detail[1:]
+    return f"{judge_display}\n{detail}"
+
+
+def _format_config_label_for_html(label: str | None) -> str:
+    """Return HTML-safe config label markup, preserving display line breaks."""
+    if label is None or label == "":
+        return _format_val(label)
+
+    display_label = _format_config_label_for_display(label)
+    return (
+        '<span class="config-label">'
+        f"{html.escape(display_label).replace(chr(10), '<br>')}"
+        "</span>"
+    )
 
 
 def render_report_html(
@@ -666,7 +708,7 @@ def render_report_html(
 
             config_table_html += (
                 "<tr>"
-                f"<td>{_format_val(cr.get('config_label'))}</td>"
+                f"<td>{_format_config_label_for_html(cr.get('config_label'))}</td>"
                 f"<td>{cr.get('n_runs', 0)}</td>"
                 f"<td>{_mean_std_cell('best_train_metric')}</td>"
                 f"<td>{_mean_std_cell('best_val_metric')}</td>"
@@ -685,7 +727,7 @@ def render_report_html(
     for s in summaries:
         rows_html += (
             "<tr>"
-            f"<td>{_format_val(s.get('config_label'))}</td>"
+            f"<td>{_format_config_label_for_html(s.get('config_label'))}</td>"
             f"<td>{_format_val(s.get('run_id'))}</td>"
             f"<td>{_format_val(s.get('best_model_name'))}</td>"
             f"<td>{_format_val(s.get('best_train_metric'))}</td>"
@@ -734,14 +776,16 @@ def _prepare_fit_vs_prediction_data(
     """
     if config_rows:
         labels = [
-            cr.get("config_label", f"cfg_{i}")
+            _format_config_label_for_display(cr.get("config_label", f"cfg_{i}"))
             for i, cr in enumerate(config_rows)
         ]
         x_vals = [cr.get("best_train_metric_mean") for cr in config_rows]
         y_vals = [cr.get("best_test_metric_mean") for cr in config_rows]
     else:
         labels = [
-            s.get("config_label", s.get("run_id", f"run_{i}"))
+            _format_config_label_for_display(
+                s.get("config_label", s.get("run_id", f"run_{i}"))
+            )
             for i, s in enumerate(summaries)
         ]
         x_vals = [s.get("best_train_metric") for s in summaries]
@@ -819,7 +863,9 @@ def export_figures(
     else:
         # Fallback: use run-level summaries as before
         labels_run = [
-            s.get("config_label", s.get("run_id", f"run_{i}"))
+            _format_config_label_for_display(
+                s.get("config_label", s.get("run_id", f"run_{i}"))
+            )
             for i, s in enumerate(summaries)
         ]
         train_vals = [s.get("best_train_metric") for s in summaries]
@@ -887,7 +933,10 @@ def _export_config_level_figures(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    labels = [cr.get("config_label", f"cfg_{i}") for i, cr in enumerate(config_rows)]
+    labels = [
+        _format_config_label_for_display(cr.get("config_label", f"cfg_{i}"))
+        for i, cr in enumerate(config_rows)
+    ]
 
     # -- 1. Main config comparison figure (test-evaluation only) --
     test_means, test_errs = _config_level_series(config_rows, "best_test_metric")
@@ -940,7 +989,10 @@ def _bar_chart_with_errors(
     if n_groups == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(max(6, n_groups * 0.8), 4))
+    has_multiline_labels = any("\n" in label for label in labels)
+    fig, ax = plt.subplots(
+        figsize=(max(6, n_groups * 0.8), 4.6 if has_multiline_labels else 4)
+    )
     index = np.arange(n_groups)
     bar_width = 0.8 / n_series
 
@@ -962,10 +1014,18 @@ def _bar_chart_with_errors(
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.set_xticks(index)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xticklabels(
+        labels,
+        rotation=0 if has_multiline_labels else 45,
+        ha="center" if has_multiline_labels else "right",
+        fontsize=8,
+    )
     ax.legend(fontsize=8)
     ax.text(
-        0.5, -0.25, caption, transform=ax.transAxes,
+        0.5,
+        -0.3 if has_multiline_labels else -0.25,
+        caption,
+        transform=ax.transAxes,
         ha="center", fontsize=8, color="gray", style="italic",
     )
     fig.tight_layout()
@@ -994,7 +1054,10 @@ def _bar_chart(
     if n_groups == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(max(6, n_groups * 0.8), 4))
+    has_multiline_labels = any("\n" in label for label in labels)
+    fig, ax = plt.subplots(
+        figsize=(max(6, n_groups * 0.8), 4.6 if has_multiline_labels else 4)
+    )
     index = np.arange(n_groups)
     bar_width = 0.8 / n_series
 
@@ -1008,10 +1071,18 @@ def _bar_chart(
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.set_xticks(index)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xticklabels(
+        labels,
+        rotation=0 if has_multiline_labels else 45,
+        ha="center" if has_multiline_labels else "right",
+        fontsize=8,
+    )
     ax.legend(fontsize=8)
     ax.text(
-        0.5, -0.25, caption, transform=ax.transAxes,
+        0.5,
+        -0.3 if has_multiline_labels else -0.25,
+        caption,
+        transform=ax.transAxes,
         ha="center", fontsize=8, color="gray", style="italic",
     )
     fig.tight_layout()

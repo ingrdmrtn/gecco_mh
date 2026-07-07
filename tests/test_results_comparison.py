@@ -496,12 +496,12 @@ def test_html_report_shows_config_and_run_tables(tmp_path: Path):
         summarise_run,
     )
 
-    # Two configs, one run each
-    run1 = tmp_path / "runs" / "cfg_x" / "run_001"
+    # Two judge configs, one run each
+    run1 = tmp_path / "runs" / "exp" / "judge_static_all_context" / "run_001"
     run1.mkdir(parents=True)
     _create_minimal_diagnostics(run1 / "diagnostics.duckdb", label="x")
 
-    run2 = tmp_path / "runs" / "cfg_y" / "run_002"
+    run2 = tmp_path / "runs" / "exp" / "judge_off" / "run_002"
     run2.mkdir(parents=True)
     _create_minimal_diagnostics(run2 / "diagnostics.duckdb", label="y")
 
@@ -517,9 +517,9 @@ def test_html_report_shows_config_and_run_tables(tmp_path: Path):
     # Should contain both tables
     assert "Config Summary" in html
     assert "Run Details" in html or "Run Overview" in html
-    # Should show config-level rows
-    assert "cfg_x" in html
-    assert "cfg_y" in html
+    # Should show readable config labels in both tables
+    assert "Static<br>All context" in html
+    assert ">Off<" in html
     # Should show run-level rows
     assert "run_001" in html
     assert "run_002" in html
@@ -588,7 +588,7 @@ def test_export_config_level_figures_uses_only_test_metrics_for_main_figure(
 
     config_rows = [
         {
-            "config_label": "cfg_a",
+            "config_label": "family/judge_off",
             "best_train_metric_mean": 100.0,
             "best_train_metric_std": 5.0,
             "best_val_metric_mean": 110.0,
@@ -601,7 +601,7 @@ def test_export_config_level_figures_uses_only_test_metrics_for_main_figure(
             "best_test_max_r2_std": 0.2,
         },
         {
-            "config_label": "cfg_b",
+            "config_label": "family/judge_static_all_context",
             "best_train_metric_mean": 200.0,
             "best_train_metric_std": 8.0,
             "best_val_metric_mean": 210.0,
@@ -620,7 +620,7 @@ def test_export_config_level_figures_uses_only_test_metrics_for_main_figure(
     assert len(calls) == 2
 
     main_call = next(c for c in calls if c["base_path"].name == "model_fit_by_config")
-    assert main_call["labels"] == ["cfg_a", "cfg_b"]
+    assert main_call["labels"] == ["Off", "Static\nAll context"]
     assert [name for name, _, _ in main_call["series"]] == ["Test"]
     assert main_call["series"][0][1] == [130.0, 230.0]
     assert main_call["series"][0][2] == [7.0, 10.0]
@@ -640,17 +640,17 @@ def test_prepare_fit_vs_prediction_with_config_rows_uses_means():
     from gecco.results_comparison import _prepare_fit_vs_prediction_data
 
     summaries = [
-        {"config_label": "cfg_a", "run_id": "run_001",
+        {"config_label": "family/judge_static_all_context", "run_id": "run_001",
          "best_train_metric": 100.0, "best_test_metric": 130.0},
-        {"config_label": "cfg_a", "run_id": "run_002",
+        {"config_label": "family/judge_static_all_context", "run_id": "run_002",
          "best_train_metric": 110.0, "best_test_metric": 140.0},
-        {"config_label": "cfg_b", "run_id": "run_003",
+        {"config_label": "family/judge_random", "run_id": "run_003",
          "best_train_metric": 200.0, "best_test_metric": 250.0},
     ]
     config_rows = [
-        {"config_label": "cfg_a",
+        {"config_label": "family/judge_static_all_context",
          "best_train_metric_mean": 105.0, "best_test_metric_mean": 135.0},
-        {"config_label": "cfg_b",
+        {"config_label": "family/judge_random",
          "best_train_metric_mean": 200.0, "best_test_metric_mean": 250.0},
     ]
 
@@ -659,7 +659,7 @@ def test_prepare_fit_vs_prediction_with_config_rows_uses_means():
     )
 
     # Uses config-level means, not run-level points
-    assert labels == ["cfg_a", "cfg_b"]
+    assert labels == ["Static\nAll context", "Random"]
     assert x_vals == [105.0, 200.0]   # config-level means
     assert y_vals == [135.0, 250.0]   # config-level means
 
@@ -670,17 +670,36 @@ def test_prepare_fit_vs_prediction_without_config_rows_uses_run_level():
     from gecco.results_comparison import _prepare_fit_vs_prediction_data
 
     summaries = [
-        {"config_label": "cfg_a", "run_id": "run_001",
+        {"config_label": "family/judge_off", "run_id": "run_001",
          "best_train_metric": 100.0, "best_test_metric": 130.0},
-        {"config_label": "cfg_b", "run_id": "run_002",
+        {"config_label": "family/judge_llm_attempted_performance_code", "run_id": "run_002",
          "best_train_metric": 200.0, "best_test_metric": 250.0},
     ]
 
     labels, x_vals, y_vals = _prepare_fit_vs_prediction_data(summaries)
 
-    assert labels == ["cfg_a", "cfg_b"]
+    assert labels == ["Off", "LLM\nAttempted performance code"]
     assert x_vals == [100.0, 200.0]   # run-level values
     assert y_vals == [130.0, 250.0]   # run-level values
+
+
+def test_format_config_label_for_display_groups_judge_type():
+    """Judge configs are rendered as readable grouped display labels."""
+    from gecco.results_comparison import _format_config_label_for_display
+
+    assert _format_config_label_for_display("family/judge_off") == "Off"
+    assert _format_config_label_for_display("family/judge_random") == "Random"
+    assert (
+        _format_config_label_for_display("family/judge_static_all_context")
+        == "Static\nAll context"
+    )
+    assert (
+        _format_config_label_for_display(
+            "family/judge_llm_attempted_performance_code"
+        )
+        == "LLM\nAttempted performance code"
+    )
+    assert _format_config_label_for_display("cfg_a") == "cfg_a"
 
 
 def test_config_level_series_uses_nan_for_missing_values():

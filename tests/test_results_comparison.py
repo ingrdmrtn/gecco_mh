@@ -559,6 +559,76 @@ def test_export_figures_with_config_rows_uses_means(tmp_path: Path):
         assert (fig_dir / f"{fname}.pdf").exists()
 
 
+def test_export_config_level_figures_uses_only_test_metrics_for_main_figure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The main config comparison figure is driven only by test metrics."""
+    from gecco.results_comparison import _export_config_level_figures
+
+    calls = []
+
+    def fake_bar_chart_with_errors(
+        base_path, labels, series, title, ylabel, caption
+    ):
+        calls.append(
+            {
+                "base_path": base_path,
+                "labels": labels,
+                "series": series,
+                "title": title,
+                "ylabel": ylabel,
+                "caption": caption,
+            }
+        )
+
+    monkeypatch.setattr(
+        "gecco.results_comparison._bar_chart_with_errors",
+        fake_bar_chart_with_errors,
+    )
+
+    config_rows = [
+        {
+            "config_label": "cfg_a",
+            "best_train_metric_mean": 100.0,
+            "best_train_metric_std": 5.0,
+            "best_val_metric_mean": 110.0,
+            "best_val_metric_std": 6.0,
+            "best_test_metric_mean": 130.0,
+            "best_test_metric_std": 7.0,
+            "best_test_mean_r2_mean": 0.5,
+            "best_test_mean_r2_std": 0.1,
+            "best_test_max_r2_mean": 0.6,
+            "best_test_max_r2_std": 0.2,
+        },
+        {
+            "config_label": "cfg_b",
+            "best_train_metric_mean": 200.0,
+            "best_train_metric_std": 8.0,
+            "best_val_metric_mean": 210.0,
+            "best_val_metric_std": 9.0,
+            "best_test_metric_mean": 230.0,
+            "best_test_metric_std": 10.0,
+            "best_test_mean_r2_mean": 0.7,
+            "best_test_mean_r2_std": 0.3,
+            "best_test_max_r2_mean": 0.8,
+            "best_test_max_r2_std": 0.4,
+        },
+    ]
+
+    _export_config_level_figures(tmp_path, config_rows)
+
+    assert len(calls) == 2
+
+    main_call = next(c for c in calls if c["base_path"].name == "model_fit_by_config")
+    assert main_call["labels"] == ["cfg_a", "cfg_b"]
+    assert [name for name, _, _ in main_call["series"]] == ["Test"]
+    assert main_call["series"][0][1] == [130.0, 230.0]
+    assert main_call["series"][0][2] == [7.0, 10.0]
+    assert main_call["title"] == "Test Evaluation by Config (mean ± SD)"
+    assert main_call["ylabel"] == "Metric Value"
+    assert main_call["caption"] == "Best Test Metric (lower is better)"
+
+
 # --------------------------------------------------------------------------- #
 # Config-level figure data helpers
 # --------------------------------------------------------------------------- #

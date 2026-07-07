@@ -572,7 +572,7 @@ _HTML_TEMPLATE = """\
 
 <h2>Figures</h2>
 <div class="fig-container">
-  <div><h3>Model Fit by Config</h3><img src="figures/model_fit_by_config.png" alt="Model fit by config"></div>
+  <div><h3>Test Evaluation by Config</h3><img src="figures/model_fit_by_config.png" alt="Test evaluation by config"></div>
   <div><h3>Individual Differences by Config</h3><img src="figures/individual_differences_by_config.png" alt="Individual differences by config"></div>
   <div><h3>Fit vs Prediction</h3><img src="figures/fit_vs_prediction.png" alt="Fit vs prediction"></div>
 </div>
@@ -779,9 +779,9 @@ def export_figures(
 
     Three figures are generated:
 
-    1. ``model_fit_by_config`` — bar chart of best train/val/test metrics per
-       config.  When *config_rows* is provided, bars show config-level means
-       with error bars (standard deviation).
+    1. ``model_fit_by_config`` — bar chart of model-comparison metrics per
+       config.  At config level this uses only test-evaluation metrics; at
+       run level it continues to show best train/val/test metrics.
     2. ``individual_differences_by_config`` — bar chart of ID R² values per
        config.  When *config_rows* is provided, bars show config-level means
        with error bars.
@@ -797,8 +797,9 @@ def export_figures(
         Directory under which a ``figures/`` sub-directory is created.
     config_rows:
         Optional list of config-level summary dicts.  When provided the
-        config comparison bar charts and the fit-vs-prediction scatter all
-        use config-level aggregates.
+        config comparison bar charts and the fit-vs-prediction scatter use
+        config-level aggregates; the main comparison chart is driven only by
+        test-evaluation metrics.
 
     Returns
     -------
@@ -888,22 +889,18 @@ def _export_config_level_figures(
 
     labels = [cr.get("config_label", f"cfg_{i}") for i, cr in enumerate(config_rows)]
 
-    # -- 1. Model fit by config (config-level means) --
-    train_means, train_errs = _config_level_series(config_rows, "best_train_metric")
-    val_means, val_errs = _config_level_series(config_rows, "best_val_metric")
+    # -- 1. Main config comparison figure (test-evaluation only) --
     test_means, test_errs = _config_level_series(config_rows, "best_test_metric")
 
     _bar_chart_with_errors(
         fig_dir / "model_fit_by_config",
         labels,
         [
-            ("Train", train_means, train_errs),
-            ("Val", val_means, val_errs),
             ("Test", test_means, test_errs),
         ],
-        "Model Fit by Config (mean ± SD)",
+        "Test Evaluation by Config (mean ± SD)",
         "Metric Value",
-        "Best Fit Metric (lower is better)",
+        "Best Test Metric (lower is better)",
     )
 
     # -- 2. Individual differences by config (config-level means) --

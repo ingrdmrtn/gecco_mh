@@ -708,27 +708,28 @@ def test_invalid_test_row_excluded_in_favor_of_valid(tmp_path: Path):
     assert summary["n_excluded_rows"] >= 1
 
 
-def test_legacy_summary_only_row_excluded(tmp_path: Path):
-    """A legacy summary-only test row (code IS NULL, status='ok')
-    with a low BIC is excluded from best_test_metric selection."""
+def test_code_null_test_row_is_selected_when_lower_bic(tmp_path: Path):
+    """A successful test row with code=NULL and a lower BIC is selected,
+    not excluded.  Only status != 'ok' rows are excluded."""
     from gecco.results_comparison import discover_run_dirs, summarise_run
 
-    run = tmp_path / "legacy_excluded"
+    run = tmp_path / "code_null_selected"
     run.mkdir(parents=True)
     # Create valid test row with higher BIC
     _create_minimal_diagnostics(run / "diagnostics.duckdb", label="modern")
-    # Add legacy row with lower (better-looking) BIC but no code
+    # Add code-NULL row with lower (better-looking) BIC
     _create_legacy_test_row(run / "diagnostics.duckdb",
-                            model_name="legacy_cheater", low_bic=90.0)
+                            model_name="code_null_better", low_bic=90.0)
 
     discovered = discover_run_dirs([tmp_path])
     summary = summarise_run(discovered[0])
 
-    # Legacy row is excluded; valid row's metrics are used
-    assert summary["best_test_metric"] == 130.0  # modern_model_a's test BIC
-    # best_model_name comes from train split (lowest train BIC = model_b)
+    # code-NULL row has lower BIC (90 < 130) so it is selected
+    assert summary["best_test_metric"] == 90.0
+    # best_model_name still comes from train split (lowest train BIC = model_b)
     assert summary["best_model_name"] == "modern_model_b"
-    assert summary["n_excluded_rows"] >= 1
+    # No rows are excluded (both have status='ok')
+    assert summary["n_excluded_rows"] == 0
 
 
 def test_exclusion_warnings_available(tmp_path: Path):
@@ -752,8 +753,134 @@ def test_exclusion_warnings_available(tmp_path: Path):
     assert "invalid" in combined or "excluded" in combined
 
 
+def _create_test_only_diagnostics(db_path: Path, *,
+                                  label: str = "test_only",
+                                  test_bic: float = 100.0,
+                                  with_id: bool = True) -> None:
+    """Create a diagnostics DuckDB with only test rows (no train/val)."""
+    store = DiagnosticStore(db_path)
+    id_data = None
+    if with_id:
+        id_data = {
+            "mean_r2": 0.5,
+            "max_r2": 0.6,
+            "best_param": "lambda",
+            "per_param_r2": {"lambda": 0.6},
+            "per_param_detail": {
+                "lambda": {"r2": 0.6, "slope": 0.7, "intercept": 0.3},
+            },
+        }
+    store.write_top_model_test({
+        "model_name": f"{label}_test_model",
+        "val_nll": 2.0,
+        "test_mean_BIC": test_bic,
+        "test_mean_NLL": 2.5,
+        "test_individual_BIC": [test_bic],
+        "test_individual_NLL": [2.5],
+        "test_individual_differences": id_data,
+        "code": None,
+        "param_names": ["lambda"],
+        "status": "ok",
+    })
+    store.close()
+
+
+def test_code_null_test_row_with_id_joins_correctly(tmp_path: Path):
+    """A code-NULL successful test row with individual_differences
+    correctly populates ID summary fields."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "code_null_id"
+    run.mkdir(parents=True)
+    # Create diagnostics with a code-NULL test row that HAS individual differences
+    _create_test_only_diagnostics(run / "diagnostics.duckdb",
+                                  label="code_null_id", test_bic=95.0, with_id=True)
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    assert summary["best_test_metric"] == 95.0
+    assert summary["best_test_nll"] == 2.5
+    assert summary["best_test_mean_r2"] == 0.5
+    assert summary["best_test_max_r2"] == 0.6
+    assert summary["best_test_param"] == "lambda"
+    assert summary["has_test_eval"] is True
+    assert summary["has_individual_differences"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Split-store fallback (unified primary + sibling diagnostics)
+# --------------------------------------------------------------------------- #
+
+
+def test_split_store_fallback_uses_sibling_test_rows(tmp_path: Path):
+    """When diagnostics_unified.duckdb has train/val only and a sibling
+    diagnostics.duckdb has test/ID rows, the summary combines train/val
+    from unified and test/ID from sibling."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "split_fallback"
+    run.mkdir(parents=True)
+
+    # Create primary unified DB with train/val only
+    _create_minimal_diagnostics_train_only(
+        run / "diagnostics_unified.duckdb", label="unified"
+    )
+
+    # Create sibling diagnostics.duckdb with test/ID rows
+    _create_test_only_diagnostics(
+        run / "diagnostics.duckdb", label="sibling", test_bic=88.0, with_id=True
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    # Discovery should pick up diagnostics_unified.duckdb (it's listed first)
+    entry = discovered[0]
+    assert "diagnostics_unified" in entry["db_path"]
+
+    summary = summarise_run(entry)
+
+    # Train/val come from the unified primary
+    assert summary["best_train_metric"] == 100.0
+    # Test/ID come from the sibling fallback
+    assert summary["best_test_metric"] == 88.0
+    assert summary["best_test_nll"] == 2.5
+    assert summary["best_test_mean_r2"] == 0.5
+    assert summary["best_test_max_r2"] == 0.6
+    assert summary["best_test_param"] == "lambda"
+    assert summary["has_test_eval"] is True
+    assert summary["has_individual_differences"] is True
+
+
+def test_split_store_primary_wins_when_it_has_test_rows(tmp_path: Path):
+    """When diagnostics_unified.duckdb already has valid test rows,
+    sibling diagnostics.duckdb test rows are NOT used."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "split_primary_wins"
+    run.mkdir(parents=True)
+
+    # Create primary unified DB with train/val/test rows (test BIC = 130)
+    _create_minimal_diagnostics(run / "diagnostics_unified.duckdb", label="unified")
+
+    # Create sibling diagnostics.duckdb with LOWER test BIC (should be ignored)
+    _create_test_only_diagnostics(
+        run / "diagnostics.duckdb", label="sibling", test_bic=20.0, with_id=True
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    entry = discovered[0]
+
+    summary = summarise_run(entry)
+
+    # Primary's test row (BIC=130) wins over sibling (BIC=20)
+    assert summary["best_test_metric"] == 130.0
+    # ID data comes from primary
+    assert summary["best_test_mean_r2"] == 0.75
+    assert summary["has_test_eval"] is True
+
+
 def test_excluded_rows_do_not_feed_figure_data(tmp_path: Path):
-    """Excluded (invalid/legacy) rows do not affect summary metrics
+    """Excluded (status != 'ok') rows do not affect summary metrics
     used by figure/report generation."""
     from gecco.results_comparison import discover_run_dirs, summarise_run
 
@@ -765,19 +892,17 @@ def test_excluded_rows_do_not_feed_figure_data(tmp_path: Path):
     discovered = discover_run_dirs([tmp_path])
     summary_before = summarise_run(discovered[0])
 
-    # Now add an invalid row and a legacy row, both with very low BIC
+    # Now add an invalid row with a very low BIC (should be excluded)
     _create_invalid_test_row(run / "diagnostics.duckdb",
                              model_name="bad_invalid", low_bic=10.0)
-    _create_legacy_test_row(run / "diagnostics.duckdb",
-                            model_name="bad_legacy", low_bic=5.0)
 
     # Re-read; summarise_run must recompute
     discovered_after = discover_run_dirs([tmp_path])
     summary_after = summarise_run(discovered_after[0])
 
-    # best_test_metric must be unchanged (invalid/legacy rows excluded)
+    # best_test_metric must be unchanged (invalid rows excluded)
     assert summary_after["best_test_metric"] == summary_before["best_test_metric"]
     assert summary_after["best_test_metric"] == 130.0
     assert summary_after["best_model_name"] == summary_before["best_model_name"]
     # n_models may differ because rows were added; but n_excluded_rows > 0
-    assert summary_after["n_excluded_rows"] > 0
+    assert summary_after["n_excluded_rows"] == 1

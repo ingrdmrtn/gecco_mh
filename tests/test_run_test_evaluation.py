@@ -249,3 +249,298 @@ class TestFitOneOnTestMissingCode:
 
         result = fit_one_on_test(candidate, mock_df, mock_cfg)
         assert result is None
+
+
+# ----------------------------------------------------------------------- #
+# Collect-candidates backfill
+# ----------------------------------------------------------------------- #
+
+
+def _make_mock_registry(iteration_history, candidate_generations=None):
+    """Build a mock SharedRegistry whose .read() returns the given data."""
+    from unittest.mock import MagicMock
+
+    registry = MagicMock()
+    registry.read.return_value = {
+        "candidate_generations": candidate_generations or {},
+        "iteration_history": iteration_history,
+    }
+    return registry
+
+
+def _make_cfg(metric="BIC"):
+    """Build a minimal mock config for collect_candidates."""
+    from unittest.mock import MagicMock
+
+    cfg = MagicMock()
+    cfg.evaluation.metric = metric
+    return cfg
+
+
+def _generation_candidate(index, code="def gen_func(a, b): return 0.0",
+                          func_name="gen_func", param_names=None):
+    """Build a candidate generation entry dict."""
+    return {
+        "index": index,
+        "code": code,
+        "func_name": func_name,
+        "function_name": func_name,
+        "executable_function_name": func_name,
+        "param_names": param_names or ["a", "b"],
+    }
+
+
+class TestCollectCandidatesBackfill:
+    """collect_candidates backfills missing result code from generated candidates."""
+
+    def test_backfills_code_from_matching_candidate_index(self):
+        """When an iteration result lacks code but has a candidate_index
+        matching a generated candidate, code/executable_function_name/param_names
+        are backfilled."""
+        from gecco.cli.run_test_evaluation import collect_candidates
+
+        generation_candidates = [
+            _generation_candidate(
+                index=2, code="def my_func(x): return x",
+                func_name="my_func", param_names=["alpha"]
+            ),
+        ]
+        iteration_history = [
+            {
+                "client_id": "client_0",
+                "iteration": 1,
+                "results": [
+                    {
+                        "candidate_index": 2,
+                        # No 'code' key → code is empty string
+                        "metric_value": 100.0,
+                        "mean_nll": 3.0,
+                    },
+                ],
+            },
+        ]
+        registry = _make_mock_registry(
+            iteration_history,
+            {"1": {"candidates": generation_candidates}},
+        )
+        cfg = _make_cfg("BIC")
+
+        candidates = collect_candidates(registry, cfg)
+        assert len(candidates) == 1
+        assert candidates[0]["code"] == "def my_func(x): return x"
+        assert candidates[0]["candidate_index"] == 2
+        assert candidates[0]["param_names"] == ["alpha"]
+        # executable_function_name may be resolved differently; at least
+        # it should not be empty given the backfill provides func_name
+        assert candidates[0]["executable_function_name"]
+
+    def test_does_not_backfill_code_when_index_missing(self):
+        """When an iteration result lacks code AND has no candidate_index,
+        no backfill occurs and the candidate has empty code."""
+        from gecco.cli.run_test_evaluation import collect_candidates
+
+        # No candidate_index and no code in the result
+        iteration_history = [
+            {
+                "client_id": "client_0",
+                "iteration": 1,
+                "results": [
+                    {
+                        "metric_value": 100.0,
+                        "mean_nll": 3.0,
+                    },
+                ],
+            },
+        ]
+        registry = _make_mock_registry(iteration_history)
+        cfg = _make_cfg("BIC")
+
+        candidates = collect_candidates(registry, cfg)
+        assert len(candidates) == 1
+        assert candidates[0]["code"] == ""
+
+    def test_does_not_backfill_from_non_matching_candidate(self):
+        """When no generated candidate matches the candidate_index,
+        code stays empty."""
+        from gecco.cli.run_test_evaluation import collect_candidates
+
+        generation_candidates = [
+            _generation_candidate(index=99, code="def unrelated(x): return x"),
+        ]
+        iteration_history = [
+            {
+                "client_id": "client_0",
+                "iteration": 1,
+                "results": [
+                    {
+                        "candidate_index": 2,  # No generated candidate with index 2
+                        "metric_value": 100.0,
+                        "mean_nll": 3.0,
+                    },
+                ],
+            },
+        ]
+        registry = _make_mock_registry(
+            iteration_history,
+            {"1": {"candidates": generation_candidates}},
+        )
+        cfg = _make_cfg("BIC")
+
+        candidates = collect_candidates(registry, cfg)
+        assert len(candidates) == 1
+        # Code stays empty because no generated candidate matched index 2
+        assert candidates[0]["code"] == ""
+
+
+# ----------------------------------------------------------------------- #
+# Write-store target selection
+# ----------------------------------------------------------------------- #
+
+
+def _fake_candidate():
+    """Return a minimal candidate dict for write-store tests."""
+    return {
+        "client_id": "client_0",
+        "iteration": 1,
+        "candidate_index": 0,
+        "function_name": "test_model",
+        "display_name": "test_model",
+        "executable_function_name": "test_model",
+        "code": "def test_model(a, b): return 0.0",
+        "code_hash": "abc123",
+        "selection_metric_name": "metric_value",
+        "selection_metric_value": 100.0,
+        "param_names": ["a", "b"],
+    }
+
+
+def _fake_test_entry():
+    """Return a minimal test result entry as returned by fit_one_on_test."""
+    return {
+        "model_name": "test_model",
+        "display_name": "test_model",
+        "executable_function_name": "test_model",
+        "client_id": "client_0",
+        "iteration": 1,
+        "candidate_index": 0,
+        "selection_metric_name": "metric_value",
+        "selection_metric_value": 100.0,
+        "val_nll": 3.5,
+        "test_mean_BIC": 120.0,
+        "test_mean_NLL": 3.8,
+        "test_individual_BIC": [120.0],
+        "test_individual_NLL": [3.8],
+        "code": "def test_model(a, b): return 0.0",
+        "param_names": ["a", "b"],
+        "status": "ok",
+    }
+
+
+def test_write_store_prefers_unified_db(tmp_path):
+    """When diagnostics_unified.duckdb exists, write_store writes test
+    rows to it instead of diagnostics.duckdb."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+    from gecco.cli.run_test_evaluation import run_test_evaluation
+    from unittest.mock import patch
+    import duckdb
+
+    # Create a dummy shared_registry.duckdb so the exists() check passes
+    registry_db = tmp_path / "shared_registry.duckdb"
+    duckdb.connect(str(registry_db)).close()
+
+    # Create diagnostics_unified.duckdb
+    unified_db = tmp_path / "diagnostics_unified.duckdb"
+    store = DiagnosticStore(unified_db)
+    store.close()
+
+    with patch("gecco.cli.run_test_evaluation.load_config") as mock_load_cfg:
+        with patch("gecco.cli.run_test_evaluation.SharedRegistry") as mock_reg:
+            with patch("gecco.cli.run_test_evaluation.load_splits") as mock_splits:
+                with patch("gecco.cli.run_test_evaluation.collect_candidates",
+                           return_value=[_fake_candidate()]) as mock_collect:
+                    with patch("gecco.cli.run_test_evaluation.fit_one_on_test",
+                               return_value=_fake_test_entry()) as mock_fit:
+                        cfg = mock_load_cfg.return_value
+                        cfg.evaluation.n_test_models = 1
+                        cfg.evaluation.metric = "BIC"
+
+                        mock_reg_instance = mock_reg.open_existing.return_value
+                        mock_reg_instance.read.return_value = {}
+
+                        run_test_evaluation(
+                            config="dummy",
+                            results_dir=str(tmp_path),
+                            write_store=True,
+                        )
+
+    # Prove rows were actually written to the unified DB
+    unified_conn = duckdb.connect(str(unified_db), read_only=True)
+    try:
+        count = unified_conn.execute(
+            "SELECT COUNT(*) FROM models WHERE split='test'"
+        ).fetchone()[0]
+        assert count > 0, f"Expected test rows in unified DB, got {count}"
+    finally:
+        unified_conn.close()
+
+    # Also verify the fallback diagnostics.duckdb was NOT written to
+    sibling_db = tmp_path / "diagnostics.duckdb"
+    if sibling_db.exists():
+        sibling_conn = duckdb.connect(str(sibling_db), read_only=True)
+        try:
+            sib_count = sibling_conn.execute(
+                "SELECT COUNT(*) FROM models WHERE split='test'"
+            ).fetchone()[0]
+            assert sib_count == 0, (
+                f"Expected 0 test rows in sibling diagnostics.duckdb, got {sib_count}"
+            )
+        finally:
+            sibling_conn.close()
+
+
+def test_write_store_falls_back_to_diagnostics_db(tmp_path):
+    """When only diagnostics.duckdb exists (no unified DB),
+    write_store writes test rows to diagnostics.duckdb."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+    from gecco.cli.run_test_evaluation import run_test_evaluation
+    from unittest.mock import patch
+    import duckdb
+
+    # Create a dummy shared_registry.duckdb
+    registry_db = tmp_path / "shared_registry.duckdb"
+    duckdb.connect(str(registry_db)).close()
+
+    # Create only diagnostics.duckdb (no unified DB)
+    legacy_db = tmp_path / "diagnostics.duckdb"
+    store = DiagnosticStore(legacy_db)
+    store.close()
+
+    with patch("gecco.cli.run_test_evaluation.load_config") as mock_load_cfg:
+        with patch("gecco.cli.run_test_evaluation.SharedRegistry") as mock_reg:
+            with patch("gecco.cli.run_test_evaluation.load_splits") as mock_splits:
+                with patch("gecco.cli.run_test_evaluation.collect_candidates",
+                           return_value=[_fake_candidate()]) as mock_collect:
+                    with patch("gecco.cli.run_test_evaluation.fit_one_on_test",
+                               return_value=_fake_test_entry()) as mock_fit:
+                        cfg = mock_load_cfg.return_value
+                        cfg.evaluation.n_test_models = 1
+                        cfg.evaluation.metric = "BIC"
+
+                        mock_reg_instance = mock_reg.open_existing.return_value
+                        mock_reg_instance.read.return_value = {}
+
+                        run_test_evaluation(
+                            config="dummy",
+                            results_dir=str(tmp_path),
+                            write_store=True,
+                        )
+
+    # Prove rows were actually written to the legacy (fallback) DB
+    legacy_conn = duckdb.connect(str(legacy_db), read_only=True)
+    try:
+        count = legacy_conn.execute(
+            "SELECT COUNT(*) FROM models WHERE split='test'"
+        ).fetchone()[0]
+        assert count > 0, f"Expected test rows in diagnostics.duckdb, got {count}"
+    finally:
+        legacy_conn.close()

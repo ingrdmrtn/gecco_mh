@@ -120,16 +120,13 @@ _COLUMN_ORDER = [
 
 
 def _count_excluded_test_rows(conn) -> tuple[int, list[str]]:
-    """Count test-split rows that are valid-ok but lack code (legacy summary-only rows),
-    returning (count, list_of_exclusion_reasons_for_this_run)."""
+    """Count test-split rows excluded from best-metric selection.
+
+    Only rows with ``status != 'ok'`` are excluded; successful test rows
+    with ``code IS NULL`` are no longer treated as legacy summary-only rows
+    and are counted as valid for test-evaluation statistics.
+    """
     reasons = []
-    # Legacy summary-only rows: status='ok', split='test', code IS NULL
-    legacy_count = conn.execute(
-        "SELECT COUNT(*) FROM models "
-        "WHERE split='test' AND status='ok' AND code IS NULL"
-    ).fetchone()[0] or 0
-    if legacy_count:
-        reasons.append(f"{legacy_count} legacy test row(s) excluded (status='ok' but no model code)")
     # Rows with non-ok status on test split
     invalid_count = conn.execute(
         "SELECT COUNT(*) FROM models "
@@ -137,7 +134,7 @@ def _count_excluded_test_rows(conn) -> tuple[int, list[str]]:
     ).fetchone()[0] or 0
     if invalid_count:
         reasons.append(f"{invalid_count} invalid test row(s) excluded (status != 'ok')")
-    return legacy_count + invalid_count, reasons
+    return invalid_count, reasons
 
 
 def summarise_run(entry: dict) -> dict[str, Any]:
@@ -228,12 +225,11 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         if val_row:
             result["best_val_metric"] = float(val_row[0])
 
-        # Best test model (lowest metric_value) — valid-only, excluding legacy summary-only
+        # Best test model (lowest metric_value) — valid-only, including code-null rows
         test_row = conn.execute(
-            "SELECT name, metric_value, mean_nll "
+            "SELECT name, metric_value, mean_nll, model_id "
             "FROM models "
             "WHERE split='test' AND status='ok' AND metric_value IS NOT NULL "
-            "AND code IS NOT NULL "
             "ORDER BY metric_value ASC "
             "LIMIT 1"
         ).fetchone()
@@ -246,13 +242,12 @@ def summarise_run(entry: dict) -> dict[str, Any]:
 
             # Look up individual differences for the best test model
             if "individual_differences" in tables:
-                test_model_name = test_row[0]
+                test_model_id = test_row[3]
                 id_row = conn.execute(
                     "SELECT id.mean_r2, id.max_r2, id.best_param "
                     "FROM individual_differences id "
-                    "JOIN models m ON m.model_id = id.model_id "
-                    "WHERE m.name=? AND m.split='test' AND id.split='test'",
-                    [test_model_name],
+                    "WHERE id.model_id=? AND id.split='test'",
+                    [test_model_id],
                 ).fetchone()
                 if id_row:
                     result["best_test_mean_r2"] = (
@@ -266,7 +261,83 @@ def summarise_run(entry: dict) -> dict[str, Any]:
     finally:
         conn.close()
 
+    # -- Sibling test-only fallback --
+    # If the primary DB is diagnostics_unified.duckdb and has no valid test
+    # rows, try a sibling diagnostics.duckdb in the same directory for
+    # test/individual-differences data only.
+    if (
+        not result["has_test_eval"]
+        and Path(db_path).name == "diagnostics_unified.duckdb"
+    ):
+        sibling = Path(db_path).parent / "diagnostics.duckdb"
+        if sibling.exists():
+            try:
+                _merge_sibling_test_rows(result, str(sibling))
+            except Exception as exc:
+                result["exclusion_warnings"].append(
+                    f"Sibling fallback to {sibling.name} failed: {exc}"
+                )
+
     return result
+
+
+def _merge_sibling_test_rows(
+    result: dict[str, Any], sibling_db_path: str
+) -> None:
+    """Query a sibling ``diagnostics.duckdb`` for test/ID rows and merge
+    into *result* when the primary DB had none.
+
+    Only the best-test-metric, test-NLL, individual-differences, and
+    test-evaluation booleans are overwritten; train/val/metrics and model
+    counts remain as set by the primary DB.
+    """
+    conn = duckdb.connect(sibling_db_path, read_only=True)
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+            ).fetchall()
+        ]
+        if "models" not in tables:
+            return
+
+        # Best test model (lowest metric_value) — valid-only
+        test_row = conn.execute(
+            "SELECT name, metric_value, mean_nll, model_id "
+            "FROM models "
+            "WHERE split='test' AND status='ok' AND metric_value IS NOT NULL "
+            "ORDER BY metric_value ASC "
+            "LIMIT 1"
+        ).fetchone()
+        if not test_row:
+            return
+
+        result["best_test_metric"] = float(test_row[1])
+        result["best_test_nll"] = (
+            float(test_row[2]) if test_row[2] is not None else None
+        )
+        result["has_test_eval"] = True
+
+        if "individual_differences" in tables:
+            test_model_id = test_row[3]
+            id_row = conn.execute(
+                "SELECT id.mean_r2, id.max_r2, id.best_param "
+                "FROM individual_differences id "
+                "WHERE id.model_id=? AND id.split='test'",
+                [test_model_id],
+            ).fetchone()
+            if id_row:
+                result["best_test_mean_r2"] = (
+                    float(id_row[0]) if id_row[0] is not None else None
+                )
+                result["best_test_max_r2"] = (
+                    float(id_row[1]) if id_row[1] is not None else None
+                )
+                result["best_test_param"] = id_row[2]
+                result["has_individual_differences"] = True
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #

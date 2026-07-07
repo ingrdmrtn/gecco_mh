@@ -146,8 +146,27 @@ def collect_candidates(registry, cfg):
                     None,
                 )
             )
-            code = result.get("code", "")
+            code = result.get("code") or ""
             candidate_index = result.get("candidate_index")
+
+            # Backfill missing code, executable function name, and param
+            # names from the matching generated candidate record when the
+            # iteration result lacks them.
+            if not code and candidate_index is not None:
+                for generation_candidate in generation_candidates:
+                    if generation_candidate.get("index") == candidate_index:
+                        code = generation_candidate.get("code") or ""
+                        if not executable_function_name:
+                            executable_function_name = (
+                                generation_candidate.get("executable_function_name")
+                                or generation_candidate.get("func_name")
+                                or generation_candidate.get("function_name")
+                                or executable_function_name
+                            )
+                        if not result.get("param_names"):
+                            result["param_names"] = generation_candidate.get("param_names", [])
+                        break
+
             candidate_key = (
                 client_id,
                 iteration,
@@ -551,7 +570,13 @@ def run_test_evaluation(
         try:
             from gecco.diagnostic_store.store import DiagnosticStore
 
-            db_path = resolved_results_dir / "diagnostics.duckdb"
+            # Prefer diagnostics_unified.duckdb when it exists, otherwise
+            # fall back to diagnostics.duckdb.
+            unified_path = resolved_results_dir / "diagnostics_unified.duckdb"
+            if unified_path.exists():
+                db_path = unified_path
+            else:
+                db_path = resolved_results_dir / "diagnostics.duckdb"
             store = DiagnosticStore(str(db_path))
             for entry in results:
                 store.write_top_model_test(entry)

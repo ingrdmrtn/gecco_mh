@@ -236,6 +236,51 @@ class TestFitOneOnTestSuccess:
 
 
 # ----------------------------------------------------------------------- #
+# Composed-path static validation (exact reported return-0.5 model)
+# ----------------------------------------------------------------------- #
+
+
+class TestFitOneOnTestExactReportedModel:
+    """fit_one_on_test with the exact reported constant-return model
+    (``return 0.5``), WITHOUT mocking the static validator."""
+
+    RETURN_HALF_CANDIDATE_CODE = (
+        "def test_model(stimulus, action, reward, params):\n"
+        "    return 0.5\n"
+    )
+
+    def test_rejects_without_success_metrics(self, mock_df, mock_cfg):
+        """A constant-return model must be rejected and expose no success
+        metrics, without the test needing to mock validate_likelihood_static."""
+        candidate = {
+            "display_name": "test_model",
+            "function_name": "test_model",
+            "code": self.RETURN_HALF_CANDIDATE_CODE,
+            "client_id": "client_0",
+            "iteration": 5,
+            "candidate_index": 2,
+            "selection_metric_name": "metric_value",
+            "selection_metric_value": 100.0,
+            "val_mean_nll": 3.5,
+            "param_names": ["alpha"],
+        }
+
+        from gecco.cli.run_test_evaluation import fit_one_on_test
+
+        result = fit_one_on_test(candidate, mock_df, mock_cfg)
+
+        assert result is not None
+        assert result["model_name"] == "test_model"
+        assert result["status"] == "constant_likelihood"
+        assert result["error_type"] == "InvalidLikelihoodError"
+        # No success metrics
+        assert result["test_mean_BIC"] is None
+        assert result["test_mean_NLL"] is None
+        assert result["test_individual_BIC"] == []
+        assert result["test_individual_NLL"] == []
+
+
+# ----------------------------------------------------------------------- #
 # Missing code
 # ----------------------------------------------------------------------- #
 

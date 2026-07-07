@@ -8,12 +8,37 @@ output from multiple GeCCo run directories.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import html
 import os
 from pathlib import Path
 from typing import Any
 
 import duckdb
+
+# --------------------------------------------------------------------------- #
+# Comparison threshold configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclasses.dataclass(frozen=True)
+class ComparisonThresholds:
+    """Sanity thresholds for selecting test rows in comparison summaries.
+
+    Attributes
+    ----------
+    min_mean_nll:
+        Minimum acceptable ``mean_nll``.  Rows with ``code IS NULL``
+        and ``mean_nll < min_mean_nll`` are excluded.  Set to ``None``
+        to disable this filter.  Default ``1.0``.
+    min_metric_value:
+        Minimum acceptable ``metric_value``.  Rows with ``code IS NULL``
+        and ``metric_value < min_metric_value`` are excluded.  Set to
+        ``None`` to disable this filter.  Default ``20.0``.
+    """
+    min_mean_nll: float | None = 1.0
+    min_metric_value: float | None = 20.0
+
 
 # --------------------------------------------------------------------------- #
 # Discovery
@@ -115,19 +140,35 @@ _COLUMN_ORDER = [
     "best_model_name",
     "n_models",
     "n_failed_models",
+    "n_excluded_rows",
+    "exclusion_warnings",
     "has_test_eval",
     "has_individual_differences",
 ]
 
 
-def _count_excluded_test_rows(conn) -> tuple[int, list[str]]:
+def _count_excluded_test_rows(
+    conn,
+    thresholds: ComparisonThresholds | None = None,
+) -> tuple[int, list[str]]:
     """Count test-split rows excluded from best-metric selection.
 
-    Only rows with ``status != 'ok'`` are excluded; successful test rows
-    with ``code IS NULL`` are no longer treated as legacy summary-only rows
-    and are counted as valid for test-evaluation statistics.
+    Rows with ``status != 'ok'`` are excluded, as are rows with
+    ``code IS NULL`` whose ``mean_nll`` or ``metric_value`` fall below the
+    configured *thresholds*.
+
+    Parameters
+    ----------
+    conn:
+        DuckDB connection to the run's database.
+    thresholds:
+        Optional sanity thresholds.  When ``None``, defaults are used.
     """
+    if thresholds is None:
+        thresholds = ComparisonThresholds()
+
     reasons = []
+
     # Rows with non-ok status on test split
     invalid_count = conn.execute(
         "SELECT COUNT(*) FROM models "
@@ -135,10 +176,82 @@ def _count_excluded_test_rows(conn) -> tuple[int, list[str]]:
     ).fetchone()[0] or 0
     if invalid_count:
         reasons.append(f"{invalid_count} invalid test row(s) excluded (status != 'ok')")
+
+    # Suspicious legacy rows (code=NULL) with implausibly low metrics.
+    # Use OR between enabled thresholds — a row failing *any* enabled
+    # threshold is excluded, matching the selection semantics used by
+    # _build_test_row_predicates (which requires ALL thresholds to pass).
+    # NULL values for mean_nll or metric_value are treated as failing
+    # their respective threshold because _build_test_row_predicates
+    # requires mean_nll >= ? and metric_value >= ?, and NULL fails >=.
+    threshold_predicates: list[str] = []
+    params: list[Any] = []
+    has_metric_filter = False
+    if thresholds.min_mean_nll is not None:
+        threshold_predicates.append(
+            "(mean_nll IS NULL OR (mean_nll IS NOT NULL AND mean_nll < ?))"
+        )
+        params.append(thresholds.min_mean_nll)
+        has_metric_filter = True
+    if thresholds.min_metric_value is not None:
+        threshold_predicates.append(
+            "(metric_value IS NULL OR (metric_value IS NOT NULL AND metric_value < ?))"
+        )
+        params.append(thresholds.min_metric_value)
+        has_metric_filter = True
+
+    if has_metric_filter:
+        where_clause = "code IS NULL AND (" + " OR ".join(threshold_predicates) + ")"
+        suspicious_count = conn.execute(
+            f"SELECT COUNT(*) FROM models WHERE split='test' AND status='ok' AND {where_clause}",
+            params,
+        ).fetchone()[0] or 0
+        if suspicious_count:
+            reasons.append(
+                f"{suspicious_count} suspicious test row(s) excluded "
+                "(code=NULL, low metric value or NLL)"
+            )
+        return invalid_count + suspicious_count, reasons
+
     return invalid_count, reasons
 
 
-def summarise_run(entry: dict) -> dict[str, Any]:
+def _build_test_row_predicates(
+    thresholds: ComparisonThresholds | None = None,
+) -> tuple[str, list[Any]]:
+    """Build SQL WHERE predicates and parameters for test-row selection.
+
+    Returns a ``(predicate_string, params)`` pair suitable for use in a
+    parameterised DuckDB query.  The predicates exclude suspicious
+    ``code=NULL`` rows whose metrics fall below *thresholds*.
+    """
+    if thresholds is None:
+        thresholds = ComparisonThresholds()
+
+    predicates = ["split='test'", "status='ok'", "metric_value IS NOT NULL"]
+    params: list[Any] = []
+
+    # If both thresholds are disabled (None), include all code=NULL rows
+    if thresholds.min_mean_nll is not None or thresholds.min_metric_value is not None:
+        code_null_filters: list[str] = []
+        if thresholds.min_mean_nll is not None:
+            code_null_filters.append("mean_nll >= ?")
+            params.append(thresholds.min_mean_nll)
+        if thresholds.min_metric_value is not None:
+            code_null_filters.append("metric_value >= ?")
+            params.append(thresholds.min_metric_value)
+        code_null_clause = " AND ".join(code_null_filters)
+        # Include rows with code IS NOT NULL, OR code=NULL rows that pass thresholds
+        predicates.append(f"(code IS NOT NULL OR ({code_null_clause}))")
+    # else: no thresholds, all code=NULL rows remain selectable
+
+    return " AND ".join(predicates), params
+
+
+def summarise_run(
+    entry: dict,
+    thresholds: ComparisonThresholds | None = None,
+) -> dict[str, Any]:
     """Query a single run's DuckDB and return a summary dict.
 
     Parameters
@@ -146,12 +259,18 @@ def summarise_run(entry: dict) -> dict[str, Any]:
     entry:
         A discovery entry dict (as returned by :func:`discover_run_dirs`)
         with at least ``db_path``.
+    thresholds:
+        Optional sanity thresholds for test-row selection.  When ``None``,
+        defaults are used (``min_mean_nll=1.0``, ``min_metric_value=20.0``).
 
     Returns
     -------
     dict
         A one-row-per-run summary with all keys listed in ``_COLUMN_ORDER``.
     """
+    if thresholds is None:
+        thresholds = ComparisonThresholds()
+
     db_path = entry["db_path"]
     result: dict[str, Any] = {
         "input_root": entry["input_root"],
@@ -198,8 +317,8 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         result["n_models"] = count_row[0] or 0
         result["n_failed_models"] = count_row[1] or 0
 
-        # Count excluded rows (legacy summary-only + invalid)
-        n_excluded, exclusion_reasons = _count_excluded_test_rows(conn)
+        # Count excluded rows (invalid + suspicious)
+        n_excluded, exclusion_reasons = _count_excluded_test_rows(conn, thresholds)
         result["n_excluded_rows"] = n_excluded
         result["exclusion_warnings"] = exclusion_reasons
 
@@ -226,13 +345,15 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         if val_row:
             result["best_val_metric"] = float(val_row[0])
 
-        # Best test model (lowest metric_value) — valid-only, including code-null rows
+        # Best test model (lowest metric_value) — valid-only, with thresholds
+        test_predicate, test_params = _build_test_row_predicates(thresholds)
         test_row = conn.execute(
-            "SELECT name, metric_value, mean_nll, model_id "
-            "FROM models "
-            "WHERE split='test' AND status='ok' AND metric_value IS NOT NULL "
-            "ORDER BY metric_value ASC "
-            "LIMIT 1"
+            f"SELECT name, metric_value, mean_nll, model_id "
+            f"FROM models "
+            f"WHERE {test_predicate} "
+            f"ORDER BY metric_value ASC "
+            f"LIMIT 1",
+            test_params,
         ).fetchone()
         if test_row:
             result["best_test_metric"] = float(test_row[1])
@@ -273,7 +394,17 @@ def summarise_run(entry: dict) -> dict[str, Any]:
         sibling = Path(db_path).parent / "diagnostics.duckdb"
         if sibling.exists():
             try:
-                _merge_sibling_test_rows(result, str(sibling))
+                _merge_sibling_test_rows(result, str(sibling), thresholds)
+                # Also count excluded rows from the sibling DB
+                sibling_conn = duckdb.connect(str(sibling), read_only=True)
+                try:
+                    sibling_excluded, sibling_reasons = _count_excluded_test_rows(
+                        sibling_conn, thresholds
+                    )
+                    result["n_excluded_rows"] += sibling_excluded
+                    result["exclusion_warnings"].extend(sibling_reasons)
+                finally:
+                    sibling_conn.close()
             except Exception as exc:
                 result["exclusion_warnings"].append(
                     f"Sibling fallback to {sibling.name} failed: {exc}"
@@ -283,7 +414,9 @@ def summarise_run(entry: dict) -> dict[str, Any]:
 
 
 def _merge_sibling_test_rows(
-    result: dict[str, Any], sibling_db_path: str
+    result: dict[str, Any],
+    sibling_db_path: str,
+    thresholds: ComparisonThresholds | None = None,
 ) -> None:
     """Query a sibling ``diagnostics.duckdb`` for test/ID rows and merge
     into *result* when the primary DB had none.
@@ -292,6 +425,9 @@ def _merge_sibling_test_rows(
     test-evaluation booleans are overwritten; train/val/metrics and model
     counts remain as set by the primary DB.
     """
+    if thresholds is None:
+        thresholds = ComparisonThresholds()
+
     conn = duckdb.connect(sibling_db_path, read_only=True)
     try:
         tables = [
@@ -303,13 +439,15 @@ def _merge_sibling_test_rows(
         if "models" not in tables:
             return
 
-        # Best test model (lowest metric_value) — valid-only
+        # Best test model (lowest metric_value) — valid-only, with thresholds
+        test_predicate, test_params = _build_test_row_predicates(thresholds)
         test_row = conn.execute(
-            "SELECT name, metric_value, mean_nll, model_id "
-            "FROM models "
-            "WHERE split='test' AND status='ok' AND metric_value IS NOT NULL "
-            "ORDER BY metric_value ASC "
-            "LIMIT 1"
+            f"SELECT name, metric_value, mean_nll, model_id "
+            f"FROM models "
+            f"WHERE {test_predicate} "
+            f"ORDER BY metric_value ASC "
+            f"LIMIT 1",
+            test_params,
         ).fetchone()
         if not test_row:
             return
@@ -361,6 +499,7 @@ _CONFIG_COLUMN_ORDER = [
     "n_with_individual_differences",
     "n_models_total",
     "n_failed_models_total",
+    "n_excluded_rows_total",
     "best_train_metric_mean",
     "best_train_metric_std",
     "best_train_metric_n",
@@ -423,6 +562,9 @@ def aggregate_configs(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["n_models_total"] = sum(r.get("n_models", 0) for r in runs)
         row["n_failed_models_total"] = sum(
             r.get("n_failed_models", 0) for r in runs
+        )
+        row["n_excluded_rows_total"] = sum(
+            r.get("n_excluded_rows", 0) for r in runs
         )
 
         # Numeric metric aggregates
@@ -565,6 +707,7 @@ _HTML_TEMPLATE = """\
   <th>ID Mean R²</th>
   <th>ID Max R²</th>
   <th>ID Best Param</th>
+  <th>Exclusions</th>
 </tr>
 </thead>
 <tbody>
@@ -677,6 +820,17 @@ def render_report_html(
             "have no individual differences data.</div>"
         )
 
+    n_with_exclusions = sum(
+        1 for s in summaries if s.get("n_excluded_rows", 0) > 0
+    )
+    if n_with_exclusions:
+        total_excluded = sum(s.get("n_excluded_rows", 0) for s in summaries)
+        missing_notes.append(
+            f"<div class=\"note\"><strong>Note:</strong> {n_with_exclusions} run(s) "
+            f"have {total_excluded} total excluded test row(s). "
+            "Hover over the Exclusions count in the run table for details.</div>"
+        )
+
     # Build config-level summary table
     config_table_html = ""
     if config_rows:
@@ -685,6 +839,7 @@ def render_report_html(
             "<table>\n<thead>\n<tr>\n"
             "  <th>Config</th>\n"
             "  <th>Runs</th>\n"
+            "  <th>Excluded</th>\n"
             "  <th>Train Metric</th>\n"
             "  <th>Val Metric</th>\n"
             "  <th>Test Metric</th>\n"
@@ -706,10 +861,15 @@ def render_report_html(
                     return f"{_format_val(mean)} ± {_format_val(std)} <span class=\"summary-cell\">(n={n})</span>"
                 return f"{_format_val(mean)} <span class=\"summary-cell\">(n={n})</span>"
 
+            excluded_total = cr.get('n_excluded_rows_total', 0)
+            excluded_display = (
+                str(excluded_total) if excluded_total else '<span class="missing">—</span>'
+            )
             config_table_html += (
                 "<tr>"
                 f"<td>{_format_config_label_for_html(cr.get('config_label'))}</td>"
                 f"<td>{cr.get('n_runs', 0)}</td>"
+                f"<td>{excluded_display}</td>"
                 f"<td>{_mean_std_cell('best_train_metric')}</td>"
                 f"<td>{_mean_std_cell('best_val_metric')}</td>"
                 f"<td>{_mean_std_cell('best_test_metric')}</td>"
@@ -725,6 +885,14 @@ def render_report_html(
     # Build run-level table rows
     rows_html = ""
     for s in summaries:
+        n_excluded = s.get("n_excluded_rows", 0)
+        warnings = s.get("exclusion_warnings", [])
+        excl_display = str(n_excluded) if n_excluded else '<span class="missing">—</span>'
+        if warnings:
+            excl_display = (
+                f'<span title="{html.escape("; ".join(warnings))}">'
+                f"{n_excluded} ⚠</span>"
+            )
         rows_html += (
             "<tr>"
             f"<td>{_format_config_label_for_html(s.get('config_label'))}</td>"
@@ -737,6 +905,7 @@ def render_report_html(
             f"<td>{_format_val(s.get('best_test_mean_r2'))}</td>"
             f"<td>{_format_val(s.get('best_test_max_r2'))}</td>"
             f"<td>{_format_val(s.get('best_test_param'))}</td>"
+            f"<td>{excl_display}</td>"
             "</tr>\n"
         )
 
@@ -745,7 +914,7 @@ def render_report_html(
     plural = "y" if n_runs == 1 else "ies"
     config_plural = "s" if n_configs != 1 else ""
 
-    html = _HTML_TEMPLATE.format(
+    report_content = _HTML_TEMPLATE.format(
         n_runs=n_runs,
         plural=plural,
         n_configs=n_configs,
@@ -756,7 +925,7 @@ def render_report_html(
     )
 
     html_path = out / "report.html"
-    html_path.write_text(html, encoding="utf-8")
+    html_path.write_text(report_content, encoding="utf-8")
     return html_path.resolve()
 
 

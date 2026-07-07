@@ -235,6 +235,105 @@ def test_compare_uses_best_split_metrics_and_id_results(tmp_path: Path):
     assert summary["has_individual_differences"] is True
 
 
+def test_compare_cli_parser_accepts_threshold_options():
+    """Parser accepts --min-test-mean-nll and --min-test-metric-value."""
+    from gecco.cli.compare_results import register_parser
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+    register_parser(subparsers)
+
+    # Test defaults
+    args = parser.parse_args([
+        "compare",
+        "--results-dirs", "/tmp/fake",
+    ])
+    assert args.handler is not None
+    # Defaults are None because argparse defaults to None for these options
+    assert args.min_test_mean_nll is None
+    assert args.min_test_metric_value is None
+
+    # Test explicit values
+    args2 = parser.parse_args([
+        "compare",
+        "--results-dirs", "/tmp/fake",
+        "--min-test-mean-nll", "2.0",
+        "--min-test-metric-value", "50.0",
+    ])
+    assert args2.min_test_mean_nll == 2.0
+    assert args2.min_test_metric_value == 50.0
+
+    # Test sentinel 0 (disable)
+    args3 = parser.parse_args([
+        "compare",
+        "--results-dirs", "/tmp/fake",
+        "--min-test-mean-nll", "0",
+        "--min-test-metric-value", "0",
+    ])
+    assert args3.min_test_mean_nll == 0.0
+    assert args3.min_test_metric_value == 0.0
+
+
+def test_compare_cli_passes_thresholds_to_summarise_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """CLI main passes parsed thresholds to summarise_run with exact values."""
+    from gecco.cli.compare_results import main as compare_main
+    from gecco.results_comparison import ComparisonThresholds
+    from types import SimpleNamespace
+
+    captured: list[ComparisonThresholds | None] = []
+
+    def fake_summarise_run(entry, thresholds=None):
+        captured.append(thresholds)
+        return {
+            "input_root": entry.get("input_root", ""),
+            "config_label": entry.get("config_label", ""),
+            "results_dir": entry.get("results_dir", ""),
+            "run_id": entry.get("run_id", "test"),
+            "best_train_metric": None,
+            "best_val_metric": None,
+            "best_test_metric": None,
+            "best_test_nll": None,
+            "best_test_mean_r2": None,
+            "best_test_max_r2": None,
+            "best_test_param": None,
+            "best_model_name": None,
+            "n_models": 0,
+            "n_failed_models": 0,
+            "has_test_eval": False,
+            "has_individual_differences": False,
+            "n_excluded_rows": 0,
+            "exclusion_warnings": [],
+        }
+
+    monkeypatch.setattr(
+        "gecco.cli.compare_results.summarise_run", fake_summarise_run
+    )
+
+    run = tmp_path / "cli_thresholds"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="cli")
+
+    out_dir = tmp_path / "cli_thresholds_out"
+
+    # Use custom thresholds
+    args = SimpleNamespace(
+        results_dirs=[tmp_path / "cli_thresholds"],
+        output=str(out_dir),
+        min_test_mean_nll=2.0,
+        min_test_metric_value=50.0,
+    )
+    compare_main(args)
+
+    assert len(captured) == 1, f"Expected 1 call to summarise_run, got {len(captured)}"
+    th = captured[0]
+    assert th is not None
+    assert th.min_mean_nll == 2.0
+    assert th.min_metric_value == 50.0
+
+
 def test_compare_cli_writes_csv_html_and_figures(tmp_path: Path):
     """CLI handler writes CSV, HTML, PNG, and PDF files."""
     from gecco.cli.compare_results import main as compare_main
@@ -733,6 +832,54 @@ def test_config_level_series_uses_nan_for_missing_values():
 # --------------------------------------------------------------------------- #
 
 
+def _create_suspicious_legacy_test_row(
+    db_path: Path,
+    *,
+    model_name: str = "suspicious_legacy",
+    low_bic: float = 6.3,
+    mean_nll: float = 0.5,
+) -> None:
+    """Write a suspicious code=NULL test row with implausibly low metrics."""
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": mean_nll,
+        "test_mean_BIC": low_bic,
+        "test_mean_NLL": mean_nll,
+        "test_individual_BIC": [low_bic],
+        "test_individual_NLL": [mean_nll],
+        "test_individual_differences": None,
+        "code": None,
+        "param_names": [],
+        "status": "ok",
+    })
+    store.close()
+
+
+def _create_plausible_legacy_test_row(
+    db_path: Path,
+    *,
+    model_name: str = "plausible_legacy",
+    bic: float = 90.0,
+    mean_nll: float = 2.5,
+) -> None:
+    """Write a plausible code=NULL test row with reasonable metrics."""
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": mean_nll,
+        "test_mean_BIC": bic,
+        "test_mean_NLL": mean_nll,
+        "test_individual_BIC": [bic],
+        "test_individual_NLL": [mean_nll],
+        "test_individual_differences": None,
+        "code": None,
+        "param_names": [],
+        "status": "ok",
+    })
+    store.close()
+
+
 def _create_invalid_test_row(db_path: Path, *, model_name: str = "invalid_model",
                              low_bic: float = 80.0) -> None:
     """Write an invalid test model row (status != 'ok') to the diagnostics DB."""
@@ -895,6 +1042,522 @@ def test_code_null_test_row_with_id_joins_correctly(tmp_path: Path):
     assert summary["best_test_param"] == "lambda"
     assert summary["has_test_eval"] is True
     assert summary["has_individual_differences"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Suspicious code=NULL row exclusion (comparison thresholds)
+# --------------------------------------------------------------------------- #
+
+
+def test_suspicious_code_null_row_excluded_in_favor_of_valid(tmp_path: Path):
+    """A suspicious code=NULL row with implausibly low mean_nll=0.5 and
+    metric_value=6.3 is excluded in favor of a valid row with BIC around 130."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "suspicious_excluded"
+    run.mkdir(parents=True)
+    # Create valid test row with higher BIC
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Add suspicious legacy row with very low (implausible) values
+    _create_suspicious_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="bad_legacy",
+        low_bic=6.3,
+        mean_nll=0.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Suspicious row is excluded; valid row's metrics are used
+    assert summary["best_test_metric"] == 130.0  # valid_model_a's test BIC
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_plausible_code_null_row_remains_selectable(tmp_path: Path):
+    """A code=NULL row with plausible mean_nll=2.5, metric_value=90 is
+    selectable (above default thresholds)."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "plausible_selected"
+    run.mkdir(parents=True)
+    # Create valid test row with higher BIC
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="modern")
+    # Add plausible code-NULL row with lower BIC
+    _create_plausible_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="good_legacy",
+        bic=90.0,
+        mean_nll=2.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Plausible code-NULL row is selectable (90 < 130)
+    assert summary["best_test_metric"] == 90.0
+    assert summary["n_excluded_rows"] == 0
+
+
+def test_thresholds_can_disable_suspicious_filter(tmp_path: Path):
+    """When thresholds are disabled (None), a suspicious code=NULL row is
+    selectable."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "thresholds_disabled"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_suspicious_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="bad_legacy",
+        low_bic=6.3,
+        mean_nll=0.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+
+    # With thresholds disabled, the suspicious row is selectable
+    thresholds_off = ComparisonThresholds(
+        min_mean_nll=None, min_metric_value=None
+    )
+    summary = summarise_run(discovered[0], thresholds=thresholds_off)
+
+    # The suspicious row has lower BIC (6.3 < 130) so it gets selected
+    assert summary["best_test_metric"] == 6.3
+    assert summary["n_excluded_rows"] == 0
+
+
+def test_lowered_threshold_can_allow_suspicious_row(tmp_path: Path):
+    """A very low threshold can allow a borderline-suspicious row through."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "lowered_threshold"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_suspicious_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="borderline",
+        low_bic=15.0,
+        mean_nll=2.0,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+
+    # Default thresholds: mean_nll=2.0 >= 1.0 and metric=15.0 < 20.0 → excluded
+    summary_default = summarise_run(discovered[0])
+    assert summary_default["best_test_metric"] == 130.0  # valid row
+
+    # Lowered metric threshold: mean_nll=2.0 >= 1.0 and metric=15.0 >= 10.0 → allowed
+    thresholds_lowered = ComparisonThresholds(
+        min_mean_nll=1.0, min_metric_value=10.0
+    )
+    summary_lowered = summarise_run(discovered[0], thresholds=thresholds_lowered)
+    assert summary_lowered["best_test_metric"] == 15.0  # borderline row
+    assert summary_lowered["n_excluded_rows"] == 0
+
+
+# ---- OR-logic threshold tests ---- #
+
+
+def _create_custom_legacy_test_row(
+    db_path: Path,
+    *,
+    model_name: str = "custom_legacy",
+    metric_value: float = 100.0,
+    mean_nll: float = 2.5,
+) -> None:
+    """Write a code=NULL test row with custom metric_value and mean_nll."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": mean_nll,
+        "test_mean_BIC": metric_value,
+        "test_mean_NLL": mean_nll,
+        "test_individual_BIC": [metric_value],
+        "test_individual_NLL": [mean_nll],
+        "test_individual_differences": None,
+        "code": None,
+        "param_names": [],
+        "status": "ok",
+    })
+    store.close()
+
+
+def test_suspicious_row_fails_only_mean_nll_is_excluded(tmp_path: Path):
+    """A legacy row failing only the mean_nll threshold (metric passes)
+    is excluded — OR logic between thresholds."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "fail_only_mean"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Legacy row: mean_nll=0.5 (below 1.0), metric_value=50.0 (above 20.0)
+    _create_custom_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="fail_mean_only",
+        metric_value=50.0,
+        mean_nll=0.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Fails only mean_nll → OR logic says excluded
+    assert summary["best_test_metric"] == 130.0  # valid row
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_fails_only_metric_value_is_excluded(tmp_path: Path):
+    """A legacy row failing only the metric_value threshold (mean_nll passes)
+    is excluded — OR logic between thresholds."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "fail_only_metric"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Legacy row: mean_nll=3.0 (above 1.0), metric_value=5.0 (below 20.0)
+    _create_custom_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="fail_metric_only",
+        metric_value=5.0,
+        mean_nll=3.0,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Fails only metric_value → OR logic says excluded
+    assert summary["best_test_metric"] == 130.0  # valid row
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_fails_both_is_excluded(tmp_path: Path):
+    """A legacy row failing both thresholds is excluded (already worked with
+    AND, still works with OR)."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "fail_both"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Legacy row: mean_nll=0.5 (below 1.0), metric_value=5.0 (below 20.0)
+    _create_custom_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="fail_both",
+        metric_value=5.0,
+        mean_nll=0.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Fails both → excluded
+    assert summary["best_test_metric"] == 130.0  # valid row
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_passes_both_not_excluded(tmp_path: Path):
+    """A legacy row passing both thresholds is NOT excluded."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "pass_both"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    # Legacy row: mean_nll=3.0 (above 1.0), metric_value=50.0 (above 20.0)
+    _create_custom_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="pass_both",
+        metric_value=50.0,
+        mean_nll=3.0,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Passes both → selectable (50.0 < 130.0)
+    assert summary["best_test_metric"] == 50.0  # legacy row wins
+    assert summary["n_excluded_rows"] == 0
+
+
+# ---- NULL value handling in threshold exclusion (regression) ---- #
+
+
+def _create_legacy_test_row_with_nulls(
+    db_path: Path,
+    *,
+    model_name: str = "null_row",
+    metric_value: float | None = 50.0,
+    mean_nll: float | None = None,
+) -> None:
+    """Write a code=NULL test row with nullable metric_value / mean_nll."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+
+    store = DiagnosticStore(db_path)
+    store.write_top_model_test({
+        "model_name": model_name,
+        "val_nll": mean_nll,  # nullable column
+        "test_mean_BIC": metric_value,
+        "test_mean_NLL": mean_nll,
+        "test_individual_BIC": [metric_value] if metric_value is not None else [],
+        "test_individual_NLL": [mean_nll] if mean_nll is not None else [],
+        "test_individual_differences": None,
+        "code": None,
+        "param_names": [],
+        "status": "ok",
+    })
+    store.close()
+
+
+def test_suspicious_row_null_mean_nll_excluded(tmp_path: Path):
+    """A code=NULL row with mean_nll=NULL (fails threshold) and
+    metric_value passing is excluded because NULL fails mean_nll >= 1.0."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "null_mean_nll"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_legacy_test_row_with_nulls(
+        run / "diagnostics.duckdb",
+        model_name="null_mean",
+        metric_value=50.0,  # passes metric_value >= 20.0
+        mean_nll=None,      # NULL fails mean_nll >= 1.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # null-mean_nll row is excluded; valid row's metrics are used
+    assert summary["best_test_metric"] == 130.0  # valid model_a's test BIC
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_null_metric_value_excluded(tmp_path: Path):
+    """A code=NULL row with metric_value=NULL (fails threshold) and
+    mean_nll passing is excluded because NULL fails metric_value >= 20.0."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "null_metric"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_legacy_test_row_with_nulls(
+        run / "diagnostics.duckdb",
+        model_name="null_metric",
+        metric_value=None,  # NULL fails metric_value >= 20.0
+        mean_nll=3.0,       # passes mean_nll >= 1.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # null-metric_value row is excluded; valid row's metrics are used
+    assert summary["best_test_metric"] == 130.0  # valid model_a's test BIC
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_both_null_excluded(tmp_path: Path):
+    """A code=NULL row with both mean_nll=NULL and metric_value=NULL
+    is excluded."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "both_null"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_legacy_test_row_with_nulls(
+        run / "diagnostics.duckdb",
+        model_name="both_null",
+        metric_value=None,
+        mean_nll=None,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    assert summary["best_test_metric"] == 130.0
+    assert summary["n_excluded_rows"] >= 1
+
+
+def test_suspicious_row_with_nulls_disabled_thresholds(tmp_path: Path):
+    """When thresholds are disabled, NULL-valued code=NULL rows are
+    selectable."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "null_disabled"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_legacy_test_row_with_nulls(
+        run / "diagnostics.duckdb",
+        model_name="null_row",
+        metric_value=90.0,  # plausible value
+        mean_nll=None,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+
+    thresholds_off = ComparisonThresholds(
+        min_mean_nll=None, min_metric_value=None
+    )
+    summary = summarise_run(discovered[0], thresholds=thresholds_off)
+
+    # With thresholds disabled, the NULL-NLL row is selectable (90 < 130)
+    assert summary["best_test_metric"] == 90.0
+    assert summary["n_excluded_rows"] == 0
+
+
+def test_suspicious_row_fails_only_one_when_other_threshold_disabled(tmp_path: Path):
+    """When only the metric_value threshold is enabled, a row failing
+    only mean_nll is NOT excluded (mean_nll threshold is disabled)."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "fail_only_mean_disabled_metric"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="valid")
+    _create_custom_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="fail_mean_nll",
+        metric_value=50.0,
+        mean_nll=0.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+
+    # Only metric_value threshold enabled, mean_nll disabled
+    thresholds = ComparisonThresholds(min_mean_nll=None, min_metric_value=20.0)
+    summary = summarise_run(discovered[0], thresholds=thresholds)
+
+    # mean_nll=0.5 is below 1.0 but mean_nll threshold is disabled
+    # metric_value=50.0 is above 20.0, so passes
+    # → legacy row is selectable
+    assert summary["best_test_metric"] == 50.0  # legacy row wins
+    assert summary["n_excluded_rows"] == 0
+
+
+def test_sibling_fallback_applies_same_thresholds(tmp_path: Path):
+    """Sibling fallback also excludes suspicious code=NULL rows."""
+    from gecco.results_comparison import ComparisonThresholds, discover_run_dirs, summarise_run
+
+    run = tmp_path / "sibling_thresholds"
+    run.mkdir(parents=True)
+
+    # Create primary unified DB with train/val only
+    _create_minimal_diagnostics_train_only(
+        run / "diagnostics_unified.duckdb", label="unified"
+    )
+
+    # Create sibling diagnostics.duckdb with a suspicious code=NULL row
+    # and a plausible code=NULL row
+    _create_suspicious_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="bad_legacy",
+        low_bic=6.3,
+        mean_nll=0.5,
+    )
+    _create_plausible_legacy_test_row(
+        run / "diagnostics.duckdb",
+        model_name="good_legacy",
+        bic=88.0,
+        mean_nll=2.5,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    entry = discovered[0]
+    assert "diagnostics_unified" in entry["db_path"]
+
+    # With default thresholds, the suspicious row is excluded
+    summary = summarise_run(entry)
+    assert summary["best_test_metric"] == 88.0  # plausible legacy row
+    assert summary["n_excluded_rows"] >= 1
+
+    # With thresholds disabled, the suspicious row is selected (lower BIC)
+    thresholds_off = ComparisonThresholds(min_mean_nll=None, min_metric_value=None)
+    summary_off = summarise_run(entry, thresholds=thresholds_off)
+    assert summary_off["best_test_metric"] == 6.3  # suspicious row selected
+    assert summary_off["n_excluded_rows"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Exclusion surfacing
+# --------------------------------------------------------------------------- #
+
+
+def test_results_csv_includes_exclusion_columns(tmp_path: Path):
+    """results.csv includes n_excluded_rows column with counts."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run, write_results_csv
+
+    run = tmp_path / "csv_excl"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="r")
+    _create_invalid_test_row(run / "diagnostics.duckdb", model_name="bad", low_bic=80.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summaries = [summarise_run(d) for d in discovered]
+
+    out_dir = tmp_path / "csv_out"
+    csv_path = write_results_csv(summaries, out_dir)
+
+    import csv
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    assert len(rows) == 1
+    assert "n_excluded_rows" in rows[0]
+    assert int(rows[0]["n_excluded_rows"]) >= 1
+
+
+def test_config_summary_includes_excluded_row_total(tmp_path: Path):
+    """config_summary.csv includes n_excluded_rows_total."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        summarise_run,
+        write_config_summary_csv,
+    )
+
+    run = tmp_path / "cfg_excl"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="r")
+    _create_invalid_test_row(run / "diagnostics.duckdb", model_name="bad", low_bic=80.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    out_dir = tmp_path / "cfg_out"
+    csv_path = write_config_summary_csv(config_rows, out_dir)
+
+    import csv
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    assert len(rows) == 1
+    assert "n_excluded_rows_total" in rows[0]
+    assert int(rows[0]["n_excluded_rows_total"]) >= 1
+
+
+def test_report_html_surfaces_exclusion_info(tmp_path: Path):
+    """report.html includes exclusion count and warnings."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        discover_run_dirs,
+        render_report_html,
+        summarise_run,
+    )
+
+    run = tmp_path / "html_excl"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="r")
+    _create_invalid_test_row(run / "diagnostics.duckdb", model_name="bad", low_bic=80.0)
+
+    discovered = discover_run_dirs([tmp_path])
+    summaries = [summarise_run(d) for d in discovered]
+    config_rows = aggregate_configs(summaries)
+
+    out_dir = tmp_path / "html_out"
+    html_path = render_report_html(summaries, out_dir, config_rows=config_rows)
+    html = html_path.read_text(encoding="utf-8")
+
+    # Should mention exclusion somewhere
+    assert "excluded" in html.lower()
 
 
 # --------------------------------------------------------------------------- #

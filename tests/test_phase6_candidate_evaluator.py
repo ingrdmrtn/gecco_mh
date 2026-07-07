@@ -37,7 +37,16 @@ def test_candidate_evaluator_fits_and_finalises_without_monolith(tmp_path: Path)
             "metric_name": "BIC",
             "metric_value": 12.3,
             "param_names": ["alpha"],
-            "code": "@njit\ndef cognitive_model1(x, model_parameters):\n    alpha, = model_parameters\n    return alpha",
+            "code": (
+                "import math\n"
+                "def cognitive_model1(x, model_parameters):\n"
+                "    alpha, = model_parameters\n"
+                "    n_trials = len(x)\n"
+                "    log_lik = 0.0\n"
+                "    for t in range(n_trials):\n"
+                "        log_lik += math.log(0.5 + 1e-10)\n"
+                "    return -log_lik\n"
+            ),
             "eval_metrics": [12.3],
             "participant_n_trials": [3],
             "parameter_values": [[0.5]],
@@ -49,7 +58,16 @@ def test_candidate_evaluator_fits_and_finalises_without_monolith(tmp_path: Path)
             model_dict={
                 "func_name": "cognitive_model1",
                 "name": "model_a",
-                "code": "@njit\ndef cognitive_model1(x, model_parameters):\n    alpha, = model_parameters\n    return alpha",
+                "code": (
+                    "import math\n"
+                    "def cognitive_model1(x, model_parameters):\n"
+                    "    alpha, = model_parameters\n"
+                    "    n_trials = len(x)\n"
+                    "    log_lik = 0.0\n"
+                    "    for t in range(n_trials):\n"
+                    "        log_lik += math.log(0.5 + 1e-10)\n"
+                    "    return -log_lik\n"
+                ),
                 "parameters": [{"name": "alpha", "lower_bound": 0, "upper_bound": 1}],
             },
             model_idx=0,
@@ -566,6 +584,56 @@ def test_candidate_evaluator_finalisation_write_failure_is_surfaced(tmp_path: Pa
                 )
 
     feedback_record.assert_not_called()
+    run_context.close()
+
+
+def test_static_invalid_return_half_does_not_call_fit(tmp_path: Path):
+    """Exact reported ``return 0.5`` model must fail static validation with
+    ``constant_likelihood`` WITHOUT mocking validate_likelihood_static,
+    and must NOT call run_fit_hierarchical."""
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(input_columns=[]),
+        task=SimpleNamespace(name="phase6_task"),
+        evaluation=SimpleNamespace(fit_type="group"),
+    )
+    run_context = RunContext.from_cfg(cfg, project_root=tmp_path)
+    diagnostic_store = DiagnosticStore(tmp_path / "diagnostics.duckdb")
+    artifact_store = ArtifactStore(run_context, diagnostic_store)
+    evaluator = CandidateEvaluator(artifact_store)
+
+    RETURN_HALF_CODE = (
+        "def cognitive_model1(stimulus, action, reward, params):\n"
+        "    return 0.5\n"
+    )
+
+    with patch(
+        "gecco.offline_evaluation.fit_generated_models.run_fit_hierarchical"
+    ) as run_fit_hierarchical:
+        result, should_stop = evaluator.fit_candidate_model(
+            model_dict={
+                "func_name": "cognitive_model1",
+                "name": "model_a",
+                "code": RETURN_HALF_CODE,
+                "parameters": [],
+            },
+            model_idx=0,
+            n_models=1,
+            it=0,
+            run_idx=1,
+            tag="",
+            model_file=artifact_store.candidate_model_path(iteration=0, run_idx=1, tag=""),
+            baseline_bic=None,
+            df=SimpleNamespace(),
+            cfg=cfg,
+        )
+
+    assert result["metric_name"] == "VALIDATION_ERROR"
+    assert result["error_type"] == "InvalidLikelihoodError"
+    assert result["error_details"].get("reason") == "constant_likelihood"
+    assert should_stop is False
+    run_fit_hierarchical.assert_not_called()
+
+    diagnostic_store.close()
     run_context.close()
 
 

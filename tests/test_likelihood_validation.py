@@ -263,6 +263,170 @@ def cognitive_model(stimulus, action_1, reward, params):
         result = validate_likelihood_static(code_bad, "cognitive_model")
         assert not result.passed
 
+    # ---- Constant numeric return tests (beyond just return 0.0) ---- #
+
+    RETURN_HALF = """
+def cognitive_model(stimulus, action, reward, params):
+    return 0.5
+"""
+
+    RETURN_NEGATIVE = """
+def cognitive_model(stimulus, action, reward, params):
+    return -0.1
+"""
+
+    def test_static_rejects_constant_numeric_return(self):
+        """Any constant numeric return (not just 0.0) is rejected."""
+        result = validate_likelihood_static(self.RETURN_HALF, "cognitive_model")
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    def test_static_rejects_negative_numeric_return(self):
+        """Negative constant numeric return is also rejected."""
+        result = validate_likelihood_static(self.RETURN_NEGATIVE, "cognitive_model")
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    # ---- No likelihood accumulation tests ---- #
+
+    NO_ACCUMULATION = """
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    n_trials = len(stimulus)
+    Q = 0.0
+    for t in range(n_trials):
+        pe = reward[t] - Q
+        prob = 1.0 / (1.0 + math.exp(-beta * pe))
+        Q = Q + alpha * pe
+    return None
+"""
+
+    def test_static_rejects_no_likelihood_accumulation(self):
+        """A model with no log_lik accumulation is rejected even if it
+        has a loop and parameters."""
+        result = validate_likelihood_static(self.NO_ACCUMULATION, "cognitive_model")
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    # ---- Vectorised likelihood (np.sum(np.log(...))) ---- #
+
+    SUM_LOG_LIKELIHOOD = """
+import numpy as np
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    probs = 1.0 / (1.0 + np.exp(-beta * np.abs(reward - 0.0)))
+    return -np.sum(np.log(probs + 1e-10))
+"""
+
+    def test_static_accepts_sum_log_likelihood_pattern(self):
+        """Vectorised pattern using np.sum(np.log(...)) must pass."""
+        result = validate_likelihood_static(
+            self.SUM_LOG_LIKELIHOOD, "cognitive_model"
+        )
+        assert result.passed, (
+            f"Expected sum-log likelihood to pass, "
+            f"got error_type={result.error_type}: {result.error_message}"
+        )
+
+    # ---- No-loop models without likelihood evidence ---- #
+
+    NO_LOOP_NO_LIKELIHOOD = """
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    return alpha + beta
+"""
+
+    HAS_LOOP_NO_LIKELIHOOD = """
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    n_trials = len(stimulus)
+    Q = 0.0
+    for t in range(n_trials):
+        pe = reward[t] - Q
+        Q = Q + alpha * pe
+    return -Q
+"""
+
+    def test_static_rejects_no_loop_no_likelihood(self):
+        """Model without a loop AND without likelihood evidence is rejected."""
+        result = validate_likelihood_static(
+            self.NO_LOOP_NO_LIKELIHOOD, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    def test_static_rejects_has_loop_no_likelihood(self):
+        """Model with a loop but no likelihood evidence is still rejected."""
+        result = validate_likelihood_static(
+            self.HAS_LOOP_NO_LIKELIHOOD, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    # ---- Init-only likelihood variable models ---- #
+
+    INIT_ONLY_LOG_LIK = """
+def cognitive_model(stimulus, action, reward, params):
+    log_lik = 0.0
+    return -log_lik
+"""
+
+    INIT_ONLY_NLL = """
+def cognitive_model(stimulus, action, reward, params):
+    nll = 0.0
+    return nll
+"""
+
+    def test_static_rejects_init_only_log_lik(self):
+        """Model with only log_lik = 0.0 init (no accumulation) is rejected."""
+        result = validate_likelihood_static(
+            self.INIT_ONLY_LOG_LIK, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    def test_static_rejects_init_only_nll(self):
+        """Model with only nll = 0.0 init (no accumulation) is rejected."""
+        result = validate_likelihood_static(
+            self.INIT_ONLY_NLL, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    # ---- No-loop parameter-only nll/log_lik assignment (regression) ---- #
+
+    PARAM_ONLY_NLL = """
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    nll = alpha + beta
+    return nll
+"""
+
+    PARAM_ONLY_LOG_LIK = """
+def cognitive_model(stimulus, action, reward, params):
+    alpha, beta = params
+    log_lik = alpha + beta
+    return -log_lik
+"""
+
+    def test_static_rejects_param_only_nll(self):
+        """No-loop nll = alpha + beta; return nll is rejected (no
+        likelihood-shaped RHS)."""
+        result = validate_likelihood_static(
+            self.PARAM_ONLY_NLL, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
+    def test_static_rejects_param_only_log_lik(self):
+        """No-loop log_lik = alpha + beta; return -log_lik is rejected (no
+        likelihood-shaped RHS)."""
+        result = validate_likelihood_static(
+            self.PARAM_ONLY_LOG_LIK, "cognitive_model"
+        )
+        assert not result.passed
+        assert result.error_type == "constant_likelihood"
+
 
 # ========================================================================
 # Post-fit validation
@@ -347,6 +511,61 @@ class TestPostFitValidation:
             n_participants=3,
         )
         assert result.passed
+
+    # ---- Configurable low per-choice NLL threshold ---- #
+
+    def test_post_fit_rejects_configured_low_per_choice_nll(self):
+        """Default threshold (0.01) rejects per-choice NLL near 0.0025."""
+        # per-participant NLL = [0.5, 0.5, 0.5], trials = [200, 200, 200]
+        # per-choice = 0.5/200 = 0.0025 < 0.01 → rejected
+        result = validate_likelihood_post_fit(
+            per_participant_nll=[0.5, 0.5, 0.5],
+            mean_nll=0.5,
+            func_name="test_model",
+            n_participants=3,
+            participant_n_trials=[200, 200, 200],
+        )
+        assert not result.passed
+        assert result.error_type == "degenerate_nll"
+
+    def test_post_fit_low_threshold_can_be_overridden(self):
+        """Explicit lower threshold allows the same 0.0025 per-choice NLL,
+        while all-zero and negative NLL remain invalid."""
+        # With a lower threshold of 0.001, 0.0025 > 0.001 → passes
+        result = validate_likelihood_post_fit(
+            per_participant_nll=[0.5, 0.5, 0.5],
+            mean_nll=0.5,
+            func_name="test_model",
+            n_participants=3,
+            participant_n_trials=[200, 200, 200],
+            min_per_choice_nll=0.001,
+        )
+        assert result.passed, (
+            f"Expected pass with lowered threshold, "
+            f"got error_type={result.error_type}: {result.error_message}"
+        )
+
+        # All-zero NLL is still rejected regardless of threshold
+        result_zero = validate_likelihood_post_fit(
+            per_participant_nll=[0.0, 0.0, 0.0],
+            mean_nll=0.0,
+            func_name="test_model",
+            n_participants=3,
+            min_per_choice_nll=0.001,
+        )
+        assert not result_zero.passed
+        assert result_zero.error_type == "degenerate_nll"
+
+        # Negative NLL is still rejected regardless of threshold
+        result_neg = validate_likelihood_post_fit(
+            per_participant_nll=[1.0, -0.5, 2.0],
+            mean_nll=0.833,
+            func_name="test_model",
+            n_participants=3,
+            min_per_choice_nll=0.001,
+        )
+        assert not result_neg.passed
+        assert result_neg.error_type == "degenerate_nll"
 
 
 # ========================================================================

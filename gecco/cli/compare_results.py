@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from gecco.results_comparison import (
+    ComparisonThresholds,
     aggregate_configs,
     discover_run_dirs,
     export_figures,
@@ -40,6 +41,24 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
         default="comparison",
         help="Output directory for generated artifacts (default: comparison)",
     )
+    parser.add_argument(
+        "--min-test-mean-nll",
+        type=float,
+        default=None,
+        help=(
+            "Minimum acceptable mean NLL for code=NULL test rows "
+            "(default: 1.0).  Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--min-test-metric-value",
+        type=float,
+        default=None,
+        help=(
+            "Minimum acceptable metric value for code=NULL test rows "
+            "(default: 20.0).  Set to 0 to disable."
+        ),
+    )
     parser.set_defaults(handler=main)
     return parser
 
@@ -48,6 +67,27 @@ def main(args: argparse.Namespace) -> int | None:
     """Run the comparison command from parsed CLI arguments."""
     results_dirs = [Path(d) for d in args.results_dirs]
     output_dir = Path(args.output)
+
+    # Build thresholds from CLI args (or use defaults).
+    # Use getattr for backward compat with callers passing SimpleNamespace
+    # that may not have these attributes.
+    cli_mean_nll = getattr(args, "min_test_mean_nll", None)
+    cli_metric_value = getattr(args, "min_test_metric_value", None)
+    thresholds = ComparisonThresholds(
+        min_mean_nll=cli_mean_nll if cli_mean_nll is not None else 1.0,
+        min_metric_value=cli_metric_value if cli_metric_value is not None else 20.0,
+    )
+    # A value of 0 means "disable" the threshold (allow all)
+    if cli_mean_nll is not None and cli_mean_nll == 0.0:
+        thresholds = ComparisonThresholds(
+            min_mean_nll=None,
+            min_metric_value=thresholds.min_metric_value,
+        )
+    if cli_metric_value is not None and cli_metric_value == 0.0:
+        thresholds = ComparisonThresholds(
+            min_mean_nll=thresholds.min_mean_nll,
+            min_metric_value=None,
+        )
 
     # Validate directories exist
     missing = [str(d) for d in results_dirs if not d.is_dir()]
@@ -72,7 +112,7 @@ def main(args: argparse.Namespace) -> int | None:
     print(f"Discovered {len(discovered)} run director{'ies' if len(discovered) != 1 else 'y'}")
 
     # Summarise
-    summaries = [summarise_run(d) for d in discovered]
+    summaries = [summarise_run(d, thresholds=thresholds) for d in discovered]
     config_rows = aggregate_configs(summaries)
     print(f"  Configs: {len(config_rows)}")
 

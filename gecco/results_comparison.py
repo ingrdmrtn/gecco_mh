@@ -521,6 +521,25 @@ def _merge_sibling_test_rows(
 # Baseline extraction helpers
 # --------------------------------------------------------------------------- #
 
+import re
+
+
+def _shorten_code(code: str, max_len: int = 60) -> str:
+    """Extract a short identifier from a Python code string.
+
+    Prefers the function name (e.g. ``hybrid_model``), falling back to
+    a truncated version of the code.
+    """
+    if not code:
+        return "<empty>"
+    m = re.search(r"def\s+(\w+)", code)
+    if m:
+        return m.group(1)
+    # No function definition found; truncate
+    if len(code) <= max_len:
+        return code
+    return code[: max_len - 3] + "..."
+
 
 def _read_baseline_code(
     results_dir: str,
@@ -588,7 +607,7 @@ def _read_baseline_registry(
                     )
                 return None
             if diagnostics is not None:
-                diagnostics.append(f"Baseline found with code='{code}'")
+                diagnostics.append(f"Baseline found with code='{_shorten_code(str(code))}'")
             return {
                 "code": code,
                 "metric_value": float(row[1]) if row[1] is not None else None,
@@ -636,19 +655,19 @@ def _find_baseline_test_row(
     if len(rows) == 0:
         if diagnostics is not None:
             diagnostics.append(
-                f"Baseline code '{baseline_code}' matches 0 test rows"
+                f"Baseline code '{_shorten_code(baseline_code)}' matches 0 test rows"
             )
         return None
     if len(rows) > 1:
         if diagnostics is not None:
             diagnostics.append(
-                f"Baseline code '{baseline_code}' matches {len(rows)} test rows "
+                f"Baseline code '{_shorten_code(baseline_code)}' matches {len(rows)} test rows "
                 "(expected exactly 1)"
             )
         return None
     row = rows[0]
     if diagnostics is not None:
-        diagnostics.append(f"Baseline test row matches code '{baseline_code}'")
+        diagnostics.append(f"Baseline test row matches code '{_shorten_code(baseline_code)}'")
     return {
         "name": row[0],
         "metric_value": float(row[1]) if row[1] is not None else None,

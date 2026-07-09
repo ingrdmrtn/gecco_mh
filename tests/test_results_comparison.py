@@ -6,6 +6,7 @@ import csv
 import os
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from gecco.diagnostic_store.store import DiagnosticStore
@@ -753,7 +754,7 @@ def test_prepare_fit_vs_prediction_with_config_rows_uses_means():
          "best_train_metric_mean": 200.0, "best_test_metric_mean": 250.0},
     ]
 
-    labels, x_vals, y_vals = _prepare_fit_vs_prediction_data(
+    labels, x_vals, y_vals, bl_labels, bl_x, bl_y = _prepare_fit_vs_prediction_data(
         summaries, config_rows=config_rows
     )
 
@@ -761,6 +762,10 @@ def test_prepare_fit_vs_prediction_with_config_rows_uses_means():
     assert labels == ["Static\nAll context", "Random"]
     assert x_vals == [105.0, 200.0]   # config-level means
     assert y_vals == [135.0, 250.0]   # config-level means
+    # No baseline data in config_rows → empty baseline groups
+    assert bl_labels == []
+    assert bl_x == []
+    assert bl_y == []
 
 
 def test_prepare_fit_vs_prediction_without_config_rows_uses_run_level():
@@ -775,11 +780,15 @@ def test_prepare_fit_vs_prediction_without_config_rows_uses_run_level():
          "best_train_metric": 200.0, "best_test_metric": 250.0},
     ]
 
-    labels, x_vals, y_vals = _prepare_fit_vs_prediction_data(summaries)
+    labels, x_vals, y_vals, bl_labels, bl_x, bl_y = _prepare_fit_vs_prediction_data(summaries)
 
     assert labels == ["Off", "LLM\nAttempted performance code"]
     assert x_vals == [100.0, 200.0]   # run-level values
     assert y_vals == [130.0, 250.0]   # run-level values
+    # No baseline data in summaries → empty baseline groups
+    assert bl_labels == []
+    assert bl_x == []
+    assert bl_y == []
 
 
 def test_format_config_label_for_display_groups_judge_type():
@@ -1603,6 +1612,94 @@ def test_split_store_fallback_uses_sibling_test_rows(tmp_path: Path):
     assert summary["has_individual_differences"] is True
 
 
+def test_merge_sibling_populates_baseline_when_no_generated_test_row(
+    tmp_path: Path,
+):
+    """When the primary DB has no test rows and the sibling DB contains only
+    a registered baseline test row, baseline_test_metric is populated but
+    best_test_metric remains missing."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+    from gecco.diagnostic_store.store import DiagnosticStore
+
+    run = tmp_path / "sibling_bl_only"
+    run.mkdir(parents=True)
+
+    baseline_code = (
+        "def bl_only_sibling(stimulus, action, reward, params):\n    return 0.0"
+    )
+
+    # Create primary unified DB with train/val only (no test rows)
+    _create_minimal_diagnostics_train_only(
+        run / "diagnostics_unified.duckdb", label="unified"
+    )
+
+    # Create sibling diagnostics.duckdb with ONLY a baseline test row
+    # (no non-baseline generated test row)
+    store = DiagnosticStore(run / "diagnostics.duckdb")
+    store.write_iteration(
+        iteration=0, run_idx=0,
+        iteration_results=[{
+            "function_name": "bl_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "mean_nll": 4.0,
+            "param_names": ["alpha"],
+            "val_metric_value": 155.0,
+            "val_mean_nll": 4.2,
+        }],
+    )
+    store.close()
+    store2 = DiagnosticStore(run / "diagnostics.duckdb")
+    store2.write_top_model_test({
+        "model_name": "baseline_sibling",
+        "val_nll": 3.5,
+        "test_mean_BIC": 100.0,
+        "test_mean_NLL": 3.0,
+        "test_individual_BIC": [100.0],
+        "test_individual_NLL": [3.0],
+        "test_individual_differences": {
+            "mean_r2": 0.8,
+            "max_r2": 0.9,
+            "best_param": "alpha",
+            "per_param_r2": {"alpha": 0.9},
+            "per_param_detail": {
+                "alpha": {"r2": 0.9, "slope": 0.95, "intercept": 0.05},
+            },
+        },
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["alpha"],
+    })
+    store2.close()
+
+    # Create shared_registry.duckdb with matching baseline code
+    _create_shared_registry_with_baseline(
+        run, baseline_code=baseline_code, metric_value=95.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    entry = discovered[0]
+    assert "diagnostics_unified" in entry["db_path"]
+
+    summary = summarise_run(entry)
+
+    # best_test_metric remains missing — no non-baseline generated test row
+    assert summary["best_test_metric"] is None
+    assert summary["has_test_eval"] is False
+    # best ID fields are also missing
+    assert summary["best_test_mean_r2"] is None
+    assert summary["best_test_max_r2"] is None
+
+    # But baseline_test_metric IS populated from the sibling baseline row
+    assert summary["baseline_test_metric"] == 100.0
+    assert summary["baseline_test_nll"] == 3.0
+    assert summary["baseline_test_mean_r2"] == 0.8
+    assert summary["baseline_test_max_r2"] == 0.9
+    assert summary["has_baseline"] is True
+    # baseline_metric comes from the registry
+    assert summary["baseline_metric"] == 95.0
+
+
 def test_split_store_primary_wins_when_it_has_test_rows(tmp_path: Path):
     """When diagnostics_unified.duckdb already has valid test rows,
     sibling diagnostics.duckdb test rows are NOT used."""
@@ -1658,3 +1755,942 @@ def test_excluded_rows_do_not_feed_figure_data(tmp_path: Path):
     assert summary_after["best_model_name"] == summary_before["best_model_name"]
     # n_models may differ because rows were added; but n_excluded_rows > 0
     assert summary_after["n_excluded_rows"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Baseline extraction tests
+# --------------------------------------------------------------------------- #
+
+
+def _create_shared_registry_with_baseline(
+    run_dir: Path,
+    *,
+    baseline_code: str = "def baseline_model(stimulus, action, reward, params):\n    return 0.0",
+    metric_value: float = 100.0,
+) -> Path:
+    """Create a ``shared_registry.duckdb`` with a ``runtime_baseline`` entry."""
+    db_path = run_dir / "shared_registry.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_baseline (
+            singleton INTEGER PRIMARY KEY DEFAULT 1,
+            function_name VARCHAR,
+            executable_function_name VARCHAR,
+            metric_name VARCHAR,
+            metric_value DOUBLE,
+            param_names JSON,
+            eval_metrics JSON,
+            mean_r2 DOUBLE,
+            max_r2 DOUBLE,
+            best_param VARCHAR,
+            per_param_r2 JSON,
+            code TEXT,
+            val_mean_nll DOUBLE,
+            CHECK (singleton = 1)
+        )
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO runtime_baseline "
+        "(singleton, function_name, executable_function_name, metric_name, "
+        " metric_value, param_names, eval_metrics, mean_r2, max_r2, best_param, "
+        " per_param_r2, code, val_mean_nll) "
+        "VALUES (1, 'baseline_model', NULL, 'BIC', ?, '[]'::JSON, '[]'::JSON, "
+        "        NULL, NULL, NULL, '{}'::JSON, ?, NULL)",
+        [metric_value, baseline_code],
+    )
+    conn.close()
+    return db_path
+
+
+def test_summarise_run_best_test_excludes_registered_baseline_row(
+    tmp_path: Path,
+):
+    """Generated-model best-test excludes the registered baseline row even when
+    the baseline row has a lower (better) metric."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "best_excl_baseline"
+    run.mkdir(parents=True)
+
+    baseline_code = (
+        "def baseline_m(stimulus, action, reward, params):\n    return 0.0"
+    )
+    generated_code = (
+        "def generated_m(stimulus, action, reward, params):\n    return 1.0"
+    )
+
+    # Create diagnostics DB with a train row
+    store = DiagnosticStore(run / "diagnostics.duckdb")
+    store.write_iteration(
+        iteration=0, run_idx=0,
+        iteration_results=[{
+            "function_name": "train_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "mean_nll": 4.0,
+            "param_names": ["alpha"],
+            "val_metric_value": 155.0,
+            "val_mean_nll": 4.2,
+        }],
+    )
+    store.close()
+
+    # Write a generated test row with metric 120.0 (higher, non-baseline code)
+    store2 = DiagnosticStore(run / "diagnostics.duckdb")
+    store2.write_top_model_test({
+        "model_name": "generated_model",
+        "val_nll": 3.0,
+        "test_mean_BIC": 120.0,
+        "test_mean_NLL": 3.5,
+        "test_individual_BIC": [120.0],
+        "test_individual_NLL": [3.5],
+        "test_individual_differences": {
+            "mean_r2": 0.75,
+            "max_r2": 0.85,
+            "best_param": "beta",
+            "per_param_r2": {"beta": 0.85},
+            "per_param_detail": {
+                "beta": {"r2": 0.85, "slope": 0.9, "intercept": 0.1},
+            },
+        },
+        "status": "ok",
+        "code": generated_code,
+        "param_names": ["beta"],
+    })
+
+    # Write a baseline test row with metric 100.0 (lower, baseline code)
+    store2.write_top_model_test({
+        "model_name": "baseline_model",
+        "val_nll": 3.5,
+        "test_mean_BIC": 100.0,
+        "test_mean_NLL": 3.0,
+        "test_individual_BIC": [100.0],
+        "test_individual_NLL": [3.0],
+        "test_individual_differences": None,
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["alpha"],
+    })
+    store2.close()
+
+    # Create shared_registry.duckdb with matching baseline code
+    _create_shared_registry_with_baseline(
+        run, baseline_code=baseline_code, metric_value=95.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # best_test_metric must come from the generated row (120.0), not the
+    # lower baseline row (100.0)
+    assert summary["best_test_metric"] == 120.0
+    # Generated ID fields come from the generated row
+    assert summary["best_test_mean_r2"] == 0.75
+    assert summary["best_test_max_r2"] == 0.85
+    # baseline_test_metric comes from the registered baseline row (100.0)
+    assert summary["baseline_test_metric"] == 100.0
+    assert summary["baseline_test_nll"] == 3.0
+    assert summary["has_baseline"] is True
+
+
+def test_summarise_run_reads_baseline_test_row_from_registry_code_match(
+    tmp_path: Path,
+):
+    """Baseline code matches exactly one test row → baseline fields populated.
+    The generated best-test selection excludes the registered baseline row
+    so a distinct generated test row is selected."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "baseline_match"
+    run.mkdir(parents=True)
+
+    baseline_code = (
+        "def my_baseline(stimulus, action, reward, params):\n    return 0.0"
+    )
+    generated_code = (
+        "def my_generated(stimulus, action, reward, params):\n    return 1.0"
+    )
+
+    # Create diagnostics DB with a train/val row
+    store = DiagnosticStore(run / "diagnostics.duckdb")
+    store.write_iteration(
+        iteration=0, run_idx=0,
+        iteration_results=[{
+            "function_name": "some_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "mean_nll": 4.0,
+            "param_names": ["alpha"],
+            "val_metric_value": 155.0,
+            "val_mean_nll": 4.2,
+        }],
+    )
+    store.close()
+
+    store2 = DiagnosticStore(run / "diagnostics.duckdb")
+    # Write a generated test row with a non-baseline code (higher metric)
+    store2.write_top_model_test({
+        "model_name": "my_generated",
+        "val_nll": 3.8,
+        "test_mean_BIC": 120.0,
+        "test_mean_NLL": 3.5,
+        "test_individual_BIC": [120.0],
+        "test_individual_NLL": [3.5],
+        "test_individual_differences": {
+            "mean_r2": 0.7,
+            "max_r2": 0.8,
+            "best_param": "beta",
+            "per_param_r2": {"beta": 0.8},
+            "per_param_detail": {"beta": {"r2": 0.8, "slope": 0.85, "intercept": 0.15}},
+        },
+        "status": "ok",
+        "code": generated_code,
+        "param_names": ["beta"],
+    })
+    # Write a baseline test row whose code matches the registry
+    store2.write_top_model_test({
+        "model_name": "my_baseline",
+        "val_nll": 3.5,
+        "test_mean_BIC": 100.0,
+        "test_mean_NLL": 3.0,
+        "test_individual_BIC": [100.0],
+        "test_individual_NLL": [3.0],
+        "test_individual_differences": {
+            "mean_r2": 0.8,
+            "max_r2": 0.9,
+            "best_param": "alpha",
+            "per_param_r2": {"alpha": 0.9},
+            "per_param_detail": {"alpha": {"r2": 0.9, "slope": 0.95, "intercept": 0.05}},
+        },
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["alpha"],
+    })
+    store2.close()
+
+    # Create shared_registry.duckdb with matching baseline code and metric
+    _create_shared_registry_with_baseline(
+        run, baseline_code=baseline_code, metric_value=95.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Baseline fields should be populated from the matching test row
+    assert summary["baseline_test_metric"] == 100.0
+    assert summary["baseline_test_nll"] == 3.0
+    assert summary["baseline_test_mean_r2"] == 0.8
+    assert summary["baseline_test_max_r2"] == 0.9
+    assert summary["has_baseline"] is True
+    # baseline_metric comes from the registry's metric_value
+    assert summary["baseline_metric"] == 95.0
+    # Generated best-test fields come from the distinct generated row
+    assert summary["best_test_metric"] == 120.0
+    assert summary["best_test_mean_r2"] == 0.7
+    assert summary["best_test_max_r2"] == 0.8
+
+
+def test_summarise_run_does_not_guess_ambiguous_baseline(tmp_path: Path):
+    """Two test rows with the same baseline code → baseline fields remain None.
+    A distinct non-baseline generated test row is still selected."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "ambiguous_baseline"
+    run.mkdir(parents=True)
+
+    baseline_code = (
+        "def my_baseline(stimulus, action, reward, params):\n    return 0.0"
+    )
+    generated_code = (
+        "def my_generated(stimulus, action, reward, params):\n    return 1.0"
+    )
+
+    # Create train row
+    store = DiagnosticStore(run / "diagnostics.duckdb")
+    store.write_iteration(
+        iteration=0, run_idx=0,
+        iteration_results=[{
+            "function_name": "some_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "mean_nll": 4.0,
+            "param_names": ["alpha"],
+            "val_metric_value": 155.0,
+            "val_mean_nll": 4.2,
+        }],
+    )
+    store.close()
+
+    # Add TWO test rows with the same baseline code → ambiguous
+    # Plus a distinct non-baseline generated test row
+    store2 = DiagnosticStore(run / "diagnostics.duckdb")
+    store2.write_top_model_test({
+        "model_name": "baseline_v1",
+        "val_nll": 3.0,
+        "test_mean_BIC": 120.0,
+        "test_mean_NLL": 3.5,
+        "test_individual_BIC": [120.0],
+        "test_individual_NLL": [3.5],
+        "test_individual_differences": None,
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["alpha"],
+    })
+    store2.write_top_model_test({
+        "model_name": "baseline_v2",
+        "val_nll": 3.2,
+        "test_mean_BIC": 110.0,
+        "test_mean_NLL": 3.3,
+        "test_individual_BIC": [110.0],
+        "test_individual_NLL": [3.3],
+        "test_individual_differences": None,
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["beta"],
+    })
+    # Non-baseline generated test row (higher metric so it tests exclusion)
+    store2.write_top_model_test({
+        "model_name": "generated_model",
+        "val_nll": 4.0,
+        "test_mean_BIC": 130.0,
+        "test_mean_NLL": 4.0,
+        "test_individual_BIC": [130.0],
+        "test_individual_NLL": [4.0],
+        "test_individual_differences": {
+            "mean_r2": 0.6,
+            "max_r2": 0.7,
+            "best_param": "gamma",
+            "per_param_r2": {"gamma": 0.7},
+            "per_param_detail": {
+                "gamma": {"r2": 0.7, "slope": 0.75, "intercept": 0.25},
+            },
+        },
+        "status": "ok",
+        "code": generated_code,
+        "param_names": ["gamma"],
+    })
+    store2.close()
+
+    # Create shared_registry.duckdb with matching baseline code
+    _create_shared_registry_with_baseline(run, baseline_code=baseline_code)
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Two rows with same code → ambiguous → baseline fields remain None
+    assert summary["baseline_test_metric"] is None
+    assert summary["baseline_test_nll"] is None
+    assert summary["has_baseline"] is False
+    # Generated selection picks the non-baseline row (130.0 is the only
+    # non-baseline test row)
+    assert summary["best_test_metric"] == 130.0
+    assert summary["best_test_mean_r2"] == 0.6
+    assert summary["best_test_max_r2"] == 0.7
+
+
+def test_summarise_run_baseline_absent_when_no_registry(tmp_path: Path):
+    """No shared_registry.duckdb → baseline fields remain None."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "no_registry"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="run")
+    # No shared_registry.duckdb created
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    assert summary["baseline_test_metric"] is None
+    assert summary["baseline_test_nll"] is None
+    assert summary["has_baseline"] is False
+    # Normal summary still works
+    assert summary["best_test_metric"] == 130.0
+
+
+def test_config_summary_aggregates_baseline_metrics(tmp_path: Path):
+    """Config-level aggregation produces baseline mean/std/n columns."""
+    from gecco.results_comparison import aggregate_configs
+
+    # Create manual summaries with mixed baseline presence
+    summaries = [
+        {
+            "config_label": "grp",
+            "best_train_metric": 100.0,
+            "best_val_metric": 105.0,
+            "best_test_metric": 130.0,
+            "best_test_nll": 4.0,
+            "best_test_mean_r2": 0.75,
+            "best_test_max_r2": 0.85,
+            "baseline_metric": 95.0,
+            "baseline_test_metric": 130.0,
+            "baseline_test_nll": 4.0,
+            "baseline_test_mean_r2": 0.75,
+            "baseline_test_max_r2": 0.85,
+            "has_baseline": True,
+            "n_models": 5,
+            "n_failed_models": 0,
+            "has_test_eval": True,
+            "has_individual_differences": True,
+        },
+        {
+            "config_label": "grp",
+            "best_train_metric": 120.0,
+            "best_val_metric": 125.0,
+            "best_test_metric": 140.0,
+            "best_test_nll": 5.0,
+            "best_test_mean_r2": 0.65,
+            "best_test_max_r2": 0.75,
+            "baseline_metric": None,
+            "baseline_test_metric": None,
+            "baseline_test_nll": None,
+            "baseline_test_mean_r2": None,
+            "baseline_test_max_r2": None,
+            "has_baseline": False,
+            "n_models": 8,
+            "n_failed_models": 1,
+            "has_test_eval": True,
+            "has_individual_differences": True,
+        },
+    ]
+
+    config_rows = aggregate_configs(summaries)
+    assert len(config_rows) == 1
+    row = config_rows[0]
+
+    # Existing aggregates still work
+    assert row["n_runs"] == 2
+    assert row["best_train_metric_mean"] == 110.0
+    assert row["best_test_metric_mean"] == 135.0
+
+    # Baseline aggregates: first run has baseline, second doesn't
+    assert row["baseline_test_metric_mean"] == 130.0
+    assert row["baseline_test_metric_n"] == 1
+    # baseline_metric: only 1 non-None value → mean = 95.0, std = 0.0
+    assert row["baseline_metric_mean"] == 95.0
+    assert row["baseline_metric_n"] == 1
+    assert row["baseline_metric_std"] == 0.0
+
+    # baseline_test_nll: only 1 value
+    assert row["baseline_test_nll_mean"] == 4.0
+    assert row["baseline_test_nll_n"] == 1
+
+    # baseline_test_mean_r2: only 1 value
+    assert row["baseline_test_mean_r2_mean"] == 0.75
+    assert row["baseline_test_mean_r2_n"] == 1
+
+    # baseline_test_max_r2: only 1 value
+    assert row["baseline_test_max_r2_mean"] == 0.85
+    assert row["baseline_test_max_r2_n"] == 1
+
+
+def test_export_config_level_figures_includes_baseline_series(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The main config comparison figure includes Baseline series when data exists."""
+    from gecco.results_comparison import _export_config_level_figures
+
+    calls = []
+
+    def fake_bar_chart_with_errors(
+        base_path, labels, series, title, ylabel, caption
+    ):
+        calls.append({
+            "base_path": base_path,
+            "labels": labels,
+            "series": series,
+            "title": title,
+            "ylabel": ylabel,
+            "caption": caption,
+        })
+
+    monkeypatch.setattr(
+        "gecco.results_comparison._bar_chart_with_errors",
+        fake_bar_chart_with_errors,
+    )
+
+    config_rows = [
+        {
+            "config_label": "family/judge_off",
+            "best_test_metric_mean": 130.0,
+            "best_test_metric_std": 7.0,
+            "baseline_test_metric_mean": 140.0,
+            "baseline_test_metric_std": 5.0,
+            "best_test_mean_r2_mean": 0.5,
+            "best_test_mean_r2_std": 0.1,
+            "best_test_max_r2_mean": 0.6,
+            "best_test_max_r2_std": 0.2,
+        },
+        {
+            "config_label": "family/judge_static_all_context",
+            "best_test_metric_mean": 230.0,
+            "best_test_metric_std": 10.0,
+            "baseline_test_metric_mean": 220.0,
+            "baseline_test_metric_std": 8.0,
+            "best_test_mean_r2_mean": 0.7,
+            "best_test_mean_r2_std": 0.3,
+            "best_test_max_r2_mean": 0.8,
+            "best_test_max_r2_std": 0.4,
+        },
+    ]
+
+    _export_config_level_figures(tmp_path, config_rows)
+
+    # Find the main figure call
+    main_call = next(
+        c for c in calls if c["base_path"].name == "model_fit_by_config"
+    )
+    series_names = [name for name, _, _ in main_call["series"]]
+    assert "Test" in series_names
+    assert "Baseline" in series_names
+
+
+def test_prepare_fit_vs_prediction_data_includes_baseline_points():
+    """_prepare_fit_vs_prediction_data includes baseline config points when
+    both baseline_metric and baseline_test_metric exist."""
+    from gecco.results_comparison import _prepare_fit_vs_prediction_data
+
+    summaries = [
+        {
+            "config_label": "cfg_a",
+            "run_id": "run_001",
+            "best_train_metric": 100.0,
+            "best_test_metric": 130.0,
+            "baseline_metric": 95.0,
+            "baseline_test_metric": 125.0,
+        },
+        {
+            "config_label": "cfg_b",
+            "run_id": "run_002",
+            "best_train_metric": 200.0,
+            "best_test_metric": 250.0,
+            "baseline_metric": None,
+            "baseline_test_metric": None,
+        },
+    ]
+
+    labels, x_vals, y_vals, bl_labels, bl_x, bl_y = (
+        _prepare_fit_vs_prediction_data(summaries)
+    )
+
+    # Generated points
+    assert len(labels) == 2
+    assert len(x_vals) == 2
+    assert len(y_vals) == 2
+
+    # Baseline points: only cfg_a has both baseline_metric and baseline_test_metric
+    assert len(bl_labels) == 1
+    assert "Baseline" in bl_labels[0]
+    assert bl_x == [95.0]
+    assert bl_y == [125.0]
+
+
+def test_config_summary_csv_includes_baseline_columns(tmp_path: Path):
+    """config_summary.csv includes baseline metric columns."""
+    from gecco.results_comparison import (
+        aggregate_configs,
+        write_config_summary_csv,
+    )
+
+    summaries = [
+        {
+            "config_label": "grp",
+            "best_train_metric": 100.0,
+            "best_val_metric": 105.0,
+            "best_test_metric": 130.0,
+            "best_test_nll": 4.0,
+            "best_test_mean_r2": 0.75,
+            "best_test_max_r2": 0.85,
+            "baseline_metric": 95.0,
+            "baseline_test_metric": 130.0,
+            "baseline_test_nll": 4.0,
+            "baseline_test_mean_r2": 0.75,
+            "baseline_test_max_r2": 0.85,
+            "has_baseline": True,
+            "n_models": 5,
+            "n_failed_models": 0,
+            "has_test_eval": True,
+            "has_individual_differences": True,
+        },
+    ]
+
+    config_rows = aggregate_configs(summaries)
+    out_dir = tmp_path / "out"
+    csv_path = write_config_summary_csv(config_rows, out_dir)
+
+    import csv
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 1
+    row = rows[0]
+    # Check baseline columns exist in CSV
+    assert "baseline_test_metric_mean" in row
+    assert "baseline_test_metric_std" in row
+    assert "baseline_test_metric_n" in row
+    assert "baseline_test_nll_mean" in row
+    assert "baseline_test_mean_r2_mean" in row
+    assert "baseline_test_max_r2_mean" in row
+    # Check values
+    assert float(row["baseline_test_metric_mean"]) == pytest.approx(130.0)
+    assert int(row["baseline_test_metric_n"]) == 1
+
+
+def test_baseline_no_code_match_leaves_missing(tmp_path: Path):
+    """Registry exists with a baseline code, but no test row has that code
+    → baseline fields remain None."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "registry_no_match"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="run")
+
+    # Create shared_registry.duckdb with a code that does NOT match any
+    # test row in the diagnostics DB.
+    _create_shared_registry_with_baseline(
+        run,
+        baseline_code="def nonexistent(stimulus, action, reward, params):\n    return 999.0",
+        metric_value=95.0,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Registry exists but code does not match → no baseline
+    assert summary["baseline_test_metric"] is None
+    assert summary["baseline_test_nll"] is None
+    assert summary["has_baseline"] is False
+    # Normal best-test still works
+    assert summary["best_test_metric"] == 130.0
+
+
+def test_baseline_null_metric_value_not_accepted(tmp_path: Path):
+    """A matching baseline test row with metric_value=NULL is not accepted
+    → baseline fields remain None."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+    from gecco.diagnostic_store.store import DiagnosticStore
+
+    run = tmp_path / "baseline_null_metric"
+    run.mkdir(parents=True)
+
+    baseline_code = (
+        "def bl_null_metric(stimulus, action, reward, params):\n    return 0.0"
+    )
+
+    # Create train row
+    store = DiagnosticStore(run / "diagnostics.duckdb")
+    store.write_iteration(
+        iteration=0, run_idx=0,
+        iteration_results=[{
+            "function_name": "some_model",
+            "metric_name": "BIC",
+            "metric_value": 150.0,
+            "mean_nll": 4.0,
+            "param_names": ["alpha"],
+            "val_metric_value": 155.0,
+            "val_mean_nll": 4.2,
+        }],
+    )
+    store.close()
+
+    # Create a test row with matching code but NULL metric_value
+    store2 = DiagnosticStore(run / "diagnostics.duckdb")
+    store2.write_top_model_test({
+        "model_name": "bl_model",
+        "val_nll": 3.5,
+        "test_mean_BIC": None,       # metric_value will be NULL
+        "test_mean_NLL": 3.0,
+        "test_individual_BIC": [],
+        "test_individual_NLL": [3.0],
+        "test_individual_differences": None,
+        "status": "ok",
+        "code": baseline_code,
+        "param_names": ["alpha"],
+    })
+    store2.close()
+
+    # Create registry with matching code
+    _create_shared_registry_with_baseline(
+        run, baseline_code=baseline_code, metric_value=95.0
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # metric_value=NULL → row not accepted as baseline
+    assert summary["baseline_test_metric"] is None
+    assert summary["has_baseline"] is False
+
+
+def test_baseline_null_code_leaves_missing(tmp_path: Path):
+    """Registry exists with NULL baseline code → baseline fields remain None."""
+    from gecco.results_comparison import discover_run_dirs, summarise_run
+
+    run = tmp_path / "null_code"
+    run.mkdir(parents=True)
+    _create_minimal_diagnostics(run / "diagnostics.duckdb", label="run")
+
+    # Create shared_registry.duckdb with NULL code
+    _create_shared_registry_with_baseline(
+        run,
+        baseline_code=None,
+        metric_value=95.0,
+    )
+
+    discovered = discover_run_dirs([tmp_path])
+    summary = summarise_run(discovered[0])
+
+    # Registry exists but code is NULL → no baseline
+    assert summary["baseline_test_metric"] is None
+    assert summary["baseline_test_nll"] is None
+    assert summary["has_baseline"] is False
+    # Normal best-test still works
+    assert summary["best_test_metric"] == 130.0
+
+
+def test_baseline_run_level_fallback_figure_includes_series(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Run-level fallback figure path includes Baseline series in main bar
+    and ID bar charts when baseline values exist."""
+    from gecco.results_comparison import export_figures
+
+    calls = []
+
+    def fake_bar_chart(base_path, labels, series, title, ylabel, caption):
+        calls.append({
+            "base_path": base_path,
+            "labels": labels,
+            "series": series,
+            "title": title,
+            "ylabel": ylabel,
+            "caption": caption,
+        })
+
+    monkeypatch.setattr(
+        "gecco.results_comparison._bar_chart",
+        fake_bar_chart,
+    )
+    monkeypatch.setattr(
+        "gecco.results_comparison._scatter_plot",
+        lambda *args, **kwargs: None,
+    )
+
+    # Summaries with baseline data in some runs
+    summaries = [
+        {
+            "config_label": "cfg_a", "run_id": "run_001",
+            "best_train_metric": 100.0, "best_val_metric": 105.0,
+            "best_test_metric": 130.0, "best_test_nll": 4.0,
+            "best_test_mean_r2": 0.75, "best_test_max_r2": 0.85,
+            "baseline_test_metric": 120.0,
+            "baseline_test_mean_r2": 0.70, "baseline_test_max_r2": 0.80,
+            "has_baseline": True,
+            "has_test_eval": True, "has_individual_differences": True,
+            "n_models": 5, "n_failed_models": 0, "n_excluded_rows": 0,
+            "exclusion_warnings": [],
+        },
+        {
+            "config_label": "cfg_b", "run_id": "run_002",
+            "best_train_metric": 200.0, "best_val_metric": 210.0,
+            "best_test_metric": 230.0, "best_test_nll": 5.0,
+            "best_test_mean_r2": 0.65, "best_test_max_r2": 0.75,
+            "baseline_test_metric": None,
+            "baseline_test_mean_r2": None, "baseline_test_max_r2": None,
+            "has_baseline": False,
+            "has_test_eval": True, "has_individual_differences": True,
+            "n_models": 8, "n_failed_models": 0, "n_excluded_rows": 0,
+            "exclusion_warnings": [],
+        },
+    ]
+
+    export_figures(summaries, str(tmp_path))
+
+    # Find the model_fit_by_config call
+    fit_call = next(
+        c for c in calls if c["base_path"].name == "model_fit_by_config"
+    )
+    series_names = [name for name, _ in fit_call["series"]]
+    assert "Train" in series_names
+    assert "Val" in series_names
+    assert "Test" in series_names
+    assert "Baseline" in series_names
+
+    # Baseline series values: first run has 120.0, second has None
+    bl_series = next(
+        vals for name, vals in fit_call["series"] if name == "Baseline"
+    )
+    assert bl_series[0] == 120.0
+    assert bl_series[1] is None
+
+    # Find the individual_differences_by_config call
+    id_call = next(
+        c for c in calls if c["base_path"].name == "individual_differences_by_config"
+    )
+    id_series_names = [name for name, _ in id_call["series"]]
+    assert "Mean R²" in id_series_names
+    assert "Max R²" in id_series_names
+    assert "Baseline Mean R²" in id_series_names
+    assert "Baseline Max R²" in id_series_names
+
+    # Baseline ID series: first run has values, second has None
+    bl_mean_series = next(
+        vals for name, vals in id_call["series"] if name == "Baseline Mean R²"
+    )
+    assert bl_mean_series[0] == 0.70
+    assert bl_mean_series[1] is None
+
+
+def test_baseline_run_level_fallback_figure_omits_when_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Run-level fallback figure path omits Baseline series when NO run
+    has baseline values (no-fabrication negative test)."""
+    from gecco.results_comparison import export_figures
+
+    calls = []
+
+    def fake_bar_chart(base_path, labels, series, title, ylabel, caption):
+        calls.append({
+            "base_path": base_path,
+            "labels": labels,
+            "series": series,
+        })
+
+    monkeypatch.setattr(
+        "gecco.results_comparison._bar_chart",
+        fake_bar_chart,
+    )
+    monkeypatch.setattr(
+        "gecco.results_comparison._scatter_plot",
+        lambda *args, **kwargs: None,
+    )
+
+    summaries = [
+        {
+            "config_label": "cfg_a", "run_id": "run_001",
+            "best_train_metric": 100.0, "best_val_metric": 105.0,
+            "best_test_metric": 130.0,
+            "best_test_mean_r2": 0.75, "best_test_max_r2": 0.85,
+            "baseline_test_metric": None,
+            "baseline_test_mean_r2": None, "baseline_test_max_r2": None,
+            "has_baseline": False,
+            "has_test_eval": True, "has_individual_differences": True,
+            "n_models": 5, "n_failed_models": 0, "n_excluded_rows": 0,
+            "exclusion_warnings": [],
+        },
+    ]
+
+    export_figures(summaries, str(tmp_path))
+
+    fit_call = next(
+        c for c in calls if c["base_path"].name == "model_fit_by_config"
+    )
+    series_names = [name for name, _ in fit_call["series"]]
+    assert "Baseline" not in series_names
+    assert "Baseline Mean R²" not in [
+        name for name, _ in next(
+            c for c in calls if c["base_path"].name == "individual_differences_by_config"
+        )["series"]
+    ]
+
+
+def test_prepare_fit_vs_prediction_config_level_includes_baseline():
+    """Config-level fit-vs-prediction includes baseline config points when
+    both baseline_metric_mean and baseline_test_metric_mean exist."""
+    from gecco.results_comparison import _prepare_fit_vs_prediction_data
+
+    summaries = [
+        {"config_label": "cfg_a", "run_id": "run_001",
+         "best_train_metric": 100.0, "best_test_metric": 130.0},
+        {"config_label": "cfg_b", "run_id": "run_002",
+         "best_train_metric": 200.0, "best_test_metric": 250.0},
+    ]
+    config_rows = [
+        {"config_label": "cfg_a",
+         "best_train_metric_mean": 100.0, "best_test_metric_mean": 130.0,
+         "baseline_metric_mean": 95.0, "baseline_test_metric_mean": 120.0},
+        {"config_label": "cfg_b",
+         "best_train_metric_mean": 200.0, "best_test_metric_mean": 250.0,
+         "baseline_metric_mean": None, "baseline_test_metric_mean": None},
+    ]
+
+    labels, x_vals, y_vals, bl_labels, bl_x, bl_y = (
+        _prepare_fit_vs_prediction_data(summaries, config_rows=config_rows)
+    )
+
+    # Config-level generated points
+    assert labels == ["cfg_a", "cfg_b"]
+    assert x_vals == [100.0, 200.0]
+    assert y_vals == [130.0, 250.0]
+
+    # Baseline points: only cfg_a has both baseline_metric_mean and
+    # baseline_test_metric_mean
+    assert len(bl_labels) == 1
+    assert "Baseline" in bl_labels[0]
+    assert bl_x == [95.0]
+    assert bl_y == [120.0]
+
+
+def test_baseline_aggregation_multiple_present_runs():
+    """Aggregation over multiple baseline-present runs proves mean/std/n."""
+    from gecco.results_comparison import aggregate_configs
+
+    summaries = [
+        {
+            "config_label": "grp",
+            "best_train_metric": 100.0, "best_val_metric": 105.0,
+            "best_test_metric": 130.0, "best_test_nll": 4.0,
+            "best_test_mean_r2": 0.75, "best_test_max_r2": 0.85,
+            "baseline_metric": 90.0,
+            "baseline_test_metric": 120.0,
+            "baseline_test_nll": 3.8,
+            "baseline_test_mean_r2": 0.70,
+            "baseline_test_max_r2": 0.80,
+            "has_baseline": True,
+            "n_models": 5, "n_failed_models": 0,
+            "has_test_eval": True, "has_individual_differences": True,
+        },
+        {
+            "config_label": "grp",
+            "best_train_metric": 120.0, "best_val_metric": 125.0,
+            "best_test_metric": 140.0, "best_test_nll": 5.0,
+            "best_test_mean_r2": 0.65, "best_test_max_r2": 0.75,
+            "baseline_metric": 95.0,
+            "baseline_test_metric": 130.0,
+            "baseline_test_nll": 4.2,
+            "baseline_test_mean_r2": 0.68,
+            "baseline_test_max_r2": 0.78,
+            "has_baseline": True,
+            "n_models": 8, "n_failed_models": 1,
+            "has_test_eval": True, "has_individual_differences": True,
+        },
+    ]
+
+    config_rows = aggregate_configs(summaries)
+    assert len(config_rows) == 1
+    row = config_rows[0]
+
+    # baseline_test_metric: [120.0, 130.0] → mean=125.0, std≈7.07, n=2
+    assert row["baseline_test_metric_mean"] == pytest.approx(125.0, abs=1e-4)
+    assert row["baseline_test_metric_std"] == pytest.approx(7.0710678118654755, abs=1e-4)  # noqa: E501
+    assert row["baseline_test_metric_n"] == 2
+
+    # baseline_metric: [90.0, 95.0] → mean=92.5, std≈3.54, n=2
+    assert row["baseline_metric_mean"] == pytest.approx(92.5, abs=1e-4)
+    assert row["baseline_metric_std"] == pytest.approx(3.5355339059327378, abs=1e-4)  # noqa: E501
+    assert row["baseline_metric_n"] == 2
+
+    # baseline_test_nll: [3.8, 4.2] → mean=4.0, std≈0.283, n=2
+    assert row["baseline_test_nll_mean"] == pytest.approx(4.0, abs=1e-4)
+    assert row["baseline_test_nll_n"] == 2
+
+    # baseline_test_mean_r2: [0.70, 0.68] → mean=0.69, std≈0.014, n=2
+    assert row["baseline_test_mean_r2_mean"] == pytest.approx(0.69, abs=1e-4)
+    assert row["baseline_test_mean_r2_n"] == 2
+
+    # baseline_test_max_r2: [0.80, 0.78] → mean=0.79, std≈0.014, n=2
+    assert row["baseline_test_max_r2_mean"] == pytest.approx(0.79, abs=1e-4)
+    assert row["baseline_test_max_r2_n"] == 2

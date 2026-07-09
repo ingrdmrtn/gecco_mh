@@ -138,6 +138,11 @@ _COLUMN_ORDER = [
     "best_test_max_r2",
     "best_test_param",
     "best_model_name",
+    "baseline_test_metric",
+    "baseline_test_nll",
+    "baseline_test_mean_r2",
+    "baseline_test_max_r2",
+    "has_baseline",
     "n_models",
     "n_failed_models",
     "n_excluded_rows",
@@ -285,6 +290,12 @@ def summarise_run(
         "best_test_max_r2": None,
         "best_test_param": None,
         "best_model_name": None,
+        "baseline_metric": None,
+        "baseline_test_metric": None,
+        "baseline_test_nll": None,
+        "baseline_test_mean_r2": None,
+        "baseline_test_max_r2": None,
+        "has_baseline": False,
         "n_models": 0,
         "n_failed_models": 0,
         "has_test_eval": False,
@@ -347,6 +358,14 @@ def summarise_run(
 
         # Best test model (lowest metric_value) — valid-only, with thresholds
         test_predicate, test_params = _build_test_row_predicates(thresholds)
+        # Exclude the registered baseline row from generated-model best-test
+        # selection so the same row is not counted twice.
+        baseline_code_for_exclusion = _read_baseline_code(
+            result.get("results_dir", "")
+        )
+        if baseline_code_for_exclusion is not None:
+            test_predicate += " AND (code IS NULL OR code != ?)"
+            test_params.append(baseline_code_for_exclusion)
         test_row = conn.execute(
             f"SELECT name, metric_value, mean_nll, model_id "
             f"FROM models "
@@ -380,6 +399,9 @@ def summarise_run(
                     )
                     result["best_test_param"] = id_row[2]
                     result["has_individual_differences"] = True
+        # -- Baseline extraction (from diagnostics DB) --
+        _populate_baseline_from_conn(result, conn, tables)
+
     finally:
         conn.close()
 
@@ -424,6 +446,9 @@ def _merge_sibling_test_rows(
     Only the best-test-metric, test-NLL, individual-differences, and
     test-evaluation booleans are overwritten; train/val/metrics and model
     counts remain as set by the primary DB.
+
+    Baseline extraction runs independently: the registered baseline row
+    is populated even when no generated best-test row exists.
     """
     if thresholds is None:
         thresholds = ComparisonThresholds()
@@ -439,8 +464,19 @@ def _merge_sibling_test_rows(
         if "models" not in tables:
             return
 
-        # Best test model (lowest metric_value) — valid-only, with thresholds
+        # -- Baseline extraction runs regardless of generated test row --
+        _populate_baseline_from_conn(result, conn, tables)
+
+        # Best test model (lowest metric_value) — valid-only, with thresholds.
+        # Exclude the registered baseline row so the same row is not counted
+        # as both generated best-test and baseline.
         test_predicate, test_params = _build_test_row_predicates(thresholds)
+        baseline_code_for_exclusion = _read_baseline_code(
+            result.get("results_dir", "")
+        )
+        if baseline_code_for_exclusion is not None:
+            test_predicate += " AND (code IS NULL OR code != ?)"
+            test_params.append(baseline_code_for_exclusion)
         test_row = conn.execute(
             f"SELECT name, metric_value, mean_nll, model_id "
             f"FROM models "
@@ -475,8 +511,143 @@ def _merge_sibling_test_rows(
                 )
                 result["best_test_param"] = id_row[2]
                 result["has_individual_differences"] = True
+
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Baseline extraction helpers
+# --------------------------------------------------------------------------- #
+
+
+def _read_baseline_code(results_dir: str) -> str | None:
+    """Return the registered baseline code from ``shared_registry.duckdb``,
+    or ``None`` if no baseline is registered.
+
+    This is a narrow helper used to exclude the baseline row from
+    generated-model best-test queries.
+    """
+    registry_data = _read_baseline_registry(results_dir)
+    if registry_data is None:
+        return None
+    return registry_data.get("code")
+
+
+def _read_baseline_registry(
+    results_dir: str,
+) -> dict[str, Any] | None:
+    """Read baseline metadata from the sibling ``shared_registry.duckdb``.
+
+    Parameters
+    ----------
+    results_dir:
+        Path to the run directory.
+
+    Returns
+    -------
+    dict or None
+        Dict with keys ``code`` (str) and ``metric_value`` (float | None),
+        or ``None`` if the registry file is missing, the
+        ``runtime_baseline`` table does not exist, or the table has no row.
+    """
+    registry_path = Path(results_dir) / "shared_registry.duckdb"
+    if not registry_path.exists():
+        return None
+    try:
+        reg_conn = duckdb.connect(str(registry_path), read_only=True)
+    except duckdb.Error:
+        # Registry file exists but cannot be opened (e.g. corrupt)
+        return None
+    try:
+        row = reg_conn.execute(
+            "SELECT code, metric_value "
+            "FROM runtime_baseline WHERE singleton = 1"
+        ).fetchone()
+        if row:
+            return {
+                "code": row[0],
+                "metric_value": float(row[1]) if row[1] is not None else None,
+            }
+        return None
+    except duckdb.CatalogException:
+        # runtime_baseline table does not exist — no baseline available
+        return None
+    except duckdb.Error:
+        # Some other query error (e.g. schema mismatch); propagate so the
+        # caller can treat it as a visible failure rather than silently
+        # returning None.
+        raise
+    finally:
+        reg_conn.close()
+
+
+def _find_baseline_test_row(
+    conn, baseline_code: str
+) -> dict[str, Any] | None:
+    """Find exactly one ``models.split='test'`` row whose ``code`` matches
+    the *baseline_code* and whose ``metric_value`` is not null.
+
+    Returns a dict with keys ``name``, ``metric_value``, ``mean_nll``,
+    ``model_id`` when exactly one match is found and the row has
+    ``status='ok'`` and non-null ``metric_value``.  Returns ``None`` when
+    zero or multiple matches exist.
+    """
+    rows = conn.execute(
+        "SELECT name, metric_value, mean_nll, model_id "
+        "FROM models "
+        "WHERE split='test' AND status='ok' AND code = ? "
+        "AND metric_value IS NOT NULL",
+        [baseline_code],
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    return {
+        "name": row[0],
+        "metric_value": float(row[1]) if row[1] is not None else None,
+        "mean_nll": float(row[2]) if row[2] is not None else None,
+        "model_id": row[3],
+    }
+
+
+def _populate_baseline_from_conn(
+    result: dict[str, Any],
+    conn,
+    tables: list[str],
+) -> None:
+    """Populate baseline fields in *result* by reading the shared registry
+    and matching the baseline code against *conn* (the diagnostics DB).
+
+    This is called from ``summarise_run`` and ``_merge_sibling_test_rows``.
+    """
+    registry_data = _read_baseline_registry(result.get("results_dir", ""))
+    if registry_data is None or registry_data["code"] is None:
+        return
+
+    baseline_row = _find_baseline_test_row(conn, registry_data["code"])
+    if baseline_row is None:
+        return
+
+    result["baseline_test_metric"] = baseline_row["metric_value"]
+    result["baseline_test_nll"] = baseline_row["mean_nll"]
+    result["baseline_metric"] = registry_data["metric_value"]
+    result["has_baseline"] = True
+
+    if "individual_differences" in tables:
+        id_row = conn.execute(
+            "SELECT mean_r2, max_r2 "
+            "FROM individual_differences "
+            "WHERE model_id=? AND split='test'",
+            [baseline_row["model_id"]],
+        ).fetchone()
+        if id_row:
+            result["baseline_test_mean_r2"] = (
+                float(id_row[0]) if id_row[0] is not None else None
+            )
+            result["baseline_test_max_r2"] = (
+                float(id_row[1]) if id_row[1] is not None else None
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +661,11 @@ _NUMERIC_METRICS = [
     "best_test_nll",
     "best_test_mean_r2",
     "best_test_max_r2",
+    "baseline_metric",
+    "baseline_test_metric",
+    "baseline_test_nll",
+    "baseline_test_mean_r2",
+    "baseline_test_max_r2",
 ]
 
 _CONFIG_COLUMN_ORDER = [
@@ -518,6 +694,21 @@ _CONFIG_COLUMN_ORDER = [
     "best_test_max_r2_mean",
     "best_test_max_r2_std",
     "best_test_max_r2_n",
+    "baseline_metric_mean",
+    "baseline_metric_std",
+    "baseline_metric_n",
+    "baseline_test_metric_mean",
+    "baseline_test_metric_std",
+    "baseline_test_metric_n",
+    "baseline_test_nll_mean",
+    "baseline_test_nll_std",
+    "baseline_test_nll_n",
+    "baseline_test_mean_r2_mean",
+    "baseline_test_mean_r2_std",
+    "baseline_test_mean_r2_n",
+    "baseline_test_max_r2_mean",
+    "baseline_test_max_r2_std",
+    "baseline_test_max_r2_n",
 ]
 
 
@@ -937,11 +1128,18 @@ def render_report_html(
 def _prepare_fit_vs_prediction_data(
     summaries: list[dict[str, Any]],
     config_rows: list[dict[str, Any]] | None = None,
-) -> tuple[list[str], list[float | None], list[float | None]]:
+) -> tuple[
+    list[str], list[float | None], list[float | None],
+    list[str], list[float | None], list[float | None],
+]:
     """Prepare data for the fit-vs-prediction scatter plot.
 
     When *config_rows* is provided the scatter uses config-level means
     (one point per config).  Otherwise run-level values are used.
+
+    Returns two groups of (labels, x_vals, y_vals):
+        Group 1: generated-model points.
+        Group 2: baseline points (empty when no baseline data exists).
     """
     if config_rows:
         labels = [
@@ -950,6 +1148,22 @@ def _prepare_fit_vs_prediction_data(
         ]
         x_vals = [cr.get("best_train_metric_mean") for cr in config_rows]
         y_vals = [cr.get("best_test_metric_mean") for cr in config_rows]
+
+        # Baseline config points: when both baseline_metric and
+        # baseline_test_metric exist
+        bl_labels = []
+        bl_x = []
+        bl_y = []
+        for i, cr in enumerate(config_rows):
+            bx = cr.get("baseline_metric_mean")
+            by = cr.get("baseline_test_metric_mean")
+            if bx is not None and by is not None:
+                cfg_label = _format_config_label_for_display(
+                    cr.get("config_label", f"cfg_{i}")
+                )
+                bl_labels.append(f"Baseline: {cfg_label}")
+                bl_x.append(bx)
+                bl_y.append(by)
     else:
         labels = [
             _format_config_label_for_display(
@@ -959,7 +1173,23 @@ def _prepare_fit_vs_prediction_data(
         ]
         x_vals = [s.get("best_train_metric") for s in summaries]
         y_vals = [s.get("best_test_metric") for s in summaries]
-    return labels, x_vals, y_vals
+
+        # Baseline run-level points
+        bl_labels = []
+        bl_x = []
+        bl_y = []
+        for i, s in enumerate(summaries):
+            bx = s.get("baseline_metric")
+            by = s.get("baseline_test_metric")
+            if bx is not None and by is not None:
+                run_label = _format_config_label_for_display(
+                    s.get("config_label", s.get("run_id", f"run_{i}"))
+                )
+                bl_labels.append(f"Baseline: {run_label}")
+                bl_x.append(bx)
+                bl_y.append(by)
+
+    return labels, x_vals, y_vals, bl_labels, bl_x, bl_y
 
 
 def _config_level_series(
@@ -1041,14 +1271,21 @@ def export_figures(
         val_vals = [s.get("best_val_metric") for s in summaries]
         test_vals = [s.get("best_test_metric") for s in summaries]
 
+        baseline_test_vals = [
+            s.get("baseline_test_metric") for s in summaries
+        ]
+        main_series = [
+            ("Train", train_vals),
+            ("Val", val_vals),
+            ("Test", test_vals),
+        ]
+        if any(v is not None for v in baseline_test_vals):
+            main_series.append(("Baseline", baseline_test_vals))
+
         _bar_chart(
             fig_dir / "model_fit_by_config",
             labels_run,
-            [
-                ("Train", train_vals),
-                ("Val", val_vals),
-                ("Test", test_vals),
-            ],
+            main_series,
             "Model Fit by Config",
             "Metric Value",
             "Best Fit Metric (lower is better)",
@@ -1056,21 +1293,30 @@ def export_figures(
 
         id_mean = [s.get("best_test_mean_r2") for s in summaries]
         id_max = [s.get("best_test_max_r2") for s in summaries]
+        bl_id_mean = [s.get("baseline_test_mean_r2") for s in summaries]
+        bl_id_max = [s.get("baseline_test_max_r2") for s in summaries]
+
+        id_series = [
+            ("Mean R²", id_mean),
+            ("Max R²", id_max),
+        ]
+        if any(v is not None for v in bl_id_mean):
+            id_series.append(("Baseline Mean R²", bl_id_mean))
+        if any(v is not None for v in bl_id_max):
+            id_series.append(("Baseline Max R²", bl_id_max))
 
         _bar_chart(
             fig_dir / "individual_differences_by_config",
             labels_run,
-            [
-                ("Mean R²", id_mean),
-                ("Max R²", id_max),
-            ],
+            id_series,
             "Individual Differences by Config",
             "R²",
             "Test Individual Differences (higher is better)",
         )
 
     # -- 3. Fit vs Prediction --
-    labels_scatter, train_vals_scatter, test_vals_scatter = (
+    (labels_scatter, train_vals_scatter, test_vals_scatter,
+     bl_labels, bl_x, bl_y) = (
         _prepare_fit_vs_prediction_data(summaries, config_rows=config_rows)
     )
 
@@ -1087,6 +1333,9 @@ def export_figures(
         title,
         "Best Train Metric",
         "Best Test Metric",
+        bl_labels=bl_labels,
+        bl_x_vals=bl_x,
+        bl_y_vals=bl_y,
     )
 
     plt.close("all")
@@ -1109,13 +1358,22 @@ def _export_config_level_figures(
 
     # -- 1. Main config comparison figure (test-evaluation only) --
     test_means, test_errs = _config_level_series(config_rows, "best_test_metric")
+    baseline_means, baseline_errs = _config_level_series(
+        config_rows, "baseline_test_metric"
+    )
+
+    series = [("Test", test_means, test_errs)]
+    # Only add Baseline series when at least one value is non-NaN
+    if any(
+        m is not None and not (isinstance(m, float) and m != m)  # noqa: E721  # NaN check
+        for m in baseline_means
+    ):
+        series.append(("Baseline", baseline_means, baseline_errs))
 
     _bar_chart_with_errors(
         fig_dir / "model_fit_by_config",
         labels,
-        [
-            ("Test", test_means, test_errs),
-        ],
+        series,
         "Test Evaluation by Config (mean ± SD)",
         "Metric Value",
         "Best Test Metric (lower is better)",
@@ -1124,14 +1382,36 @@ def _export_config_level_figures(
     # -- 2. Individual differences by config (config-level means) --
     id_mean_vals, id_mean_errs = _config_level_series(config_rows, "best_test_mean_r2")
     id_max_vals, id_max_errs = _config_level_series(config_rows, "best_test_max_r2")
+    bl_id_mean_vals, bl_id_mean_errs = _config_level_series(
+        config_rows, "baseline_test_mean_r2"
+    )
+    bl_id_max_vals, bl_id_max_errs = _config_level_series(
+        config_rows, "baseline_test_max_r2"
+    )
+
+    id_series = [
+        ("Mean R²", id_mean_vals, id_mean_errs),
+        ("Max R²", id_max_vals, id_max_errs),
+    ]
+    if any(
+        m is not None and not (isinstance(m, float) and m != m)
+        for m in bl_id_mean_vals
+    ):
+        id_series.append(
+            ("Baseline Mean R²", bl_id_mean_vals, bl_id_mean_errs)
+        )
+    if any(
+        m is not None and not (isinstance(m, float) and m != m)
+        for m in bl_id_max_vals
+    ):
+        id_series.append(
+            ("Baseline Max R²", bl_id_max_vals, bl_id_max_errs)
+        )
 
     _bar_chart_with_errors(
         fig_dir / "individual_differences_by_config",
         labels,
-        [
-            ("Mean R²", id_mean_vals, id_mean_errs),
-            ("Max R²", id_max_vals, id_max_errs),
-        ],
+        id_series,
         "Individual Differences by Config (mean ± SD)",
         "R²",
         "Test Individual Differences (higher is better)",
@@ -1293,15 +1573,33 @@ def _scatter_plot(
     title: str,
     xlabel: str,
     ylabel: str,
+    bl_labels: list[str] | None = None,
+    bl_x_vals: list[float | None] | None = None,
+    bl_y_vals: list[float | None] | None = None,
 ) -> None:
-    """Draw a scatter plot and save as PNG + PDF."""
+    """Draw a scatter plot and save as PNG + PDF.
+
+    Parameters
+    ----------
+    bl_labels, bl_x_vals, bl_y_vals:
+        Optional second group of points (baseline) plotted with a
+        different marker and a separate legend entry.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
 
     valid = [(l, x, y) for l, x, y in zip(labels, x_vals, y_vals) if x is not None and y is not None]
-    if len(valid) < 2:
+    has_baseline = bl_labels and bl_x_vals and bl_y_vals and any(
+        x is not None and y is not None
+        for x, y in zip(bl_x_vals, bl_y_vals)
+    )
+    total_points = len(valid) + (
+        sum(1 for x, y in zip(bl_x_vals or [], bl_y_vals or [])
+            if x is not None and y is not None)
+    )
+    if total_points < 2:
         # Not enough points; draw a placeholder
         fig, ax = plt.subplots(figsize=(5, 4))
         ax.text(0.5, 0.5, "Insufficient data for scatter plot",
@@ -1314,14 +1612,35 @@ def _scatter_plot(
         return
 
     fig, ax = plt.subplots(figsize=(5, 4))
-    l, x, y = zip(*valid)
-    ax.scatter(x, y, alpha=0.7)
 
-    for li, xi, yi in zip(l, x, y):
-        ax.annotate(li, (xi, yi), fontsize=7, alpha=0.8)
+    # Generated-model points
+    if valid:
+        l, x, y = zip(*valid)
+        ax.scatter(x, y, alpha=0.7, label="Generated models")
+
+        for li, xi, yi in zip(l, x, y):
+            ax.annotate(li, (xi, yi), fontsize=7, alpha=0.8)
+
+    # Baseline points
+    if has_baseline and bl_x_vals and bl_y_vals:
+        bl_valid = [
+            (l, x, y) for l, x, y in zip(bl_labels, bl_x_vals, bl_y_vals)
+            if x is not None and y is not None
+        ]
+        if bl_valid:
+            bl_l, bl_x, bl_y = zip(*bl_valid)
+            ax.scatter(bl_x, bl_y, alpha=0.7, marker="s", label="Baseline")
+            for li, xi, yi in zip(bl_l, bl_x, bl_y):
+                ax.annotate(li, (xi, yi), fontsize=7, alpha=0.8)
 
     # Diagonal reference line
-    all_vals = [v for v in x + y if v is not None]
+    all_x = [v for v in x_vals if v is not None] + (
+        [v for v in (bl_x_vals or []) if v is not None]
+    )
+    all_y = [v for v in y_vals if v is not None] + (
+        [v for v in (bl_y_vals or []) if v is not None]
+    )
+    all_vals = all_x + all_y
     if all_vals:
         lo, hi = min(all_vals), max(all_vals)
         margin = (hi - lo) * 0.1 if hi > lo else 1.0
@@ -1331,6 +1650,8 @@ def _scatter_plot(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    if valid or has_baseline:
+        ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(str(base_path) + ".png", dpi=150)
     fig.savefig(str(base_path) + ".pdf")

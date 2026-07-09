@@ -1146,7 +1146,7 @@ def _bar_chart_with_errors(
     ylabel: str,
     caption: str,
 ) -> None:
-    """Draw a grouped bar chart with error bars and save as PNG + PDF."""
+    """Draw a grouped horizontal bar chart with error bars and save it."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1158,46 +1158,63 @@ def _bar_chart_with_errors(
     if n_groups == 0:
         return
 
-    has_multiline_labels = any("\n" in label for label in labels)
+    max_label_lines = max(label.count("\n") + 1 for label in labels)
+    max_label_line_length = max(
+        len(line) for label in labels for line in label.splitlines()
+    )
+    fig_height = max(4.5, n_groups * (0.38 + 0.1 * max_label_lines) + 1.8)
+    fig_width = max(9.5, 6.5 + max_label_line_length * 0.12)
+    left_margin = min(0.45, max(0.24, 0.14 + max_label_line_length * 0.008))
     fig, ax = plt.subplots(
-        figsize=(max(6, n_groups * 0.8), 4.6 if has_multiline_labels else 4)
+        figsize=(fig_width, fig_height)
     )
     index = np.arange(n_groups)
-    bar_width = 0.8 / n_series
+    bar_height = 0.8 / n_series
+    max_extent = 0.0
 
     for i, (name, values, errors) in enumerate(series):
-        offset = (i - (n_series - 1) / 2) * bar_width
-        # Pass yerr when at least one error is valid; matplotlib skips
+        offset = (i - (n_series - 1) / 2) * bar_height
+        # Pass xerr when at least one error is valid; matplotlib skips
         # NaN entries in error bars.
         has_valid_err = any(
             e is not None and not np.isnan(e) and e > 0 for e in errors
         )
-        bars = ax.bar(
-            index + offset, values, bar_width, label=name, alpha=0.8,
-            yerr=errors if has_valid_err else None,
+        bars = ax.barh(
+            index + offset,
+            values,
+            bar_height,
+            label=name,
+            alpha=0.8,
+            xerr=errors if has_valid_err else None,
             capsize=3,
         )
-        _label_bars(bars, values)
+        _label_bar_values(bars, values)
 
-    ax.set_xlabel("Config")
-    ax.set_ylabel(ylabel)
+        for value, error in zip(values, errors):
+            if value is None or np.isnan(value):
+                continue
+            extent = float(value)
+            if error is not None and not np.isnan(error) and error > 0:
+                extent += float(error)
+            max_extent = max(max_extent, extent)
+
+    ax.set_xlabel(ylabel)
+    ax.set_ylabel("Config")
     ax.set_title(title)
-    ax.set_xticks(index)
-    ax.set_xticklabels(
-        labels,
-        rotation=0 if has_multiline_labels else 45,
-        ha="center" if has_multiline_labels else "right",
-        fontsize=8,
-    )
+    ax.set_yticks(index)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
     ax.legend(fontsize=8)
+    if max_extent > 0:
+        ax.set_xlim(0, max_extent * 1.16)
     ax.text(
         0.5,
-        -0.3 if has_multiline_labels else -0.25,
+        -0.08,
         caption,
         transform=ax.transAxes,
         ha="center", fontsize=8, color="gray", style="italic",
     )
-    fig.tight_layout()
+    fig.subplots_adjust(left=left_margin, right=0.97, top=0.92, bottom=0.12)
     fig.savefig(str(base_path) + ".png", dpi=150)
     fig.savefig(str(base_path) + ".pdf")
     plt.close(fig)
@@ -1211,7 +1228,7 @@ def _bar_chart(
     ylabel: str,
     caption: str,
 ) -> None:
-    """Draw a grouped bar chart and save as PNG + PDF."""
+    """Draw a grouped horizontal bar chart and save it."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1223,38 +1240,46 @@ def _bar_chart(
     if n_groups == 0:
         return
 
-    has_multiline_labels = any("\n" in label for label in labels)
+    max_label_lines = max(label.count("\n") + 1 for label in labels)
+    max_label_line_length = max(
+        len(line) for label in labels for line in label.splitlines()
+    )
+    fig_height = max(4.5, n_groups * (0.38 + 0.1 * max_label_lines) + 1.8)
+    fig_width = max(9.5, 6.5 + max_label_line_length * 0.12)
+    left_margin = min(0.45, max(0.24, 0.14 + max_label_line_length * 0.008))
     fig, ax = plt.subplots(
-        figsize=(max(6, n_groups * 0.8), 4.6 if has_multiline_labels else 4)
+        figsize=(fig_width, fig_height)
     )
     index = np.arange(n_groups)
-    bar_width = 0.8 / n_series
+    bar_height = 0.8 / n_series
+    max_extent = 0.0
 
     for i, (name, values) in enumerate(series):
-        offset = (i - (n_series - 1) / 2) * bar_width
+        offset = (i - (n_series - 1) / 2) * bar_height
         clean = [v if v is not None else 0 for v in values]
-        bars = ax.bar(index + offset, clean, bar_width, label=name, alpha=0.8)
-        _label_bars(bars, values)
+        bars = ax.barh(index + offset, clean, bar_height, label=name, alpha=0.8)
+        _label_bar_values(bars, values)
+        for value in values:
+            if value is not None:
+                max_extent = max(max_extent, float(value))
 
-    ax.set_xlabel("Config")
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel(ylabel)
+    ax.set_ylabel("Config")
     ax.set_title(title)
-    ax.set_xticks(index)
-    ax.set_xticklabels(
-        labels,
-        rotation=0 if has_multiline_labels else 45,
-        ha="center" if has_multiline_labels else "right",
-        fontsize=8,
-    )
+    ax.set_yticks(index)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
     ax.legend(fontsize=8)
+    if max_extent > 0:
+        ax.set_xlim(0, max_extent * 1.16)
     ax.text(
         0.5,
-        -0.3 if has_multiline_labels else -0.25,
+        -0.08,
         caption,
         transform=ax.transAxes,
         ha="center", fontsize=8, color="gray", style="italic",
     )
-    fig.tight_layout()
+    fig.subplots_adjust(left=left_margin, right=0.97, top=0.92, bottom=0.12)
     fig.savefig(str(base_path) + ".png", dpi=150)
     fig.savefig(str(base_path) + ".pdf")
     plt.close(fig)
@@ -1312,19 +1337,22 @@ def _scatter_plot(
     plt.close(fig)
 
 
-def _label_bars(bars, values: list[float | None]) -> None:
-    """Add text labels above bars when value is not None and not NaN."""
+def _label_bar_values(bars, values: list[float | None]) -> None:
+    """Add value labels to horizontal bars when the value is present."""
     import numpy as np
+
+    valid_values = [float(v) for v in values if v is not None and not np.isnan(v)]
+    max_value = max(valid_values) if valid_values else 0.0
+    x_pad = max(max_value * 0.01, 0.2)
 
     for bar, val in zip(bars, values):
         if val is not None and not np.isnan(val):
-            height = bar.get_height()
             ax = bar.axes
             ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                height,
+                bar.get_width() + x_pad,
+                bar.get_y() + bar.get_height() / 2.0,
                 f"{val:.2f}" if abs(val) < 1000 else f"{val:.1e}",
-                ha="center",
-                va="bottom" if height >= 0 else "top",
+                ha="left",
+                va="center",
                 fontsize=6,
             )

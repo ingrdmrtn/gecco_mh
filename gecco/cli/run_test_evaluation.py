@@ -34,8 +34,9 @@ def register_parser(subparsers) -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--results-dir", required=True)
-    parser.add_argument("--write-store", action="store_true")
-    parser.set_defaults(handler=main)
+    parser.add_argument("--write-store", action="store_true", dest="write_store")
+    parser.add_argument("--no-write-store", action="store_false", dest="write_store")
+    parser.set_defaults(handler=main, write_store=True)
     return parser
 
 
@@ -472,7 +473,7 @@ def _render_summary_table(results: list[dict]) -> None:
 
 
 def run_test_evaluation(
-    *, config: str, results_dir: str, write_store: bool = False
+    *, config: str, results_dir: str, write_store: bool = True
 ) -> int | None:
     """Run the test evaluation post-processing pipeline."""
     configure_temp_dirs(PROJECT_ROOT, prefix="test-eval")
@@ -587,8 +588,8 @@ def run_test_evaluation(
             print("[test] Re-run with --write-store to persist the diagnostic store")
     else:
         print(
-            "[test] Diagnostic store persistence is disabled; pass --write-store "
-            "to persist the diagnostic store"
+            "[test] Diagnostic store persistence is disabled; pass --no-write-store "
+            "to skip persistence"
         )
     return None
 

@@ -589,3 +589,96 @@ def test_write_store_falls_back_to_diagnostics_db(tmp_path):
         assert count > 0, f"Expected test rows in diagnostics.duckdb, got {count}"
     finally:
         legacy_conn.close()
+
+
+def test_write_store_default_enabled(tmp_path):
+    """Default run_test_evaluation (without write_store=) persists to the
+    diagnostic store."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+    from gecco.cli.run_test_evaluation import run_test_evaluation
+    from unittest.mock import patch
+    import duckdb
+
+    registry_db = tmp_path / "shared_registry.duckdb"
+    duckdb.connect(str(registry_db)).close()
+
+    unified_db = tmp_path / "diagnostics_unified.duckdb"
+    store = DiagnosticStore(unified_db)
+    store.close()
+
+    with patch("gecco.cli.run_test_evaluation.load_config") as mock_load_cfg:
+        with patch("gecco.cli.run_test_evaluation.SharedRegistry") as mock_reg:
+            with patch("gecco.cli.run_test_evaluation.load_splits") as mock_splits:
+                with patch("gecco.cli.run_test_evaluation.collect_candidates",
+                           return_value=[_fake_candidate()]) as mock_collect:
+                    with patch("gecco.cli.run_test_evaluation.fit_one_on_test",
+                               return_value=_fake_test_entry()) as mock_fit:
+                        cfg = mock_load_cfg.return_value
+                        cfg.evaluation.n_test_models = 1
+                        cfg.evaluation.metric = "BIC"
+
+                        mock_reg_instance = mock_reg.open_existing.return_value
+                        mock_reg_instance.read.return_value = {}
+
+                        # No explicit write_store= — default True should persist
+                        run_test_evaluation(
+                            config="dummy",
+                            results_dir=str(tmp_path),
+                        )
+
+    unified_conn = duckdb.connect(str(unified_db), read_only=True)
+    try:
+        count = unified_conn.execute(
+            "SELECT COUNT(*) FROM models WHERE split='test'"
+        ).fetchone()[0]
+        assert count > 0, (
+            f"Expected test rows in unified DB by default, got {count}"
+        )
+    finally:
+        unified_conn.close()
+
+
+def test_write_store_false_skips_persistence(tmp_path):
+    """Explicit write_store=False must NOT write to the diagnostic store."""
+    from gecco.diagnostic_store.store import DiagnosticStore
+    from gecco.cli.run_test_evaluation import run_test_evaluation
+    from unittest.mock import patch
+    import duckdb
+
+    registry_db = tmp_path / "shared_registry.duckdb"
+    duckdb.connect(str(registry_db)).close()
+
+    unified_db = tmp_path / "diagnostics_unified.duckdb"
+    store = DiagnosticStore(unified_db)
+    store.close()
+
+    with patch("gecco.cli.run_test_evaluation.load_config") as mock_load_cfg:
+        with patch("gecco.cli.run_test_evaluation.SharedRegistry") as mock_reg:
+            with patch("gecco.cli.run_test_evaluation.load_splits") as mock_splits:
+                with patch("gecco.cli.run_test_evaluation.collect_candidates",
+                           return_value=[_fake_candidate()]) as mock_collect:
+                    with patch("gecco.cli.run_test_evaluation.fit_one_on_test",
+                               return_value=_fake_test_entry()) as mock_fit:
+                        cfg = mock_load_cfg.return_value
+                        cfg.evaluation.n_test_models = 1
+                        cfg.evaluation.metric = "BIC"
+
+                        mock_reg_instance = mock_reg.open_existing.return_value
+                        mock_reg_instance.read.return_value = {}
+
+                        run_test_evaluation(
+                            config="dummy",
+                            results_dir=str(tmp_path),
+                            write_store=False,
+                        )
+
+    unified_conn = duckdb.connect(str(unified_db), read_only=True)
+    try:
+        count = unified_conn.execute(
+            "SELECT COUNT(*) FROM models WHERE split='test'"
+        ).fetchone()[0]
+        assert count == 0, (
+            f"Expected 0 test rows with write_store=False, got {count}"
+        )
+    finally:
+        unified_conn.close()

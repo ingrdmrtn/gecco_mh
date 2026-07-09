@@ -307,6 +307,7 @@ def test_compare_cli_passes_thresholds_to_summarise_run(
             "has_individual_differences": False,
             "n_excluded_rows": 0,
             "exclusion_warnings": [],
+            "baseline_diagnostics": [],
         }
 
     monkeypatch.setattr(
@@ -2490,6 +2491,7 @@ def test_baseline_run_level_fallback_figure_includes_series(
             "has_test_eval": True, "has_individual_differences": True,
             "n_models": 5, "n_failed_models": 0, "n_excluded_rows": 0,
             "exclusion_warnings": [],
+            "baseline_diagnostics": [],
         },
         {
             "config_label": "cfg_b", "run_id": "run_002",
@@ -2502,6 +2504,7 @@ def test_baseline_run_level_fallback_figure_includes_series(
             "has_test_eval": True, "has_individual_differences": True,
             "n_models": 8, "n_failed_models": 0, "n_excluded_rows": 0,
             "exclusion_warnings": [],
+            "baseline_diagnostics": [],
         },
     ]
 
@@ -2580,6 +2583,7 @@ def test_baseline_run_level_fallback_figure_omits_when_missing(
             "has_test_eval": True, "has_individual_differences": True,
             "n_models": 5, "n_failed_models": 0, "n_excluded_rows": 0,
             "exclusion_warnings": [],
+            "baseline_diagnostics": [],
         },
     ]
 

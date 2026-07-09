@@ -302,6 +302,7 @@ def summarise_run(
         "has_individual_differences": False,
         "n_excluded_rows": 0,
         "exclusion_warnings": [],
+        "baseline_diagnostics": [],
     }
 
     try:
@@ -521,14 +522,17 @@ def _merge_sibling_test_rows(
 # --------------------------------------------------------------------------- #
 
 
-def _read_baseline_code(results_dir: str) -> str | None:
+def _read_baseline_code(
+    results_dir: str,
+    diagnostics: list[str] | None = None,
+) -> str | None:
     """Return the registered baseline code from ``shared_registry.duckdb``,
     or ``None`` if no baseline is registered.
 
     This is a narrow helper used to exclude the baseline row from
     generated-model best-test queries.
     """
-    registry_data = _read_baseline_registry(results_dir)
+    registry_data = _read_baseline_registry(results_dir, diagnostics=diagnostics)
     if registry_data is None:
         return None
     return registry_data.get("code")
@@ -536,6 +540,7 @@ def _read_baseline_code(results_dir: str) -> str | None:
 
 def _read_baseline_registry(
     results_dir: str,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Read baseline metadata from the sibling ``shared_registry.duckdb``.
 
@@ -543,6 +548,9 @@ def _read_baseline_registry(
     ----------
     results_dir:
         Path to the run directory.
+    diagnostics:
+        Optional list to which human-readable diagnostic messages are
+        appended for each failure or success case.
 
     Returns
     -------
@@ -553,11 +561,18 @@ def _read_baseline_registry(
     """
     registry_path = Path(results_dir) / "shared_registry.duckdb"
     if not registry_path.exists():
+        if diagnostics is not None:
+            diagnostics.append(
+                f"shared_registry.duckdb not found in {results_dir}"
+            )
         return None
     try:
         reg_conn = duckdb.connect(str(registry_path), read_only=True)
     except duckdb.Error:
-        # Registry file exists but cannot be opened (e.g. corrupt)
+        if diagnostics is not None:
+            diagnostics.append(
+                "shared_registry.duckdb exists but could not be opened"
+            )
         return None
     try:
         row = reg_conn.execute(
@@ -565,13 +580,30 @@ def _read_baseline_registry(
             "FROM runtime_baseline WHERE singleton = 1"
         ).fetchone()
         if row:
+            code = row[0]
+            if code is None:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        "Baseline code is NULL in runtime_baseline"
+                    )
+                return None
+            if diagnostics is not None:
+                diagnostics.append(f"Baseline found with code='{code}'")
             return {
-                "code": row[0],
+                "code": code,
                 "metric_value": float(row[1]) if row[1] is not None else None,
             }
+        if diagnostics is not None:
+            diagnostics.append(
+                "runtime_baseline table exists but has no rows"
+            )
         return None
     except duckdb.CatalogException:
         # runtime_baseline table does not exist — no baseline available
+        if diagnostics is not None:
+            diagnostics.append(
+                "runtime_baseline table does not exist in shared_registry.duckdb"
+            )
         return None
     except duckdb.Error:
         # Some other query error (e.g. schema mismatch); propagate so the
@@ -583,7 +615,8 @@ def _read_baseline_registry(
 
 
 def _find_baseline_test_row(
-    conn, baseline_code: str
+    conn, baseline_code: str,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Find exactly one ``models.split='test'`` row whose ``code`` matches
     the *baseline_code* and whose ``metric_value`` is not null.
@@ -600,9 +633,22 @@ def _find_baseline_test_row(
         "AND metric_value IS NOT NULL",
         [baseline_code],
     ).fetchall()
-    if len(rows) != 1:
+    if len(rows) == 0:
+        if diagnostics is not None:
+            diagnostics.append(
+                f"Baseline code '{baseline_code}' matches 0 test rows"
+            )
+        return None
+    if len(rows) > 1:
+        if diagnostics is not None:
+            diagnostics.append(
+                f"Baseline code '{baseline_code}' matches {len(rows)} test rows "
+                "(expected exactly 1)"
+            )
         return None
     row = rows[0]
+    if diagnostics is not None:
+        diagnostics.append(f"Baseline test row matches code '{baseline_code}'")
     return {
         "name": row[0],
         "metric_value": float(row[1]) if row[1] is not None else None,
@@ -621,14 +667,22 @@ def _populate_baseline_from_conn(
 
     This is called from ``summarise_run`` and ``_merge_sibling_test_rows``.
     """
-    registry_data = _read_baseline_registry(result.get("results_dir", ""))
+    diagnostics: list[str] = []
+    registry_data = _read_baseline_registry(
+        result.get("results_dir", ""), diagnostics=diagnostics
+    )
     if registry_data is None or registry_data["code"] is None:
+        result["baseline_diagnostics"] = diagnostics
         return
 
-    baseline_row = _find_baseline_test_row(conn, registry_data["code"])
+    baseline_row = _find_baseline_test_row(
+        conn, registry_data["code"], diagnostics=diagnostics
+    )
     if baseline_row is None:
+        result["baseline_diagnostics"] = diagnostics
         return
 
+    result["baseline_diagnostics"] = diagnostics
     result["baseline_test_metric"] = baseline_row["metric_value"]
     result["baseline_test_nll"] = baseline_row["mean_nll"]
     result["baseline_metric"] = registry_data["metric_value"]

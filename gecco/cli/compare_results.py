@@ -124,6 +124,14 @@ def main(args: argparse.Namespace) -> int | None:
             for w in warnings:
                 print(f"  [yellow]Warning ({run_id}): {w}[/]")
 
+    # Print baseline diagnostics
+    for s in summaries:
+        diag = s.get("baseline_diagnostics", [])
+        if diag:
+            run_id = s.get("run_id", "?")
+            for msg in diag:
+                print(f"  [cyan]Baseline ({run_id}): {msg}[/]")
+
     # Export
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -216,11 +216,99 @@ class TwoStepSimulator(TaskSimulator):
 
 
 # ============================================================
+# Probabilistic reversal (ProbSwitch) task simulator
+# ============================================================
+
+class ProbSwitchSimulator(TaskSimulator):
+    """Simulator for the two-armed probabilistic reversal-learning task
+    (Eckstein et al., eLife 2022; "ProbSwitch").
+
+    Task structure:
+    - Choose one of two boxes on every trial
+    - The "correct" box pays out with probability p_reward; the other box
+      essentially never pays out (p_reward_incorrect)
+    - The correct side reverses once the participant has collected a
+      criterion number of rewards, drawn uniformly per block. Because the
+      criterion is counted in rewards, a reversal always immediately
+      follows a rewarded trial.
+
+    Defaults are estimated from data/preprocessed_eckstein.csv:
+    P(reward | correct box) = 0.767, P(reward | incorrect box) = 0.000,
+    rewards per block before reversal ~ Uniform{5..15} (mean 9.4), and
+    every one of the 2218 observed reversals followed a rewarded trial.
+
+    Data columns (in model function order):
+    selected_box, reward
+    """
+
+    def __init__(self, p_reward=0.75, p_reward_incorrect=0.0,
+                 reward_criterion=(5, 15)):
+        self.p_reward = float(p_reward)
+        self.p_reward_incorrect = float(p_reward_incorrect)
+        lo, hi = reward_criterion
+        self.criterion_lo = int(lo)
+        self.criterion_hi = int(hi)
+
+    def get_input_columns(self):
+        return ["selected_box", "reward"]
+
+    def simulate_subject(self, model_func, true_params, n_trials, rng=None):
+        """Simulate one subject using the incremental NLL trick.
+
+        Per trial:
+        1. Extract p(selected_box) via NLL trick -> sample the choice
+        2. Sample reward from the current contingency
+        3. Reverse the correct side once the reward criterion is hit
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        # Column indices in model function signature
+        COL_A = 0     # selected_box
+        COL_R = 1     # reward
+
+        action = np.zeros(n_trials, dtype=int)
+        reward = np.zeros(n_trials, dtype=int)
+
+        data_arrays = [action, reward]
+
+        correct_box = int(rng.integers(2))
+        criterion = int(rng.integers(self.criterion_lo, self.criterion_hi + 1))
+        n_rewards = 0
+
+        for t in range(n_trials):
+            # --- Choice: extract p(selected_box) and sample ---
+            probs_a = _extract_choice_probs(
+                model_func, data_arrays, t, COL_A, 2, true_params
+            )
+            a = rng.choice(2, p=probs_a)
+            action[t] = a
+
+            # --- Environment: reward from the current contingency ---
+            p = self.p_reward if a == correct_box else self.p_reward_incorrect
+            r = int(rng.binomial(1, p))
+            reward[t] = r
+
+            # --- Environment: reversal after the reward criterion is met ---
+            if r:
+                n_rewards += 1
+                if n_rewards >= criterion:
+                    correct_box = 1 - correct_box
+                    n_rewards = 0
+                    criterion = int(
+                        rng.integers(self.criterion_lo, self.criterion_hi + 1)
+                    )
+
+        return [action, reward]
+
+
+# ============================================================
 # Simulator registry
 # ============================================================
 
 _SIMULATOR_REGISTRY = {
     "two_step": TwoStepSimulator,
+    "probswitch": ProbSwitchSimulator,
 }
 
 

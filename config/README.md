@@ -10,8 +10,15 @@ config/
 ├── __init__.py                # Empty package init
 ├── schema.py                  # Pydantic config schema + loader
 ├── two_step_factors/          # Active experiment configs
-│   └── deepseekv4flash/       # Configs for DeepSeek V4 Flash model
-│       ├── README.md          # Per-run config documentation
+│   ├── deepseekv4flash/       # Configs for DeepSeek V4 Flash model
+│   │   ├── README.md          # Per-run config documentation
+│   │   ├── judge_off.yaml
+│   │   ├── judge_random.yaml
+│   │   ├── judge_static_*.yaml
+│   │   ├── judge_llm_*.yaml
+│   │   └── judge_agent_*.yaml
+│   └── gpt56luna/             # Configs for OpenAI GPT-5.6 Luna model
+│       ├── README.md
 │       ├── judge_off.yaml
 │       ├── judge_random.yaml
 │       ├── judge_static_*.yaml

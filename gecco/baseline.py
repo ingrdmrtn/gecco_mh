@@ -22,6 +22,76 @@ def _log(msg):
     print(f"[{ts}] {msg}")
 
 
+def _fit_comparators(comparators, cfg, df_eval, id_eval_data=None):
+    """Fit additional reference models for reporting alongside the baseline.
+
+    Each entry needs a `model` (code string) and optionally a `name`. A failure
+    in one comparator is recorded and skipped rather than aborting the run —
+    these are reporting extras, not something the search depends on.
+    """
+    import re
+
+    from gecco.offline_evaluation.fit_generated_models import (
+        run_fit_hierarchical as run_fit,
+    )
+
+    results = []
+    for entry in comparators:
+        code = getattr(entry, "model", None)
+        if not code:
+            continue
+        match = re.search(r"def\s+(\w+)\s*\(", code)
+        func_name = match.group(1) if match else "cognitive_model"
+        label = getattr(entry, "name", func_name)
+
+        _log(f"[GeCCo] Fitting comparator model ({label})...")
+        console.print(f"[bold]Fitting comparator model ({label})...[/]")
+        try:
+            fit_res = run_fit(df_eval, code, cfg=cfg, expected_func_name=func_name)
+        except Exception as e:
+            _log(f"[GeCCo] Comparator {label} failed: {e}")
+            console.print(f"[yellow]Comparator {label} failed:[/] {e}")
+            results.append({"name": label, "function_name": func_name, "error": str(e)})
+            continue
+
+        entry_result = {
+            "name": label,
+            "function_name": func_name,
+            "metric_name": fit_res["metric_name"],
+            "metric_value": float(fit_res["metric_value"]),
+            "param_names": fit_res["param_names"],
+            "code": code,
+            "eval_metrics": [float(v) for v in fit_res.get("eval_metrics", [])],
+        }
+
+        if id_eval_data is not None:
+            try:
+                from gecco.offline_evaluation.individual_differences import (
+                    evaluate_individual_differences,
+                )
+
+                id_results = evaluate_individual_differences(
+                    fit_res, df_eval, cfg, id_data=id_eval_data
+                )
+                entry_result["individual_differences"] = {
+                    "mean_r2": id_results.get("mean_r2"),
+                    "max_r2": id_results.get("max_r2"),
+                    "best_param": id_results.get("best_param"),
+                    "per_param_r2": id_results.get("per_param_r2"),
+                }
+            except Exception as e:
+                _log(f"[GeCCo] Comparator {label} individual differences failed: {e}")
+
+        console.print(
+            f"  [bold green]{label} {fit_res['metric_name']}:[/] "
+            f"[cyan]{fit_res['metric_value']:.2f}[/] "
+            f"(params: {', '.join(fit_res['param_names'])})"
+        )
+        results.append(entry_result)
+
+    return results
+
+
 def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_data=None):
     """
     Fit the template model as a baseline if results don't already exist.
@@ -114,6 +184,16 @@ def fit_baseline_if_needed(baseline_path, cfg, df_eval, registry=None, id_eval_d
                 v.tolist() if isinstance(v, np.ndarray) else list(v)
                 for v in param_values
             ]
+
+        # Additional published comparators, fitted the same way. These are
+        # reported alongside the primary baseline but do NOT feed the search or
+        # early stopping — the registry's single `baseline` slot still holds the
+        # primary, so the dashboard and monitor are unaffected.
+        comparators = getattr(baseline_cfg, "comparators", None) or []
+        if comparators:
+            result["comparators"] = _fit_comparators(
+                comparators, cfg, df_eval, id_eval_data
+            )
 
         # Individual differences evaluation
         if id_eval_data is not None:

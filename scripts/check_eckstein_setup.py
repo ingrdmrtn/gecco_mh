@@ -141,6 +141,24 @@ def check_baseline(cfg, out_path):
 
     Path(out_path).write_text(code)
     console.print(f"Baseline code written to [dim]{out_path}[/]")
+
+    # Comparators are reporting-only, but a compile error in one still costs a
+    # run, so surface it here rather than mid-search.
+    for entry in getattr(baseline_cfg, "comparators", None) or []:
+        c_code = getattr(entry, "model", None)
+        if not c_code:
+            continue
+        c_match = re.search(r"def\s+(\w+)\s*\(", c_code)
+        c_func = c_match.group(1) if c_match else "cognitive_model"
+        label = getattr(entry, "name", c_func)
+        try:
+            c_spec = build_model_spec(c_code, expected_func_name=c_func, cfg=cfg)
+            console.print(
+                f"Compiled comparator [bold]{label}[/] ({c_func}) — parameters: "
+                f"{', '.join(f'{p}{c_spec.bounds[p]}' for p in c_spec.param_names)}"
+            )
+        except Exception as e:
+            console.print(f"[bold red]Comparator {label} failed to compile:[/] {e}")
     console.print(
         "\nTime an HBI fit on the eval split with:\n"
         f"  [cyan]python scripts/test_fit_model.py --config {cfg._config_name} "

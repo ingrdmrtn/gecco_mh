@@ -252,7 +252,14 @@ def main():
         # fit the best model to test data
         console.print("[dim]Fitting best model to test data...[/]")
         try:
-            func_name = f"cognitive_model{best_iter}"
+            # Use the winning model's actual function name. Reconstructing it
+            # as f"cognitive_model{best_iter}" mixes up the iteration index
+            # with the model-within-iteration index, so it silently requested a
+            # function that was never defined and run_fit returned a sentinel
+            # 1e10 NLL instead of raising.
+            func_name = getattr(search, "best_func_name", None) or (
+                f"cognitive_model{best_iter}"
+            )
             fit_res = run_fit(
                 df_test, best_model, cfg=cfg, expected_func_name=func_name
             )

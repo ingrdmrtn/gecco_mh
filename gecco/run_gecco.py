@@ -81,6 +81,7 @@ class GeCCoModelSearch:
         self.best_metric = np.inf
         self.best_params = []
         self.best_iter = -1
+        self.best_func_name = None
         self.best_param_names = []
         self.best_param_values = None
         self.tried_param_sets = []
@@ -1015,6 +1016,11 @@ class GeCCoModelSearch:
                         self.best_metric = mean_metric
                         self.best_model = func_code
                         self.best_iter = it
+                        # Models are named by their index WITHIN an iteration
+                        # (cognitive_model1, cognitive_model2, ...), not by
+                        # iteration number, so record the real name here rather
+                        # than reconstructing it from best_iter downstream.
+                        self.best_func_name = func_name
                         self.best_params = params
                         self.best_param_names = fit_res["param_names"]
                         self.best_param_values = fit_res["parameter_values"]

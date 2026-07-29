@@ -35,6 +35,7 @@ from gecco.offline_evaluation.fit_generated_models import run_fit, run_fit_hiera
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 console = Console()
@@ -191,7 +192,15 @@ def main():
         )
 
     # --- Show the code ---
-    console.print(Panel(code, title="Model Code", border_style="blue"))
+    # Syntax (not a bare str) so Rich does not treat `[trial]`-style indices as
+    # console markup tags and silently strip them from the displayed code.
+    console.print(
+        Panel(
+            Syntax(code, "python", theme="ansi_dark", word_wrap=True),
+            title="Model Code",
+            border_style="blue",
+        )
+    )
 
     # --- Fit ---
     fit_type = args.fit_type or "hierarchical"

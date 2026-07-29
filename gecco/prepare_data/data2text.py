@@ -42,6 +42,37 @@ def narrative(
     return "\n\n".join(text_blocks)
 
 
+def apply_value_mappings(vals, value_mappings):
+    """Replace raw column values with human-readable labels.
+
+    `value_mappings` maps a column name to a {raw_value: label} dict, e.g.
+    {"selected_box": {"0": "L", "1": "R"}}. Keys arrive from YAML as strings,
+    so numeric values are normalised to their integer string form before
+    lookup. Values with no mapping entry are left untouched.
+
+    Accepts dicts or SimpleNamespaces at either level (configs are loaded as
+    nested namespaces).
+    """
+    if not value_mappings:
+        return vals
+
+    if not isinstance(value_mappings, dict):
+        value_mappings = vars(value_mappings)
+
+    for col, mapping in value_mappings.items():
+        if not isinstance(mapping, dict):
+            mapping = vars(mapping)
+        if col in vals:
+            key = (
+                str(int(vals[col]))
+                if isinstance(vals[col], (int, float))
+                else str(vals[col])
+            )
+            vals[col] = mapping.get(key, vals[col])
+
+    return vals
+
+
 def get_data2text_function(name):
     if name == "narrative":
         def data2text(df, id_col, template, fit_type,
@@ -66,22 +97,7 @@ def get_data2text_function(name):
                         block_df = block_df.head(max_trials)
 
                         for _, row in block_df.iterrows():
-                            vals = dict(row)
-
-                            if value_mappings:
-                                if not isinstance(value_mappings, dict):
-                                    value_mappings = vars(value_mappings)
-
-                                for col, mapping in value_mappings.items():
-                                    if not isinstance(mapping, dict):
-                                        mapping = vars(mapping)
-                                    if col in vals:
-                                        key = (
-                                            str(int(vals[col]))
-                                            if isinstance(vals[col], (int, float))
-                                            else str(vals[col])
-                                        )
-                                        vals[col] = mapping.get(key, vals[col])
+                            vals = apply_value_mappings(dict(row), value_mappings)
 
                             try:
                                 trial_lines.append(template.format(**vals))
@@ -95,7 +111,7 @@ def get_data2text_function(name):
                     # Fallback behavior
                     sub = sub.head(max_trials or len(sub))
                     for _, row in sub.iterrows():
-                        vals = dict(row)
+                        vals = apply_value_mappings(dict(row), value_mappings)
                         if 'trial' in vals.keys():
                             vals['trial'] = str(int(vals['trial'])+1)
                         try:   

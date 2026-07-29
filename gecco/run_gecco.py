@@ -1,6 +1,7 @@
 # engine/model_search.py
 import os
 import json
+import re
 import time
 from datetime import datetime
 import numpy as np
@@ -24,6 +25,24 @@ from gecco.construct_feedback.feedback import FeedbackGenerator, LLMFeedbackGene
 from pathlib import Path
 
 console = Console()
+
+
+def extract_model_func_name(code, default=None):
+    """Return the cognitive_model function defined in `code`.
+
+    Generated models are named by their index within an iteration
+    (cognitive_model1, cognitive_model2, ...), which cannot be reconstructed
+    from the iteration number, and the registry records only the LLM's display
+    name. Reading the definition out of the code itself is the one approach
+    that works for both locally-generated and registry-adopted models.
+    """
+    if not code:
+        return default
+    match = re.search(r"def\s+(cognitive_model\d*)\s*\(", code)
+    if match:
+        return match.group(1)
+    match = re.search(r"def\s+(\w+)\s*\(", code)
+    return match.group(1) if match else default
 
 
 class GeCCoModelSearch:
@@ -712,6 +731,13 @@ class GeCCoModelSearch:
             self.best_metric = global_best["metric_value"]
             self.best_model = global_best["model_code"]
             self.best_params = global_best["param_names"]
+            # The adopted model came from another client, so this client's
+            # best_func_name no longer describes it. The registry stores the
+            # display name (the LLM's chosen label), not the defined function
+            # name, so read the real one out of the code.
+            self.best_func_name = extract_model_func_name(
+                global_best["model_code"], self.best_func_name
+            )
             console.print(
                 f"  [bold magenta]Synced global best from client {global_best['client_id']}:[/] "
                 f"BIC = {global_best['metric_value']:.2f}"

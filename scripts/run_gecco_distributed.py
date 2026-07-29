@@ -15,7 +15,7 @@ from gecco.offline_evaluation.fit_generated_models import (
 from gecco.prepare_data.io import load_data, split_by_participant
 from gecco.prepare_data.data2text import get_data2text_function
 from gecco.load_llms.model_loader import load_llm
-from gecco.run_gecco import GeCCoModelSearch
+from gecco.run_gecco import GeCCoModelSearch, extract_model_func_name
 from gecco.prompt_builder.prompt import PromptBuilderWrapper
 from gecco.coordination import SharedRegistry, apply_client_profile
 import pandas as pd
@@ -252,13 +252,14 @@ def main():
         # fit the best model to test data
         console.print("[dim]Fitting best model to test data...[/]")
         try:
-            # Use the winning model's actual function name. Reconstructing it
-            # as f"cognitive_model{best_iter}" mixes up the iteration index
-            # with the model-within-iteration index, so it silently requested a
-            # function that was never defined and run_fit returned a sentinel
-            # 1e10 NLL instead of raising.
-            func_name = getattr(search, "best_func_name", None) or (
-                f"cognitive_model{best_iter}"
+            # Read the function name out of the winning model's own code.
+            # Reconstructing it as f"cognitive_model{best_iter}" mixed up the
+            # iteration index with the model-within-iteration index, and
+            # tracking it as state missed the case where a client adopts
+            # another client's model from the shared registry. Either way
+            # run_fit silently returned a sentinel 1e10 NLL rather than raising.
+            func_name = extract_model_func_name(
+                best_model, getattr(search, "best_func_name", None)
             )
             fit_res = run_fit(
                 df_test, best_model, cfg=cfg, expected_func_name=func_name

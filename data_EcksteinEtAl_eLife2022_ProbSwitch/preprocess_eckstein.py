@@ -31,6 +31,18 @@ RAW_TASK_DIR = SCRIPT_DIR                 # PS_*.csv live alongside this script
 RAW_GLOB = "PS_*.csv"
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "..", "data", "preprocessed_eckstein.csv")
 
+# Restrict to the paper's analysis sample. 306 participants have trial files,
+# but Eckstein et al. (2022, Dev Cogn Neurosci) analysed N=291 — exactly the
+# subjects present in the subject-level summary table, so that table defines the
+# inclusion set. The 15 extras are the authors' exclusions. This also brings the
+# age range in line with the published 8-30 (7.8-30.0 for the 291, vs 7.8-50.0
+# for all 306), which matters because the individual-differences analysis
+# regresses fitted parameters on age.
+ANALYSIS_SAMPLE_FILE = os.path.join(
+    SCRIPT_DIR, "EcksteinEtAl_eLife2022_ProbSwitch.csv"
+)
+RESTRICT_TO_ANALYSIS_SAMPLE = True
+
 # Columns kept from each raw file. selected_box + reward are what GeCCo fits;
 # the rest are useful covariates. Lag features (outcome_*_back, choice_*_back)
 # are dropped — the model is meant to learn dynamics from the sequence.
@@ -49,14 +61,33 @@ KEEP_COLUMNS = [
 # =========================================================================
 # Step 1: Load and combine per-participant task files
 # =========================================================================
-def combine_task_files(raw_dir, raw_glob):
+def load_analysis_sample():
+    """Subject ids the paper analysed, taken from the subject-level summary."""
+    if not RESTRICT_TO_ANALYSIS_SAMPLE:
+        return None
+    summary = pd.read_csv(ANALYSIS_SAMPLE_FILE)
+    ids = set(summary["sID"].astype(int))
+    print(f"Analysis sample: {len(ids)} subjects from {os.path.basename(ANALYSIS_SAMPLE_FILE)}")
+    return ids
+
+
+def combine_task_files(raw_dir, raw_glob, analysis_sample=None):
     files = sorted(glob.glob(os.path.join(raw_dir, raw_glob)))
     print(f"Found {len(files)} participant files matching {raw_glob}")
 
     frames = []
-    for idx, file_path in enumerate(files):
+    n_excluded = 0
+    # participant is a contiguous 0-based index, assigned after exclusions so
+    # there are no gaps (splits index into sorted unique ids).
+    next_participant = 0
+    for file_path in files:
         # Subject id is the number in the filename, e.g. PS_100.csv -> 100
         subj_id = os.path.basename(file_path).replace("PS_", "").replace(".csv", "")
+
+        if analysis_sample is not None and int(subj_id) not in analysis_sample:
+            n_excluded += 1
+            continue
+
         df = pd.read_csv(file_path)
 
         missing = [c for c in KEEP_COLUMNS if c not in df.columns]
@@ -66,8 +97,12 @@ def combine_task_files(raw_dir, raw_glob):
 
         df = df[KEEP_COLUMNS].copy()
         df["subject_id"] = subj_id
-        df["participant"] = idx
+        df["participant"] = next_participant
+        next_participant += 1
         frames.append(df)
+
+    if n_excluded:
+        print(f"  Excluded {n_excluded} subjects not in the paper's analysis sample")
 
     combined = pd.concat(frames, ignore_index=True)
     print(f"Combined {len(frames)} participants, {len(combined)} total trials")
@@ -106,7 +141,8 @@ def main():
     print("Preprocessing Eckstein et al. (2022) ProbSwitch data for GeCCo")
     print("=" * 60)
 
-    df = combine_task_files(RAW_TASK_DIR, RAW_GLOB)
+    analysis_sample = load_analysis_sample()
+    df = combine_task_files(RAW_TASK_DIR, RAW_GLOB, analysis_sample=analysis_sample)
 
     print("\nCleaning values...")
     df = clean_values(df)
